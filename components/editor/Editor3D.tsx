@@ -59,6 +59,7 @@ import {
 } from '@/lib/text-voxel';
 import { buildSmoothTextMesh } from '@/lib/text-outline';
 import { exportSTL, exportOBJ, exportPLY, exportGLB } from '@/lib/mesh-export';
+import { importModelFile, getFormatFromExtension, IMPORT_FORMATS, normalizeAndCenterMeshes } from '@/lib/mesh-import';
 import { Modal } from '@/components/ui/modal';
 import { Slider } from '@/components/ui/slider';
 import {
@@ -66,6 +67,7 @@ import {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu';
 import Object3DPreview, {
   Object3DThumbnail,
@@ -1161,6 +1163,11 @@ export default function Home() {
 
   // Input oculto para seleccionar un archivo .zeus desde el navegador
   const obj3dFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Input oculto para importar modelos 3D (.obj, .glb, etc.)
+  const modelFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const [modelImportMsg, setModelImportMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
   // La escena: objetos con sus transformaciones e instantáneas de
   // malla, el objeto seleccionado y el dueño de la configuración. Se
@@ -3273,6 +3280,67 @@ export default function Home() {
     [loadObject, obj3dCreating]
   );
 
+  // Importa un modelo 3D (.obj, .glb, .gltf, .stl, .ply) desde el navegador
+  const handleModelFileSelect = useCallback(
+    async (file: File) => {
+      setModelImportMsg(null);
+      // Límite de tamaño de archivo: 500 MB
+      if (file.size > 500 * 1024 * 1024) {
+        setModelImportMsg({ ok: false, text: 'El archivo es demasiado grande (máx. 500 MB)' });
+        return;
+      }
+      const format = getFormatFromExtension(file.name);
+      if (!format) {
+        setModelImportMsg({ ok: false, text: 'Formato no soportado' });
+        return;
+      }
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const result = await importModelFile(format, arrayBuffer);
+        if (!result) {
+          setModelImportMsg({ ok: false, text: 'No se pudieron extraer vértices del modelo' });
+          return;
+        }
+        const { meshes } = result;
+        // Contamos el total de vértices entre todas las piezas
+        let totalVertices = 0;
+        for (const m of meshes) {
+          if (m.vertices.length === 0) {
+            setModelImportMsg({ ok: false, text: 'El modelo no contiene vértices' });
+            return;
+          }
+          totalVertices += m.vertices.length;
+        }
+        if (totalVertices > 10000000) {
+          setModelImportMsg({ ok: false, text: `Demasiados vértices (${totalVertices}). Máximo 10.000,000.` });
+          return;
+        }
+        // Normalizamos y centramos todas las piezas juntas
+        normalizeAndCenterMeshes(meshes);
+        const baseId = `object-${Date.now()}`;
+        // Creamos un objeto escena por pieza, con identificadores únicos
+        setSceneObjects((objects) => [
+          ...objects,
+          ...meshes.map((mesh, i) => ({
+            id: i === 0 ? baseId : `${baseId}-${i}`,
+            transform: { px: 0, py: 0, pz: 0, sx: 1, sy: 1, sz: 1, rx: 0, ry: 0, rz: 0 },
+            mesh: structuredClone(mesh),
+            smooth: true,
+          })),
+        ]);
+        // Seleccionamos la primera pieza
+        setSelectedObjectId(baseId);
+        setModelImportMsg({ ok: true, text: `Importado: ${meshes.length} pieza(s), ${totalVertices} vértices` });
+      } catch (e: unknown) {
+        setModelImportMsg({
+          ok: false,
+          text: e instanceof Error ? e.message : 'Error al importar el modelo',
+        });
+      }
+    },
+    []
+  );
+
   // Abre el modal "Objeto 3D": lista los .zeus de public/Obj-3D y los de la
   // carpeta local donde guarda el botón Guardar (la carpeta local solo
   // existe en la app de escritorio).
@@ -4400,57 +4468,101 @@ export default function Home() {
             </>
            )}
 
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <button
-                disabled={mesh.vertices.length === 0}
-                title="Exportar el objeto 3D a un archivo (STL, OBJ, PLY, GLB)"
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 disabled:opacity-40 transition-colors"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Exportar
-                <ChevronDown className="w-3 h-3" />
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="end"
-              className="bg-gray-900 border-gray-800 text-white min-w-[240px]"
-            >
-              {(
-                [
-                  {
-                    key: 'stl',
-                    label: 'STL',
-                    desc: 'Impresión 3D (estereolitografía)',
-                  },
-                  {
-                    key: 'obj',
-                    label: 'OBJ',
-                    desc: 'Wavefront: lo abre casi todo',
-                  },
-                  {
-                    key: 'ply',
-                    label: 'PLY',
-                    desc: 'Polígonos con color por cara',
-                  },
-                  {
-                    key: 'glb',
-                    label: 'GLB',
-                    desc: 'glTF binario para web y visores 3D',
-                  },
-                ] as const
-              ).map(({ key, label, desc }) => (
-                <DropdownMenuItem
-                  key={key}
-                  onClick={() => exportModel(key)}
-                  className="hover:bg-gray-800 cursor-pointer p-3 flex flex-col items-start gap-0.5"
-                >
-                  <span className="text-sm font-bold">{label}</span>
-                  <span className="text-xs text-gray-400">{desc}</span>
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
+           <DropdownMenu>
+             <DropdownMenuTrigger asChild>
+               <button
+                 disabled={mesh.vertices.length === 0}
+                 title="Exportar/Importar el objeto 3D (STL, OBJ, PLY, GLB, GLTF)"
+                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 disabled:opacity-40 transition-colors"
+               >
+                 <Download className="w-3.5 h-3.5" />
+                 Export/Import
+                 <ChevronDown className="w-3 h-3" />
+               </button>
+             </DropdownMenuTrigger>
+             <DropdownMenuContent
+               align="end"
+               className="bg-gray-900 border-gray-800 text-white min-w-[240px]"
+             >
+               <DropdownMenuItem
+                 className="cursor-default p-2 flex flex-col items-start gap-0.5"
+               >
+                 <span className="text-xs font-semibold text-gray-400">Exportar</span>
+               </DropdownMenuItem>
+               {(
+                 [
+                   {
+                     key: 'stl',
+                     label: 'STL',
+                     desc: 'Impresión 3D (estereolitografía)',
+                   },
+                   {
+                     key: 'obj',
+                     label: 'OBJ',
+                     desc: 'Wavefront: lo abre casi todo',
+                   },
+                   {
+                     key: 'ply',
+                     label: 'PLY',
+                     desc: 'Polígonos con color por cara',
+                   },
+                   {
+                     key: 'glb',
+                     label: 'GLB',
+                     desc: 'glTF binario para web y visores 3D',
+                   },
+                 ] as const
+               ).map(({ key, label, desc }) => (
+                 <DropdownMenuItem
+                   key={key}
+                   onClick={() => exportModel(key)}
+                   className="hover:bg-gray-800 cursor-pointer p-3 flex flex-col items-start gap-0.5"
+                 >
+                   <span className="text-sm font-bold">{label}</span>
+                   <span className="text-xs text-gray-400">{desc}</span>
+                 </DropdownMenuItem>
+               ))}
+               <DropdownMenuSeparator className="bg-gray-700" />
+               <DropdownMenuItem
+                 className="cursor-default p-2 flex flex-col items-start gap-0.5"
+               >
+                 <span className="text-xs font-semibold text-gray-400">Importar</span>
+               </DropdownMenuItem>
+               {IMPORT_FORMATS.map(({ ext, label, desc, format }) => (
+                 <DropdownMenuItem
+                   key={format}
+                   onSelect={(e) => {
+                     e.preventDefault();
+                     modelFileInputRef.current?.click();
+                   }}
+                   className="hover:bg-gray-800 cursor-pointer p-3 flex flex-col items-start gap-0.5"
+                 >
+                   <span className="text-sm font-bold">{label}</span>
+                   <span className="text-xs text-gray-400">{desc}</span>
+                 </DropdownMenuItem>
+               ))}
+               <input
+                 ref={modelFileInputRef}
+                 type="file"
+                 accept={IMPORT_FORMATS.map((f) => f.ext).join(',')}
+                 className="hidden"
+                 onChange={(e) => {
+                   const file = e.target.files?.[0];
+                   if (file) handleModelFileSelect(file);
+                   e.target.value = '';
+                 }}
+               />
+               {modelImportMsg && (
+                 <DropdownMenuItem
+                   className="cursor-default p-2 flex flex-col items-start gap-0.5"
+                 >
+                   <span className={`text-xs ${modelImportMsg.ok ? 'text-green-300' : 'text-red-300'}`}>
+                     {modelImportMsg.text}
+                   </span>
+                 </DropdownMenuItem>
+               )}
+             </DropdownMenuContent>
+           </DropdownMenu>
 
           <button
             onClick={resetModel}
