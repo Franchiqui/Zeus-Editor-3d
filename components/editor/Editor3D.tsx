@@ -9,7 +9,8 @@ import Viewer3D from '@/components/viewer-3d';
 import { ViewerPanel } from '@/components/editor/viewer-panel';
 import { KeyframeEditor } from '@/components/editor/keyframe-editor';
 import type { LightConfig } from '@/components/viewer-3d';
-import type { AnimationTrack } from '@/lib/animation';
+import type { FxConfig } from '@/components/viewer-3d';
+import type { AnimationTrack, Keyframe } from '@/lib/animation';
 import LightingModal from '@/components/LightingModal';
 import TextureBrowserModal from '@/components/texture-browser-modal';
 import BooleanCSGModal from './BooleanCSGModal';
@@ -480,7 +481,7 @@ function sanitizeObjectConfig(raw: unknown): ObjectConfig | null {
     ),
     textureFinish: oneOf(
       c.textureFinish,
-      ['matte', 'semi-matte', 'glossy'] as const,
+       ['matte', 'semi-matte', 'glossy', 'metallic'] as const,
       d.textureFinish
     ),
     textureRelief:
@@ -803,10 +804,26 @@ export default function Home() {
   // Muestra/oculta la rejilla del suelo
   const [showGrid, setShowGrid] = useState(true);
   // Estado de efectos visuales (brillo, chispas, fuego)
-  const [fxConfig, setFxConfig] = useState({
+  const [fxConfig, setFxConfig] = useState<FxConfig>({
     glow: false,
+    glowColor: '#5fd4ff',
+    glowIntensity: 1.4,
     sparks: false,
+    sparksCount: 140,
+    sparksSize: 0.035,
     fire: false,
+    fireCount: 160,
+    fireSize: 0.11,
+    fireIntensity: 1,
+    rain: false,
+    rainCount: 320,
+    rainSpeed: 2,
+    smoke: false,
+    smokeCount: 120,
+    smokeSize: 0.11,
+    smokeColor: '#444a52',
+    smokeRiseSpeed: 1,
+    glowObjects: false,
   });
 
   const [texture, setTexture] = useState<string | null>(null);
@@ -830,13 +847,18 @@ export default function Home() {
 
   const [showTextureModal, setShowTextureModal] = useState(false);
   const [cameraViewMode, setCameraViewMode] = useState(false);
+  const [showCameraPath, setShowCameraPath] = useState(true);
+  const [exportMp4Trigger, setExportMp4Trigger] = useState(0);
+  const [exportProgress, setExportProgress] = useState<number | null>(null);
+  const [exportResult, setExportResult] = useState<{ success: boolean; outputPath?: string; error?: string } | null>(null);
   const [isRecordingCameraPath, setIsRecordingCameraPath] = useState(false);
   const [cameraPathKeyframes, setCameraPathKeyframes] = useState<Array<{time: number; camera: Camera3D}>>([]);
   const [textureSelectTarget, setTextureSelectTarget] = useState<'ground' | 'skybox' | 'object' | null>(null);
   const [groundTexture, setGroundTexture] = useState<string | null>(null);
   const [groundTextureFileName, setGroundTextureFileName] = useState('');
-  const [groundTextureFinish, setGroundTextureFinish] = useState<'glossy' | 'semi-matte' | 'matte' | 'mirror'>('semi-matte');
-  const [objectTextureFinish, setObjectTextureFinish] = useState<'glossy' | 'semi-matte' | 'matte' | 'mirror'>('semi-matte');
+  const [groundTextureFinish, setGroundTextureFinish] = useState<TextureFinish>('semi-matte');
+  const [groundTextureRepeat, setGroundTextureRepeat] = useState(4);
+  const [objectTextureFinish, setObjectTextureFinish] = useState<TextureFinish>('semi-matte');
   const [skyboxImage, setSkyboxImage] = useState<string | null>(null);
   const [skyboxImageFileName, setSkyboxImageFileName] = useState('');
   const [selectedObjectTexture, setSelectedObjectTexture] = useState<string | null>(null);
@@ -1199,8 +1221,14 @@ export default function Home() {
    const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
    const [playing, setPlaying] = useState(false);
     const [currentTime, setCurrentTime] = useState(0.1);
-   const [showKeyframeEditor, setShowKeyframeEditor] = useState(false);
-   const animationStartTimeRef = useRef<number | null>(null);
+    const [showKeyframeEditor, setShowKeyframeEditor] = useState(false);
+
+    useEffect(() => {
+      if (cameraViewMode && animationTracks.length > 0) {
+        setShowKeyframeEditor(true);
+      }
+    }, [cameraViewMode, animationTracks.length]);
+    const animationStartTimeRef = useRef<number | null>(null);
    const animIdRef = useRef<number | null>(null);
   const recordingStartTimeRef = useRef<number>(0);
    const noopRef = useRef(() => {});
@@ -1760,11 +1788,23 @@ export default function Home() {
          easing: 'ease-in-out' as any,
        })),
      };
-    setAnimationTracks((prev) => [...prev, newTrack]);
-    setSelectedTrackId(newTrack.id);
-  }, [cameraPathKeyframes]);
+     setAnimationTracks((prev) => [...prev, newTrack]);
+     setSelectedTrackId(newTrack.id);
+   }, [cameraPathKeyframes]);
 
-  const ensureStylesheet = useCallback((url: string, key: string) => {
+   const handleCameraGizmoMove = useCallback(
+     (keyframes: Keyframe[]) => {
+       setAnimationTracks((prev) =>
+         prev.map((track) => {
+           if (track.objectId !== null) return track;
+           return { ...track, keyframes };
+         })
+       );
+     },
+     []
+   );
+
+   const ensureStylesheet = useCallback((url: string, key: string) => {
     return new Promise<void>((resolve) => {
       if (document.querySelector(`link[data-gfont="${key}"]`)) return resolve();
       const link = document.createElement('link');
@@ -2877,6 +2917,7 @@ export default function Home() {
         fxConfig,
         groundTexture,
         groundTextureFinish,
+        groundTextureRepeat,
         objectTextureFinish,
         skyboxImage,
         animationTracks,
@@ -3043,7 +3084,7 @@ export default function Home() {
         ) {
           setTextureProjection(data.textureProjection);
         }
-        if (['matte', 'semi-matte', 'glossy'].includes(data.textureFinish)) {
+        if (['matte', 'semi-matte', 'glossy', 'metallic'].includes(data.textureFinish)) {
           setTextureFinish(data.textureFinish);
         }
         if (typeof data.textureRelief === 'number')
@@ -3177,11 +3218,14 @@ export default function Home() {
           if (typeof data.groundTexture === 'string') {
             setGroundTexture(data.groundTexture);
           }
-          if (typeof data.groundTextureFinish === 'string') {
-            setGroundTextureFinish(data.groundTextureFinish as 'glossy' | 'semi-matte' | 'matte' | 'mirror');
-          }
+           if (typeof data.groundTextureFinish === 'string') {
+             setGroundTextureFinish(data.groundTextureFinish as TextureFinish);
+           }
+           if (typeof data.groundTextureRepeat === 'number') {
+             setGroundTextureRepeat(data.groundTextureRepeat);
+           }
           if (typeof data.objectTextureFinish === 'string') {
-            setObjectTextureFinish(data.objectTextureFinish as 'glossy' | 'semi-matte' | 'matte' | 'mirror');
+            setObjectTextureFinish(data.objectTextureFinish as TextureFinish);
           }
           if (typeof data.skyboxImage === 'string') {
             setSkyboxImage(data.skyboxImage);
@@ -4115,27 +4159,37 @@ export default function Home() {
                   }}
                   className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5"
                 >
-                  <span className="text-sm font-bold flex items-center gap-1.5">
-                    <ImageIcon className="w-3.5 h-3.5" />
-                    Textura del suelo
-                  </span>
+                   <span className="text-sm font-bold flex items-center gap-1.5">
+                     <ImageIcon className="w-3.5 h-3.5" />
+                     Textura del suelo
+                   </span>
                    {groundTexture && (
-                     <img src={groundTexture} alt="Suelo" className="w-6 h-6 object-cover rounded border border-white/20 mt-0.5" />
+                     <div className="flex items-center gap-1 mt-0.5" onClick={(e) => e.stopPropagation()}>
+                       <img src={groundTexture} alt="Suelo" className="w-6 h-6 object-cover rounded border border-white/20" />
+                       <input
+                         type="number"
+                         min={1}
+                         max={100}
+                         value={groundTextureRepeat}
+                         onChange={(e) => setGroundTextureRepeat(Math.max(1, Math.min(100, parseInt(e.target.value) || 1)))}
+                         className="w-14 px-1 py-0.5 text-xs bg-black/40 border border-white/10 rounded text-foreground"
+                       />
+                     </div>
                    )}
                  </DropdownMenuItem>
                  {groundTexture && (
                    <DropdownMenuItem
                     onSelect={(e) => {
                       e.preventDefault();
-                      const finishes = ['matte', 'semi-matte', 'glossy', 'mirror'];
+                      const finishes = ['matte', 'semi-matte', 'glossy', 'metallic', 'mirror'];
                       const idx = finishes.indexOf(groundTextureFinish);
-                      setGroundTextureFinish(finishes[(idx + 1) % finishes.length] as 'glossy' | 'semi-matte' | 'matte' | 'mirror');
+                      setGroundTextureFinish(finishes[(idx + 1) % finishes.length] as TextureFinish);
                     }}
                      className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5"
                    >
                    <span className="text-sm font-bold flex items-center gap-1.5">
                      <Palette className="w-3.5 h-3.5" />
-                      Acabado: {groundTextureFinish === 'matte' ? 'Mate' : groundTextureFinish === 'semi-matte' ? 'Semimate' : groundTextureFinish === 'mirror' ? 'Espejo' : 'Brillo'}
+                       Acabado: {groundTextureFinish === 'matte' ? 'Mate' : groundTextureFinish === 'semi-matte' ? 'Semimate' : groundTextureFinish === 'metallic' ? 'Brillo metalizado' : groundTextureFinish === 'glossy' ? 'Espejo' : groundTextureFinish === 'mirror' ? 'Espejo Suelo' : 'Brillo'}
                     </span>
                     </DropdownMenuItem>
                   )}
@@ -4602,10 +4656,19 @@ export default function Home() {
                   setCurrentTime={setCurrentTime}
                   sceneObjects={visibleSceneObjects}
                   panelCameras={panelCameras}
-                  isRecordingCameraPath={isRecordingCameraPath}
-                  onStartCameraRecording={startCameraPathRecording}
-                  onStopCameraRecording={stopCameraPathRecording}
-                />
+                   isRecordingCameraPath={isRecordingCameraPath}
+                   onStartCameraRecording={startCameraPathRecording}
+                   onStopCameraRecording={stopCameraPathRecording}
+                    showCameraPath={showCameraPath}
+                   onShowCameraPathChange={setShowCameraPath}
+                   onExportMp4={() => {
+                     setExportProgress(null);
+                     setExportResult(null);
+                     setExportMp4Trigger((t) => t + 1);
+                   }}
+                   exportProgress={exportProgress}
+                   exportResult={exportResult}
+                 />
               </div>
             )}
           </div>
@@ -4909,10 +4972,11 @@ export default function Home() {
                     }
                     className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
                   >
-                     <option value="glossy">Brillo metalizado</option>
+                     <option value="metallic">Brillo metalizado</option>
                      <option value="semi-matte">Semimate</option>
                      <option value="matte">Mate</option>
-                     <option value="mirror">Espejo</option>
+                     <option value="glossy">Espejo</option>
+                     <option value="mirror">Espejo Suelo</option>
                   </select>
                   <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
                     <span>Relieve de la textura</span>
@@ -5452,10 +5516,11 @@ export default function Home() {
                     }
                     className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
                   >
-                     <option value="glossy">Brillo metalizado</option>
+                     <option value="metallic">Brillo metalizado</option>
                      <option value="semi-matte">Semimate</option>
                      <option value="matte">Mate</option>
-                     <option value="mirror">Espejo</option>
+                     <option value="glossy">Espejo</option>
+                     <option value="mirror">Espejo Suelo</option>
                   </select>
                   <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
                     <span>Relieve de la textura</span>
@@ -5839,12 +5904,12 @@ export default function Home() {
                         }
                         className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
                       >
-                     <option value="glossy">Brillo metalizado</option>
+                     <option value="metallic">Brillo metalizado</option>
                      <option value="semi-matte">Semimate</option>
                      <option value="matte">Mate</option>
-                     <option value="mirror">Espejo</option>
-                    <option value="mirror">Espejo</option>
-                  </select>
+                     <option value="glossy">Espejo</option>
+                     <option value="mirror">Espejo Suelo</option>
+                   </select>
 
                       <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
                         <span>Relieve de la textura</span>
@@ -6137,8 +6202,42 @@ export default function Home() {
              )}
          </div>
 
-        <div className="flex-1 flex flex-col min-w-0 min-h-0">
-          <div
+         <div className="flex-1 flex flex-col min-w-0 min-h-0">
+           {cameraViewMode && (
+             <div className="flex items-center gap-2 px-2 py-1.5 bg-black/60 backdrop-blur-sm border-b border-white/5 shrink-0">
+               <button
+                 onClick={() => setPlaying(!playing)}
+                 className={`p-1 rounded text-xs ${
+                   playing
+                     ? 'bg-green-500/20 text-green-300'
+                     : 'bg-blue-500/20 hover:bg-blue-500/30 text-blue-300'
+                 }`}
+                 title={playing ? 'Pausar' : 'Reproducir'}
+               >
+                 {playing ? '⏸' : '▶'}
+               </button>
+               <button
+                 onClick={() => { setPlaying(false); setCurrentTime(0.1); }}
+                 className="p-1 rounded text-xs bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground"
+                 title="Detener"
+               >
+                 ⏹
+               </button>
+               <input
+                 type="range"
+                 min={0.01}
+                 max={Math.max(...(animationTracks.length > 0 ? animationTracks.map((t) => t.duration) : [3000])) / 1000}
+                 step={0.01}
+                 value={currentTime}
+                 onChange={(e) => setCurrentTime(Math.max(parseFloat(e.target.value) || 0.1, 0.01))}
+                 className="flex-1 h-1"
+               />
+               <span className="w-16 text-right text-foreground text-xs font-mono">
+                 {currentTime.toFixed(1)}s / {Math.max(...(animationTracks.length > 0 ? animationTracks.map((t) => t.duration) : [3000])) / 1000}s
+               </span>
+             </div>
+           )}
+           <div
             className={`relative flex-1 ${isEditingCanvas ? 'grid grid-cols-1 grid-rows-1' : 'grid grid-cols-2 grid-rows-2'} gap-1.5 p-1.5 min-w-0 min-h-0`}
           >
             {mode === 'lathe' && editingLatheProfile ? (
@@ -6232,9 +6331,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -6246,7 +6346,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -6287,9 +6392,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -6301,7 +6407,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -6342,9 +6453,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -6356,7 +6468,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -6397,9 +6514,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -6411,7 +6529,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -6454,9 +6577,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -6468,7 +6592,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -6509,9 +6638,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -6523,7 +6653,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -6564,9 +6699,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -6578,7 +6714,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -6619,9 +6760,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -6633,7 +6775,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -6676,9 +6823,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -6690,7 +6838,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -6731,9 +6884,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -6745,7 +6899,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -6786,9 +6945,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -6800,7 +6960,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -6841,9 +7006,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -6855,7 +7021,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -7231,9 +7402,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -7245,7 +7417,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -7286,9 +7463,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -7300,7 +7478,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -7341,9 +7524,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -7355,7 +7539,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}
@@ -7396,9 +7585,10 @@ export default function Home() {
           lightConfig={lightConfig}
           showLightHelpers={showLightHelpers}
           showGround={showGround}
-          groundTexture={groundTexture}
-            groundTextureFinish={groundTextureFinish}
-            objectTextureFinish={objectTextureFinish}
+           groundTexture={groundTexture}
+             groundTextureFinish={groundTextureFinish}
+             groundTextureRepeat={groundTextureRepeat}
+             objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
           forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
@@ -7410,7 +7600,12 @@ export default function Home() {
           panelCameras={panelCameras}
            handleCameraChange={handleCameraChange}
             onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-            showCameraPathGizmo={showGround || isRecordingCameraPath}
+             showCameraPathGizmo={showGround || isRecordingCameraPath}
+             onCameraGizmoMove={handleCameraGizmoMove}
+             showCameraPath={showCameraPath}
+             exportMp4Trigger={exportMp4Trigger}
+             onExportProgress={setExportProgress}
+             onExportComplete={setExportResult}
             cameraViewMode={cameraViewMode}
            animationTracks={animationTracks}
             animationTime={playing ? currentTime : 0.1}

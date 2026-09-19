@@ -3,7 +3,7 @@
 import type { FC } from 'react';
 import Viewer3D from '@/components/viewer-3d';
 import { PanelButtons } from '@/components/editor/Editor3D';
-import type { AnimationTrack } from '@/lib/animation';
+import type { AnimationTrack, Keyframe } from '@/lib/animation';
 
 interface ViewerPanelProps {
   viewName: 'front' | 'top' | 'side' | '3d';
@@ -39,8 +39,9 @@ interface ViewerPanelProps {
    setLightConfig: (cfg: any) => void;
    panelCameras: Record<string, any>;
    groundTexture?: string | null;
-   groundTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror';
-   objectTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror';
+   groundTextureRepeat?: number;
+   groundTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
+  objectTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
    skyboxImage?: string | null;
    /** Objeto cortador en modo boolean preview: se muestra transparente */
    booleanToolObjectId?: string | null;
@@ -54,8 +55,14 @@ interface ViewerPanelProps {
   zoom3D: (view: any, f: number) => void;
   orbit3D: (view: any, dir: any, angle: number) => void;
   onCameraMove?: (cam: any) => void;
-  showCameraPathGizmo?: boolean;
-  cameraViewMode?: boolean;
+   showCameraPathGizmo?: boolean;
+   showCameraPath?: boolean;
+    cameraViewMode?: boolean;
+    onCameraGizmoMove?: (keyframes: Keyframe[]) => void;
+    selectedKeyframeIndex?: number;
+    exportMp4Trigger?: number;
+   onExportProgress?: (percent: number) => void;
+   onExportComplete?: (result: { success: boolean; outputPath?: string; error?: string }) => void;
 }
 
 export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
@@ -84,8 +91,9 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
   lightConfig,
   showLightHelpers,
   showGround,
-   groundTexture,
-   groundTextureFinish,
+    groundTexture,
+    groundTextureRepeat,
+    groundTextureFinish,
    objectTextureFinish,
    skyboxImage,
    booleanToolObjectId,
@@ -106,7 +114,13 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
    orbit3D,
    onCameraMove,
    showCameraPathGizmo,
-   cameraViewMode,
+    showCameraPath,
+    cameraViewMode,
+    onCameraGizmoMove,
+    selectedKeyframeIndex,
+    exportMp4Trigger,
+    onExportProgress,
+    onExportComplete,
 }) => (
   <div
     onClick={onActiveView}
@@ -158,8 +172,9 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
         lightConfig={lightConfig}
         showLightHelpers={showLightHelpers}
         showGround={showGround}
-        groundTexture={groundTexture}
-         groundTextureFinish={groundTextureFinish}
+         groundTexture={groundTexture}
+          groundTextureRepeat={groundTextureRepeat}
+          groundTextureFinish={groundTextureFinish}
          objectTextureFinish={objectTextureFinish}
         skyboxImage={skyboxImage}
         showGrid={showGrid}
@@ -171,11 +186,17 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
         onCameraChange={(cam) => handleCameraChange(viewName, cam)}
          onCameraMove={onCameraMove}
         showCameraPathGizmo={showCameraPathGizmo}
+        showCameraPath={showCameraPath}
         cameraViewMode={cameraViewMode}
+        onCameraGizmoMove={onCameraGizmoMove}
+        selectedKeyframeIndex={selectedKeyframeIndex}
         animationTracks={animationTracks}
         animationTime={animationTime}
         onAnimationComplete={onAnimationComplete}
         smoothShading={viewerSmooth}
+        exportMp4Trigger={exportMp4Trigger}
+        onExportProgress={onExportProgress}
+        onExportComplete={onExportComplete}
       />
     </div>
   </div>

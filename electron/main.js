@@ -320,6 +320,14 @@ ipcMain.handle('fs:saveLocalPaths', async (_, paths) => {
   }
 });
 
+ipcMain.handle('app:get-temp-dir', async () => {
+  try {
+    return { success: true, path: app.getPath('temp') };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
 // Captura de pantalla: enumerar fuentes (pantallas enteras y ventanas) con desktopCapturer.
 // Devuelve [{id, name, display_id, thumbnail}] para que el renderer muestre un selector.
 ipcMain.handle('screen:getSources', async (_event, types) => {

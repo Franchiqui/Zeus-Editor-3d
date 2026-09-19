@@ -16,7 +16,7 @@ interface TextureItem {
 }
 
 type ViewMode = 'planar' | 'cylindrical';
-type PreviewFinish = 'semi-matte' | 'matte' | 'glossy';
+type PreviewFinish = 'semi-matte' | 'matte' | 'glossy' | 'metallic';
 
 interface TextureBrowserModalProps {
   isOpen: boolean;
@@ -37,6 +37,7 @@ const FINISH_OPTIONS = [
   { label: 'Semimate', value: 'semi-matte' },
   { label: 'Mate', value: 'matte' },
   { label: 'Brillo', value: 'glossy' },
+  { label: 'Brillo metalizado', value: 'metallic' },
 ];
 
 function TexturePreview({
@@ -106,9 +107,9 @@ function TexturePreview({
 
     const material = new THREE.MeshPhysicalMaterial({
       color: 0xffffff,
-      metalness: finish === 'glossy' ? 0.3 : finish === 'matte' ? 0.05 : 0.15,
-      roughness: finish === 'glossy' ? 0.1 : finish === 'matte' ? 0.9 : 0.45,
-      clearcoat: finish === 'glossy' ? 1 : 0,
+      metalness: finish === 'glossy' || finish === 'metallic' ? 0.3 : finish === 'matte' ? 0.05 : 0.15,
+      roughness: finish === 'glossy' || finish === 'metallic' ? 0.1 : finish === 'matte' ? 0.9 : 0.45,
+      clearcoat: finish === 'glossy' || finish === 'metallic' ? 1 : 0,
       clearcoatRoughness: 0.015,
       side: THREE.DoubleSide,
       map: null,
@@ -203,9 +204,9 @@ function TexturePreview({
   useEffect(() => {
     if (!materialRef.current) return;
     const m = materialRef.current;
-    m.metalness = finish === 'glossy' ? 0.3 : finish === 'matte' ? 0.05 : 0.15;
-    m.roughness = finish === 'glossy' ? 0.1 : finish === 'matte' ? 0.9 : 0.45;
-    m.clearcoat = finish === 'glossy' ? 1 : 0;
+    m.metalness = finish === 'glossy' || finish === 'metallic' ? 0.3 : finish === 'matte' ? 0.05 : 0.15;
+    m.roughness = finish === 'glossy' || finish === 'metallic' ? 0.1 : finish === 'matte' ? 0.9 : 0.45;
+    m.clearcoat = finish === 'glossy' || finish === 'metallic' ? 1 : 0;
     m.needsUpdate = true;
   }, [finish]);
 

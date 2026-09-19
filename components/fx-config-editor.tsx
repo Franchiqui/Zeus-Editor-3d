@@ -16,23 +16,26 @@ const ColorField: React.FC<{
   label: string;
   value: string;
   onChange: (v: string) => void;
-}> = ({ label, value, onChange }) => (
-  <div className="flex items-center gap-2">
+}> = ({ label, value, onChange }) => {
+  const safeValue = typeof value === 'string' && value.length > 0 ? value : '#000000';
+  return (
+  <div className="flex items-center gap-2 col-span-2">
     <label className="w-20 text-xs text-gray-400">{label}</label>
     <input
       type="color"
-      value={value}
+      value={safeValue}
       onChange={(e) => onChange(e.target.value)}
       className="w-8 h-6 p-0 border rounded cursor-pointer bg-gray-800 border-gray-600"
     />
     <input
       type="text"
-      value={value}
+      value={safeValue}
       onChange={(e) => onChange(e.target.value)}
       className="w-20 text-xs text-gray-300 bg-gray-800 border border-gray-600 rounded px-1 py-0.5"
     />
   </div>
-);
+  );
+};
 
 const NumberField: React.FC<{
   label: string;
@@ -41,27 +44,39 @@ const NumberField: React.FC<{
   max: number;
   step?: number;
   onChange: (v: number) => void;
-}> = ({ label, value, min, max, step = 1, onChange }) => (
-  <div className="flex items-center gap-2">
+}> = ({ label, value, min, max, step = 1, onChange }) => {
+  const safeValue = Number.isFinite(value) ? Math.round(value) : Math.round(min);
+  const safeMin = Number.isFinite(min) ? min : 0;
+  const safeMax = Number.isFinite(max) ? max : 100;
+  const safeStep = Number.isFinite(step) ? step : 1;
+  const safeOnChange = (v: number) => {
+    if (Number.isFinite(v)) onChange(v);
+  };
+  return (
+  <div className="flex items-center gap-2 col-span-2">
     <label className="w-24 text-xs text-gray-400">{label}</label>
     <Slider
-      min={min}
-      max={max}
-      step={step}
-      value={[Math.round(value)]}
-      onValueChange={([v]) => onChange(v)}
+      min={safeMin}
+      max={safeMax}
+      step={safeStep}
+      value={[safeValue]}
+      onValueChange={([v]) => safeOnChange(v)}
       className="flex-1"
     />
     <input
       type="number"
-      value={Math.round(value)}
-      onChange={(e) => onChange(Number(e.target.value))}
-      min={min}
-      max={max}
+      value={safeValue}
+      onChange={(e) => {
+        const num = Number(e.target.value);
+        if (!Number.isNaN(num)) safeOnChange(num);
+      }}
+      min={safeMin}
+      max={safeMax}
       className="w-12 text-xs text-gray-300 bg-gray-800 border border-gray-600 rounded px-1 py-0.5"
     />
   </div>
-);
+  );
+};
 
 const FloatField: React.FC<{
   label: string;
@@ -70,28 +85,40 @@ const FloatField: React.FC<{
   max: number;
   step?: number;
   onChange: (v: number) => void;
-}> = ({ label, value, min, max, step = 0.1, onChange }) => (
-  <div className="flex items-center gap-2">
+}> = ({ label, value, min, max, step = 0.1, onChange }) => {
+  const safeValue = Number.isFinite(value) ? value : min;
+  const safeMin = Number.isFinite(min) ? min : 0;
+  const safeMax = Number.isFinite(max) ? max : 1;
+  const safeStep = Number.isFinite(step) ? step : 0.1;
+  const safeOnChange = (v: number) => {
+    if (Number.isFinite(v)) onChange(v);
+  };
+  return (
+  <div className="flex items-center gap-2 col-span-2">
     <label className="w-24 text-xs text-gray-400">{label}</label>
     <Slider
-      min={min}
-      max={max}
-      step={step}
-      value={[value]}
-      onValueChange={([v]) => onChange(v)}
+      min={safeMin}
+      max={safeMax}
+      step={safeStep}
+      value={[safeValue]}
+      onValueChange={([v]) => safeOnChange(v)}
       className="flex-1"
     />
     <input
       type="number"
-      value={value}
-      onChange={(e) => onChange(Number(e.target.value))}
-      min={min}
-      max={max}
-      step={step}
+      value={safeValue}
+      onChange={(e) => {
+        const num = Number(e.target.value);
+        if (!Number.isNaN(num)) safeOnChange(num);
+      }}
+      min={safeMin}
+      max={safeMax}
+      step={safeStep}
       className="w-14 text-xs text-gray-300 bg-gray-800 border border-gray-600 rounded px-1 py-0.5"
     />
   </div>
-);
+  );
+};
 
 export const FxConfigEditor: React.FC<FxConfigEditorProps> = ({
   isOpen,
@@ -127,16 +154,24 @@ export const FxConfigEditor: React.FC<FxConfigEditorProps> = ({
               value={fxConfig.glowColor}
               onChange={(v) => onFxChange({ glowColor: v })}
             />
-            <FloatField
-              label="Intensidad"
-              value={fxConfig.glowIntensity}
-              min={0}
-              max={3}
-              step={0.1}
-              onChange={(v) => onFxChange({ glowIntensity: v })}
-            />
-          </div>
-        </div>
+           <FloatField
+               label="Intensidad"
+               value={fxConfig.glowIntensity}
+               min={0}
+               max={3}
+               step={0.1}
+               onChange={(v) => onFxChange({ glowIntensity: v })}
+             />
+           </div>
+           <label className="flex items-center gap-1 text-xs text-gray-300">
+             <input
+               type="checkbox"
+               checked={fxConfig.glowObjects ?? false}
+               onChange={(e) => onFxChange({ glowObjects: e.target.checked })}
+             />
+             Aplicar a objetos
+           </label>
+         </div>
 
         {/* Sparks */}
         <div className="space-y-2">

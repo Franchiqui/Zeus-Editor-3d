@@ -53,7 +53,7 @@ export type Mesh = {
 };
 
 export type LatheTextureProjection = 'planar' | 'cylindrical' | 'spherical';
-export type TextureFinish = 'glossy' | 'semi-matte' | 'matte' | 'mirror';
+export type TextureFinish = 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
 
 export type Views = {
   front: Polygon;

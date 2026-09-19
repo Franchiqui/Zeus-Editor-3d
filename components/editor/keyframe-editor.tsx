@@ -1,6 +1,7 @@
 'use client';
 
 import type { FC } from 'react';
+import { Download } from 'lucide-react';
 import {
   AnimationTrack,
   Keyframe,
@@ -30,6 +31,11 @@ interface KeyframeEditorProps {
   isRecordingCameraPath?: boolean;
   onStartCameraRecording?: () => void;
   onStopCameraRecording?: () => void;
+  showCameraPath?: boolean;
+  onShowCameraPathChange?: (show: boolean) => void;
+  onExportMp4?: () => void;
+  exportProgress?: number | null;
+  exportResult?: { success: boolean; outputPath?: string; error?: string } | null;
 }
 
 export const KeyframeEditor: FC<KeyframeEditorProps> = ({
@@ -46,6 +52,11 @@ export const KeyframeEditor: FC<KeyframeEditorProps> = ({
   isRecordingCameraPath = false,
   onStartCameraRecording,
   onStopCameraRecording,
+  showCameraPath = true,
+  onShowCameraPathChange,
+  onExportMp4,
+  exportProgress,
+  exportResult,
 }) => {
   const selectedTrack = tracks.find((t) => t.id === selectedTrackId) ?? null;
 
@@ -287,10 +298,59 @@ export const KeyframeEditor: FC<KeyframeEditorProps> = ({
             {isRecordingCameraPath ? '● Detener' : 'Grabar recorrido'}
           </button>
         )}
-      </div>
+        {onShowCameraPathChange && (
+          <button
+            onClick={() => onShowCameraPathChange(!showCameraPath)}
+            className={`px-2 py-1 rounded text-xs font-medium ${
+              showCameraPath
+                ? 'bg-green-500/20 hover:bg-green-500/30 text-green-300'
+                : 'bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground'
+            }`}
+            title={showCameraPath ? 'Ocultar línea de recorrido de cámara' : 'Mostrar línea de recorrido de cámara'}
+          >
+            <span className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: showCameraPath ? '#4ade80' : '#666' }} />
+              Recorrido {showCameraPath ? 'visible' : 'oculto'}
+            </span>
+          </button>
+          )}
+        </div>
 
-      {selectedTrack && properties.length > 0 && (
-        <div className="border border-white/10 rounded-md overflow-auto thin-scrollbar max-h-64">
+        {/* Botón de exportación MP4 y barra de progreso */}
+        {tracks.length > 0 && (
+          <div className="flex flex-col gap-1.5">
+            {exportProgress != null && exportProgress < 100 && (
+              <div className="flex items-center gap-2 text-xs">
+                <span className="text-green-300">Exportando MP4... {exportProgress}%</span>
+                <div className="flex-1 h-1 bg-white/10 rounded overflow-hidden">
+                  <div className="h-full bg-green-500 transition-all" style={{ width: exportProgress + '%' }} />
+                </div>
+              </div>
+            )}
+            {exportResult && exportProgress == null && (
+              <div className="text-xs">
+                {exportResult.success ? (
+                  <span className="text-green-300">✓ MP4 exportado: {exportResult.outputPath}</span>
+                ) : (
+                  <span className="text-red-300">✗ {exportResult.error}</span>
+                )}
+              </div>
+            )}
+            {exportProgress == null && !exportResult && onExportMp4 && (
+              <button
+                onClick={onExportMp4}
+                className="px-3 py-1 rounded text-xs font-medium bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-300 flex items-center gap-1"
+                title="Exportar animación como MP4"
+              >
+                <Download className="w-3.5 h-3.5" />
+                Exportar MP4
+              </button>
+            )}
+          </div>
+        )}
+
+        {selectedTrack && properties.length > 0 && (
+          <div className="border border-white/10 rounded-md overflow-auto thin-scrollbar max-h-64">
           <table className="w-full border-collapse text-xs min-w-[400px]">
             <thead>
               <tr>

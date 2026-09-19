@@ -57,7 +57,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   // Captura de pantalla (desktopCapturer)
   getDesktopSources: (types) => ipcRenderer.invoke('screen:getSources', types),
-  saveCapture: (opts) => ipcRenderer.invoke('screen:saveCapture', opts),
+   saveCapture: (opts) => ipcRenderer.invoke('screen:saveCapture', opts),
+   getTempDir: () => ipcRenderer.invoke('app:get-temp-dir'),
   // Overlay icon de la barra de tareas (estado de captura)
   setCaptureOverlay: (opts) => ipcRenderer.send('capture:overlay', opts),
   // Audio export

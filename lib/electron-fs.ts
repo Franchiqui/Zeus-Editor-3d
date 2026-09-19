@@ -17,7 +17,8 @@ declare global {
       getMediaUrl: (filePath: string) => string;
       getFilePath: (file: File) => string | null;
       getDesktopSources: (types?: string[]) => Promise<Array<{ id: string; name: string; display_id?: string; thumbnail?: string | null; appIcon?: string | null }>>;
-      saveCapture: (opts: { base64: string; ext: string }) => Promise<{ success: boolean; filePath?: string; error?: string }>;
+       saveCapture: (opts: { base64: string; ext: string }) => Promise<{ success: boolean; filePath?: string; error?: string }>;
+       getTempDir: () => Promise<{ success: boolean; path?: string; error?: string }>;
       setCaptureOverlay: (opts: { dataUrl: string | null; description?: string }) => void;
       startComfyUI: () => Promise<{ success: boolean; message?: string; error?: string }>;
       startFluxBridge: () => Promise<{ success: boolean; message?: string; error?: string }>;
@@ -150,6 +151,14 @@ export async function getLocalPaths(): Promise<Record<string, string>> {
     if (raw) return JSON.parse(raw);
   } catch (e) {}
   return {};
+}
+
+export async function getTempDir(): Promise<string | null> {
+  if (isElectron()) {
+    const res = await window.electronAPI!.getTempDir();
+    return res.path || null;
+  }
+  return null;
 }
 
 export async function saveLocalPaths(paths: Record<string, string>): Promise<void> {

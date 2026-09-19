@@ -1,6 +1,8 @@
 'use client';
 
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+let mp4ExportActive = false;
+
+import { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { Mesh, Vertex3D, LatheTextureProjection } from '@/lib/geometry';
@@ -8,6 +10,8 @@ import { evaluateTrack } from '@/lib/animation';
 import type { AnimationTrack, Keyframe, KeyframeProperty } from '@/lib/animation';
 import { smoothVoxelMesh } from '@/lib/mesh-smooth';
 import { Slider } from '@/components/ui/slider';
+import { FxConfigEditor } from '@/components/fx-config-editor';
+import { isElectron, writeFile, deleteFile, transcodeVideo, getLocalPaths, getTempDir, readFileBuffer } from '@/lib/electron-fs';
 import {
   RotateCcw,
   Maximize2,
@@ -21,9 +25,63 @@ import {
   Sparkle,
   Zap,
   Flame,
-  Star,
-  Pin,
-} from 'lucide-react';
+  Cloud,
+  CloudRain,
+   Star,
+   Pin,
+   Settings,
+ } from 'lucide-react';
+
+/** Configuración completa de efectos visuales con parámetros ajustables. */
+export interface FxConfig {
+  /** Halo de neón alrededor del texto */
+  glow: boolean;
+  glowColor: string;      // hex #RRGGBB
+  glowIntensity: number;  // 0..3
+  /** Chispas que salen disparadas del texto */
+  sparks: boolean;
+  sparksCount: number;    // 50..500
+  sparksSize: number;     // 0.01..0.2
+  /** Llamas que suben por el texto */
+  fire: boolean;
+  fireCount: number;      // 50..500
+  fireSize: number;       // 0.05..0.3
+  fireIntensity: number;  // 0..3 (multiplica color + luz)
+  /** Lluvia cayendo sobre el texto */
+  rain: boolean;
+  rainCount: number;      // 100..1000
+  rainSpeed: number;      // 1..10
+   /** Estrellas que brillan sobre el texto */
+   glowObjects: boolean;  // apply glow effect to scene objects too
+  smoke: boolean;
+  smokeCount: number;     // 50..500
+  smokeSize: number;      // 0.05..0.5
+  smokeColor: string;     // hex #RRGGBB
+  smokeRiseSpeed: number; // 0.1..5
+}
+
+/** Configuración de efectos visuales por defecto (modo no controlado). */
+export const DEFAULT_FX_CONFIG: FxConfig = {
+  glow: false,
+  glowColor: '#5fd4ff',
+  glowIntensity: 1.4,
+  sparks: false,
+  sparksCount: 140,
+  sparksSize: 0.035,
+  fire: false,
+  fireCount: 160,
+  fireSize: 0.11,
+  fireIntensity: 1,
+  rain: false,
+  rainCount: 320,
+  rainSpeed: 2,
+  smoke: false,
+  smokeCount: 120,
+  smokeSize: 0.11,
+  smokeColor: '#444a52',
+  smokeRiseSpeed: 1,
+  glowObjects: false,
+};
 
 // Presets de iluminación: "Natural" (blanca neutra) es el predeterminado.
 const LIGHT_PRESETS = [
@@ -180,37 +238,45 @@ interface Viewer3DProps {
     showGround?: boolean;
     /** Texture URL for the ground plane */
     groundTexture?: string | null;
-     /** Finish for ground texture: glossy, semi-matte, matte, or mirror */
-     groundTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror';
-     /** Finish for object textures: glossy, semi-matte, matte, or mirror */
-     objectTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror';
+    /** Number of times the ground texture repeats (tiling) */
+    groundTextureRepeat?: number;
+      /** Finish for ground texture: glossy, semi-matte, matte, mirror, or metallic */
+      groundTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
+      /** Finish for object textures: glossy, semi-matte, matte, mirror, or metallic */
+      objectTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
      /** Background image URL for the skybox */
-     skyboxImage?: string | null;
-    /** Estado de los efectos visuales (brillo, chispas, fuego, estrellas) */
-   fxConfig?: {
-     glow: boolean;
-     sparks: boolean;
-     fire: boolean;
-   };
-   /** Notifica al padre cuando un efecto visual cambió */
-   onFxChange?: (fx: { glow?: boolean; sparks?: boolean; fire?: boolean }) => void;
-   /** Mostrar u ocultar la rejilla del suelo */
-   showGrid?: boolean;
-   onShowGridChange?: (visible: boolean) => void;
+      skyboxImage?: string | null;
+    /** Estado de los efectos visuales con parámetros ajustables */
+    fxConfig?: FxConfig;
+    /** Notifica al padre cuando un efecto visual cambió */
+    onFxChange?: (fx: Partial<FxConfig>) => void;
+    /** Abrir el modal de configuración de efectos visuales */
+    onOpenFxConfig?: () => void;
+    /** Mostrar u ocultar la rejilla del suelo */
+    showGrid?: boolean;
+    onShowGridChange?: (visible: boolean) => void;
    /** Tracks de animación para este visor. */
    animationTracks?: AnimationTrack[];
    /** Tiempo actual de reproducción en segundos. */
    animationTime?: number;
     /** Called when a non-looping animation track completes. */
     onAnimationComplete?: (trackId: string) => void;
-    /** Show path and camera gizmo for camera animation tracks */
+     /** Show path and camera gizmo for camera animation tracks */
     showCameraPathGizmo?: boolean;
+    /** Show the green camera path curve (recorrido) for camera animation tracks */
+    showCameraPath?: boolean;
     /** When true, the 3D view follows the animated camera (camera view mode) */
     cameraViewMode?: boolean;
     /** Called when the camera gizmo is moved, returns updated track keyframes */
     onCameraGizmoMove?: (keyframes: Keyframe[]) => void;
-    /** Currently selected keyframe (index) being edited via gizmo */
+     /** Currently selected keyframe (index) being edited via gizmo */
     selectedKeyframeIndex?: number;
+    /** Trigger to export the current animation as MP4 (increment to start export) */
+    exportMp4Trigger?: number;
+    /** Called during MP4 export with progress (0-100) */
+    onExportProgress?: (percent: number) => void;
+    /** Called when MP4 export completes */
+    onExportComplete?: (result: { success: boolean; outputPath?: string; error?: string }) => void;
     }
 
 /** Posición, rotación y escala del objeto en el visor (la usa el manipulador) */
@@ -327,7 +393,7 @@ export function buildSnapshotObjectVisual(
   mesh: Mesh,
   smooth: boolean,
   projection: LatheTextureProjection,
-  textureFinishOverride?: 'glossy' | 'semi-matte' | 'matte' | 'mirror'
+  textureFinishOverride?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic'
 ): THREE.Group {
   const group = new THREE.Group();
   if (!mesh.vertices.length || !mesh.faces.length) return group;
@@ -411,12 +477,13 @@ export function buildSnapshotObjectVisual(
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
 
+    const finish = mesh.textureFinish ?? textureFinishOverride;
     const material = new THREE.MeshPhysicalMaterial({
       color: 0xffffff,
-        metalness: (mesh.textureFinish ?? textureFinishOverride) === 'glossy' ? 0 : (mesh.textureFinish ?? textureFinishOverride) === 'matte' ? 0.05 : (mesh.textureFinish ?? textureFinishOverride) === 'mirror' ? 1 : 0.3,
-        roughness: (mesh.textureFinish ?? textureFinishOverride) === 'glossy' ? 0 : (mesh.textureFinish ?? textureFinishOverride) === 'matte' ? 0.9 : (mesh.textureFinish ?? textureFinishOverride) === 'mirror' ? 0.05 : 0.45,
-        clearcoat: (mesh.textureFinish ?? textureFinishOverride) === 'glossy' ? 0 : (mesh.textureFinish ?? textureFinishOverride) === 'mirror' ? 1 : 0,
-        clearcoatRoughness: (mesh.textureFinish ?? textureFinishOverride) === 'glossy' ? 0.015 : (mesh.textureFinish ?? textureFinishOverride) === 'mirror' ? 0 : 0,
+        metalness: finish === 'metallic' ? 0.3 : finish === 'glossy' ? 0 : finish === 'matte' ? 0.05 : finish === 'mirror' ? 1 : 0.3,
+        roughness: finish === 'metallic' ? 0.1 : finish === 'glossy' ? 0 : finish === 'matte' ? 0.9 : finish === 'mirror' ? 0.05 : 0.45,
+        clearcoat: finish === 'metallic' ? 1 : finish === 'glossy' ? 0 : finish === 'mirror' ? 1 : 0,
+        clearcoatRoughness: finish === 'metallic' ? 0.015 : finish === 'glossy' ? 0.015 : finish === 'mirror' ? 0 : 0,
         side: THREE.DoubleSide,
         map: null,
         bumpMap: null,
@@ -424,7 +491,7 @@ export function buildSnapshotObjectVisual(
         transparent: true,
         opacity: finalOpacity,
         alphaTest: 0,
-        envMapIntensity: (mesh.textureFinish ?? textureFinishOverride) === 'mirror' ? 1.5 : 0,
+        envMapIntensity: finish === 'mirror' ? 1.5 : 0,
     });
     const meshObj = new THREE.Mesh(geometry, material);
     meshObj.castShadow = true;
@@ -499,10 +566,10 @@ export function buildSnapshotObjectVisual(
       // de cada cara salga exacto (multiplicación)
       color: allFacesShareColor ? uniformFaceColor! : useFaceColors ? 0xffffff : 0xdedede,
       vertexColors: useFaceColors && !allFacesShareColor,
-      metalness: mesh.textureFinish === 'glossy' ? 0.1 : mesh.textureFinish === 'matte' ? 0.05 : 0.1,
-      roughness: mesh.textureFinish === 'glossy' ? 0.025 : mesh.textureFinish === 'matte' ? 0.9 : 0.45,
-      clearcoat: mesh.textureFinish === 'glossy' ? 1 : 0,
-      clearcoatRoughness: mesh.textureFinish === 'glossy' ? 0.015 : 0,
+      metalness: mesh.textureFinish === 'metallic' ? 0.3 : mesh.textureFinish === 'glossy' ? 0.1 : mesh.textureFinish === 'matte' ? 0.05 : 0.1,
+      roughness: mesh.textureFinish === 'metallic' ? 0.1 : mesh.textureFinish === 'glossy' ? 0.025 : mesh.textureFinish === 'matte' ? 0.9 : 0.45,
+      clearcoat: mesh.textureFinish === 'metallic' ? 1 : mesh.textureFinish === 'glossy' ? 1 : 0,
+      clearcoatRoughness: mesh.textureFinish === 'metallic' ? 0.015 : mesh.textureFinish === 'glossy' ? 0.015 : 0,
       side: THREE.DoubleSide,
       transparent: finalOpacity < 1,
       opacity: finalOpacity,
@@ -692,12 +759,12 @@ function buildGizmoHandles(group: THREE.Group): THREE.Mesh[] {
     ): THREE.Mesh => {
       const hit = new THREE.Mesh(
         geo,
-        new THREE.MeshBasicMaterial({
-          transparent: true,
-          opacity: 0,
-          depthTest: false,
-          depthWrite: false,
-        })
+         new THREE.MeshBasicMaterial({
+           transparent: true,
+           opacity: 0,
+           depthTest: false,
+           depthWrite: false,
+         })
       );
       hit.userData = { axis, mode };
       hit.position.y = y;
@@ -1027,21 +1094,27 @@ export default function Viewer3D({
    onLightConfigChange,
    showLightHelpers = true,
      showGround = false,
-     groundTexture = null,
-     groundTextureFinish = 'semi-matte',
+      groundTexture = null,
+      groundTextureRepeat = 4,
+      groundTextureFinish = 'semi-matte',
      objectTextureFinish = 'semi-matte',
      skyboxImage = null,
     fxConfig,
     onFxChange,
+    onOpenFxConfig,
     showGrid: showGridProp,
      onShowGridChange,
       animationTracks,
       animationTime = 0,
       onAnimationComplete,
-      showCameraPathGizmo = false,
+       showCameraPathGizmo = false,
+       showCameraPath = true,
       cameraViewMode = false,
       onCameraGizmoMove,
-      selectedKeyframeIndex,
+       selectedKeyframeIndex,
+       exportMp4Trigger = 0,
+       onExportProgress,
+       onExportComplete,
     }: Viewer3DProps) {
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -1067,11 +1140,29 @@ export default function Viewer3D({
     onCameraMoveRef.current = onCameraMove;
    const animationTracksRef = useRef<AnimationTrack[] | undefined>(animationTracks);
    animationTracksRef.current = animationTracks;
-   const animationTimeRef = useRef(animationTime);
-   animationTimeRef.current = animationTime;
+    const animationTimeRef = useRef(animationTime);
+    animationTimeRef.current = animationTime;
+    const cameraViewModeRef = useRef(cameraViewMode);
+    cameraViewModeRef.current = cameraViewMode;
+    const showCameraPathGizmoRef = useRef(showCameraPathGizmo);
+    showCameraPathGizmoRef.current = showCameraPathGizmo;
+    const onCameraGizmoMoveRef = useRef(onCameraGizmoMove);
+    onCameraGizmoMoveRef.current = onCameraGizmoMove;
+    const selectedKeyframeIndexRef = useRef(selectedKeyframeIndex);
+    selectedKeyframeIndexRef.current = selectedKeyframeIndex;
    const onAnimationCompleteRef = useRef(onAnimationComplete);
    onAnimationCompleteRef.current = onAnimationComplete;
-   const completedTracksRef = useRef<Set<string>>(new Set());
+    const completedTracksRef = useRef<Set<string>>(new Set());
+    const exportTriggerRef = useRef(exportMp4Trigger);
+    const exportStateRef = useRef<{
+      mediaRecorder: MediaRecorder;
+      startTime: number;
+      duration: number;
+    } | null>(null);
+    const onExportProgressRef = useRef(onExportProgress);
+    onExportProgressRef.current = onExportProgress;
+    const onExportCompleteRef = useRef(onExportComplete);
+    onExportCompleteRef.current = onExportComplete;
    const vertexHelpersRef = useRef<THREE.Group | null>(null);
   const raycasterRef = useRef(new THREE.Raycaster());
   const pointerRef = useRef(new THREE.Vector2());
@@ -1081,32 +1172,92 @@ export default function Viewer3D({
     index: number;
   } | null>(null);
   const planeRef = useRef<THREE.Plane | null>(null);
-  const lightConfigRef = useRef(lightConfig);
-  lightConfigRef.current = lightConfig;
+    const lightConfigRef = useRef(lightConfig);
+    lightConfigRef.current = lightConfig;
 
-   const [showVertices, setShowVertices] = useState(showVerticesDefault);
-   const [smoothCapture, setSmoothCapture] = useState(true);
-   const [fxGlow, setFxGlow] = useState(fxConfig?.glow ?? false);
-   const [fxSparks, setFxSparks] = useState(fxConfig?.sparks ?? false);
-   const [fxFire, setFxFire] = useState(fxConfig?.fire ?? false);
+    const buildUpdatedCameraKeyframes = useCallback(
+      (tracks: AnimationTrack[] | undefined, camState: Camera3D): Keyframe[] | null => {
+        if (!tracks?.length) return null;
+        const camTrack = tracks.find((t) => t.objectId === null);
+        if (!camTrack?.keyframes.length) return null;
 
-   // Controlled/uncontrolled helpers for effects
-   const glowValue = fxConfig ? fxConfig.glow : fxGlow;
-   const sparksValue = fxConfig ? fxConfig.sparks : fxSparks;
-   const fireValue = fxConfig ? fxConfig.fire : fxFire;
-   const toggleGlow = useCallback(() => {
-     if (fxConfig !== undefined) { onFxChange?.({ glow: !fxConfig.glow }); }
-     else { setFxGlow(!fxGlow); }
-   }, [fxConfig, onFxChange, fxGlow]);
-   const toggleSparks = useCallback(() => {
-     if (fxConfig !== undefined) { onFxChange?.({ sparks: !fxConfig.sparks }); }
-     else { setFxSparks(!fxSparks); }
-   }, [fxConfig, onFxChange, fxSparks]);
-   const toggleFire = useCallback(() => {
-     if (fxConfig !== undefined) { onFxChange?.({ fire: !fxConfig.fire }); }
-     else { setFxFire(!fxFire); }
-   }, [fxConfig, onFxChange, fxFire]);
-  const [fxStars, setFxStars] = useState(false);
+        const idx = selectedKeyframeIndexRef.current;
+        let targetKf: Keyframe | null = null;
+
+        if (idx !== undefined && idx !== null && idx >= 0 && idx < camTrack.keyframes.length) {
+          targetKf = camTrack.keyframes[idx];
+        } else {
+          const sorted = [...camTrack.keyframes].sort((a, b) => a.time - b.time);
+          const effectiveTimeMs = (animationTimeRef.current ?? 0) * 1000;
+          let best: Keyframe = sorted[0];
+          let bestDist = Math.abs((sorted[0]?.time ?? 0) - effectiveTimeMs);
+          for (let i = 1; i < sorted.length; i++) {
+            const d = Math.abs((sorted[i]?.time ?? 0) - effectiveTimeMs);
+            if (d < bestDist) {
+              bestDist = d;
+              best = sorted[i];
+            }
+          }
+          targetKf = best;
+        }
+
+        const updated: Keyframe = {
+          ...targetKf,
+          values: {
+            ...targetKf.values,
+            zoom: camState.zoom,
+            offsetX: camState.offsetX,
+            offsetY: camState.offsetY,
+            rotationX: camState.rotationX,
+            rotationY: camState.rotationY,
+          },
+        };
+
+        return camTrack.keyframes.map((kf) =>
+          kf === targetKf ? updated : kf
+        );
+      },
+      []
+    );
+
+    const [showVertices, setShowVertices] = useState(showVerticesDefault);
+    const [smoothCapture, setSmoothCapture] = useState(true);
+    // Estado local sólo se usa cuando el componente es no controlado
+    // (fxConfig === undefined). Mantiene una copia editable del FX.
+    const [fxConfigLocal, setFxConfigLocal] = useState<FxConfig | undefined>(undefined);
+
+    // Valores efectivos: fxConfig (controlado) si existe, else local state
+    const fx = fxConfig ?? fxConfigLocal ?? DEFAULT_FX_CONFIG;
+   const glowValue = fx.glow;
+   const sparksValue = fx.sparks;
+   const fireValue = fx.fire;
+    const rainValue = fx.rain;
+    const smokeValue = fx.smoke;
+
+    const [showFxConfigModal, setShowFxConfigModal] = useState(false);
+
+
+    const toggleGlow = useCallback(() => {
+      if (fxConfig !== undefined) onFxChange?.({ glow: !fxConfig.glow });
+      else setFxConfigLocal((prev) => ({ ...DEFAULT_FX_CONFIG, ...prev, glow: !(prev?.glow ?? false) }));
+     }, [fxConfig, onFxChange, fxConfigLocal]);
+     const toggleSparks = useCallback(() => {
+       if (fxConfig !== undefined) onFxChange?.({ sparks: !fxConfig.sparks });
+       else setFxConfigLocal((prev) => ({ ...DEFAULT_FX_CONFIG, ...prev, sparks: !(prev?.sparks ?? false) }));
+     }, [fxConfig, onFxChange, fxConfigLocal]);
+     const toggleFire = useCallback(() => {
+       if (fxConfig !== undefined) onFxChange?.({ fire: !fxConfig.fire });
+       else setFxConfigLocal((prev) => ({ ...DEFAULT_FX_CONFIG, ...prev, fire: !(prev?.fire ?? false) }));
+     }, [fxConfig, onFxChange, fxConfigLocal]);
+     const toggleRain = useCallback(() => {
+       if (fxConfig !== undefined) onFxChange?.({ rain: !fxConfig.rain });
+       else setFxConfigLocal((prev) => ({ ...DEFAULT_FX_CONFIG, ...prev, rain: !(prev?.rain ?? false) }));
+     }, [fxConfig, onFxChange, fxConfigLocal]);
+     const toggleSmoke = useCallback(() => {
+       if (fxConfig !== undefined) onFxChange?.({ smoke: !fxConfig.smoke });
+       else setFxConfigLocal((prev) => ({ ...DEFAULT_FX_CONFIG, ...prev, smoke: !(prev?.smoke ?? false) }));
+     }, [fxConfig, onFxChange, fxConfigLocal]);
+    const [fxStars, setFxStars] = useState(false);
   const [starPlacement, setStarPlacement] = useState(false);
   const [starSize, setStarSize] = useState(1);
    const [showGridInternal, setShowGridInternal] = useState(true);
@@ -1130,13 +1281,37 @@ export default function Viewer3D({
   vertexSizeRef.current = vertexSize;
   const meshRef = useRef(mesh);
   meshRef.current = mesh;
+  // Bounding box del texto (recalculado al cambiar la malla) — usado por
+  // efectos de partículas (lluvia, humo) para saber el volumen a cubrir.
+  const meshBoxRef = useRef<THREE.Box3 | null>(null);
    const gridGroupRef = useRef<THREE.Group | null>(null);
    const groundRef = useRef<THREE.Mesh | null>(null);
    const skyboxRef = useRef<THREE.Mesh | null>(null);
   const cameraPathRef = useRef<THREE.Group | null>(null);
   const cameraGizmoRef = useRef<THREE.Group | null>(null);
+  const cameraGizmoHandleGroupRef = useRef<THREE.Group | null>(null);
+  const cameraGizmoHandlesRef = useRef<THREE.Mesh[]>([]);
+  const cameraGizmoDragRef = useRef<{
+    axis: GizmoAxis;
+    axisWorld: THREE.Vector3;
+    startPos: THREE.Vector3;
+    startQuat: THREE.Quaternion;
+    startDir: THREE.Vector3;
+    startT: number;
+    mode: 'move' | 'rotate';
+    startAngle: number;
+    plane: THREE.Plane;
+    basisU: THREE.Vector3;
+    basisV: THREE.Vector3;
+    startOffsetX: number;
+    startOffsetY: number;
+    startZoom: number;
+    startRotationX: number;
+    startRotationY: number;
+  } | null>(null);
   const getCameraPositionFromStateRef = useRef<(camState: Camera3D) => THREE.Vector3>();
   const drawCameraPathRef = useRef<(track: AnimationTrack) => void>();
+  const startMp4ExportRef = useRef<() => void>();
   const latheAxisRef = useRef<THREE.Group | null>(null);
   const ambientLightRef = useRef<THREE.AmbientLight | null>(null);
   const dirLightRef = useRef<THREE.DirectionalLight | null>(null);
@@ -1187,6 +1362,10 @@ export default function Viewer3D({
   const fireRef = useRef<ParticleSystem | null>(null);
   const starsRef = useRef<StarSystem | null>(null);
   const fireLightRef = useRef<THREE.PointLight | null>(null);
+  const rainRef = useRef<RainSystem | null>(null);
+  const rainEnabledRef = useRef(false);
+  const smokeRef = useRef<SmokeSystem | null>(null);
+  const smokeEnabledRef = useRef(false);
    const fxFireRef = useRef(fireValue);
    fxFireRef.current = fireValue;
   const fxStarsRef = useRef(fxStars);
@@ -1739,6 +1918,13 @@ export default function Viewer3D({
       scene.add(cameraGizmoGroup);
       cameraGizmoRef.current = cameraGizmoGroup;
 
+      const cameraGizmoHandleGroup = new THREE.Group();
+      cameraGizmoHandleGroup.visible = false;
+      cameraGizmoHandleGroup.scale.set(0.5, 0.5, 0.5);
+      scene.add(cameraGizmoHandleGroup);
+      cameraGizmoHandleGroupRef.current = cameraGizmoHandleGroup;
+      cameraGizmoHandlesRef.current = buildLightGizmoHandles(cameraGizmoHandleGroup);
+
       const meshGroup = new THREE.Group();
     meshGroup.receiveShadow = true;
     meshGroup.castShadow = true;
@@ -1906,10 +2092,13 @@ export default function Viewer3D({
       controls.update();
       const dt = Math.min(clock.getDelta(), 0.05);
 
+      const exportState = exportStateRef.current;
       const hasCameraTrack = animationTracksRef.current?.some((t) => t.objectId === null) ?? false;
-      const effectiveTime = hasCameraTrack && cameraViewMode
-        ? (performance.now() - animStartTime) / 1000
-        : animationTimeRef.current;
+      const effectiveTime = exportState
+        ? Math.min((performance.now() - exportState.startTime) / 1000, exportState.duration)
+        : (hasCameraTrack && cameraViewModeRef.current
+          ? (performance.now() - animStartTime) / 1000
+          : animationTimeRef.current);
       if (sparksRef.current?.points.visible) {
         updateSparks(sparksRef.current, dt, randomSurfacePoint);
       }
@@ -1919,6 +2108,15 @@ export default function Viewer3D({
       if (starsRef.current?.group.visible) {
         updateStars(starsRef.current, dt, randomSurfacePoint, starSizeRef.current);
       }
+      if (rainRef.current) {
+        rainRef.current.points.visible = rainEnabledRef.current;
+        if (rainEnabledRef.current) updateRain(rainRef.current, dt);
+      }
+      if (smokeRef.current) {
+        smokeRef.current.points.visible = smokeEnabledRef.current;
+        if (smokeEnabledRef.current) updateSmoke(smokeRef.current, dt);
+      }
+      // Humo intensifica la luz cálida del fuego cuando ambos activos
       // Estrellas colocadas: latido suave + giro lento. Las aleatorias
       // se pausan mientras se está colocando para editar sin ruido.
       const placed = placedStarsRef.current;
@@ -1937,11 +2135,13 @@ export default function Viewer3D({
           fxStarsRef.current && !starPlacementRef.current;
       }
       if (fireLightRef.current) {
-        // Fuego: luz cálida que parpadea
+        // Fuego: luz cálida que parpadea; si hay humo, la luz se atenúa
+        // (el humo oscurece el brillo del fuego).
         const t = clock.elapsedTime;
-        fireLightRef.current.intensity = fxFireRef.current
-          ? 1.1 + Math.sin(t * 11.3) * 0.3 + Math.sin(t * 27.1) * 0.25
+        const base = fxFireRef.current
+          ? 0.9 + Math.sin(t * 11.3) * 0.28 + Math.sin(t * 27.1) * 0.2
           : 0;
+        fireLightRef.current.intensity = smokeEnabledRef.current ? base * 0.35 : base;
       }
 
       // Update light helper visuals each frame so cones follow lights
@@ -2002,21 +2202,34 @@ export default function Viewer3D({
               rotationX: evaluated.rotationX ?? baseCam.rotationX,
               rotationY: evaluated.rotationY ?? baseCam.rotationY,
             };
-            if (cameraViewMode) {
-              applyCamera(camera, controls, interpolated);
-            } else if (showCameraPathGizmo) {
-              const camPos = getCameraPositionFromStateRef.current?.(interpolated) ?? new THREE.Vector3();
-              const camQuat = getCameraQuaternionFromState(interpolated);
-              cameraGizmoRef.current!.position.copy(camPos);
-              cameraGizmoRef.current!.quaternion.copy(camQuat);
-              cameraGizmoRef.current!.visible = true;
-            }
+              if (cameraViewModeRef.current) {
+                applyCamera(camera, controls, interpolated);
+              } else if (showCameraPathGizmoRef.current) {
+                const camPos = getCameraPositionFromStateRef.current?.(interpolated) ?? new THREE.Vector3();
+                const camQuat = getCameraQuaternionFromState(interpolated);
+                cameraGizmoRef.current!.position.copy(camPos);
+                cameraGizmoRef.current!.quaternion.copy(camQuat);
+                cameraGizmoRef.current!.visible = true;
+                cameraGizmoHandleGroupRef.current!.position.copy(camPos);
+                cameraGizmoHandleGroupRef.current!.visible = !cameraGizmoDragRef.current;
+              }
             if (!track.looping && effectiveTime * 1000 >= track.duration && !completedTracksRef.current.has(track.id)) {
               completedTracksRef.current.add(track.id);
               onAnimationCompleteRef.current?.(track.id);
-            }
           }
           }
+        }
+        // Hide camera gizmo handles if not in edit mode (not cameraViewMode,
+        // showCameraPathGizmo active, and a camera track exists)
+        if (cameraGizmoHandleGroupRef.current) {
+          const shouldShow = showCameraPathGizmoRef.current
+            && !cameraViewModeRef.current
+            && animationTracksRef.current
+            && animationTracksRef.current.some((t) => t.objectId === null);
+          if (!shouldShow && !cameraGizmoDragRef.current) {
+            cameraGizmoHandleGroupRef.current.visible = false;
+          }
+        }
         }
        // Actualizar el CubeCamera para reflejos de espejo
        const cubeCam = cubeCameraRef.current;
@@ -2025,9 +2238,162 @@ export default function Viewer3D({
          cubeCam.position.y = Math.max(0.5, cubeCam.position.y);
          cubeCam.update(renderer, scene);
        }
-      renderer.render(scene, camera);
-    };
-    animate();
+       renderer.render(scene, camera);
+
+       if (exportState) {
+         const elapsed = (performance.now() - exportState.startTime) / 1000;
+         const percent = Math.min(100, Math.round((elapsed / exportState.duration) * 100));
+         onExportProgressRef.current?.(percent);
+         if (elapsed >= exportState.duration) {
+           exportState.mediaRecorder.stop();
+           exportStateRef.current = null;
+         }
+       }
+     };
+      animate();
+
+      startMp4ExportRef.current = () => {
+        if (mp4ExportActive) return;
+        const renderer = rendererRef.current;
+        const tracks = animationTracksRef.current;
+        if (!renderer || !tracks || tracks.length === 0) {
+          onExportCompleteRef.current?.({ success: false, error: 'No hay animación para exportar' });
+          return;
+        }
+        mp4ExportActive = true;
+        const canvas = renderer.domElement;
+        if (!canvas.captureStream || !(window as any).MediaRecorder) {
+          onExportCompleteRef.current?.({ success: false, error: 'No se pudo iniciar la grabación (MediaRecorder no disponible)' });
+          return;
+        }
+        const hasCameraTrack = tracks.some((t) => t.objectId === null);
+        if (!hasCameraTrack) {
+          onExportCompleteRef.current?.({ success: false, error: 'No hay pista de cámara para exportar' });
+          return;
+        }
+        const maxDuration = Math.max(...tracks.map((t) => t.duration)) / 1000;
+
+        // Temporarily set a high canvas resolution for the capture.
+        // The canvas may be small in a multi-panel UI, so we render at a
+        // higher fixed resolution and restore the original afterward.
+        const exportWidth = 1920;
+        const exportHeight = 1080;
+        const originalPixelRatio = renderer.getPixelRatio();
+        renderer.setPixelRatio(1);
+        renderer.setSize(exportWidth, exportHeight, false);
+        renderer.setAnimationLoop(null);
+        renderer.render(scene, camera);
+        const fps = 30;
+        const stream = canvas.captureStream(fps);
+        const mediaRecorder = new (window as any).MediaRecorder(stream, { mimeType: 'video/webm;codec=vp8' });
+
+        const chunks: BlobPart[] = [];
+        mediaRecorder.ondataavailable = (e: BlobEvent) => chunks.push(e.data);
+        mediaRecorder.onstop = async () => {
+          try {
+            const webmBlob = new Blob(chunks, { type: 'video/webm' });
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+
+            const doTranscodeAndDownload = async (tempDir: string) => {
+              const tempWebmPath = tempDir + '/zeus_export_temp_' + stamp + '.webm';
+              const tempMp4Path = tempDir + '/zeus_anim_' + stamp + '.mp4';
+
+              const arrayBuffer = await webmBlob.arrayBuffer();
+              const written = await writeFile(tempWebmPath, new Uint8Array(arrayBuffer));
+              if (!written) {
+                onExportCompleteRef.current?.({ success: false, error: 'No se pudo guardar el archivo temporal' });
+                return;
+              }
+              onExportProgressRef.current?.(70);
+              const result = await transcodeVideo(tempWebmPath, tempMp4Path, (percent) => {
+                onExportProgressRef.current?.(70 + Math.round(percent * 0.3));
+              });
+              await deleteFile(tempWebmPath);
+
+              if (!result.success) {
+                onExportCompleteRef.current?.({ success: false, error: result.error });
+                return;
+              }
+
+              const mp4Data = await readFileBuffer(result.outputPath!);
+              await deleteFile(result.outputPath!);
+
+              if (mp4Data) {
+                const mp4Blob = new Blob([mp4Data.buffer as ArrayBuffer], { type: 'video/mp4' });
+                const url = URL.createObjectURL(mp4Blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'zeus_anim_' + stamp + '.mp4';
+                a.style.display = 'none';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                onExportCompleteRef.current?.({ success: true, outputPath: 'Descargado' });
+              } else {
+                onExportCompleteRef.current?.({ success: false, error: 'No se pudo leer el MP4 generado' });
+              }
+            };
+
+            if (isElectron()) {
+              const paths = await getLocalPaths();
+              const videoFolder = paths.video || paths.proyectos_video;
+              if (videoFolder) {
+                const tempWebmPath = videoFolder + '/zeus_export_temp_' + stamp + '.webm';
+                const mp4OutputPath = videoFolder + '/zeus_anim_' + stamp + '.mp4';
+                const arrayBuffer = await webmBlob.arrayBuffer();
+                const written = await writeFile(tempWebmPath, new Uint8Array(arrayBuffer));
+                if (!written) {
+                  onExportCompleteRef.current?.({ success: false, error: 'No se pudo guardar el archivo temporal' });
+                  return;
+                }
+                onExportProgressRef.current?.(70);
+                const result = await transcodeVideo(tempWebmPath, mp4OutputPath, (percent) => {
+                  onExportProgressRef.current?.(70 + Math.round(percent * 0.3));
+                });
+                await deleteFile(tempWebmPath);
+                if (result.success) {
+                  onExportCompleteRef.current?.({ success: true, outputPath: result.outputPath });
+                } else {
+                  onExportCompleteRef.current?.({ success: false, error: result.error });
+                }
+              } else {
+                const tempDir = await getTempDir();
+                if (!tempDir) {
+                  onExportCompleteRef.current?.({ success: false, error: 'No se pudo determinar la carpeta temporal' });
+                  return;
+                }
+                await doTranscodeAndDownload(tempDir);
+              }
+            } else {
+              const url = URL.createObjectURL(webmBlob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = 'zeus_anim_' + stamp + '.webm';
+              a.style.display = 'none';
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+              onExportCompleteRef.current?.({ success: true, outputPath: 'Descargado (WebM)' });
+            }
+          } catch (e) {
+            onExportCompleteRef.current?.({ success: false, error: (e as Error)?.message ?? 'Error durante la exportación' });
+          } finally {
+            mp4ExportActive = false;
+            // Restore original renderer resolution and pixel ratio
+            renderer.setPixelRatio(originalPixelRatio);
+            renderer.setSize(mount.clientWidth, mount.clientHeight, false);
+          }
+        };
+        mediaRecorder.start();
+        exportStateRef.current = {
+          mediaRecorder,
+          startTime: performance.now(),
+          duration: maxDuration,
+        };
+        onExportProgressRef.current?.(0);
+      };
 
     const handleResize = () => {
       if (!mount) return;
@@ -2387,11 +2753,105 @@ export default function Viewer3D({
                }
              }
            }
-         }
-        return;
-      }
+          }
+         return;
+       }
 
-      // Cursor de mano al pasar por encima de un asa del manipulador o de
+        // Camera gizmo drag update: move/rotate the camera gizmo and sync
+        // position/rotation back to the Camera3D state + callbacks.
+        if (cameraGizmoDragRef.current) {
+          raycasterRef.current.setFromCamera(pointerRef.current, camera);
+          const drag = cameraGizmoDragRef.current;
+
+          if (drag.mode === 'move') {
+            const tc = closestPointOnAxis(raycasterRef.current.ray, drag.startPos, drag.axisWorld);
+            if (tc !== null) {
+              const delta = tc - drag.startT;
+              const newPos = drag.startPos.clone().addScaledVector(drag.axisWorld, delta);
+
+              const target = new THREE.Vector3(drag.startOffsetX, drag.startOffsetY, 0);
+              const dir = new THREE.Vector3().subVectors(newPos, target).normalize();
+              const distance = newPos.distanceTo(target);
+              const newZoom = 5.5 / Math.max(distance, 0.01);
+
+              const clampedDirY = Math.max(-1, Math.min(1, dir.y));
+              const newRotX = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, Math.asin(clampedDirY)));
+              const newRotY = Math.atan2(dir.x, dir.z);
+
+              const newCamState: Camera3D = {
+                zoom: newZoom,
+                offsetX: drag.startOffsetX,
+                offsetY: drag.startOffsetY,
+                rotationX: newRotX,
+                rotationY: newRotY,
+              };
+
+              // Visual update: place the gizmo at the new camera position
+              const newCamPos = getCameraPositionFromStateRef.current?.(newCamState) ?? newPos;
+               cameraGizmoRef.current!.position.copy(newCamPos);
+               cameraGizmoHandleGroupRef.current!.position.copy(newCamPos);
+
+              // Notify parent of the updated camera state (for recording)
+              const onCamMove = onCameraMoveRef.current;
+              if (onCamMove) onCamMove(newCamState);
+
+              // Build updated keyframes for the animation track
+              const onGizmoMove = onCameraGizmoMoveRef.current;
+              if (onGizmoMove && animationTracksRef.current) {
+                const updatedKeyframes = buildUpdatedCameraKeyframes(
+                  animationTracksRef.current,
+                  newCamState
+                );
+                if (updatedKeyframes) onGizmoMove(updatedKeyframes);
+              }
+            }
+          } else if (drag.mode === 'rotate') {
+            const hit = new THREE.Vector3();
+            if (raycasterRef.current.ray.intersectPlane(drag.plane, hit)) {
+              const d = hit.clone().sub(drag.startPos);
+              d.projectOnPlane(drag.axisWorld);
+              if (d.lengthSq() > 1e-6) {
+                const deltaAngle = Math.atan2(
+                  d.dot(drag.basisV),
+                  d.dot(drag.basisU)
+                ) - drag.startAngle;
+
+                const dq = new THREE.Quaternion().setFromAxisAngle(drag.axisWorld, deltaAngle);
+                const newDir = drag.startDir.clone().applyQuaternion(dq).normalize();
+
+                 const clampedY = Math.max(-1, Math.min(1, newDir.y));
+                 const newRotX = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, Math.asin(clampedY)));
+                 const newRotY = Math.atan2(newDir.x, newDir.z);
+
+                const newCamState: Camera3D = {
+                  zoom: drag.startZoom,
+                  offsetX: drag.startOffsetX,
+                  offsetY: drag.startOffsetY,
+                  rotationX: newRotX,
+                  rotationY: newRotY,
+                };
+
+                const newQuat = getCameraQuaternionFromState(newCamState);
+                cameraGizmoRef.current!.quaternion.copy(newQuat);
+
+                const onCamMove = onCameraMoveRef.current;
+                if (onCamMove) onCamMove(newCamState);
+
+                const onGizmoMove = onCameraGizmoMoveRef.current;
+                 if (onGizmoMove && animationTracksRef.current) {
+                   const updatedKeyframes = buildUpdatedCameraKeyframes(
+                     animationTracksRef.current,
+                     newCamState
+                   );
+                   if (updatedKeyframes) onGizmoMove(updatedKeyframes);
+                 }
+              }
+            }
+          }
+          return;
+        }
+
+        // Cursor de mano al pasar por encima de un asa del manipulador o de
       // la pieza de textura
       const hoverHandles =
         gizmoOnRef.current && gizmoGroupRef.current?.visible
@@ -2438,6 +2898,17 @@ export default function Viewer3D({
             const ud = gizmoHits[0].object.userData as { axis: GizmoAxis; mode: string };
             renderer.domElement.style.cursor = ud.mode === 'move' ? `grab` : '';
           }
+        }
+      }
+      // Hover for camera gizmo handles
+      if (cameraGizmoHandleGroupRef.current?.visible && !cameraGizmoDragRef.current && !lightGizmoDragRef.current) {
+        raycasterRef.current.setFromCamera(pointerRef.current, camera);
+        const camGizmoHover = raycasterRef.current.intersectObjects(
+          cameraGizmoHandlesRef.current,
+          false
+        );
+        if (camGizmoHover.length > 0) {
+          renderer.domElement.style.cursor = 'grab';
         }
       }
       if (dragRef.current) {
@@ -2770,9 +3241,126 @@ export default function Viewer3D({
                   ? { x: e.clientX - rect2.left, y: e.clientY - rect2.top }
                   : undefined,
               };
-            controls.enabled = false;
-            renderer.domElement.style.cursor = 'grabbing';
-            return;
+              controls.enabled = false;
+              renderer.domElement.style.cursor = 'grabbing';
+              return;
+          }
+        }
+      }
+
+      // Camera gizmo (3-axis arrows + rotation rings): if click hits a handle, start drag.
+      // Only interactive when showCameraPathGizmo is active and NOT in cameraViewMode.
+      if (
+        cameraGizmoHandleGroupRef.current?.visible &&
+        !cameraGizmoDragRef.current &&
+        !lightGizmoDragRef.current &&
+        !lightDragRef.current &&
+        !gizmoDragRef.current &&
+        !dragRef.current
+      ) {
+        const rect = renderer.domElement.getBoundingClientRect();
+        pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        raycasterRef.current.setFromCamera(pointerRef.current, camera);
+        const camGizmoHits = raycasterRef.current.intersectObjects(
+          cameraGizmoHandlesRef.current,
+          false
+        );
+        if (camGizmoHits.length > 0) {
+          const ud = camGizmoHits[0].object.userData as {
+            axis: GizmoAxis;
+            mode: 'move' | 'rotate';
+          };
+          const camGizmo = cameraGizmoRef.current;
+          if (camGizmo && camera3D) {
+            const camPos = camGizmo.position.clone();
+            const camQuat = camGizmo.quaternion.clone();
+            const startDir = getCameraPositionFromStateRef.current
+              ? getCameraPositionFromStateRef.current(camera3D).sub(
+                  new THREE.Vector3(camera3D.offsetX, camera3D.offsetY, 0)
+                ).normalize()
+              : new THREE.Vector3(0, 0, 1);
+
+            if (ud.mode === 'move') {
+              const axisWorld = GIZMO_AXIS_DIR[ud.axis].clone();
+              const t0 = closestPointOnAxis(
+                raycasterRef.current.ray,
+                camPos,
+                axisWorld
+              );
+              if (t0 !== null) {
+                cameraGizmoDragRef.current = {
+                  axis: ud.axis,
+                  axisWorld,
+                  startPos: camPos,
+                  startQuat: camQuat,
+                  startDir,
+                  startT: t0,
+                  mode: 'move',
+                  plane: new THREE.Plane(),
+                  basisU: new THREE.Vector3(),
+                  basisV: new THREE.Vector3(),
+                  startAngle: 0,
+                  startOffsetX: camera3D.offsetX,
+                  startOffsetY: camera3D.offsetY,
+                  startZoom: camera3D.zoom,
+                  startRotationX: camera3D.rotationX,
+                  startRotationY: camera3D.rotationY,
+                };
+                controls.enabled = false;
+                renderer.domElement.style.cursor = 'grabbing';
+                return;
+              }
+            } else if (ud.mode === 'rotate') {
+              const axisWorld = GIZMO_AXIS_DIR[ud.axis].clone();
+              const plane = new THREE.Plane();
+              plane.setFromNormalAndCoplanarPoint(axisWorld, camPos);
+              const hit = new THREE.Vector3();
+              if (raycasterRef.current.ray.intersectPlane(plane, hit)) {
+                const camDir = new THREE.Vector3();
+                camera.getWorldDirection(camDir);
+                let basisU = camDir
+                  .clone()
+                  .sub(axisWorld.clone().multiplyScalar(camDir.dot(axisWorld)));
+                if (basisU.lengthSq() < 1e-6) {
+                  basisU = new THREE.Vector3(1, 0, 0);
+                }
+                basisU.normalize();
+                const basisV = new THREE.Vector3().crossVectors(axisWorld, basisU).normalize();
+
+                const d = hit.clone().sub(camPos);
+                const startProj = d.clone().projectOnPlane(axisWorld);
+                if (startProj.lengthSq() < 1e-6) {
+                  startProj.crossVectors(axisWorld, basisU).cross(axisWorld).normalize();
+                }
+                const startAngle = Math.atan2(
+                  startProj.dot(basisV),
+                  startProj.dot(basisU)
+                );
+
+                cameraGizmoDragRef.current = {
+                  axis: ud.axis,
+                  axisWorld,
+                  startPos: camPos,
+                  startQuat: camQuat,
+                  startDir,
+                  startT: 0,
+                  mode: 'rotate',
+                  plane,
+                  basisU,
+                  basisV,
+                  startAngle,
+                  startOffsetX: camera3D.offsetX,
+                  startOffsetY: camera3D.offsetY,
+                  startZoom: camera3D.zoom,
+                  startRotationX: camera3D.rotationX,
+                  startRotationY: camera3D.rotationY,
+                };
+                controls.enabled = false;
+                renderer.domElement.style.cursor = 'grabbing';
+                return;
+              }
+            }
           }
         }
       }
@@ -2965,6 +3553,15 @@ export default function Viewer3D({
         return;
       }
 
+      // Release camera gizmo drag (3-axis arrows + rotation rings)
+      if (cameraGizmoDragRef.current) {
+        cameraGizmoDragRef.current = null;
+        controls.enabled = true;
+        renderer.domElement.style.cursor = '';
+        cameraGizmoHandleGroupRef.current!.visible = true;
+        return;
+      }
+
       if (gizmoDragRef.current) {
         const wasHelper = gizmoDragRef.current.target === 'texture';
         gizmoDragRef.current = null;
@@ -3011,17 +3608,27 @@ export default function Viewer3D({
       gizmoDragRef.current = null;
       renderer.dispose();
       for (const sys of [sparksRef.current, fireRef.current]) {
-        if (sys) {
-          sys.points.geometry.dispose();
-          (sys.points.material as THREE.Material)?.dispose();
-        }
-      }
-      sparksRef.current = null;
-      fireRef.current = null;
-      if (starsRef.current) {
-        for (const star of starsRef.current.stars) {
-          star.sprite.material.dispose();
-        }
+         if (sys) {
+           sys.points.geometry.dispose();
+           (sys.points.material as THREE.Material)?.dispose();
+         }
+       }
+       sparksRef.current = null;
+       fireRef.current = null;
+       if (rainRef.current) {
+         rainRef.current.points.geometry.dispose();
+         (rainRef.current.points.material as THREE.Material)?.dispose();
+         rainRef.current = null;
+       }
+       if (smokeRef.current) {
+         smokeRef.current.points.geometry.dispose();
+         (smokeRef.current.points.material as THREE.Material)?.dispose();
+         smokeRef.current = null;
+       }
+       if (starsRef.current) {
+         for (const star of starsRef.current.stars) {
+           star.sprite.material.dispose();
+         }
       }
       starsRef.current = null;
       if (placedStarsRef.current) {
@@ -3198,12 +3805,13 @@ export default function Viewer3D({
       const opacity = typeof mesh.opacity === 'number'
         ? Math.max(0, Math.min(1, mesh.opacity))
         : 1;
-      const material = new THREE.MeshPhysicalMaterial({
-        color: 0xffffff,
-        metalness: (mesh.textureFinish ?? objectTextureFinish) === 'glossy' ? 0 : (mesh.textureFinish ?? objectTextureFinish) === 'matte' ? 0.05 : (mesh.textureFinish ?? objectTextureFinish) === 'mirror' ? 1 : 0.3,
-        roughness: (mesh.textureFinish ?? objectTextureFinish) === 'glossy' ? 0 : (mesh.textureFinish ?? objectTextureFinish) === 'matte' ? 0.9 : (mesh.textureFinish ?? objectTextureFinish) === 'mirror' ? 0.05 : 0.45,
-        clearcoat: (mesh.textureFinish ?? objectTextureFinish) === 'glossy' ? 0 : (mesh.textureFinish ?? objectTextureFinish) === 'mirror' ? 1 : 0,
-        clearcoatRoughness: (mesh.textureFinish ?? objectTextureFinish) === 'glossy' ? 0.015 : (mesh.textureFinish ?? objectTextureFinish) === 'mirror' ? 0 : 0,
+        const finish = mesh.textureFinish ?? objectTextureFinish;
+        const material = new THREE.MeshPhysicalMaterial({
+          color: 0xffffff,
+          metalness: finish === 'metallic' ? 0.3 : finish === 'glossy' ? 0 : finish === 'matte' ? 0.05 : finish === 'mirror' ? 1 : 0.3,
+          roughness: finish === 'metallic' ? 0.1 : finish === 'glossy' ? 0 : finish === 'matte' ? 0.9 : finish === 'mirror' ? 0.05 : 0.45,
+          clearcoat: finish === 'metallic' ? 1 : finish === 'glossy' ? 0 : finish === 'mirror' ? 1 : 0,
+          clearcoatRoughness: finish === 'metallic' ? 0.015 : finish === 'glossy' ? 0.015 : finish === 'mirror' ? 0 : 0,
         side: THREE.DoubleSide,
         map: null, // Se cargará después
         bumpMap: null,
@@ -3211,7 +3819,7 @@ export default function Viewer3D({
         transparent: true,
         opacity,
         alphaTest: 0,
-        envMapIntensity: (mesh.textureFinish ?? objectTextureFinish) === 'mirror' ? 1.5 : 0,
+        envMapIntensity: finish === 'mirror' ? 1.5 : 0,
       });
 
       const meshObj = new THREE.Mesh(geometry, material);
@@ -3421,10 +4029,10 @@ export default function Viewer3D({
           color: mesh.texture ? 0xffffff :
             (allFacesShareColor ? uniformFaceColor! : useFaceColors ? 0xffffff : 0xdedede),
           vertexColors: useFaceColors && !mesh.texture && !allFacesShareColor,
-          metalness: mesh.textureFinish === 'glossy' ? 0.1 : mesh.textureFinish === 'matte' ? 0.05 : 0.1,
-          roughness: mesh.textureFinish === 'glossy' ? 0.025 : mesh.textureFinish === 'matte' ? 0.9 : 0.45,
-          clearcoat: mesh.textureFinish === 'glossy' ? 1 : 0,
-          clearcoatRoughness: mesh.textureFinish === 'glossy' ? 0.015 : 0,
+          metalness: mesh.textureFinish === 'metallic' ? 0.3 : mesh.textureFinish === 'glossy' ? 0.1 : mesh.textureFinish === 'matte' ? 0.05 : 0.1,
+          roughness: mesh.textureFinish === 'metallic' ? 0.1 : mesh.textureFinish === 'glossy' ? 0.025 : mesh.textureFinish === 'matte' ? 0.9 : 0.45,
+          clearcoat: mesh.textureFinish === 'metallic' ? 1 : mesh.textureFinish === 'glossy' ? 1 : 0,
+          clearcoatRoughness: mesh.textureFinish === 'metallic' ? 0.015 : mesh.textureFinish === 'glossy' ? 0.015 : 0,
           side: THREE.DoubleSide,
           map: null,
           bumpMap: null,
@@ -3755,23 +4363,29 @@ export default function Viewer3D({
          }
          meshGroup.add(duplicate);
        }
-        // En modo boolean preview: el objeto cortador se muestra transparente
+        // En modo boolean preview: el objeto cortador (duplicate) se muestra transparente
         if (booleanToolObjectId === object.id) {
           duplicate.traverse(function (child) {
             if (child instanceof THREE.Mesh && child.material) {
-              const mat = Array.isArray(child.material)
-                ? child.material.map((m) => cloneAndStyleToolMaterial(m))
-                : cloneAndStyleToolMaterial(child.material);
-              child.material = mat;
+              if (Array.isArray(child.material)) {
+                child.material = child.material.map((m) =>
+                  m && !(m as any).isBooleanPreview ? cloneAndStyleToolMaterial(m) : m
+                );
+              } else if (!(child.material as any).isBooleanPreview) {
+                child.material = cloneAndStyleToolMaterial(child.material);
+              }
             }
           });
         }
-        // Si no es el tool: restaurar material (no clone — restaurar el original)
+        // Si no es el tool: restaurar materiales clonados de preview previo
         if (booleanToolObjectId !== object.id) {
           duplicate.traverse(function (child) {
             if (child instanceof THREE.Mesh && child.material) {
-              // Si el material fue clonado para preview, restaurar el original
-              if ((child.material as any).isPreviewClone && (child.material as any).originalMaterial) {
+              if (Array.isArray(child.material)) {
+                child.material = child.material.map((m) =>
+                  m && (m as any).isBooleanPreview ? (m as any).originalMaterial : m
+                );
+              } else if ((child.material as any).isBooleanPreview) {
                 child.material = (child.material as any).originalMaterial;
               }
             }
@@ -3837,43 +4451,131 @@ export default function Viewer3D({
   // --- tocar la malla original. En modo "vista plana" se omite.
   useEffect(() => {
     const glowGroup = glowGroupRef.current;
-    const meshGroup = meshGroupRef.current;
-    if (!glowGroup) return;
-    while (glowGroup.children.length > 0) {
-      glowGroup.remove(glowGroup.children[0]);
-    }
-    if (!glowValue || !meshGroup || meshRef.current.texture) return;
+     const meshGroup = meshGroupRef.current;
+     if (!glowGroup) return;
+     while (glowGroup.children.length > 0) {
+       glowGroup.remove(glowGroup.children[0]);
+     }
+     // Also remove shells attached directly to scene objects
+     if (meshGroup) {
+       for (const child of meshGroup.children) {
+         if (child instanceof THREE.Mesh) {
+           while (child.children.length > 0) {
+             const sub = child.children[child.children.length - 1];
+             if (sub.userData?.isGlowShell) child.remove(sub);
+             else break;
+           }
+         }
+       }
+     }
+     if (!glowValue || !meshGroup) return;
     for (const child of meshGroup.children) {
       if (!(child instanceof THREE.Mesh)) continue;
       const shell = new THREE.Mesh(child.geometry, getGlowMaterial());
       shell.scale.setScalar(1.1);
-      glowGroup.add(shell);
+      if (child.userData.sceneObjectDuplicate && !fx.glowObjects) continue;
+      (shell as any).userData = { isGlowShell: true };
+      if (child.userData.sceneObjectDuplicate) {
+        // Object: attach directly so it inherits the object's transform
+        child.add(shell);
+      } else {
+        // Text: add to glowGroup (text transform handles positioning)
+        glowGroup.add(shell);
+      }
     }
-   }, [mesh, glowValue]);
+    }, [mesh, glowValue, fx.glowObjects]);
 
-   // --- Chispas: partículas brillantes que saltan desde el texto ---
-   useEffect(() => {
-     const group = effectsGroupRef.current;
-     if (!group) return;
-     if (sparksValue && !sparksRef.current) {
-       sparksRef.current = createParticleSystem(140, 0.035);
-       group.add(sparksRef.current.points);
-     }
-     if (sparksRef.current) sparksRef.current.points.visible = sparksValue;
-   }, [sparksValue]);
+    // Update glow material uniforms (color + intensity) when fxConfig changes
+    useEffect(() => {
+     if (glowValue) updateGlowMaterial(fx);
+   }, [fx.glowColor, fx.glowIntensity, glowValue]);
 
-   // --- Fuego: partículas de llama que suben por el texto ---
-   useEffect(() => {
-     const group = effectsGroupRef.current;
-     if (!group) return;
-     if (fireValue && !fireRef.current) {
-       fireRef.current = createParticleSystem(160, 0.11);
-       group.add(fireRef.current.points);
-     }
-     if (fireRef.current) fireRef.current.points.visible = fireValue;
-   }, [fireValue]);
+    // --- Chispas: partículas brillantes que saltan desde el texto ---
+    useEffect(() => {
+      const group = effectsGroupRef.current;
+      if (!group) return;
+      if (sparksValue && !sparksRef.current) {
+        sparksRef.current = createParticleSystem(fx.sparksCount, fx.sparksSize);
+        group.add(sparksRef.current.points);
+      } else if (!sparksValue && sparksRef.current) {
+        group.remove(sparksRef.current.points);
+        sparksRef.current.points.geometry.dispose();
+        (sparksRef.current.points.material as THREE.Material)?.dispose();
+        sparksRef.current = null;
+      }
+      if (sparksRef.current) sparksRef.current.points.visible = sparksValue;
+    }, [sparksValue, fx.sparksCount, fx.sparksSize]);
 
-  // --- Estrellas de brillo: destellos en cruz sobre el texto ---
+    // --- Fuego: partículas de llama que suben por el texto ---
+    useEffect(() => {
+      const group = effectsGroupRef.current;
+      if (!group) return;
+      if (fireValue && !fireRef.current) {
+        fireRef.current = createParticleSystem(fx.fireCount, fx.fireSize);
+        group.add(fireRef.current.points);
+      } else if (!fireValue && fireRef.current) {
+        group.remove(fireRef.current.points);
+        fireRef.current.points.geometry.dispose();
+        (fireRef.current.points.material as THREE.Material)?.dispose();
+        fireRef.current = null;
+      }
+      if (fireRef.current) fireRef.current.points.visible = fireValue;
+    }, [fireValue, fx.fireCount, fx.fireSize]);
+
+    // --- Lluvia: gotas que caen sobre el texto ---
+    useEffect(() => {
+      const group = effectsGroupRef.current;
+      if (!group) return;
+       if (rainValue && !rainRef.current && mesh.vertices.length > 0) {
+         const box = new THREE.Box3();
+         for (const v of mesh.vertices) box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
+         const pad = box.getSize(new THREE.Vector3()).multiplyScalar(0.15);
+         box.min.sub(pad);
+         box.max.add(pad);
+         box.max.y += 0.3;
+         // Recrear si el count/speed cambió
+         const sys = createRainSystem(box, fx.rainCount, fx.rainSpeed);
+         group.add(sys.points);
+         rainRef.current = sys;
+       } else if (!rainValue && rainRef.current) {
+         group.remove(rainRef.current.points);
+         rainRef.current.points.geometry.dispose();
+         (rainRef.current.points.material as THREE.Material)?.dispose();
+         rainRef.current = null;
+       }
+       rainEnabledRef.current = !!rainValue;
+     }, [rainValue, fx.rainCount, fx.rainSpeed, mesh.vertices]);
+
+     // --- Humo: nube que asciende desde la base del texto ---
+     useEffect(() => {
+       const group = effectsGroupRef.current;
+       if (!group) return;
+       if (smokeValue && !smokeRef.current && mesh.vertices.length > 0) {
+         const box = new THREE.Box3();
+         for (const v of mesh.vertices) box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
+         const min = box.min.clone();
+         const center = new THREE.Vector3();
+         box.getCenter(center);
+         const origin = new THREE.Vector3(center.x, min.y, center.z);
+         const sys = createSmokeSystem(origin, fx.smokeCount, fx.smokeSize, fx.smokeColor, fx.smokeRiseSpeed, fx.fireIntensity);
+         group.add(sys.points);
+         smokeRef.current = sys;
+       } else if (!smokeValue && smokeRef.current) {
+         group.remove(smokeRef.current.points);
+         smokeRef.current.points.geometry.dispose();
+         (smokeRef.current.points.material as THREE.Material)?.dispose();
+         smokeRef.current = null;
+       }
+       smokeEnabledRef.current = !!smokeValue;
+     }, [smokeValue, fx.smokeCount, fx.smokeSize, fx.smokeColor, fx.smokeRiseSpeed, mesh.vertices]);
+
+     // Sincroniza los flags de enabled para el animation loop (controlled mode)
+     useEffect(() => {
+       rainEnabledRef.current = !!rainValue;
+       smokeEnabledRef.current = !!smokeValue;
+       }, [rainValue, smokeValue]);
+
+   // --- Estrellas de brillo: destellos en cruz sobre el texto ---
   useEffect(() => {
     const group = effectsGroupRef.current;
     if (!group) return;
@@ -4001,18 +4703,22 @@ export default function Viewer3D({
       loader.load(groundTexture, (texture) => {
         texture.wrapS = THREE.RepeatWrapping;
         texture.wrapT = THREE.RepeatWrapping;
-        texture.repeat.set(4, 4);
+        texture.repeat.set(groundTextureRepeat, groundTextureRepeat);
+        texture.colorSpace = THREE.SRGBColorSpace;
+        texture.anisotropy = 4;
         material.map = texture;
+        material.color.set(0xffffff);
         applyGroundTextureFinish(material, groundTextureFinish);
         material.needsUpdate = true;
       });
     } else {
       material.map = null;
+      material.color.set(0x1a1a2e);
       material.roughness = 0.9;
       material.metalness = 0.0;
       material.needsUpdate = true;
     }
-   }, [groundTexture, groundTextureFinish]);
+    }, [groundTexture, groundTextureRepeat, groundTextureFinish]);
 
   const applyGroundTextureFinish = (material: THREE.MeshPhysicalMaterial, finish: string) => {
     material.envMap = cubeRenderTargetRef.current?.texture ?? null;
@@ -4022,6 +4728,10 @@ export default function Viewer3D({
       case 'glossy':
         material.roughness = 0.1;
         material.metalness = 0.0;
+        break;
+      case 'metallic':
+        material.roughness = 0.1;
+        material.metalness = 0.3;
         break;
       case 'mirror':
         material.roughness = 0.05;
@@ -4045,15 +4755,25 @@ export default function Viewer3D({
     }
   };
 
-   // Update camera path and gizmo when tracks change (not during playback)
-   useEffect(() => {
-     if (!showCameraPathGizmo) return;
-     const cameraTrack = animationTracks?.find((t) => t.objectId === null);
-     if (!cameraTrack || cameraTrack.keyframes.length === 0) return;
-     drawCameraPathRef.current?.(cameraTrack);
-   }, [animationTracks, showCameraPathGizmo]);
+    // Update camera path and gizmo when tracks change (not during playback)
+    useEffect(() => {
+      if (!showCameraPath) {
+        if (cameraPathRef.current) cameraPathRef.current.visible = false;
+        return;
+      }
+      const cameraTrack = animationTracks?.find((t) => t.objectId === null);
+      if (!cameraTrack || cameraTrack.keyframes.length === 0) return;
+      drawCameraPathRef.current?.(cameraTrack);
+    }, [animationTracks, showCameraPath]);
 
-  useEffect(() => {
+    useEffect(() => {
+      if (exportMp4Trigger && exportMp4Trigger > exportTriggerRef.current) {
+        exportTriggerRef.current = exportMp4Trigger;
+        startMp4ExportRef.current?.();
+      }
+    }, [exportMp4Trigger]);
+
+    useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
 
@@ -4401,8 +5121,22 @@ export default function Viewer3D({
              onClick={toggleFire}
              title="Fuego"
           >
-            <Flame className="w-3.5 h-3.5" />
-          </ToggleButton>
+             <Flame className="w-3.5 h-3.5" />
+           </ToggleButton>
+           <ToggleButton
+             active={rainValue}
+             onClick={toggleRain}
+             title="Lluvia (gotas cayendo sobre el texto)"
+           >
+             <CloudRain className="w-3.5 h-3.5" />
+           </ToggleButton>
+           <ToggleButton
+             active={smokeValue}
+             onClick={toggleSmoke}
+             title="Humo (nube que asciende desde la base)"
+           >
+             <Cloud className="w-3.5 h-3.5" />
+           </ToggleButton>
           <ToggleButton
             active={fxStars}
             onClick={() => setFxStars(!fxStars)}
@@ -4440,8 +5174,30 @@ export default function Viewer3D({
           <ToggleButton onClick={capturePNG} title="Capturar PNG (fondo transparente)">
             <Camera className="w-3.5 h-3.5" />
           </ToggleButton>
+          <ToggleButton
+            active={false}
+            onClick={() => setShowFxConfigModal(true)}
+            title="Configuración de FX"
+          >
+            <Settings className="w-3.5 h-3.5" />
+          </ToggleButton>
         </div>
       </div>
+
+      {showFxConfigModal && (
+        <FxConfigEditor
+          isOpen={showFxConfigModal}
+          onClose={() => setShowFxConfigModal(false)}
+          fxConfig={fx}
+          onFxChange={(partial) => {
+            if (fxConfig !== undefined) {
+              onFxChange?.(partial);
+            } else {
+              setFxConfigLocal((prev) => ({ ...DEFAULT_FX_CONFIG, ...prev, ...partial }));
+            }
+          }}
+        />
+      )}
       <div
         ref={mountRef}
         className="relative flex-1 min-h-0"
@@ -4581,6 +5337,26 @@ type ParticleSystem = {
   maxLife: Float32Array;
 };
 
+type RainSystem = {
+  points: THREE.Points;
+  positions: Float32Array;
+  velocities: Float32Array;
+  box: { min: THREE.Vector3; max: THREE.Vector3 };
+  speed: number;
+};
+
+type SmokeSystem = {
+  points: THREE.Points;
+  positions: Float32Array;
+  colors: Float32Array;
+  velocities: Float32Array;
+  life: Float32Array;
+  maxLife: Float32Array;
+  origin: THREE.Vector3;
+  color: THREE.Color;
+  riseSpeed: number;
+};
+
 type StarGlint = {
   sprite: THREE.Sprite;
   state: 'wait' | 'live';
@@ -4612,10 +5388,10 @@ function addPlacedStar(
   pos: THREE.Vector3,
   starSize: number
 ): void {
-  const material = new THREE.SpriteMaterial({
-    map: getStarTexture(),
-    transparent: true,
-    depthWrite: false,
+    const material = new THREE.SpriteMaterial({
+      map: getStarTexture(),
+      transparent: true,
+      opacity: 0,
     depthTest: false, // siempre por delante del texto
     blending: THREE.AdditiveBlending,
     rotation: Math.random() * Math.PI,
@@ -4731,7 +5507,7 @@ function getStarTexture(): THREE.Texture {
   return tex;
 }
 
-let glowMaterialCache: THREE.ShaderMaterial | null = null;
+   let glowMaterialCache: THREE.ShaderMaterial | null = null;
 
 /**
  * Material del halo de neón (fresnel): la copia ampliada por detrás solo
@@ -4780,6 +5556,14 @@ function getGlowMaterial(): THREE.ShaderMaterial {
     side: THREE.BackSide,
   });
   return glowMaterialCache;
+}
+
+/** Update glow material uniforms from the current fxConfig (color + intensity). */
+function updateGlowMaterial(fx: FxConfig): void {
+  if (!glowMaterialCache) return;
+  glowMaterialCache.uniforms.uColor.value = new THREE.Color(fx.glowColor);
+  glowMaterialCache.uniforms.uIntensity.value = fx.glowIntensity;
+  glowMaterialCache.uniformsNeedUpdate = true;
 }
 
 function createParticleSystem(count: number, size: number): ParticleSystem {
@@ -4849,7 +5633,149 @@ function updateSparks(
   (sys.points.geometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
 }
 
-/** Fuego: llamas que nacen en el texto y suben temblando. */
+/**
+ * Sistema de partículas de lluvia.
+ * Partículas que caen desde un punto elevado sobre el texto con trazo azul
+ * tenue y brillo sutil, simulando gotas de lluvia.
+ */
+function createRainSystem(
+  box: { min: THREE.Vector3; max: THREE.Vector3 },
+  count: number,
+  speed: number
+): RainSystem {
+  const positions = new Float32Array(count * 3);
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+  const material = new THREE.PointsMaterial({
+    size: 0.032,
+    map: getSoftDotTexture(),
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+    blending: THREE.AdditiveBlending,
+    vertexColors: true,
+  });
+  const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+  points.renderOrder = 999;
+  const velocities = new Float32Array(count * 3);
+  const spread = box.max.clone().sub(box.min);
+  for (let i = 0; i < count; i++) {
+    const o = i * 3;
+    const x = box.min.x + Math.random() * spread.x;
+    const y = box.max.y + Math.random() * 0.6;
+    const z = box.min.z + Math.random() * spread.z;
+    positions[o] = x;
+    positions[o + 1] = y;
+    positions[o + 2] = z;
+    velocities[o] = (Math.random() - 0.5) * 0.02;
+    velocities[o + 1] = -(speed * 0.4 + Math.random() * speed * 0.3);
+    velocities[o + 2] = (Math.random() - 0.5) * 0.02;
+  }
+  geometry.attributes.position.needsUpdate = true;
+  (geometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+  return { points, positions, velocities, box, speed };
+}
+
+/** Actualiza las gotas de lluvia: caen y se regeneran al pasar del bounds. */
+function updateRain(sys: RainSystem, dt: number): void {
+  const count = sys.velocities.length / 3;
+  const min = sys.box.min;
+  const max = sys.box.max;
+  const fallSpeed = sys.speed * 0.4;
+  for (let i = 0; i < count; i++) {
+    const o = i * 3;
+    sys.positions[o] += sys.velocities[o] * dt;
+    sys.positions[o + 1] += sys.velocities[o + 1] * dt;
+    sys.positions[o + 2] += sys.velocities[o + 2] * dt;
+    if (sys.positions[o + 1] < min.y - 0.3) {
+      const spread = max.clone().sub(min);
+      sys.positions[o] = min.x + Math.random() * spread.x;
+      sys.positions[o + 1] = max.y + Math.random() * 0.6;
+      sys.positions[o + 2] = min.z + Math.random() * spread.z;
+      sys.velocities[o + 1] = -(fallSpeed + Math.random() * 0.3);
+    }
+    const t = Math.min(1, -sys.positions[o + 1] / (max.y - min.y + 1));
+    const c = 0.5 + t * 0.5;
+    sys.points.geometry.attributes.color.setXYZ(i, c * 0.45, c * 0.55, c);
+  }
+  sys.points.geometry.attributes.position.needsUpdate = true;
+  (sys.points.geometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+}
+
+/**
+ * Sistema de partículas de humo.
+ * Partículas que nacen en una fuente (base del texto) y ascienden con
+ * dispersión lateral, atenuándose con la edad para simular nube de humo.
+ */
+function createSmokeSystem(origin: THREE.Vector3, count: number, size: number, color: string, riseSpeed: number, intensity: number): SmokeSystem {
+  const positions = new Float32Array(count * 3);
+  const colors = new Float32Array(count * 3);
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  const material = new THREE.PointsMaterial({
+    size,
+    map: getSoftDotTexture(),
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+    blending: THREE.AdditiveBlending,
+    vertexColors: true,
+  });
+  const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+  points.renderOrder = 999;
+  const velocities = new Float32Array(count * 3);
+  const life = new Float32Array(count);
+  const maxLife = new Float32Array(count);
+  for (let i = 0; i < count; i++) {
+    life[i] = 0;
+  }
+  return { points, positions, colors, velocities, life, maxLife, origin, color: new THREE.Color(color), riseSpeed };
+}
+
+/** Actualiza las partículas de humo: ascienden, se dispersan y se desvanecen. */
+function updateSmoke(sys: SmokeSystem, dt: number): void {
+  const count = sys.life.length;
+  const baseT = 0.42 * sys.riseSpeed * 0.5;
+  for (let i = 0; i < count; i++) {
+    const o = i * 3;
+    if (sys.life[i] <= 0) {
+      const r = (Math.random() * Math.PI) * 2;
+      const rad = Math.random() * 0.12;
+      sys.positions[o] = sys.origin.x + Math.cos(r) * rad;
+      sys.positions[o + 1] = sys.origin.y;
+      sys.positions[o + 2] = sys.origin.z + Math.sin(r) * rad;
+      sys.velocities[o] = (Math.random() - 0.5) * 0.04;
+      sys.velocities[o + 1] = 0.12 * sys.riseSpeed + Math.random() * 0.18 * sys.riseSpeed;
+      sys.velocities[o + 2] = (Math.random() - 0.5) * 0.04;
+      sys.maxLife[i] = 1.2 + Math.random() * 1.2;
+      sys.life[i] = sys.maxLife[i];
+    } else {
+      sys.life[i] -= dt;
+      sys.positions[o] += sys.velocities[o] * dt;
+      sys.positions[o + 1] += sys.velocities[o + 1] * dt;
+      sys.positions[o + 2] += sys.velocities[o + 2] * dt;
+      sys.velocities[o] += (Math.random() - 0.5) * 0.03 * dt;
+      // expansión lateral creciente con la altura
+      const expansion = 0.01 * dt * sys.riseSpeed;
+      sys.velocities[o] += (Math.random() - 0.5) * expansion;
+      sys.velocities[o + 2] += (Math.random() - 0.5) * expansion;
+    }
+    const t = Math.max(sys.life[i], 0) / (sys.maxLife[i] || 1);
+    const fade = t < 0.15 ? t / 0.15 : t > 0.8 ? (1 - t) / 0.2 : 0.9;
+    const c = sys.color;
+    sys.colors[o] = c.r * fade;
+    sys.colors[o + 1] = c.g * fade;
+    sys.colors[o + 2] = c.b * fade;
+  }
+  sys.points.geometry.attributes.position.needsUpdate = true;
+  (sys.points.geometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+}
+
+/** Fuego: llamas que nacen en el texto y suben temblando. Color amarillo→naranja→rojo. */
 function updateFire(
   sys: ParticleSystem,
   dt: number,
@@ -4889,19 +5815,22 @@ function updateFire(
 function createStarSystem(): StarSystem {
   const group = new THREE.Group();
   const stars: StarGlint[] = [];
-  for (let i = 0; i < 8; i++) {
+  // Más estrellas para un cielo de fondo más denso y dinámico
+  const count = 24;
+  for (let i = 0; i < count; i++) {
     const material = new THREE.SpriteMaterial({
       map: getStarTexture(),
       transparent: true,
       depthWrite: false,
       depthTest: false, // siempre por delante del texto
       blending: THREE.AdditiveBlending,
+      opacity: 0,
       rotation: Math.random() * Math.PI,
     });
     // Mayoría blancas; algunas con matiz frío o cálido
     const hue = Math.random();
-    if (hue < 0.7) material.color.setHex(0xffffff);
-    else if (hue < 0.85) material.color.setHex(0x9fe8ff);
+    if (hue < 0.66) material.color.setHex(0xffffff);
+    else if (hue < 0.83) material.color.setHex(0x9fe8ff);
     else material.color.setHex(0xffe3b0);
     const sprite = new THREE.Sprite(material);
     sprite.renderOrder = 999;
@@ -4910,9 +5839,9 @@ function createStarSystem(): StarSystem {
     stars.push({
       sprite,
       state: 'wait',
-      timer: Math.random() * 1.5,
+      timer: Math.random() * 1.8,
       duration: 1,
-      baseScale: 0.25,
+      baseScale: 0.2,
     });
   }
   return { group, stars };
@@ -4931,20 +5860,31 @@ function updateStars(
       if (star.timer <= 0) {
         const p = randomPoint();
         if (!p) {
-          star.timer = 0.5;
+          star.timer = 0.4;
           continue;
         }
         star.sprite.position.copy(p);
-        star.duration = 0.45 + Math.random() * 0.85;
+        star.duration = 0.5 + Math.random() * 0.9;
         star.timer = star.duration;
-        star.baseScale = (0.16 + Math.random() * 0.3) * starSize;
+        star.baseScale = (0.14 + Math.random() * 0.28) * starSize;
         star.sprite.material.rotation = Math.random() * Math.PI;
         star.state = 'live';
       }
     } else {
       const t = 1 - star.timer / star.duration;
+      // Pulso suave en crecimiento y desvanecimiento
       const s = Math.sin(Math.PI * Math.min(Math.max(t, 0), 1));
       star.sprite.scale.setScalar(star.baseScale * s);
+      // Fade de material: brillo al medio, transparente al inicio/final
+      const m = star.sprite.material as THREE.SpriteMaterial;
+      const fade = 0.5 + 0.5 * Math.sin(Math.PI * Math.min(Math.max(t, 0), 1));
+      m.opacity = fade;
+      if (star.timer <= 0) {
+        star.sprite.scale.setScalar(0);
+        star.state = 'wait';
+        star.timer = 0.2 + Math.random() * 1.5;
+      }
+    }
       if (star.timer <= 0) {
         star.sprite.scale.setScalar(0);
         star.state = 'wait';
@@ -4952,4 +5892,29 @@ function updateStars(
       }
     }
   }
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
