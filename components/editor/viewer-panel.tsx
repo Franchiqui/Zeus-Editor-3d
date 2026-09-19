@@ -1,7 +1,7 @@
 'use client';
 
 import type { FC } from 'react';
-import Viewer3D from '@/components/viewer-3d';
+import Viewer3D, { type ObjectTransform } from '@/components/viewer-3d';
 import { PanelButtons } from '@/components/editor/Editor3D';
 import type { AnimationTrack, Keyframe } from '@/lib/animation';
 
@@ -18,9 +18,22 @@ interface ViewerPanelProps {
   triMesh: any;
   smoothShadingValue: boolean;
   textureProjection: any;
-   selectedObjectId: string | null;
-   sceneObjects: any[];
-   handleObjectSelect: (id: string | null) => void;
+    selectedObjectId: string | null;
+    sceneObjects: any[];
+    handleObjectSelect: (id: string | null) => void;
+    selectedObjectIds?: string[];
+    onSelectionChange?: (ids: string[]) => void;
+    selectionMode?: boolean;
+    onSelectionModeChange?: (active: boolean) => void;
+    faceSelectMode?: boolean;
+    faceSelectionTool?: 'rectangle' | 'circle' | 'polygon';
+    selectedFaceIds?: number[];
+    onFaceSelectionChange?: (faceIds: number[]) => void;
+    onFaceSelectionModeChange?: (active: boolean) => void;
+    onFaceSelectionToolChange?: (tool: 'rectangle' | 'circle' | 'polygon') => void;
+    onMultiObjectTransform?: (transforms: { id: string; transform: ObjectTransform }[]) => void;
+    objectName?: string;
+    onObjectNameChange?: (name: string) => void;
    showGizmo: boolean;
    handleObjectTransform: (transform: any) => void;
    handleVerticesChange: (vertices: any) => void;
@@ -28,6 +41,7 @@ interface ViewerPanelProps {
    viewerProjection: any;
    textureHelper: any;
    textureHelperTransform: any;
+   textureRepeat?: number;
    setTextureHelperTransform: (transform: any) => void;
    lightConfig: any;
    showLightHelpers: boolean;
@@ -77,16 +91,30 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
   triMesh,
   smoothShadingValue,
   textureProjection,
-  selectedObjectId,
-  sceneObjects,
-  handleObjectSelect,
-  showGizmo,
+    selectedObjectId,
+    sceneObjects,
+    handleObjectSelect,
+    selectedObjectIds,
+    onSelectionChange,
+    selectionMode,
+    onSelectionModeChange,
+    faceSelectMode,
+    faceSelectionTool,
+    selectedFaceIds,
+    onFaceSelectionChange,
+    onFaceSelectionModeChange,
+    onFaceSelectionToolChange,
+    onMultiObjectTransform,
+    objectName,
+    onObjectNameChange,
+   showGizmo,
   handleObjectTransform,
   handleVerticesChange,
   showLatheAxis,
-  viewerProjection,
-  textureHelper,
-  textureHelperTransform,
+   viewerProjection,
+   textureHelper,
+   textureHelperTransform,
+   textureRepeat,
   setTextureHelperTransform,
   lightConfig,
   showLightHelpers,
@@ -142,6 +170,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
         onEdit={() => onSetEditing(!editingState)}
         showRotate
         isEditing={editingState}
+        viewName={viewName}
       />
     </div>
     <div className="flex-1 min-h-0">
@@ -155,7 +184,20 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
         configProjection={textureProjection}
          selectedObjectId={selectedObjectId ?? undefined}
          onObjectSelect={handleObjectSelect}
-         gizmo={showGizmo}
+         selectedObjectIds={selectedObjectIds}
+         onSelectionChange={onSelectionChange}
+          selectionMode={selectionMode}
+          onSelectionModeChange={onSelectionModeChange}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={onFaceSelectionChange}
+          onFaceSelectionModeChange={onFaceSelectionModeChange}
+          onFaceSelectionToolChange={onFaceSelectionToolChange}
+         onMultiObjectTransform={onMultiObjectTransform}
+          objectName={objectName}
+          onObjectNameChange={onObjectNameChange}
+          gizmo={showGizmo}
           booleanToolObjectId={booleanToolObjectId}
           forceObjectsUpdate={forceUpdate}
          objectTransform={
@@ -167,8 +209,9 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
         showLatheAxis={showLatheAxis}
         textureProjection={viewerProjection}
         textureHelper={textureHelper}
-        textureHelperTransform={textureHelperTransform}
-        onTextureHelperTransform={setTextureHelperTransform}
+         textureHelperTransform={textureHelperTransform}
+         onTextureHelperTransform={setTextureHelperTransform}
+         textureRepeat={textureRepeat}
         lightConfig={lightConfig}
         showLightHelpers={showLightHelpers}
         showGround={showGround}

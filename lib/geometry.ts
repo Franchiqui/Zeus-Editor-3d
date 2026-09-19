@@ -36,8 +36,10 @@ export type Mesh = {
   texture?: string;
   /** Color configurado para teñir la textura sin sustituirla. */
   textureColor?: string;
-  /** Intensidad del relieve de la textura (0 = plano). */
-  textureRelief?: number;
+   /** Intensidad del relieve de la textura (0 = plano). */
+   textureRelief?: number;
+   /** Número de veces que se repite la textura (1 = sin repetición). */
+   textureRepeat?: number;
   /** Acabado de la superficie texturizada. */
   textureFinish?: TextureFinish;
   /**

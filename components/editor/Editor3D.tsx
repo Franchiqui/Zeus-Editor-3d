@@ -67,6 +67,7 @@ import {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuCheckboxItem,
   DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu';
 import Object3DPreview, {
@@ -144,9 +145,10 @@ type EditorClipboard = {
   figureColor: string;
   texture: string | null;
   textureProjection: LatheTextureProjection;
-  textureFinish: TextureFinish;
-  textureRelief: number;
-  editedVertices: Vertex3D[] | null;
+   textureFinish: TextureFinish;
+   textureRelief: number;
+   textureRepeat: number;
+   editedVertices: Vertex3D[] | null;
   meshSilhouette: Polygon;
   meshSections: Array<{ id: number; polygon: Polygon; y: number }>;
   meshSilhouetteView: 'front' | 'side' | 'both';
@@ -173,10 +175,15 @@ type EditorClipboard = {
  * pertenece a cada objeto de la escena (viaja dentro de SceneObject) y
  * lo que se aplica al panel al seleccionarlo, pegarlo o cargarlo.
  */
-type ObjectConfig = Omit<EditorClipboard, 'mode' | 'mesh' | 'smooth'>;
+ type ObjectConfig = Omit<EditorClipboard, 'mode' | 'mesh' | 'smooth'>;
+
+type MultiObjectClipboard = {
+  objects: SceneObject[];
+};
 
 type SceneObject = {
   id: string;
+  name: string;
   transform: ObjectTransform;
   /**
    * Pestaña donde se debe mostrar este objeto. Si no se especifica,
@@ -198,8 +205,12 @@ type SceneObject = {
    * en los objetos de archivos antiguos y del modal «Objeto 3D»: esos
    * solo se ven (su malla congelada), sin recuperar sus plantillas.
    */
-  config?: ObjectConfig;
-};
+   config?: ObjectConfig;
+   /** Si el objeto está oculto en la escena (no se dibuja en el visor 3D) */
+   hidden?: boolean;
+   /** Si el objeto está congelado: se muestra en gris y no responde a interacciones */
+   frozen?: boolean;
+ };
 
 /**
  * Figura representativa de un objeto guardado (.zeus): la del dueño de
@@ -208,14 +219,16 @@ type SceneObject = {
  * el modal "Objeto 3D" (crear y vista previa) como su miniatura.
  */
 function extractObj3dMesh(data: unknown): {
+  name?: string;
   mesh: Mesh;
   smooth?: boolean;
   textureProjection?: LatheTextureProjection;
 } | null {
   if (!data || typeof data !== 'object') return null;
   const project = data as {
-    sceneObjects?: Array<{
+     sceneObjects?: Array<{
       id?: string;
+      name?: string;
       mesh?: Mesh;
       smooth?: boolean;
       textureProjection?: LatheTextureProjection;
@@ -232,6 +245,7 @@ function extractObj3dMesh(data: unknown): {
     objs.find((o) => o?.mesh && o.mesh.vertices.length > 0)?.mesh;
   if (!source || source.vertices.length === 0) return null;
   return {
+    name: owner?.name,
     mesh: source,
     smooth: owner?.smooth,
     textureProjection: owner?.textureProjection,
@@ -266,9 +280,10 @@ type HistoryState = {
   texture: string | null;
   latheTexture: string | null;
   textureProjection: LatheTextureProjection;
-  textureFinish: TextureFinish;
-  textureRelief: number;
-  resolution: number;
+   textureFinish: TextureFinish;
+   textureRelief: number;
+   textureRepeat: number;
+   resolution: number;
   meshStyle: 'fusionada' | 'suave' | 'voxeles';
   meshSilhouette: Polygon;
   meshSections: Array<{ id: number; polygon: Polygon; y: number }>;
@@ -403,9 +418,10 @@ const DEFAULT_OBJECT_CONFIG: ObjectConfig = {
   figureColor: '#121ca7',
   texture: null,
   textureProjection: 'cylindrical',
-  textureFinish: 'semi-matte',
-  textureRelief: 0.25,
-  editedVertices: null,
+   textureFinish: 'semi-matte',
+   textureRelief: 0.25,
+   textureRepeat: 1,
+   editedVertices: null,
   meshSilhouette: structuredClone(DEFAULT_MESH_SILHOUETTE),
   meshSections: structuredClone(DEFAULT_MESH_SECTIONS),
   meshSilhouetteView: 'both',
@@ -486,9 +502,11 @@ function sanitizeObjectConfig(raw: unknown): ObjectConfig | null {
        ['matte', 'semi-matte', 'glossy', 'metallic'] as const,
       d.textureFinish
     ),
-    textureRelief:
-      typeof c.textureRelief === 'number' ? c.textureRelief : d.textureRelief,
-    editedVertices:
+     textureRelief:
+       typeof c.textureRelief === 'number' ? c.textureRelief : d.textureRelief,
+     textureRepeat:
+       typeof c.textureRepeat === 'number' ? c.textureRepeat : d.textureRepeat,
+     editedVertices:
       Array.isArray(c.editedVertices) && c.editedVertices.length > 0
         ? (structuredClone(c.editedVertices) as Vertex3D[])
         : null,
@@ -774,9 +792,11 @@ export default function Home() {
   // Portapapeles de formas 2D: Copiar con un lienzo abierto a pantalla
   // completa (una plantilla sola, la silueta o el costado) guarda aquí su
   // polígono, y Pegar lo vuelca en otro lienzo que se abra igual.
-  const [polygonClipboard, setPolygonClipboard] = useState<Polygon | null>(
-    null
-  );
+   const [polygonClipboard, setPolygonClipboard] = useState<Polygon | null>(
+     null
+   );
+   const [multiObjectClipboard, setMultiObjectClipboard] =
+     useState<MultiObjectClipboard | null>(null);
   const [text, setText] = useState('HOLA');
   const [fontCss, setFontCss] = useState("'Textura', sans-serif");
   const [textDepth, setTextDepth] = useState(48);
@@ -843,8 +863,9 @@ export default function Home() {
   // aunque se esconda con la casilla, así que el botón de restablecer
   // tiene que seguir a la vista mientras esté movida.
   const textureHelperDirty = !isIdentityTransform(textureHelperTransform);
-  const [textureFinish, setTextureFinish] = useState<TextureFinish>('glossy');
-  const [textureRelief, setTextureRelief] = useState(0.25);
+   const [textureFinish, setTextureFinish] = useState<TextureFinish>('glossy');
+   const [textureRelief, setTextureRelief] = useState(0.25);
+   const [textureRepeat, setTextureRepeat] = useState(1);
   const [textureBrowserOpen, setTextureBrowserOpen] = useState(false);
 
   const [showTextureModal, setShowTextureModal] = useState(false);
@@ -1175,6 +1196,12 @@ export default function Home() {
   // fotografía en cada paso.
   const [sceneObjects, setSceneObjects] = useState<SceneObject[]>([]);
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
+  const [selectedObjectIds, setSelectedObjectIds] = useState<string[]>([]);
+   const [selectionMode, setSelectionMode] = useState(false);
+   const [faceSelectMode, setFaceSelectMode] = useState(false);
+   const [faceSelectionTool, setFaceSelectionTool] = useState<'rectangle' | 'circle' | 'polygon'>('rectangle');
+   const [selectedFaceIds, setSelectedFaceIds] = useState<number[]>([]);
+   const [viewRefreshTick, setViewRefreshTick] = useState(0);
   // Objeto dueño de la configuración actual: su figura es la malla que
   // el editor construye ahora. Los demás son copias congeladas (pegadas
   // o dejadas atrás al crear/seleccionar) con su propia instantánea.
@@ -1387,6 +1414,7 @@ export default function Home() {
       textureProjection,
       textureFinish,
       textureRelief,
+      textureRepeat,
       resolution,
       meshStyle,
       meshSilhouette,
@@ -1496,9 +1524,10 @@ export default function Home() {
     texture,
     latheTexture,
     textureProjection,
-    textureFinish,
-    textureRelief,
-    resolution,
+     textureFinish,
+     textureRelief,
+     textureRepeat,
+     resolution,
     meshStyle,
     meshSilhouette,
     meshSections,
@@ -1635,16 +1664,17 @@ export default function Home() {
         const cam = { ...newState[panel] };
 
         if (panel === 'front') {
-          // Front view: invert dx (right button was moving left)
           cam.offsetX -= dx;
           cam.offsetY += dy;
         } else if (panel === 'top') {
-          // Top view: invert both dx and dy
+          // Top view: camera looks down -Y. Moving target +Z makes object appear UP on screen.
+          // ▼ (Adelante, dy=+5): want object to move DOWN on screen → target must move -Z → offsetY -= dy
+          // ▲ (Atrás, dy=-5): want object to move UP on screen → target must move +Z → offsetY -= dy
           cam.offsetX -= dx;
-          cam.offsetY -= dy;
+          cam.offsetY += dy;
         } else if (panel === 'side') {
-          // Side view: is correct, keep as is
-          cam.offsetX += dx;
+          // Side view: invertir dx para que ◀ = adelante, ▶ = atrás
+          cam.offsetX -= dx;
           cam.offsetY += dy;
         } else {
           // 3D free view: invert only dy (up/down reversed)
@@ -2484,6 +2514,7 @@ export default function Home() {
           texture,
           textureColor: '#ffffff',
           textureRelief,
+          textureRepeat,
           textureFinish,
         };
       } else if (m.faces) {
@@ -2550,6 +2581,7 @@ export default function Home() {
           texture: texture,
           textureColor: '#ffffff',
           textureRelief: textureRelief,
+          textureRepeat: textureRepeat,
           textureFinish: textureFinish,
         };
       } else {
@@ -2583,9 +2615,10 @@ export default function Home() {
     extrudeHoles,
     figureColor,
     texture,
-    textureProjection,
-    textureRelief,
-    textureFinish,
+     textureProjection,
+     textureRelief,
+     textureRepeat,
+     textureFinish,
     latheProfile,
     latheSegments,
     latheClamp,
@@ -2705,6 +2738,7 @@ export default function Home() {
       textureProjection,
       textureFinish,
       textureRelief,
+      textureRepeat,
       editedVertices: editedVertices ? structuredClone(editedVertices) : null,
       meshSilhouette: structuredClone(meshSilhouette),
       meshSections: structuredClone(meshSections),
@@ -2781,9 +2815,10 @@ export default function Home() {
     setFigureColor(config.figureColor);
     setTexture(config.texture);
     setTextureFileName(config.texture ? 'textura-objeto' : '');
-    setTextureProjection(config.textureProjection);
-    setTextureFinish(config.textureFinish);
-    setTextureRelief(config.textureRelief);
+     setTextureProjection(config.textureProjection);
+     setTextureFinish(config.textureFinish);
+     setTextureRelief(config.textureRelief);
+     setTextureRepeat(config.textureRepeat ?? 1);
     setEditedVertices(
       config.editedVertices ? structuredClone(config.editedVertices) : null
     );
@@ -2861,6 +2896,7 @@ export default function Home() {
       textureProjection,
       textureFinish,
       textureRelief,
+      textureRepeat,
       editedVertices,
       latheProfile,
       latheTexture: mode === 'lathe' ? ownerTexture : latheTexture,
@@ -2989,9 +3025,10 @@ export default function Home() {
     figureColor,
     texture,
     textureProjection,
-    textureFinish,
-    textureRelief,
-    editedVertices,
+      textureFinish,
+      textureRelief,
+      textureRepeat,
+      editedVertices,
     meshSilhouette,
     meshSections,
     meshSilhouetteView,
@@ -3094,8 +3131,10 @@ export default function Home() {
         if (['matte', 'semi-matte', 'glossy', 'metallic'].includes(data.textureFinish)) {
           setTextureFinish(data.textureFinish);
         }
-        if (typeof data.textureRelief === 'number')
-          setTextureRelief(data.textureRelief);
+         if (typeof data.textureRelief === 'number')
+           setTextureRelief(data.textureRelief);
+         if (typeof data.textureRepeat === 'number')
+           setTextureRepeat(data.textureRepeat);
         if (Array.isArray(data.latheProfile) && data.latheProfile.length >= 3) {
           setLatheProfile(data.latheProfile);
         }
@@ -3122,7 +3161,12 @@ export default function Home() {
             : null
         );
         if (Array.isArray(data.sceneObjects) && data.sceneObjects.length > 0) {
-          setSceneObjects(data.sceneObjects);
+          setSceneObjects(
+            data.sceneObjects.map((obj: Partial<SceneObject>, i: number) => ({
+              ...obj,
+              name: obj.name ?? `Objeto ${i + 1}`,
+            }))
+          );
           const loadedSelected =
             typeof data.selectedObjectId === 'string'
               ? data.selectedObjectId
@@ -3323,6 +3367,7 @@ export default function Home() {
           ...objects,
           ...meshes.map((mesh, i) => ({
             id: i === 0 ? baseId : `${baseId}-${i}`,
+            name: `Pieza ${i + 1}`,
             transform: { px: 0, py: 0, pz: 0, sx: 1, sy: 1, sz: 1, rx: 0, ry: 0, rz: 0 },
             mesh: structuredClone(mesh),
             smooth: true,
@@ -3471,6 +3516,7 @@ export default function Home() {
           ...objects,
           {
             id: newId,
+            name: `Copia de ${source.name ?? 'objeto'}`,
             mode, // Solo visible en esta pestaña
             transform: {
               ...(current?.transform ?? IDENTITY_TRANSFORM),
@@ -3595,6 +3641,7 @@ export default function Home() {
     texture,
     latheTexture,
     textureRelief,
+    textureRepeat,
     textureFinish,
     textureProjection,
   });
@@ -3605,6 +3652,7 @@ export default function Home() {
       prev.texture !== texture ||
       prev.latheTexture !== latheTexture ||
       prev.textureRelief !== textureRelief ||
+      prev.textureRepeat !== textureRepeat ||
       prev.textureFinish !== textureFinish ||
       prev.textureProjection !== textureProjection;
     textureAdjustPrevRef.current = {
@@ -3612,6 +3660,7 @@ export default function Home() {
       texture,
       latheTexture,
       textureRelief,
+      textureRepeat,
       textureFinish,
       textureProjection,
     };
@@ -3637,6 +3686,7 @@ export default function Home() {
             texture: appliedTexture ?? undefined,
             textureColor: '#ffffff',
             textureRelief,
+            textureRepeat,
             textureFinish,
           },
         };
@@ -3645,9 +3695,10 @@ export default function Home() {
   }, [
     mode,
     texture,
-    latheTexture,
-    textureRelief,
-    textureFinish,
+     latheTexture,
+     textureRelief,
+     textureRepeat,
+     textureFinish,
     textureProjection,
     frozenSelectedId,
     isUndoRedo,
@@ -3660,6 +3711,18 @@ export default function Home() {
       setPolygonClipboard(structuredClone(fullScreenCanvas.polygon));
       return;
     }
+    // Si hay objetos multiseleccionados, copiar todos ellos
+    if (selectedObjectIds.length > 1) {
+      const objsToCopy = sceneObjects.filter((obj) =>
+        selectedObjectIds.includes(obj.id)
+      );
+      if (objsToCopy.length > 0) {
+        setMultiObjectClipboard({
+          objects: structuredClone(objsToCopy),
+        });
+        return;
+      }
+    }
     setEditorClipboard({
       mode,
       ...capturePanelConfig(),
@@ -3668,7 +3731,8 @@ export default function Home() {
       mesh: structuredClone(triMesh),
       smooth: smoothShadingValue,
     });
-  }, [mode, capturePanelConfig, triMesh, smoothShadingValue, fullScreenCanvas]);
+    setMultiObjectClipboard(null);
+  }, [mode, capturePanelConfig, triMesh, smoothShadingValue, fullScreenCanvas, selectedObjectIds, sceneObjects]);
 
   // Solo el dueño de la configuración se congela con la malla actual,
   // porque su figura ES la que el editor está construyendo. Las copias
@@ -3676,24 +3740,59 @@ export default function Home() {
   // sobrescribe con la configuración de otro. Junto a la malla se
   // congela también su configuración completa: al volver a
   // seleccionarlo, el panel recuperará sus plantillas y ajustes.
-  const freezeObjectSnapshot = useCallback(
-    (objectId: string) => {
-      setSceneObjects((current) =>
-        current.map((object) =>
-          object.id === objectId
-            ? {
-                ...object,
-                mesh: structuredClone(triMesh),
-                smooth: smoothShadingValue,
-                textureProjection,
-                config: capturePanelConfig(),
-              }
-            : object
-        )
-      );
-    },
-    [triMesh, smoothShadingValue, textureProjection, capturePanelConfig]
-  );
+   const freezeObjectSnapshot = useCallback(
+     (objectId: string) => {
+       setSceneObjects((current) =>
+         current.map((object) =>
+           object.id === objectId
+             ? {
+                 ...object,
+                 mesh: structuredClone(triMesh),
+                 smooth: smoothShadingValue,
+                 textureProjection,
+                 config: capturePanelConfig(),
+               }
+             : object
+         )
+       );
+     },
+     [triMesh, smoothShadingValue, textureProjection, capturePanelConfig]
+   );
+
+   // Apply the current texture to ALL selected objects in the scene
+   const applyTextureToSelectedObjects = useCallback(() => {
+     if (selectedObjectIds.length === 0) return;
+     const textureUrl = mode === 'lathe' ? latheTexture : texture;
+     setSceneObjects((current) =>
+       current.map((object) => {
+         if (!selectedObjectIds.includes(object.id)) return object;
+         const mesh = object.mesh;
+         if (!mesh || mesh.vertices.length === 0) return object;
+         const newMesh = structuredClone(mesh);
+          newMesh.texture = textureUrl ?? undefined;
+          newMesh.textureColor = '#ffffff';
+          newMesh.textureRepeat = textureRepeat;
+         // Note: textureRelief, textureFinish, and textureProjection are
+         // panel-level settings and are saved to the object's mesh only
+         // when the object is frozen (freezeObjectSnapshot).
+         return {
+           ...object,
+           mesh: newMesh,
+         };
+       })
+     );
+    }, [selectedObjectIds, mode, latheTexture, texture, textureRepeat]);
+
+    // Apply texture (URL + repeat) state changes to all selected objects in real-time
+    const textureApplySkipRef = useRef(false);
+    useEffect(() => {
+      if (textureApplySkipRef.current) {
+        textureApplySkipRef.current = false;
+        return;
+      }
+      applyTextureToSelectedObjects();
+      setViewRefreshTick((t) => t + 1);
+    }, [texture, latheTexture, textureRepeat, applyTextureToSelectedObjects]);
 
   // Al cambiar de objeto activo, los controles de textura pasan a
   // mostrar los ajustes del recién seleccionado: los que tiene
@@ -3701,10 +3800,11 @@ export default function Home() {
   // proyección), no los que quedaran en pantalla del anterior. Sin
   // instantánea (dueño recién creado o objetos de proyectos cargados)
   // no se toca nada: lo que hay en pantalla ya es lo suyo.
-  const syncTextureStateToSelection = useCallback(
-    (id: string | null) => {
-      if (!id) return;
-      const object = sceneObjects.find((o) => o.id === id);
+   const syncTextureStateToSelection = useCallback(
+     (id: string | null) => {
+       if (!id) return;
+       textureApplySkipRef.current = true;
+       const object = sceneObjects.find((o) => o.id === id);
       const mesh = object?.mesh;
       if (!mesh || mesh.vertices.length === 0) return;
       const objectTexture = mesh.texture ?? null;
@@ -3718,9 +3818,34 @@ export default function Home() {
       setTextureProjection(object?.textureProjection ?? 'planar');
       setTextureFinish(mesh.textureFinish ?? 'semi-matte');
       setTextureRelief(mesh.textureRelief ?? 0.25);
+      setTextureRepeat(mesh.textureRepeat ?? 1);
     },
     [mode, sceneObjects]
   );
+
+   const toggleObjectHidden = useCallback(
+     (id: string) => {
+       setSceneObjects((current) =>
+         current.map((object) =>
+           object.id === id ? { ...object, hidden: !object.hidden } : object
+         )
+       );
+       setViewRefreshTick((t) => t + 1);
+     },
+     []
+   );
+
+   const toggleObjectFrozen = useCallback(
+     (id: string) => {
+       setSceneObjects((current) =>
+         current.map((object) =>
+           object.id === id ? { ...object, frozen: !object.frozen } : object
+         )
+       );
+       setViewRefreshTick((t) => t + 1);
+     },
+     []
+   );
 
   const handleObjectSelect = useCallback(
     (id: string | null) => {
@@ -3767,9 +3892,17 @@ export default function Home() {
         applyObjectConfig(structuredClone(nextObject.config));
         setConfigObjectId(id);
         setSelectedObjectId(id);
+        // Si el nuevo objeto activo no está en la multiselección actual, limpiar
+        if (id && !selectedObjectIds.includes(id)) {
+          setSelectedObjectIds([]);
+        }
         return;
       }
       setSelectedObjectId(id);
+      // Si el nuevo objeto activo no está en la multiselección actual, limpiar
+      if (id && !selectedObjectIds.includes(id)) {
+        setSelectedObjectIds([]);
+      }
       syncTextureStateToSelection(id);
     },
     [
@@ -3780,7 +3913,26 @@ export default function Home() {
       syncTextureStateToSelection,
       sceneObjects,
       mode,
+      selectedObjectIds,
     ]
+    );
+
+  const handleMultiObjectTransform = useCallback(
+    (transforms: { id: string; transform: ObjectTransform }[]) => {
+      setSceneObjects((prev) =>
+        prev.map((obj) => {
+          const update = transforms.find((t) => t.id === obj.id);
+          if (update) {
+            return {
+              ...obj,
+              transform: update.transform,
+            };
+          }
+          return obj;
+        })
+      );
+    },
+    []
   );
 
   const pasteCurrentObject = useCallback(() => {
@@ -3792,13 +3944,53 @@ export default function Home() {
       fullScreenCanvas.apply(polygonClipboard);
       return;
     }
-     if (!editorClipboard) return;
+      if (!editorClipboard && !multiObjectClipboard) return;
+      // Pegar múltiples objetos previamente copiados
+      if (multiObjectClipboard) {
+        const current = sceneObjects.find(
+          (object) => object.id === selectedObjectId
+        );
+        const baseTransform = current?.transform ?? IDENTITY_TRANSFORM;
+        // Find the center of the copied objects to compute relative offsets
+        const copiedObjects = multiObjectClipboard.objects;
+        const centerX = copiedObjects.reduce((sum, obj) => sum + obj.transform.px, 0) / copiedObjects.length;
+        const centerY = copiedObjects.reduce((sum, obj) => sum + obj.transform.py, 0) / copiedObjects.length;
+        const centerZ = copiedObjects.reduce((sum, obj) => sum + obj.transform.pz, 0) / copiedObjects.length;
+        // Offset the whole group from the active object's position, preserving relative composition
+        const offsetX = 1.5;
+        const offsetY = 1.5;
+        const offsetZ = 0;
+        const pastedObjects: SceneObject[] = copiedObjects.map((obj, i) => ({
+          ...structuredClone(obj),
+          id: `object-${Date.now()}-${i}`,
+          name: `Copia de ${obj.name ?? 'objeto'}`,
+          transform: {
+            ...obj.transform,
+            px: baseTransform.px + (obj.transform.px - centerX) + offsetX,
+            py: baseTransform.py + (obj.transform.py - centerY) + offsetY,
+            pz: baseTransform.pz + (obj.transform.pz - centerZ) + offsetZ,
+          },
+            mode: undefined,
+            mesh: obj.mesh,
+            smooth: obj.smooth,
+            textureProjection: obj.textureProjection,
+            config: obj.config,
+          })
+        );
+        setSceneObjects((objects) => [...objects, ...pastedObjects]);
+        const firstNewId = pastedObjects[0]?.id;
+        setSelectedObjectId(firstNewId ?? null);
+        setSelectedObjectIds(pastedObjects.map((o) => o.id));
+        return;
+      }
+      // At this point editorClipboard is guaranteed non-null
+      const cb = editorClipboard!;
      // Pegar en OTRA pestaña: el objeto copiado entra en la escena tal
     // como era, montado sobre su instantánea de malla. La configuración
     // de ESTA pestaña no se toca y el objeto activo sigue siendo el
     // mismo; la copia queda al lado, como las de "pegar" normal.
-    if (editorClipboard.mode !== mode) {
-      if (!editorClipboard.mesh || editorClipboard.mesh.vertices.length === 0)
+    if (cb.mode !== mode) {
+      if (!cb.mesh || cb.mesh.vertices.length === 0)
         return;
       const current = sceneObjects.find(
         (object) => object.id === selectedObjectId
@@ -3807,17 +3999,18 @@ export default function Home() {
         ...objects,
         {
           id: `object-${Date.now()}`,
+          name: `Objeto ${sceneObjects.length + 1}`,
           mode: mode, // Solo visible en esta pestaña
           transform: {
             ...(current?.transform ?? IDENTITY_TRANSFORM),
             px: (current?.transform.px ?? 0) + 1.5,
           },
-          mesh: structuredClone(editorClipboard.mesh),
-          smooth: editorClipboard.smooth,
-          textureProjection: editorClipboard.textureProjection,
+          mesh: structuredClone(cb.mesh),
+          smooth: cb.smooth,
+          textureProjection: cb.textureProjection,
           // Su configuración viaja con él: al seleccionarlo en su
           // pestaña, el panel recuperará sus plantillas y ajustes.
-          config: objectConfigFromClipboard(editorClipboard),
+          config: objectConfigFromClipboard(cb),
         },
       ]);
       return;
@@ -3835,16 +4028,17 @@ export default function Home() {
     // Configuración completa del objeto pegado: viaja con él (al
     // seleccionarlo de nuevo, el panel la recuperará) y se aplica al
     // panel porque la copia pasa a ser el nuevo dueño.
-    const pastedConfig = objectConfigFromClipboard(editorClipboard);
+    const pastedConfig = objectConfigFromClipboard(cb);
     const baseTransform = selected?.transform ?? IDENTITY_TRANSFORM;
     setSceneObjects((current) => [
       ...current,
       {
         id: duplicateId,
+        name: `Copia de ${selected?.name ?? 'objeto'}`,
         transform: { ...baseTransform, px: baseTransform.px + 1.5 },
-        mesh: structuredClone(editorClipboard.mesh),
-        smooth: editorClipboard.smooth,
-        textureProjection: editorClipboard.textureProjection,
+         mesh: structuredClone(cb.mesh),
+         smooth: cb.smooth,
+         textureProjection: cb.textureProjection,
         config: pastedConfig,
       },
     ]);
@@ -3853,6 +4047,7 @@ export default function Home() {
     applyObjectConfig(pastedConfig);
   }, [
     editorClipboard,
+    multiObjectClipboard,
     mode,
     sceneObjects,
     selectedObjectId,
@@ -3861,11 +4056,11 @@ export default function Home() {
     fullScreenCanvas,
     polygonClipboard,
     smoothShadingValue,
-     textureProjection,
-     triMesh,
-     capturePanelConfig,
-     freezeObjectSnapshot,
-   ]);
+    textureProjection,
+    triMesh,
+    capturePanelConfig,
+    freezeObjectSnapshot,
+  ]);
 
   const createNewObject = useCallback(() => {
     const current = sceneObjects.find(
@@ -3880,6 +4075,7 @@ export default function Home() {
       ...objects,
       {
         id,
+        name: `Objeto ${sceneObjects.length + 1}`,
         transform: {
           ...(current?.transform ?? IDENTITY_TRANSFORM),
           px: (current?.transform.px ?? 0) + 1.5,
@@ -3923,17 +4119,28 @@ export default function Home() {
     mode,
   ]);
 
-  const handleObjectTransform = useCallback(
-    (transform: ObjectTransform) => {
-      if (!selectedObjectId) return;
-      setSceneObjects((current) =>
-        current.map((object) =>
-          object.id === selectedObjectId ? { ...object, transform } : object
-        )
-      );
-    },
-    [selectedObjectId]
-  );
+   const handleObjectTransform = useCallback(
+     (transform: ObjectTransform) => {
+       if (!selectedObjectId) return;
+       setSceneObjects((current) =>
+         current.map((object) =>
+           object.id === selectedObjectId ? { ...object, transform } : object
+         )
+       );
+     },
+     [selectedObjectId]
+   );
+
+   const handleObjectNameChange = useCallback(
+     (id: string, name: string) => {
+       setSceneObjects((current) =>
+         current.map((object) =>
+           object.id === id ? { ...object, name } : object
+         )
+       );
+     },
+     []
+   );
 
   // Eliminar el objeto confirmado en el diálogo. Si el que se va es el
   // dueño de la configuración: el que queda pasa a ser el nuevo dueño
@@ -4320,54 +4527,134 @@ export default function Home() {
             <button
              onClick={copyCurrentObject}
              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground border border-white/10 transition-colors"
-            title={
-              fullScreenCanvas
-                ? `Copiar la forma de ${fullScreenCanvas.name} para pegarla en otro lienzo abierto a pantalla completa`
-                : 'Copiar la configuración del objeto actual'
-            }
+             title={
+               fullScreenCanvas
+                 ? `Copiar la forma de ${fullScreenCanvas.name} para pegarla en otro lienzo abierto a pantalla completa`
+                 : selectedObjectIds.length > 1
+                   ? `Copiar ${selectedObjectIds.length} objetos seleccionados`
+                   : 'Copiar la configuración del objeto actual'
+             }
           >
             <Copy className="w-3.5 h-3.5" />
             Copiar
           </button>
           <button
             onClick={pasteCurrentObject}
-            disabled={
-              fullScreenCanvas
-                ? !polygonClipboard
-                : !editorClipboard ||
-                  (editorClipboard.mode !== mode &&
-                    (!editorClipboard.mesh ||
-                      editorClipboard.mesh.vertices.length === 0))
-            }
+              disabled={
+                fullScreenCanvas
+                  ? !polygonClipboard
+                  : !editorClipboard && !multiObjectClipboard
+              }
             className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground border border-white/10 transition-colors disabled:opacity-30 disabled:hover:bg-white/5"
-            title={
-              fullScreenCanvas
-                ? polygonClipboard
-                  ? `Pegar en ${fullScreenCanvas.name} la forma copiada`
-                  : 'Copia antes una forma: abre una plantilla (o la silueta/costado) a pantalla completa y pulsa Copiar'
-                : editorClipboard && editorClipboard.mode !== mode
-                  ? 'Pegar el objeto copiado en esta pestaña (entra como objeto nuevo)'
-                  : 'Pegar como otra configuración del mismo tipo'
-            }
+             title={
+               fullScreenCanvas
+                 ? polygonClipboard
+                   ? `Pegar en ${fullScreenCanvas.name} la forma copiada`
+                   : 'Copia antes una forma: abre una plantilla (o la silueta/costado) a pantalla completa y pulsa Copiar'
+                 : multiObjectClipboard
+                   ? `Pegar ${multiObjectClipboard.objects.length} objetos copiados`
+                   : editorClipboard && editorClipboard.mode !== mode
+                     ? 'Pegar el objeto copiado en esta pestaña (entra como objeto nuevo)'
+                     : 'Pegar como otra configuración del mismo tipo'
+             }
           >
             <ClipboardPaste className="w-3.5 h-3.5" />
             Pegar
           </button>
-          {sceneObjects.length > 1 && (
-            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <span>Objeto activo</span>
-              <select
-                value={selectedObjectId ?? ''}
-                onChange={(e) => handleObjectSelect(e.target.value || null)}
-                className="bg-gray-900 border border-white/10 rounded-md px-2 py-1.5 text-xs text-foreground focus:outline-none focus:border-green-500"
-              >
-                {sceneObjects.map((object, index) => (
-                  <option key={object.id} value={object.id}>
-                    Objeto {index + 1}
-                  </option>
-                ))}
-              </select>
-            </label>
+           {sceneObjects.length > 1 && (
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <span>Objeto activo</span>
+                 <select
+                   value={selectedObjectIds.includes(selectedObjectId ?? '') ? (selectedObjectId ?? '') : ''}
+                   onChange={(e) => handleObjectSelect(e.target.value || null)}
+                  className="bg-gray-900 border border-white/10 rounded-md px-2 py-1.5 text-xs text-foreground focus:outline-none focus:border-green-500"
+                >
+                   {sceneObjects.map((object, index) => (
+                     <option key={object.id} value={object.id}>
+                       {object.name || `Objeto ${index + 1}`}
+                     </option>
+                   ))}
+                </select>
+              </label>
+            )}
+            {sceneObjects.length > 1 && (
+             <DropdownMenu>
+               <DropdownMenuTrigger asChild>
+                 <button
+                   title="Seleccionar múltiples objetos"
+                  className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium border transition-colors ${
+                    selectedObjectIds.length > 0
+                      ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30 hover:bg-cyan-500/25'
+                      : 'bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 border border-white/10'
+                  }`}
+                >
+                  <BoxSelect className="w-3.5 h-3.5" />
+                  Multi ({selectedObjectIds.length})
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent className="bg-gray-900 border-gray-800 text-white min-w-[200px] max-h-[300px] overflow-y-auto [&::-webkit-scrollbar]:w-[3px] [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-gray-600/50 hover:[&::-webkit-scrollbar-thumb]:bg-gray-500/50">
+                {sceneObjects.map((object, index) => {
+                  const checked = selectedObjectIds.includes(object.id);
+                  const color = object.hidden
+                    ? 'text-red-400'
+                    : object.frozen
+                      ? 'text-gray-400'
+                      : 'text-foreground';
+                  return (
+                      <DropdownMenuCheckboxItem
+                       key={object.id}
+                       checked={checked}
+                       onCheckedChange={(v) => {
+                          if (v) {
+                            setSelectedObjectIds((prev) => [...prev, object.id]);
+                            // Set this object as the active one for the name input
+                            setSelectedObjectId(object.id);
+                          } else {
+                            setSelectedObjectIds((prev) => {
+                              const next = prev.filter((id) => id !== object.id);
+                              // If we're removing the active object, pick another from the remaining
+                              if (selectedObjectId === object.id && next.length > 0) {
+                                setSelectedObjectId(next[0]);
+                              } else if (next.length === 0) {
+                                setSelectedObjectId(null);
+                              }
+                              return next;
+                            });
+                          }
+                        }}
+                       className={`hover:bg-gray-800 cursor-pointer text-xs ${object.hidden ? 'opacity-60' : ''}`}
+                     >
+                       <span className="flex items-center gap-1.5">
+                         <span className={`w-2 h-2 rounded-full ${object.hidden ? 'bg-red-400' : object.frozen ? 'bg-gray-400' : 'bg-green-400'}`} />
+                         <span className={color}>
+                           {object.name || `Objeto ${index + 1}`}
+                         </span>
+                       </span>
+                       <button
+                         onClick={(e) => {
+                           e.stopPropagation();
+                           toggleObjectHidden(object.id);
+                         }}
+                         title={object.hidden ? 'Mostrar objeto' : 'Ocultar objeto'}
+                         className="ml-auto px-1 py-0.5 rounded text-[10px] hover:bg-gray-700"
+                       >
+                         {object.hidden ? '🟢' : '🔴'}
+                       </button>
+                       <button
+                         onClick={(e) => {
+                           e.stopPropagation();
+                           toggleObjectFrozen(object.id);
+                         }}
+                         title={object.frozen ? 'Descongelar objeto' : 'Congelar objeto'}
+                         className="ml-auto px-1 py-0.5 rounded text-[10px] hover:bg-gray-700"
+                       >
+                         {object.frozen ? '🔓' : '🔒'}
+                       </button>
+                     </DropdownMenuCheckboxItem>
+                  );
+                })}
+              </DropdownMenuContent>
+            </DropdownMenu>
           )}
          {lightConfig && lightConfig.spotlights.length > 0 && (
             <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -4962,10 +5249,6 @@ export default function Home() {
                       title="Color de la figura 3D"
                       className="w-8 h-8 rounded cursor-pointer bg-transparent border border-white/10 p-0.5"
                     />
-                    <div
-                      className="flex-1 h-6 rounded"
-                      style={{ backgroundColor: figureColor }}
-                    />
                     <button
                       onClick={() => {
                         setFigureColor('#121ca7');
@@ -4976,14 +5259,6 @@ export default function Home() {
                     >
                       Restablecer
                     </button>
-                  </div>
-                </div>
-
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-[10px] text-muted-foreground/80">
-                    Textura (imagen)
-                  </label>
-                  <div className="flex gap-1.5">
                     <input
                       type="text"
                       value={textureFileName}
@@ -5023,23 +5298,39 @@ export default function Home() {
                       e.target.value = '';
                     }}
                   />
-                  <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
-                    <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
-                    La textura se aplica sobre el color de la figura. Formatos:
-                    JPG, PNG, WebP, SVG.
-                  </p>
-                  {texture && (
-                    <div className="mt-1 rounded-md border border-white/10 overflow-hidden w-16 h-16 bg-black/40">
-                      <img
-                        src={texture}
-                        alt="Textura cargada"
-                        className="w-full h-full object-cover"
-                      />
-                    </div>
-                  )}
-                  <label className="text-[10px] text-muted-foreground/80 mt-1">
-                    Proyección de la textura
-                  </label>
+                   <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
+                     <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
+                     La textura se aplica sobre el color de la figura. Formatos:
+                     JPG, PNG, WebP, SVG.
+                   </p>
+                   {texture && (
+                     <div className="mt-1 rounded-md border border-white/10 overflow-hidden w-16 h-16 bg-black/40">
+                       <img
+                         src={texture}
+                         alt="Textura cargada"
+                         className="w-full h-full object-cover"
+                       />
+                     </div>
+                   )}
+                    {texture && (
+                      <div className="flex items-center gap-2 mt-1">
+                        <label className="text-[10px] text-muted-foreground/80">
+                          Repetición:
+                        </label>
+                        <input
+                          type="number"
+                          min={0.1}
+                          max={10}
+                          step={0.1}
+                          value={textureRepeat}
+                          onChange={(e) => setTextureRepeat(Math.max(0.1, Math.min(10, parseFloat(e.target.value) || 1)))}
+                          className="w-16 px-1 py-0.5 text-xs bg-black/40 border border-white/10 rounded text-foreground focus:outline-none focus:border-green-500"
+                        />
+                      </div>
+                    )}
+                   <label className="text-[10px] text-muted-foreground/80 mt-1">
+                     Proyección de la textura
+                   </label>
                   <select
                     value={textureProjection}
                     onChange={(event) =>
@@ -5866,10 +6157,6 @@ export default function Home() {
                           }}
                           className="w-8 h-8 rounded cursor-pointer bg-transparent border border-white/10 p-0.5"
                         />
-                        <div
-                          className="flex-1 h-6 rounded"
-                          style={{ backgroundColor: figureColor }}
-                        />
                         <button
                           onClick={() => {
                             setFigureColor('#121ca7');
@@ -6122,69 +6409,57 @@ export default function Home() {
                     Apariencia de la figura
                   </h3>
 
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
-                      <span>Color de la figura</span>
-                      <span className="font-mono text-[10px] text-green-400">
-                        {latheFigureColor}
-                      </span>
-                    </label>
-                    <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-black/40 border border-white/10">
-                      <input
-                        type="color"
-                        value={latheFigureColor}
-                        onChange={(e) => {
-                          setLatheFigureColor(e.target.value);
-                          setEditedVertices(null);
-                        }}
-                        className="w-8 h-8 rounded cursor-pointer bg-transparent border border-white/10 p-0.5"
-                      />
-                      <div
-                        className="flex-1 h-6 rounded"
-                        style={{ backgroundColor: latheFigureColor }}
-                      />
-                      <button
-                        onClick={() => {
-                          setLatheFigureColor('#121ca7');
-                          setEditedVertices(null);
-                        }}
-                        className="text-[10px] text-muted-foreground/60 hover:text-foreground transition-colors"
-                      >
-                        Restablecer
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] text-muted-foreground/80">
-                      Textura (imagen)
-                    </label>
-                    <div className="flex gap-1.5">
-                      <input
-                        type="text"
-                        value={latheTextureFileName}
-                        readOnly
-                        placeholder="Ninguna textura seleccionada"
-                        className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 text-foreground placeholder:text-muted-foreground/40 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap"
-                        onClick={openTexturePicker}
-                      />
-                      <button
-                        onClick={() => setTextureBrowserOpen(true)}
-                        title="Explorar texturas de la carpeta local"
-                        className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 transition-colors"
-                      >
-                        <ImageIcon className="w-3.5 h-3.5" />
-                        Explorar
-                      </button>
-                      {latheTexture && (
-                        <button
-                          onClick={clearTexture}
-                          title="Quitar textura"
-                          className="shrink-0 flex items-center gap-1.5 px-2 py-2 rounded-md text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/30 transition-colors"
-                        >
-                          <X className="w-3.5 h-3.5" />
-                        </button>
-                      )}
+                   <div className="flex flex-col gap-1.5">
+                     <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
+                       <span>Color de la figura</span>
+                       <span className="font-mono text-[10px] text-green-400">
+                         {latheFigureColor}
+                       </span>
+                     </label>
+                     <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-black/40 border border-white/10">
+                       <input
+                         type="color"
+                         value={latheFigureColor}
+                         onChange={(e) => {
+                           setLatheFigureColor(e.target.value);
+                           setEditedVertices(null);
+                         }}
+                         className="w-8 h-8 rounded cursor-pointer bg-transparent border border-white/10 p-0.5"
+                       />
+                       <button
+                         onClick={() => {
+                           setLatheFigureColor('#121ca7');
+                           setEditedVertices(null);
+                         }}
+                         className="text-[10px] text-muted-foreground/60 hover:text-foreground transition-colors"
+                       >
+                         Restablecer
+                       </button>
+                       <input
+                         type="text"
+                         value={latheTextureFileName}
+                         readOnly
+                         placeholder="Ninguna textura seleccionada"
+                         className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 text-foreground placeholder:text-muted-foreground/40 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap"
+                         onClick={openTexturePicker}
+                       />
+                       <button
+                         onClick={() => setTextureBrowserOpen(true)}
+                         title="Explorar texturas de la carpeta local"
+                         className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 transition-colors"
+                       >
+                         <ImageIcon className="w-3.5 h-3.5" />
+                         Explorar
+                       </button>
+                       {latheTexture && (
+                         <button
+                           onClick={clearTexture}
+                           title="Quitar textura"
+                           className="shrink-0 flex items-center gap-1.5 px-2 py-2 rounded-md text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/30 transition-colors"
+                         >
+                           <X className="w-3.5 h-3.5" />
+                         </button>
+                       )}
                     </div>
                     <input
                       ref={textureInputRef}
@@ -6431,12 +6706,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -6449,7 +6738,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -6492,12 +6781,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -6510,7 +6813,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -6553,12 +6856,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -6571,7 +6888,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -6614,12 +6931,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -6632,7 +6963,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -6677,12 +7008,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -6695,7 +7040,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -6738,12 +7083,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -6756,7 +7115,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -6799,12 +7158,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -6817,7 +7190,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -6860,12 +7233,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -6878,7 +7265,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -6923,12 +7310,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -6941,7 +7342,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -6984,12 +7385,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -7002,7 +7417,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -7045,12 +7460,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -7063,7 +7492,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -7106,12 +7535,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -7124,7 +7567,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -7502,12 +7945,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -7520,7 +7977,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -7563,12 +8020,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -7581,7 +8052,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -7624,12 +8095,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -7642,7 +8127,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -7685,12 +8170,26 @@ export default function Home() {
           selectedObjectId={selectedObjectId}
           sceneObjects={sceneObjects}
           handleObjectSelect={handleObjectSelect}
+             onMultiObjectTransform={handleMultiObjectTransform}
+              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={setSelectedObjectIds}
+          selectionMode={selectionMode}
+          onSelectionModeChange={setSelectionMode}
+          faceSelectMode={faceSelectMode}
+          faceSelectionTool={faceSelectionTool}
+          selectedFaceIds={selectedFaceIds}
+          onFaceSelectionChange={setSelectedFaceIds}
+          onFaceSelectionModeChange={setFaceSelectMode}
+          onFaceSelectionToolChange={setFaceSelectionTool}
           showGizmo={showGizmo}
           handleObjectTransform={handleObjectTransform}
           handleVerticesChange={handleVerticesChange}
           showLatheAxis={mode === 'lathe' as never}
 
           viewerProjection={viewerProjection}
+          textureRepeat={textureRepeat}
           textureHelper={textureHelper}
           textureHelperTransform={textureHelperTransform}
           setTextureHelperTransform={setTextureHelperTransform}
@@ -7703,7 +8202,7 @@ export default function Home() {
              objectTextureFinish={objectTextureFinish}
           skyboxImage={skyboxImage}
           booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick : undefined}
+          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
           showGrid={showGrid}
           setShowGrid={setShowGrid}
           fxConfig={fxConfig}
@@ -8259,6 +8758,7 @@ export function PanelButtons({
   onRotateRight,
   showRotate = false,
   isEditing = false,
+  viewName,
 }: {
   onPan: (dx: number, dy: number) => void;
   onZoom: (factor: number) => void;
@@ -8267,6 +8767,7 @@ export function PanelButtons({
   onRotateRight?: () => void;
   showRotate?: boolean;
   isEditing?: boolean;
+  viewName?: 'front' | 'top' | 'side' | '3d';
 }) {
   const btn =
     'w-5 h-5 flex items-center justify-center text-[10px] rounded bg-white/5 hover:bg-white/15 border border-white/10 text-white transition-colors';
@@ -8277,33 +8778,53 @@ export function PanelButtons({
     e.stopPropagation();
     fn();
   };
+
+  // Etiquetas de movimiento según la vista
+  const isTop = viewName === 'top';
+  const isFront = viewName === 'front';
+  const isSide = viewName === 'side';
+  const isTopOrFront = isTop || isFront;
+
+  const upTitle = isTop ? 'Arriba' : isTopOrFront ? 'Arriba' : isSide ? 'Arriba' : 'Arriba';
+  const downTitle = isTop ? 'Abajo' : isTopOrFront ? 'Abajo' : isSide ? 'Abajo' : 'Abajo';
+  const leftTitle = isTop ? 'Izquierda' : isSide ? 'Izquierda' : 'Izquierda';
+  const rightTitle = isTop ? 'Derecha' : isSide ? 'Derecha' : 'Derecha';
+
+  // onPan deltas for each button (dx, dy)
+  // Top view: ▶=Derecha(+X), ◀=Izquierda(-X), ▲=Arriba(-Z), ▼=Abajo(+Z)
+  // Front/Side: ▲/▼=Y (adelante/atrás), ◀/▶=X (izq/der)
+  const upPan = () => onPan(0, -5); // ▲ igual en todas las vistas
+  const downPan = () => onPan(0, 5); // ▼ igual en todas las vistas
+  const leftPan = isTop ? () => onPan(-5, 0) : () => onPan(5, 0);
+  const rightPan = isTop ? () => onPan(5, 0) : () => onPan(-5, 0);
+
   return (
     <div className="flex items-center gap-0.5">
       <button
         className={btn}
         onClick={(e) => stop(e, () => onPan(0, -5))}
-        title="Arriba"
+        title={upTitle}
       >
         ▲
       </button>
       <button
         className={btn}
         onClick={(e) => stop(e, () => onPan(0, 5))}
-        title="Abajo"
+        title={downTitle}
       >
         ▼
       </button>
       <button
         className={btn}
         onClick={(e) => stop(e, () => onPan(-5, 0))}
-        title="Izquierda"
+        title={leftTitle}
       >
         ◀
       </button>
       <button
         className={btn}
         onClick={(e) => stop(e, () => onPan(5, 0))}
-        title="Derecha"
+        title={rightTitle}
       >
         ▶
       </button>

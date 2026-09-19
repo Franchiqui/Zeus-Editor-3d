@@ -10,6 +10,14 @@ import { evaluateTrack } from '@/lib/animation';
 import type { AnimationTrack, Keyframe, KeyframeProperty } from '@/lib/animation';
 import { smoothVoxelMesh } from '@/lib/mesh-smooth';
 import { Slider } from '@/components/ui/slider';
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { FxConfigEditor } from '@/components/fx-config-editor';
 import { isElectron, writeFile, deleteFile, transcodeVideo, getLocalPaths, getTempDir, readFileBuffer } from '@/lib/electron-fs';
 import {
@@ -28,9 +36,11 @@ import {
   Cloud,
   CloudRain,
    Star,
-   Pin,
-   Settings,
- } from 'lucide-react';
+    Pin,
+     Settings,
+     MousePointerClick,
+     Menu,
+  } from 'lucide-react';
 
 /** Configuración completa de efectos visuales con parámetros ajustables. */
 export interface FxConfig {
@@ -169,6 +179,12 @@ interface Viewer3DProps {
     smooth?: boolean;
     /** Proyección con la que se mapeaba su textura */
     textureProjection?: LatheTextureProjection;
+   /** Número de veces que se repite la textura (1 = sin repetición) */
+    textureRepeat?: number;
+    /** Si el objeto está oculto (no se dibuja) */
+    hidden?: boolean;
+    /** Si el objeto está congelado (gris, no interactivo) */
+    frozen?: boolean;
   }>;
   /**
    * Objeto dueño de la configuración actual: su figura es la malla que
@@ -186,8 +202,28 @@ interface Viewer3DProps {
   configSmooth?: boolean;
   /** Proyección con la que se mapea la textura del dueño */
   configProjection?: LatheTextureProjection;
-  selectedObjectId?: string;
-  onObjectSelect?: (id: string) => void;
+   selectedObjectId?: string;
+   onObjectSelect?: (id: string) => void;
+   /** IDs de objetos seleccionados en modo multi-selección */
+   selectedObjectIds?: string[];
+   /** Notifica al padre del cambio en la selección múltiple */
+   onSelectionChange?: (ids: string[]) => void;
+    /** Activar modo de selección por rectángulo (rubber-band) */
+    selectionMode?: boolean;
+    /** Notifica al padre del cambio en el modo de selección */
+    onSelectionModeChange?: (active: boolean) => void;
+    /** Activar modo de selección de caras de la figura activa */
+    faceSelectMode?: boolean;
+    /** Herramienta de selección de caras: rectángulo, círculo o polígono (línea) */
+    faceSelectionTool?: 'rectangle' | 'circle' | 'polygon';
+    /** Índices de caras seleccionadas en el modo de selección de caras */
+    selectedFaceIds?: number[];
+    /** Notifica al padre del cambio en la selección de caras */
+    onFaceSelectionChange?: (faceIds: number[]) => void;
+    /** Notifica al padre del cambio en el modo de selección de caras */
+    onFaceSelectionModeChange?: (active: boolean) => void;
+    /** Notifica al padre del cambio en la herramienta de selección de caras */
+    onFaceSelectionToolChange?: (tool: 'rectangle' | 'circle' | 'polygon') => void;
   onVerticesChange?: (vertices: Vertex3D[]) => void;
   showVerticesDefault?: boolean;
   camera3D?: Camera3D;
@@ -205,8 +241,9 @@ interface Viewer3DProps {
    */
   smoothShading?: boolean;
   /** Muestra el eje vertical de revolución del torno. */
-  showLatheAxis?: boolean;
-  textureProjection?: LatheTextureProjection;
+   showLatheAxis?: boolean;
+   textureProjection?: LatheTextureProjection;
+   textureRepeat?: number;
   /**
    * Pieza amarilla de la ayuda de proyección: el marco editable de la
    * textura (rectángulo plano, tubo cilíndrico o esfera) que se ve al
@@ -223,10 +260,16 @@ interface Viewer3DProps {
    * dirección, la bolita AMARILLA lo estira a lo largo de esa dirección
    * y el ARO del color del eje lo rota alrededor de ese eje.
    */
-   gizmo?: boolean;
+    gizmo?: boolean;
   /** Posición, rotación y escala actuales del objeto (las fija el manipulador) */
   objectTransform?: ObjectTransform;
   onObjectTransform?: (t: ObjectTransform) => void;
+  /** Called when the gizmo drag ends with multi-selected objects: sends the
+      transform delta applied to all selected objects so the parent can update their stored transforms. */
+   onMultiObjectTransform?: (transforms: { id: string; transform: ObjectTransform }[]) => void;
+   /** Nombre amigable del objeto activo, para mostrarlo/editablecerlo */
+  objectName?: string;
+  onObjectNameChange?: (name: string) => void;
    /** Configuración de luces personalizadas. Cuando se proporciona,
        reemplaza los valores del preset de iluminación. */
   lightConfig?: LightConfig | null;
@@ -393,7 +436,8 @@ export function buildSnapshotObjectVisual(
   mesh: Mesh,
   smooth: boolean,
   projection: LatheTextureProjection,
-  textureFinishOverride?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic'
+  textureFinishOverride?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic',
+  textureRepeat?: number
 ): THREE.Group {
   const group = new THREE.Group();
   if (!mesh.vertices.length || !mesh.faces.length) return group;
@@ -500,15 +544,19 @@ export function buildSnapshotObjectVisual(
 
     new THREE.TextureLoader().load(
       mesh.texture,
-      (texture) => {
-        texture.colorSpace = THREE.SRGBColorSpace;
-        texture.anisotropy = 4;
-        texture.needsUpdate = true;
-        material.map = texture;
-        material.bumpMap = texture;
-        material.bumpScale = (mesh.textureRelief ?? 0) * 0.5;
-        material.color.set(0xffffff);
-        material.needsUpdate = true;
+       (texture) => {
+         texture.colorSpace = THREE.SRGBColorSpace;
+         texture.anisotropy = 4;
+         texture.needsUpdate = true;
+          const repeat = mesh.textureRepeat ?? textureRepeat ?? 1;
+          texture.repeat.set(repeat, repeat);
+         texture.wrapS = THREE.RepeatWrapping;
+         texture.wrapT = THREE.RepeatWrapping;
+         material.map = texture;
+         material.bumpMap = texture;
+         material.bumpScale = (mesh.textureRelief ?? 0) * 0.5;
+         material.color.set(0xffffff);
+         material.needsUpdate = true;
       },
       undefined,
       () => {
@@ -631,8 +679,9 @@ export function buildSnapshotObjectVisual(
     opacity: finalOpacity,
     envMapIntensity: 0,
   });
-  const meshObj = new THREE.Mesh(geometry, material);
-  meshObj.castShadow = true;
+      const meshObj = new THREE.Mesh(geometry, material);
+      meshObj.name = 'mesh';
+      meshObj.castShadow = true;
   meshObj.receiveShadow = true;
   group.add(meshObj);
 
@@ -1065,6 +1114,135 @@ function buildTextureHelperVisual(
   return group;
 }
 
+/**
+ * Computes the centroid (promedio de vértices) de cada cara de la malla,
+ * devolviendo las posiciones en ESPACIO MUNDI (tras aplicar la matriz del
+ * objeto) para poder proyectarlas a pantalla.
+ */
+export function computeFaceCentroids(
+  mesh: Mesh,
+  worldMatrix: THREE.Matrix4
+): THREE.Vector3[] {
+  const centroids: THREE.Vector3[] = [];
+  for (const face of mesh.faces) {
+    if (face.length < 3) continue;
+    let sx = 0, sy = 0, sz = 0;
+    for (const vi of face) {
+      const v = mesh.vertices[vi];
+      if (!v) continue;
+      sx += v.x; sy += v.y; sz += v.z;
+    }
+    const n = face.length;
+    const local = new THREE.Vector3(sx / n, sy / n, sz / n);
+    const world = local.applyMatrix4(worldMatrix);
+    centroids.push(world);
+  }
+  return centroids;
+}
+
+/** Proyecta una posición 3D al espacio de pantalla (píxeles canvas). */
+export function projectToScreen(
+  worldPos: THREE.Vector3,
+  camera: THREE.Camera,
+  canvasRect: DOMRect
+): { x: number; y: number } | null {
+  const proj = worldPos.clone().project(camera);
+  if (proj.z > 1 || proj.z < -1) return null;
+  return {
+    x: ((proj.x + 1) * 0.5) * canvasRect.width + canvasRect.left,
+    y: ((1 - proj.y) * 0.5) * canvasRect.height + canvasRect.top,
+  };
+}
+
+/** Punto dentro de un rectángulo (en pantalla). */
+function isPointInRect(
+  px: number, py: number,
+  x1: number, y1: number, x2: number, y2: number
+): boolean {
+  return px >= Math.min(x1, x2) && px <= Math.max(x1, x2) &&
+         py >= Math.min(y1, y2) && py <= Math.max(y1, y2);
+}
+
+/** Punto dentro de un círculo (en pantalla). */
+function isPointInCircle(
+  px: number, py: number,
+  cx: number, cy: number, radius: number
+): boolean {
+  const dx = px - cx;
+  const dy = py - cy;
+  return dx * dx + dy * dy <= radius * radius;
+}
+
+/** Punto dentro de un polígono (ray-casting, en pantalla). */
+function isPointInPolygon(px: number, py: number, polygon: Array<{ x: number; y: number }>): boolean {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x, yi = polygon[i].y;
+    const xj = polygon[j].x, yj = polygon[j].y;
+    if (((yi > py) !== (yj > py)) &&
+        (px < (xj - xi) * (py - yi) / (yj - yi + 1e-10) + xi)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/**
+ * Construye un mesh de overlay (malla de resaltado) para las caras
+ * seleccionadas: geometría de triángulos de esas caras con material
+ * semitransparente de color cyan brillante.
+ */
+function buildFaceSelectionOverlay(
+  mesh: Mesh,
+  faceIds: Set<number>
+): THREE.Mesh | null {
+  if (faceIds.size === 0) return null;
+
+  const positions: number[] = [];
+  const indices: number[] = [];
+  let baseIdx = 0;
+  let faceCount = 0;
+  for (const face of mesh.faces) {
+    if (!faceIds.has(faceCount)) {
+      faceCount++;
+      continue;
+    }
+    faceCount++;
+    if (face.length < 3) continue;
+    const v0 = mesh.vertices[face[0]];
+    if (!v0) continue;
+    positions.push(v0.x, v0.y, v0.z);
+    for (let j = 1; j + 1 < face.length; j++) {
+      const v1 = mesh.vertices[face[j]];
+      const v2 = mesh.vertices[face[j + 1]];
+      if (!v1 || !v2) continue;
+      positions.push(v1.x, v1.y, v1.z);
+      positions.push(v2.x, v2.y, v2.z);
+      indices.push(baseIdx, baseIdx + 1, baseIdx + 2);
+      baseIdx += 3;
+    }
+  }
+
+  if (positions.length === 0) return null;
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setIndex(indices);
+
+  const material = new THREE.MeshBasicMaterial({
+    color: 0x00ffff,
+    transparent: true,
+    opacity: 0.35,
+    depthWrite: false,
+    depthTest: true,
+    side: THREE.DoubleSide,
+  });
+
+  const overlay = new THREE.Mesh(geometry, material);
+  overlay.renderOrder = 997;
+  return overlay;
+}
+
 export default function Viewer3D({
    mesh,
    objects,
@@ -1076,11 +1254,22 @@ export default function Viewer3D({
    configSmooth,
   configProjection,
   onObjectSelect,
-  onVerticesChange,
-  showVerticesDefault = true,
+  selectedObjectIds,
+  onSelectionChange,
+    selectionMode,
+    onSelectionModeChange,
+    faceSelectMode,
+    faceSelectionTool,
+    selectedFaceIds,
+    onFaceSelectionChange,
+    onFaceSelectionModeChange,
+    onFaceSelectionToolChange,
+    onVerticesChange,
+   showVerticesDefault = true,
   smoothShading = false,
   showLatheAxis = false,
-  textureProjection = 'cylindrical',
+   textureProjection = 'cylindrical',
+   textureRepeat = 1,
   textureHelper = false,
   textureHelperTransform,
   onTextureHelperTransform,
@@ -1089,7 +1278,10 @@ export default function Viewer3D({
    camera3D,
     onCameraChange,
     onCameraMove,
-    onObjectTransform,
+     onObjectTransform,
+     onMultiObjectTransform,
+   objectName,
+   onObjectNameChange,
    lightConfig,
    onLightConfigChange,
    showLightHelpers = true,
@@ -1171,9 +1363,41 @@ export default function Viewer3D({
     offset: THREE.Vector3;
     index: number;
   } | null>(null);
-  const planeRef = useRef<THREE.Plane | null>(null);
+   const planeRef = useRef<THREE.Plane | null>(null);
+   const selectionModeRef = useRef(selectionMode);
+   selectionModeRef.current = selectionMode ?? false;
+   const onSelectionChangeRef = useRef(onSelectionChange);
+   onSelectionChangeRef.current = onSelectionChange;
+   const selectedObjectIdsRef = useRef(selectedObjectIds);
+   selectedObjectIdsRef.current = selectedObjectIds ?? [];
+   const onSelectionModeChangeRef = useRef(onSelectionModeChange);
+   onSelectionModeChangeRef.current = onSelectionModeChange;
+    const selectionStartRef = useRef<{ x: number; y: number; rect: DOMRect } | null>(null);
+    const selectionRectRef = useRef<HTMLDivElement | null>(null);
+    const multiTransformStartRef = useRef<Record<string, ObjectTransform>>({});
     const lightConfigRef = useRef(lightConfig);
     lightConfigRef.current = lightConfig;
+
+    // Face selection
+    const faceSelectModeRef = useRef(faceSelectMode);
+    faceSelectModeRef.current = faceSelectMode ?? false;
+    const faceSelectionToolRef = useRef(faceSelectionTool ?? 'rectangle');
+    faceSelectionToolRef.current = faceSelectionTool ?? 'rectangle';
+    const selectedFaceIdsRef = useRef(selectedFaceIds ?? []);
+    selectedFaceIdsRef.current = selectedFaceIds ?? [];
+    const onFaceSelectionChangeRef = useRef(onFaceSelectionChange);
+    onFaceSelectionChangeRef.current = onFaceSelectionChange;
+    const onFaceSelectionModeChangeRef = useRef(onFaceSelectionModeChange);
+    onFaceSelectionModeChangeRef.current = onFaceSelectionModeChange;
+    const onFaceSelectionToolChangeRef = useRef(onFaceSelectionToolChange);
+    onFaceSelectionToolChangeRef.current = onFaceSelectionToolChange;
+    const faceSelectionOverlayRef = useRef<THREE.Group | null>(null);
+    const faceSelectionStartRef = useRef<{ x: number; y: number; rect: DOMRect } | null>(null);
+    const faceSelectionPointsRef = useRef<Array<{ x: number; y: number }>>([]);
+    const faceSelectionPolyDivRef = useRef<SVGPolygonElement | null>(null);
+    const faceSelectionRectDivRef = useRef<HTMLDivElement | null>(null);
+    const faceSelectionCircleDivRef = useRef<HTMLDivElement | null>(null);
+
 
     const buildUpdatedCameraKeyframes = useCallback(
       (tracks: AnimationTrack[] | undefined, camState: Camera3D): Keyframe[] | null => {
@@ -1259,7 +1483,7 @@ export default function Viewer3D({
      }, [fxConfig, onFxChange, fxConfigLocal]);
     const [fxStars, setFxStars] = useState(false);
   const [starPlacement, setStarPlacement] = useState(false);
-  const [starSize, setStarSize] = useState(1);
+   const [starSize, setStarSize] = useState(1);
    const [showGridInternal, setShowGridInternal] = useState(true);
    const gridValue = showGridProp !== undefined ? showGridProp : showGridInternal;
    const toggleGrid = useCallback(() => {
@@ -1409,8 +1633,10 @@ export default function Viewer3D({
     objectTransform ?? IDENTITY_TRANSFORM
   );
   const transformRef = useRef(transform);
-  const onObjectTransformRef = useRef(onObjectTransform);
-  onObjectTransformRef.current = onObjectTransform;
+   const onObjectTransformRef = useRef(onObjectTransform);
+   onObjectTransformRef.current = onObjectTransform;
+   const onMultiObjectTransformRef = useRef(onMultiObjectTransform);
+   onMultiObjectTransformRef.current = onMultiObjectTransform;
 
 
   // Aplica el transform a la malla y a sus acompañantes. El gizmo y las
@@ -1966,6 +2192,11 @@ export default function Viewer3D({
     scene.add(vertexGroup);
     vertexHelpersRef.current = vertexGroup;
 
+    // Face selection overlay group (children of meshGroup so it follows the mesh transform)
+    const faceSelectOverlayGroup = new THREE.Group();
+    meshGroup.add(faceSelectOverlayGroup);
+    faceSelectionOverlayRef.current = faceSelectOverlayGroup;
+
     const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
     planeRef.current = plane;
 
@@ -2238,6 +2469,58 @@ export default function Viewer3D({
          cubeCam.position.y = Math.max(0.5, cubeCam.position.y);
          cubeCam.update(renderer, scene);
        }
+
+        // Update face selection overlay and HTML elements
+        const m = meshRef.current;
+        const meshObj = meshGroupRef.current?.getObjectByName('mesh') as THREE.Mesh | undefined;
+        if (faceSelectModeRef.current && m && meshObj) {
+          const worldMatrix = meshObj.matrixWorld;
+
+          // Update 3D overlay of selected faces
+          const group = faceSelectionOverlayRef.current;
+          if (group) {
+            // Remove old overlay meshes
+            while (group.children.length) {
+              const child = group.children[0];
+              group.remove(child);
+              if (child instanceof THREE.Mesh) {
+                child.geometry?.dispose?.();
+                (child.material as THREE.Material)?.dispose?.();
+              }
+            }
+            const faceSet = new Set(selectedFaceIdsRef.current);
+            const overlay = buildFaceSelectionOverlay(m, faceSet);
+            if (overlay) {
+              group.add(overlay);
+            }
+          }
+
+          // Update HTML overlay for freehand polygon lines (only visible during drawing)
+          if (faceSelectionPolyDivRef.current) {
+            const polyDiv = faceSelectionPolyDivRef.current;
+            polyDiv.style.display = faceSelectionPointsRef.current.length > 0 && faceSelectionToolRef.current === 'polygon' ? 'block' : 'none';
+            if (polyDiv.style.display === 'block') {
+              const pts = faceSelectionPointsRef.current;
+              if (pts.length >= 2) {
+                const ptsString = pts.map(p => `${p.x},${p.y}`).join(' ');
+                polyDiv.setAttribute('points', ptsString);
+              }
+            }
+          }
+        } else if (!faceSelectModeRef.current) {
+          console.log('[FaceSelect] animate loop hiding overlays, faceSelectModeRef =', faceSelectModeRef.current);
+          // Only hide 3D overlay when NOT in face select mode
+          if (faceSelectionOverlayRef.current) {
+            faceSelectionOverlayRef.current.traverse((child) => {
+              if (child instanceof THREE.Mesh) {
+                child.visible = false;
+              }
+            });
+          }
+          if (faceSelectionPolyDivRef.current) faceSelectionPolyDivRef.current.style.display = 'none';
+          if (faceSelectionRectDivRef.current) faceSelectionRectDivRef.current.style.display = 'none';
+          if (faceSelectionCircleDivRef.current) faceSelectionCircleDivRef.current.style.display = 'none';
+        }
        renderer.render(scene, camera);
 
        if (exportState) {
@@ -2500,12 +2783,101 @@ export default function Viewer3D({
       }
     };
 
-    const onPointerMove = (e: PointerEvent) => {
-      const rect = renderer.domElement.getBoundingClientRect();
-      pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+     const onPointerMove = (e: PointerEvent) => {
+       const rect = renderer.domElement.getBoundingClientRect();
+       pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+       pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 
-      if (gizmoDragRef.current) {
+        // --- Face selection: update overlay during drag ---
+        if (faceSelectionStartRef.current && faceSelectModeRef.current) {
+          console.log('[FaceSelect] onPointerMove: updating overlay, tool =', faceSelectionToolRef.current);
+          const start = faceSelectionStartRef.current;
+          const startRect = start.rect;
+          const canvasRect = startRect;
+          const tool = faceSelectionToolRef.current;
+          const dx = e.clientX - start.x;
+          const dy = e.clientY - start.y;
+
+          if (tool === 'rectangle') {
+            const left = Math.min(start.x - canvasRect.left, e.clientX - canvasRect.left);
+            const top = Math.min(start.y - canvasRect.top, e.clientY - canvasRect.top);
+            const width = Math.abs(dx);
+            const height = Math.abs(dy);
+          const rectDiv = faceSelectionRectDivRef.current;
+          console.log('[FaceSelect] rectDiv found:', !!rectDiv, 'width:', width, 'height:', height);
+          if (rectDiv) {
+              if (width > 2 && height > 2) {
+                rectDiv.style.display = 'block';
+                rectDiv.style.left = `${left}px`;
+                rectDiv.style.top = `${top}px`;
+                rectDiv.style.width = `${width}px`;
+                rectDiv.style.height = `${height}px`;
+              } else {
+                rectDiv.style.display = 'none';
+              }
+            }
+          } else if (tool === 'circle') {
+            const radius = Math.sqrt(dx * dx + dy * dy);
+            const circleDiv = faceSelectionCircleDivRef.current;
+            if (circleDiv) {
+              if (radius > 5) {
+                circleDiv.style.display = 'block';
+                circleDiv.style.left = `${start.x - canvasRect.left}px`;
+                circleDiv.style.top = `${start.y - canvasRect.top}px`;
+                circleDiv.style.width = `${radius * 2}px`;
+                circleDiv.style.height = `${radius * 2}px`;
+              } else {
+                circleDiv.style.display = 'none';
+              }
+            }
+          } else if (tool === 'polygon') {
+            // Add a point every ~8px of drag distance
+            const pts = faceSelectionPointsRef.current;
+            const lastPt = pts.length > 0 ? pts[pts.length - 1] : null;
+            if (!lastPt || Math.hypot(e.clientX - lastPt.x, e.clientY - lastPt.y) > 8) {
+              pts.push({ x: e.clientX, y: e.clientY });
+            }
+            const polyDiv = faceSelectionPolyDivRef.current;
+            if (polyDiv) {
+              if (pts.length >= 2) {
+                polyDiv.style.display = 'block';
+                polyDiv.setAttribute('points', pts.map(p => `${p.x},${p.y}`).join(' '));
+              }
+            }
+          }
+          controls.enabled = false;
+          renderer.domElement.style.cursor = 'crosshair';
+          return;
+        }
+
+        // --- Rubber-band selection: update rectangle overlay ---
+        if (selectionStartRef.current) {
+         const start = selectionStartRef.current;
+         const canvasRect = renderer.domElement.getBoundingClientRect();
+         const x1 = start.x - canvasRect.left;
+         const y1 = start.y - canvasRect.top;
+         const x2 = e.clientX - canvasRect.left;
+         const y2 = e.clientY - canvasRect.top;
+         const selRect = selectionRectRef.current;
+         if (selRect) {
+           const left = Math.min(x1, x2);
+           const top = Math.min(y1, y2);
+           const width = Math.abs(x2 - x1);
+           const height = Math.abs(y2 - y1);
+           if (width > 2 && height > 2) {
+             selRect.style.display = 'block';
+             selRect.style.left = `${left}px`;
+             selRect.style.top = `${top}px`;
+             selRect.style.width = `${width}px`;
+             selRect.style.height = `${height}px`;
+           } else {
+             selRect.style.display = 'none';
+           }
+         }
+         return;
+       }
+
+       if (gizmoDragRef.current) {
         updateGizmoDrag();
         return;
       }
@@ -3077,13 +3449,107 @@ export default function Viewer3D({
       };
     };
 
-    const onPointerDown = (e: PointerEvent) => {
-      if (starPlacementRef.current) {
-        // Registrar el punto inicial: solo coloca si NO hubo arrastre
-        // (así girar la cámara con arrastre no coloca estrellas).
-        placeDownRef.current = { x: e.clientX, y: e.clientY };
-        return;
-      }
+     const onPointerDown = (e: PointerEvent) => {
+       if (starPlacementRef.current) {
+         // Registrar el punto inicial: solo coloca si NO hubo arrastre
+         // (así girar la cámara con arrastre no coloca estrellas).
+         placeDownRef.current = { x: e.clientX, y: e.clientY };
+         return;
+       }
+
+        // --- Face selection: start drag ---
+        if (faceSelectModeRef.current && !gizmoDragRef.current) {
+          console.log('[FaceSelect] onPointerDown: faceSelectModeRef =', faceSelectModeRef.current, 'mountEl =', !!mountRef.current);
+          const rect = renderer.domElement.getBoundingClientRect();
+          faceSelectionStartRef.current = {
+            x: e.clientX,
+            y: e.clientY,
+            rect,
+          };
+          controls.enabled = false;
+          renderer.domElement.style.cursor = 'crosshair';
+          faceSelectionPointsRef.current = [];
+
+          // Create / ensure HTML overlays for selection shapes
+          const mountEl = mountRef.current;
+          console.log('[FaceSelect] creating overlays, mountEl =', !!mountEl);
+          if (mountEl) {
+            if (!faceSelectionRectDivRef.current) {
+              const div = document.createElement('div');
+              div.style.position = 'absolute';
+              div.style.border = '1px dashed #06b7a3';
+              div.style.backgroundColor = 'rgba(6, 183, 163, 0.15)';
+              div.style.pointerEvents = 'none';
+              div.style.zIndex = '10';
+              div.style.display = 'none';
+              mountEl.appendChild(div);
+              faceSelectionRectDivRef.current = div;
+            } else if (!faceSelectionRectDivRef.current.parentElement) {
+              mountEl.appendChild(faceSelectionRectDivRef.current);
+            }
+            if (!faceSelectionCircleDivRef.current) {
+              const div = document.createElement('div');
+              div.style.position = 'absolute';
+              div.style.border = '1px dashed #06b7a3';
+              div.style.backgroundColor = 'rgba(6, 183, 163, 0.15)';
+              div.style.borderRadius = '50%';
+              div.style.pointerEvents = 'none';
+              div.style.zIndex = '10';
+              div.style.display = 'none';
+              mountEl.appendChild(div);
+              faceSelectionCircleDivRef.current = div;
+            } else if (!faceSelectionCircleDivRef.current.parentElement) {
+              mountEl.appendChild(faceSelectionCircleDivRef.current);
+            }
+            if (!faceSelectionPolyDivRef.current) {
+              const svgNS = 'http://www.w3.org/2000/svg';
+              const svg = document.createElementNS(svgNS, 'svg');
+              svg.style.position = 'absolute';
+              svg.style.top = '0';
+              svg.style.left = '0';
+              svg.style.width = '100%';
+              svg.style.height = '100%';
+              svg.style.pointerEvents = 'none';
+              svg.style.zIndex = '10';
+              const poly = document.createElementNS(svgNS, 'polygon');
+              poly.setAttribute('fill', 'rgba(6, 183, 163, 0.15)');
+              poly.setAttribute('stroke', '#06b7a3');
+              poly.setAttribute('stroke-width', '1');
+              svg.appendChild(poly);
+              mountEl.appendChild(svg);
+              faceSelectionPolyDivRef.current = poly;
+            }
+          }
+          return;
+        }
+
+        // --- Rubber-band selection ---
+        if (selectionModeRef.current && !gizmoDragRef.current) {
+         const rect = renderer.domElement.getBoundingClientRect();
+         selectionStartRef.current = {
+           x: e.clientX,
+           y: e.clientY,
+           rect,
+         };
+         controls.enabled = false;
+         renderer.domElement.style.cursor = 'crosshair';
+         // Create selection rectangle overlay
+         if (!selectionRectRef.current) {
+           const selDiv = document.createElement('div');
+           selDiv.style.position = 'absolute';
+           selDiv.style.border = '1px dashed #38bdf8';
+           selDiv.style.backgroundColor = 'rgba(56, 189, 248, 0.1)';
+           selDiv.style.pointerEvents = 'none';
+           selDiv.style.zIndex = '10';
+           selDiv.style.display = 'none';
+           mountRef.current?.appendChild(selDiv);
+           selectionRectRef.current = selDiv;
+         } else if (!selectionRectRef.current.parentElement) {
+           mountRef.current?.appendChild(selectionRectRef.current);
+         }
+         return;
+       }
+
 
       // Light gizmo (3-axis arrows + rotation rings): if click hits a handle, start drag
       if (lightGizmoGroupRef.current?.visible && !lightDragRef.current) {
@@ -3396,6 +3862,14 @@ export default function Viewer3D({
             'object'
           );
           if (!drag) return;
+          // Store initial transforms of all selected objects for multi-transform
+          const selIds = selectedObjectIdsRef.current ?? [];
+          multiTransformStartRef.current = {};
+          for (const obj of objectsRef.current ?? []) {
+            if (selIds.includes(obj.id)) {
+              multiTransformStartRef.current[obj.id] = { ...obj.transform };
+            }
+          }
           gizmoDragRef.current = drag;
           controls.enabled = false;
           renderer.domElement.style.cursor = 'grabbing';
@@ -3526,8 +4000,147 @@ export default function Viewer3D({
       }
     };
 
-    const onPointerUp = (e: PointerEvent) => {
-      if (starPlacementRef.current && placeDownRef.current) {
+      const onPointerUp = (e: PointerEvent) => {
+        // --- Face selection: finalize ---
+        if (faceSelectionStartRef.current && faceSelectModeRef.current) {
+          const start = faceSelectionStartRef.current;
+          faceSelectionStartRef.current = null;
+          controls.enabled = true;
+          renderer.domElement.style.cursor = '';
+
+          // Hide HTML overlays
+          if (faceSelectionRectDivRef.current) faceSelectionRectDivRef.current.style.display = 'none';
+          if (faceSelectionCircleDivRef.current) faceSelectionCircleDivRef.current.style.display = 'none';
+          if (faceSelectionPolyDivRef.current) faceSelectionPolyDivRef.current.style.display = 'none';
+
+          const m = meshRef.current;
+          if (!m) return;
+
+          // Get the world matrix of the mesh object in the scene
+          const meshGroup = meshGroupRef.current;
+          if (!meshGroup) return;
+          meshGroup.updateMatrixWorld();
+          const meshObj = meshGroup.getObjectByName('mesh') as THREE.Mesh | undefined;
+          if (!meshObj) return;
+          meshObj.updateWorldMatrix(true, false);
+          const worldMatrix = meshObj.matrixWorld;
+
+          const rect = renderer.domElement.getBoundingClientRect();
+          const tool = faceSelectionToolRef.current;
+          const centroids = computeFaceCentroids(m, worldMatrix);
+
+          const selected: number[] = [];
+          const selectedFaceIds = selectedFaceIdsRef.current ?? [];
+
+          for (let i = 0; i < centroids.length; i++) {
+            const screenPt = projectToScreen(centroids[i], camera, rect);
+            if (!screenPt) continue;
+
+            let inside = false;
+            if (tool === 'rectangle') {
+              const x1 = Math.min(start.x, e.clientX);
+              const y1 = Math.min(start.y, e.clientY);
+              const x2 = Math.max(start.x, e.clientX);
+              const y2 = Math.max(start.y, e.clientY);
+              inside = isPointInRect(screenPt.x, screenPt.y, x1, y1, x2, y2);
+            } else if (tool === 'circle') {
+              const radius = Math.sqrt(
+                (e.clientX - start.x) ** 2 + (e.clientY - start.y) ** 2
+              );
+              inside = isPointInCircle(screenPt.x, screenPt.y, start.x, start.y, radius);
+            } else if (tool === 'polygon') {
+              const pts = faceSelectionPointsRef.current;
+              // Close the polygon by adding the start point
+              const polygon = pts.length >= 3 ? [...pts, { x: pts[0].x, y: pts[0].y }] : pts;
+              inside = polygon.length >= 3 && isPointInPolygon(screenPt.x, screenPt.y, polygon);
+            }
+
+            if (inside) {
+              selected.push(i);
+            }
+          }
+
+          faceSelectionPointsRef.current = [];
+
+          // Toggle: if all selected faces are already in the selection, deselect; otherwise add
+          let newFaceIds: number[];
+          if (selected.length > 0 && selected.every((f) => selectedFaceIds.includes(f))) {
+            newFaceIds = selectedFaceIds.filter((f) => !selected.includes(f));
+          } else {
+            newFaceIds = [...new Set([...selectedFaceIds, ...selected])];
+          }
+          onFaceSelectionChangeRef.current?.(newFaceIds);
+          selectedFaceIdsRef.current = newFaceIds;
+          return;
+        }
+
+        // --- Rubber-band selection: finalize ---
+        if (selectionStartRef.current) {
+         const start = selectionStartRef.current;
+         const canvasRect = renderer.domElement.getBoundingClientRect();
+         const dx = e.clientX - start.x;
+         const dy = e.clientY - start.y;
+         // Hide selection rectangle
+         if (selectionRectRef.current) {
+           selectionRectRef.current.style.display = 'none';
+         }
+         selectionStartRef.current = null;
+         controls.enabled = true;
+         renderer.domElement.style.cursor = '';
+
+          // Only do selection if there was a meaningful drag
+          if (dx * dx + dy * dy > 16) {
+            const x1 = Math.min(start.x, e.clientX);
+            const y1 = Math.min(start.y, e.clientY);
+            const x2 = Math.max(start.x, e.clientX);
+            const y2 = Math.max(start.y, e.clientY);
+
+            const meshGroup = meshGroupRef.current;
+            if (meshGroup) {
+              meshGroup.updateMatrixWorld();
+              const duplicates = meshGroup.children.filter(
+                (c) => c.userData.sceneObjectDuplicate
+              );
+              const selectedIds: string[] = [];
+              for (const dup of duplicates) {
+                const box = new THREE.Box3().setFromObject(dup);
+                if (box.isEmpty()) continue;
+                // Project bounding box corners to screen space
+                const min = box.min.project(camera);
+                const max = box.max.project(camera);
+                // Convert NDC to canvas pixel coordinates
+                const rect = renderer.domElement.getBoundingClientRect();
+                const sx1 = ((min.x + 1) * 0.5) * rect.width + rect.left;
+                const sy1 = ((1 - min.y) * 0.5) * rect.height + rect.top;
+                const sx2 = ((max.x + 1) * 0.5) * rect.width + rect.left;
+                const sy2 = ((1 - max.y) * 0.5) * rect.height + rect.top;
+                // Check if the projected bounding box intersects with the selection rect
+                if (sx2 < x1 || sx1 > x2 || sy2 < y1 || sy1 > y2) continue;
+                const objId = dup.userData.sceneObjectId;
+                if (objId) selectedIds.push(objId);
+              }
+              // If the rectangle selected nothing, clear all selections
+              if (selectedIds.length === 0) {
+                onSelectionChangeRef.current?.([]);
+                return;
+              }
+              // Toggle selection: if all found objects are already selected, deselect them;
+              // otherwise add to current selection
+              const current = selectedObjectIdsRef.current ?? [];
+              const allSelected = selectedIds.every((id) => current.includes(id));
+              let newIds: string[];
+              if (allSelected && selectedIds.length > 0) {
+                newIds = current.filter((id) => !selectedIds.includes(id));
+              } else {
+                newIds = [...new Set([...current, ...selectedIds])];
+              }
+              onSelectionChangeRef.current?.(newIds);
+            }
+          }
+          return;
+        }
+
+        if (starPlacementRef.current && placeDownRef.current) {
         const dx = e.clientX - placeDownRef.current.x;
         const dy = e.clientY - placeDownRef.current.y;
         placeDownRef.current = null;
@@ -3574,7 +4187,64 @@ export default function Viewer3D({
           const t = transformRef.current;
           setTransform(t);
           onObjectTransformRef.current?.(t);
+          // Si hay objetos multiseleccionados, aplica el delta al resto
+          const startTransforms = multiTransformStartRef.current;
+          const selIds = selectedObjectIdsRef.current ?? [];
+          const activeId = selectedObjectIdRef.current;
+          if (selIds.length > 0 && selIds.includes(activeId ?? '')) {
+            const updatedTransforms: { id: string; transform: ObjectTransform }[] = [];
+            const startActive = startTransforms[activeId ?? ''];
+            if (startActive) {
+              const deltaPos = {
+                x: t.px - startActive.px,
+                y: t.py - startActive.py,
+                z: t.pz - startActive.pz,
+              };
+              // Quaternion delta for rotation
+              const startQuat = new THREE.Quaternion().setFromEuler(
+                new THREE.Euler(startActive.rx, startActive.ry, startActive.rz)
+              );
+              const endQuat = new THREE.Quaternion().setFromEuler(
+                new THREE.Euler(t.rx, t.ry, t.rz)
+              );
+              const deltaQuat = endQuat.clone().multiply(startQuat.invert());
+              // Scale delta (factor)
+              const deltaScale = {
+                x: startActive.sx !== 0 ? t.sx / startActive.sx : 1,
+                y: startActive.sy !== 0 ? t.sy / startActive.sy : 1,
+                z: startActive.sz !== 0 ? t.sz / startActive.sz : 1,
+              };
+              for (const id of selIds) {
+                if (id === activeId) continue;
+                const startObj = startTransforms[id];
+                if (!startObj) continue;
+                const objQuat = new THREE.Quaternion().setFromEuler(
+                  new THREE.Euler(startObj.rx, startObj.ry, startObj.rz)
+                );
+                const newQuat = deltaQuat.clone().multiply(objQuat);
+                const newEuler = new THREE.Euler().setFromQuaternion(newQuat, 'XYZ');
+                updatedTransforms.push({
+                  id,
+                  transform: {
+                    px: startObj.px + deltaPos.x,
+                    py: startObj.py + deltaPos.y,
+                    pz: startObj.pz + deltaPos.z,
+                    rx: newEuler.x,
+                    ry: newEuler.y,
+                    rz: newEuler.z,
+                    sx: startObj.sx * deltaScale.x,
+                    sy: startObj.sy * deltaScale.y,
+                    sz: startObj.sz * deltaScale.z,
+                  },
+                });
+              }
+            }
+            if (updatedTransforms.length > 0) {
+              onMultiObjectTransformRef.current?.(updatedTransforms);
+            }
+          }
         }
+        multiTransformStartRef.current = {};
         return;
       }
       if (dragRef.current) {
@@ -3590,6 +4260,18 @@ export default function Viewer3D({
 
     return () => {
       cancelAnimationFrame(animId);
+    // Clean up face selection HTML overlays
+    if (faceSelectionRectDivRef.current) faceSelectionRectDivRef.current.remove();
+    if (faceSelectionCircleDivRef.current) faceSelectionCircleDivRef.current.remove();
+    if (faceSelectionPolyDivRef.current) {
+      const parent = faceSelectionPolyDivRef.current.ownerSVGElement;
+      if (parent) parent.remove();
+    }
+    faceSelectionRectDivRef.current = null;
+    faceSelectionCircleDivRef.current = null;
+    faceSelectionPolyDivRef.current = null;
+    faceSelectionStartRef.current = null;
+    faceSelectionPointsRef.current = [];
       window.removeEventListener('resize', handleResize);
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
@@ -3638,10 +4320,13 @@ export default function Viewer3D({
         placedStarsRef.current.stars = [];
         placedStarsRef.current = null;
       }
-      if (mount.contains(renderer.domElement)) {
-        mount.removeChild(renderer.domElement);
-      }
-    };
+       if (mount.contains(renderer.domElement)) {
+         mount.removeChild(renderer.domElement);
+       }
+       if (selectionRectRef.current?.parentElement) {
+         selectionRectRef.current.parentElement.removeChild(selectionRectRef.current);
+       }
+     };
   }, [showVertices]);
 
   useEffect(() => {
@@ -3828,26 +4513,31 @@ export default function Viewer3D({
       meshGroup.add(meshObj);
 
       // Cargar la textura
-      const loader = new THREE.TextureLoader();
-      loader.load(
-        mesh.texture,
-        (texture) => {
-          if (cancelled) return;
-          texture.colorSpace = THREE.SRGBColorSpace;
-          texture.anisotropy = 4;
-          texture.needsUpdate = true;
-          material.map = texture;
-          material.bumpMap = texture;
-          material.bumpScale = (mesh.textureRelief ?? 0) * 0.5;
-          material.color.set(0xffffff);
-          material.needsUpdate = true;
-        },
-        undefined,
-        (err) => {
-          console.error('Error loading texture:', err);
-          material.color.set(0xcccccc); // Fallback
-        }
-      );
+      if (mesh.texture) {
+        const loader = new THREE.TextureLoader();
+        loader.load(
+          mesh.texture,
+          (texture) => {
+            if (cancelled) return;
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.anisotropy = 4;
+            texture.needsUpdate = true;
+            texture.repeat.set(textureRepeat, textureRepeat);
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            material.map = texture;
+            material.bumpMap = texture;
+            material.bumpScale = (mesh.textureRelief ?? 0) * 0.5;
+            material.color.set(0xffffff);
+            material.needsUpdate = true;
+          },
+          undefined,
+          (err) => {
+            console.error('Error loading texture:', err);
+            material.color.set(0xcccccc); // Fallback
+          }
+        );
+      }
 
       // Líneas de wireframe si está activado
       if (wireframe) {
@@ -4303,12 +4993,23 @@ export default function Viewer3D({
     );
     const inverseSelected = selectedMatrix.clone().invert();
 
-    for (const object of objects) {
-      if (object.id === selected.id) continue;
-      let duplicate = meshGroup.children.find(
-        (child) => child.userData.sceneObjectDuplicate && child.userData.sceneObjectId === object.id
-      ) as THREE.Group | undefined;
-      if (!duplicate) {
+     for (const object of objects) {
+       if (object.id === selected.id) continue;
+       // Find or create the duplicate for this object
+       let duplicate = meshGroup.children.find(
+         (child) => child.userData.sceneObjectDuplicate && child.userData.sceneObjectId === object.id
+       ) as THREE.Group | undefined;
+
+       // Handle hidden objects: remove existing duplicate
+       if (object.hidden) {
+         if (duplicate) {
+           meshGroup.remove(duplicate);
+         }
+         continue;
+       }
+
+       // If the duplicate doesn't exist, create it
+       if (!duplicate) {
         duplicate = new THREE.Group();
         duplicate.userData.sceneObjectId = object.id;
         duplicate.userData.sceneObjectDuplicate = true;
@@ -4334,26 +5035,32 @@ export default function Viewer3D({
                   textureRelief: object.mesh.textureRelief,
                   textureFinish: object.mesh.textureFinish,
                 },
-                configSmooth ?? smoothShading,
-                object.textureProjection ?? configProjection ?? textureProjection
-              )
+                 configSmooth ?? smoothShading,
+                 object.textureProjection ?? configProjection ?? textureProjection,
+                 undefined,
+                 object.mesh.textureRepeat ?? textureRepeat
+               )
             );
           } else {
             duplicate.add(
               buildSnapshotObjectVisual(
                 configMesh ?? mesh,
-                configSmooth ?? smoothShading,
-                configProjection ?? textureProjection
-              )
+             configSmooth ?? smoothShading,
+             configProjection ?? textureProjection,
+             undefined,
+             (configMesh ?? mesh).textureRepeat ?? textureRepeat
+           )
             );
           }
         } else if (object.mesh && object.mesh.vertices.length > 0) {
           duplicate.add(
-            buildSnapshotObjectVisual(
-              object.mesh,
-              object.smooth ?? false,
-              object.textureProjection ?? 'planar'
-            )
+             buildSnapshotObjectVisual(
+               object.mesh,
+               object.smooth ?? false,
+               object.textureProjection ?? 'planar',
+               undefined,
+               object.mesh.textureRepeat ?? textureRepeat
+             )
           );
         } else {
           for (const child of [...meshGroup.children]) {
@@ -4391,7 +5098,43 @@ export default function Viewer3D({
             }
           });
         }
-      const objectMatrix = new THREE.Matrix4().compose(
+        // Apply frozen/unfrozen visual
+        if (object.frozen && !duplicate.userData.isFrozen) {
+          duplicate.userData.isFrozen = true;
+          duplicate.userData.originalMaterials = [];
+          duplicate.traverse(function (child) {
+            if (child instanceof THREE.Mesh && child.material) {
+              const originals = Array.isArray(child.material)
+                ? child.material.map((m) => m.clone())
+                : [child.material.clone()];
+              (child.userData as any).originalMaterials = originals;
+              const grayMat = new THREE.MeshStandardMaterial({
+                color: 0x888888,
+                roughness: 0.9,
+                metalness: 0,
+              });
+              if (Array.isArray(child.material)) {
+                child.material = child.material.map(() => grayMat);
+              } else {
+                child.material = grayMat;
+              }
+            }
+          });
+        } else if (!object.frozen && duplicate.userData.isFrozen) {
+          duplicate.userData.isFrozen = false;
+          duplicate.traverse(function (child) {
+            if (child instanceof THREE.Mesh && (child.userData as any).originalMaterials) {
+              const originals = (child.userData as any).originalMaterials;
+              if (Array.isArray(child.material) && Array.isArray(originals)) {
+                child.material = originals;
+              } else if (!Array.isArray(child.material) && !Array.isArray(originals) && originals.length >= 1) {
+                child.material = originals[0];
+              }
+              delete (child.userData as any).originalMaterials;
+            }
+          });
+        }
+       const objectMatrix = new THREE.Matrix4().compose(
         new THREE.Vector3(object.transform.px, object.transform.py, object.transform.pz),
         new THREE.Quaternion().setFromEuler(
           new THREE.Euler(object.transform.rx, object.transform.ry, object.transform.rz)
@@ -4415,7 +5158,29 @@ export default function Viewer3D({
     textureProjection,
     ]);
 
-    // --- Modo boolean preview: aplicar transparencia naranja al cortador
+    // --- Highlight for multi-selected objects: draw a wireframe box ---
+    useEffect(() => {
+     const meshGroup = meshGroupRef.current;
+     if (!meshGroup) return;
+     meshGroup.updateMatrixWorld();
+     let highlightGroup = meshGroup.userData.multiSelectHighlight as THREE.Group | undefined;
+     if (!highlightGroup) {
+       highlightGroup = new THREE.Group();
+       meshGroup.add(highlightGroup);
+       meshGroup.userData.multiSelectHighlight = highlightGroup;
+     }
+      highlightGroup.clear();
+      const selectedIds = selectedObjectIdsRef.current ?? [];
+       if (selectedIds.length === 0) return;
+       for (const child of meshGroup.children) {
+        if (!child.userData.sceneObjectDuplicate) continue;
+        if (!selectedIds.includes(child.userData.sceneObjectId)) continue;
+        const box = new THREE.Box3().setFromObject(child);
+        if (box.isEmpty()) continue;
+        const helper = new THREE.Box3Helper(box, 0x38bdf8);
+        highlightGroup.add(helper);
+      }
+     }, [selectedObjectIds, objects?.length, forceObjectsUpdate]);
     // --- (toolId) tanto si es un duplicate como si es el mesh principal
     // --- (activa). El resto de objetos se muestran normales.
     useEffect(() => {
@@ -5019,6 +5784,16 @@ export default function Viewer3D({
           </span>
         )}
         <div className="flex items-center gap-1 flex-wrap">
+          {objectName !== undefined && (
+            <input
+              type="text"
+              value={objectName}
+              onChange={(e) => onObjectNameChange?.(e.target.value)}
+              placeholder="Nombre del objeto"
+              className="w-32 px-1.5 py-0.5 text-[10px] rounded border border-input bg-background focus:outline-none focus:ring-1 focus:ring-ring"
+              title="Nombre del objeto"
+            />
+          )}
           <ToggleButton
             active={showVertices}
             onClick={() => setShowVertices(!showVertices)}
@@ -5099,87 +5874,155 @@ export default function Viewer3D({
           >
             <RotateCcw className="w-3.5 h-3.5" />
           </ToggleButton>
-          <ToggleButton onClick={resetCamera} title="Reset cámara">
-            <Maximize2 className="w-3.5 h-3.5" />
-          </ToggleButton>
+           <ToggleButton onClick={resetCamera} title="Reset cámara">
+             <Maximize2 className="w-3.5 h-3.5" />
+           </ToggleButton>
+            {objects && objects.length > 0 && (
+              <ToggleButton
+                active={selectionMode}
+                onClick={() => onSelectionModeChangeRef.current?.(!selectionMode)}
+                title="Seleccionar múltiples objetos (arrastra en la ventana)"
+              >
+                <MousePointerClick className="w-3.5 h-3.5" />
+              </ToggleButton>
+            )}
+            {mesh && (
+              <>
+                <ToggleButton
+                  active={faceSelectMode}
+                  onClick={() => onFaceSelectionModeChangeRef.current?.(!faceSelectMode)}
+                  title="Seleccionar caras de la figura activa"
+                >
+                  <MousePointerClick className="w-3.5 h-3.5" />
+                </ToggleButton>
+                {faceSelectMode && (
+                  <select
+                    value={faceSelectionTool}
+                    onChange={(e) => onFaceSelectionToolChangeRef.current?.(e.target.value as any)}
+                    className="px-1.5 py-0.5 text-xs bg-white/10 rounded border border-white/20 text-white"
+                  >
+                    <option value="rectangle">Rectángulo</option>
+                    <option value="circle">Círculo</option>
+                    <option value="polygon">Polígono</option>
+                  </select>
+                )}
+              </>
+            )}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                title="Efectos visuales"
+                className="p-1.5 rounded-md transition-colors text-muted-foreground hover:text-foreground hover:bg-white/5 flex items-center gap-1"
+              >
+                <Menu className="w-3.5 h-3.5" />
+                <span className="text-[10px] font-medium">FX</span>
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent className="bg-gray-900 border-gray-800 text-white min-w-[200px]">
+              <DropdownMenuCheckboxItem
+                checked={glowValue}
+                onCheckedChange={toggleGlow}
+                className="hover:bg-gray-800 cursor-pointer"
+              >
+                <div className="flex items-center gap-2">
+                  <Zap className="w-4 h-4 text-amber-300" />
+                  <span className="text-xs">Brillo neón</span>
+                </div>
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={sparksValue}
+                onCheckedChange={toggleSparks}
+                className="hover:bg-gray-800 cursor-pointer"
+              >
+                <div className="flex items-center gap-2">
+                  <Sparkle className="w-4 h-4 text-cyan-300" />
+                  <span className="text-xs">Chispas</span>
+                </div>
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={fireValue}
+                onCheckedChange={toggleFire}
+                className="hover:bg-gray-800 cursor-pointer"
+              >
+                <div className="flex items-center gap-2">
+                  <Flame className="w-4 h-4 text-orange-300" />
+                  <span className="text-xs">Llamas</span>
+                </div>
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={rainValue}
+                onCheckedChange={toggleRain}
+                className="hover:bg-gray-800 cursor-pointer"
+              >
+                <div className="flex items-center gap-2">
+                  <CloudRain className="w-4 h-4 text-blue-300" />
+                  <span className="text-xs">Lluvia</span>
+                </div>
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={smokeValue}
+                onCheckedChange={toggleSmoke}
+                className="hover:bg-gray-800 cursor-pointer"
+              >
+                <div className="flex items-center gap-2">
+                  <Cloud className="w-4 h-4 text-gray-400" />
+                  <span className="text-xs">Humo</span>
+                </div>
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={fxStars}
+                onCheckedChange={() => setFxStars(!fxStars)}
+                className="hover:bg-gray-800 cursor-pointer"
+              >
+                <div className="flex items-center gap-2">
+                  <Star className="w-4 h-4 text-amber-300" />
+                  <span className="text-xs">Estrellas</span>
+                </div>
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={starPlacement}
+                onCheckedChange={() => setStarPlacement(!starPlacement)}
+                className="hover:bg-gray-800 cursor-pointer"
+              >
+                <div className="flex items-center gap-2">
+                  <Pin className="w-4 h-4 text-purple-300" />
+                  <span className="text-xs">Colocar estrellas</span>
+                </div>
+              </DropdownMenuCheckboxItem>
+              {(fxStars || starPlacement) && (
+                <div className="px-2 py-1.5 flex items-center gap-1">
+                  <Star className="w-3 h-3 text-amber-300" />
+                  <Slider
+                    min={0.3}
+                    max={3}
+                    step={0.1}
+                    value={[starSize]}
+                    onValueChange={([v]) => setStarSize(v)}
+                    className="flex-1 h-4"
+                  />
+                </div>
+              )}
+              <DropdownMenuSeparator className="bg-gray-700" />
+              <DropdownMenuItem
+                onSelect={() => setShowFxConfigModal(true)}
+                className="hover:bg-gray-800 cursor-pointer"
+              >
+                <div className="flex items-center gap-2">
+                  <Settings className="w-4 h-4 text-gray-300" />
+                  <span className="text-xs">Configuración de FX</span>
+                </div>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           <ToggleButton
-             active={glowValue}
-             onClick={toggleGlow}
-             title="Brillo neón (halo alrededor del texto)"
-           >
-             <Zap className="w-3.5 h-3.5" />
-           </ToggleButton>
-           <ToggleButton
-             active={sparksValue}
-             onClick={toggleSparks}
-             title="Chispas"
-           >
-             <Sparkle className="w-3.5 h-3.5" />
-           </ToggleButton>
-           <ToggleButton
-             active={fireValue}
-             onClick={toggleFire}
-             title="Fuego"
+             active={smoothCapture}
+             onClick={() => setSmoothCapture(!smoothCapture)}
+             title="Suavizar curvas en la captura PNG"
           >
-             <Flame className="w-3.5 h-3.5" />
-           </ToggleButton>
-           <ToggleButton
-             active={rainValue}
-             onClick={toggleRain}
-             title="Lluvia (gotas cayendo sobre el texto)"
-           >
-             <CloudRain className="w-3.5 h-3.5" />
-           </ToggleButton>
-           <ToggleButton
-             active={smokeValue}
-             onClick={toggleSmoke}
-             title="Humo (nube que asciende desde la base)"
-           >
-             <Cloud className="w-3.5 h-3.5" />
-           </ToggleButton>
-          <ToggleButton
-            active={fxStars}
-            onClick={() => setFxStars(!fxStars)}
-            title="Estrellas de brillo (aleatorias)"
-          >
-            <Star className="w-3.5 h-3.5" />
-          </ToggleButton>
-          <ToggleButton
-            active={starPlacement}
-            onClick={() => setStarPlacement(!starPlacement)}
-            title="Colocar estrellas: clic en el texto para ponerlas, clic sobre una colocada para quitarla"
-          >
-            <Pin className="w-3.5 h-3.5" />
-          </ToggleButton>
-          {(fxStars || starPlacement) && (
-            <div className="flex items-center gap-1 px-1" title="Tamaño de las estrellas">
-              <Star className="w-3 h-3 text-amber-300" />
-              <Slider
-                min={0.3}
-                max={3}
-                step={0.1}
-                value={[starSize]}
-                onValueChange={([v]) => setStarSize(v)}
-                className="w-14"
-              />
-            </div>
-          )}
-          <ToggleButton
-            active={smoothCapture}
-            onClick={() => setSmoothCapture(!smoothCapture)}
-            title="Suavizar curvas en la captura PNG"
-          >
-            <Sparkles className="w-3.5 h-3.5" />
+             <Sparkles className="w-3.5 h-3.5" />
           </ToggleButton>
           <ToggleButton onClick={capturePNG} title="Capturar PNG (fondo transparente)">
-            <Camera className="w-3.5 h-3.5" />
-          </ToggleButton>
-          <ToggleButton
-            active={false}
-            onClick={() => setShowFxConfigModal(true)}
-            title="Configuración de FX"
-          >
-            <Settings className="w-3.5 h-3.5" />
+             <Camera className="w-3.5 h-3.5" />
           </ToggleButton>
         </div>
       </div>
