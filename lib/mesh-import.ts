@@ -7,12 +7,12 @@ import type { Mesh, Vertex3D } from '@/lib/geometry';
 
 export type ImportFormat = 'obj' | 'glb' | 'gltf' | 'stl' | 'ply';
 
-export const IMPORT_FORMATS: { ext: string; label: string; format: ImportFormat; desc: string }[] = [
-  { ext: '.obj', label: 'OBJ', format: 'obj', desc: 'Wavefront 3D' },
-  { ext: '.glb', label: 'GLB', format: 'glb', desc: 'glTF binario' },
-  { ext: '.gltf', label: 'GLTF', format: 'gltf', desc: 'glTF (JSON)' },
-  { ext: '.stl', label: 'STL', format: 'stl', desc: 'Estereolitografía' },
-  { ext: '.ply', label: 'PLY', format: 'ply', desc: 'Stanford Polygon' },
+export const IMPORT_FORMATS: { ext: string; label: string; format: ImportFormat; descKey: string }[] = [
+  { ext: '.obj', label: 'OBJ', format: 'obj', descKey: 'editor3D.importFormats.obj' },
+  { ext: '.glb', label: 'GLB', format: 'glb', descKey: 'editor3D.importFormats.glb' },
+  { ext: '.gltf', label: 'GLTF', format: 'gltf', descKey: 'editor3D.importFormats.gltf' },
+  { ext: '.stl', label: 'STL', format: 'stl', descKey: 'editor3D.importFormats.stl' },
+  { ext: '.ply', label: 'PLY', format: 'ply', descKey: 'editor3D.importFormats.ply' },
 ];
 
 export function getFormatFromExtension(filename: string): ImportFormat | null {

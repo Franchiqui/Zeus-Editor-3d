@@ -1423,8 +1423,20 @@ export default function EditorCanvas({
                   />
                 </g>
               );
-            })}
-          </svg>
+             })}
+             </svg>
+             {axisLabel && (
+               <div className="absolute bottom-2 left-2 flex items-center gap-3 pointer-events-none z-10">
+                 <div className="flex items-center gap-0.5 text-xs text-green-400 font-mono">
+                   <span>→</span>
+                   <span>{axisLabel.split('·')[0]}</span>
+                 </div>
+                 <div className="flex items-center gap-0.5 text-xs text-pink-400 font-mono">
+                   <span>↑</span>
+                   <span>{axisLabel.split('·')[1]}</span>
+                 </div>
+               </div>
+             )}
           {/* Capa de la mano: mientras está activada, cubre el lienzo para
               que arrastrar mueva la vista en vez de dibujar. Doble clic
               vuelve a centrar el lienzo. */}

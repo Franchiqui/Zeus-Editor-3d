@@ -173,74 +173,86 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
         viewName={viewName}
       />
     </div>
-    <div className="flex-1 min-h-0">
-      <Viewer3D
-        key={`${viewName}-${editingState}`}
-        mesh={viewerMesh}
-        objects={visibleSceneObjects}
-        configObjectId={configObjectId}
-        configMesh={triMesh}
-        configSmooth={smoothShadingValue}
-        configProjection={textureProjection}
-         selectedObjectId={selectedObjectId ?? undefined}
-         onObjectSelect={handleObjectSelect}
-         selectedObjectIds={selectedObjectIds}
-         onSelectionChange={onSelectionChange}
-          selectionMode={selectionMode}
-          onSelectionModeChange={onSelectionModeChange}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={onFaceSelectionChange}
-          onFaceSelectionModeChange={onFaceSelectionModeChange}
-          onFaceSelectionToolChange={onFaceSelectionToolChange}
-         onMultiObjectTransform={onMultiObjectTransform}
-          objectName={objectName}
-          onObjectNameChange={onObjectNameChange}
-          gizmo={showGizmo}
-          booleanToolObjectId={booleanToolObjectId}
-          forceObjectsUpdate={forceUpdate}
-         objectTransform={
-          sceneObjects.find((o) => o.id === selectedObjectId)?.transform
-        }
-        onObjectTransform={handleObjectTransform}
-        onVerticesChange={handleVerticesChange}
-        showVerticesDefault={false}
-        showLatheAxis={showLatheAxis}
-        textureProjection={viewerProjection}
-        textureHelper={textureHelper}
-         textureHelperTransform={textureHelperTransform}
-         onTextureHelperTransform={setTextureHelperTransform}
-         textureRepeat={textureRepeat}
-        lightConfig={lightConfig}
-        showLightHelpers={showLightHelpers}
-        showGround={showGround}
-         groundTexture={groundTexture}
-          groundTextureRepeat={groundTextureRepeat}
-          groundTextureFinish={groundTextureFinish}
-         objectTextureFinish={objectTextureFinish}
-        skyboxImage={skyboxImage}
-        showGrid={showGrid}
-        onShowGridChange={setShowGrid}
-        fxConfig={fxConfig}
-        onFxChange={(fx) => setFxConfig((prev) => ({ ...prev, ...fx }))}
-        onLightConfigChange={setLightConfig}
-        camera3D={panelCameras[viewName]}
-        onCameraChange={(cam) => handleCameraChange(viewName, cam)}
-         onCameraMove={onCameraMove}
-        showCameraPathGizmo={showCameraPathGizmo}
-        showCameraPath={showCameraPath}
-        cameraViewMode={cameraViewMode}
-        onCameraGizmoMove={onCameraGizmoMove}
-        selectedKeyframeIndex={selectedKeyframeIndex}
-        animationTracks={animationTracks}
-        animationTime={animationTime}
-        onAnimationComplete={onAnimationComplete}
-        smoothShading={viewerSmooth}
-        exportMp4Trigger={exportMp4Trigger}
-        onExportProgress={onExportProgress}
-        onExportComplete={onExportComplete}
-      />
-    </div>
-  </div>
+     <div className="flex-1 min-h-0">
+       <Viewer3D
+         key={`${viewName}-${editingState}`}
+         mesh={viewerMesh}
+         objects={visibleSceneObjects}
+         configObjectId={configObjectId}
+         configMesh={triMesh}
+         configSmooth={smoothShadingValue}
+         configProjection={textureProjection}
+          selectedObjectId={selectedObjectId ?? undefined}
+          onObjectSelect={handleObjectSelect}
+          selectedObjectIds={selectedObjectIds}
+          onSelectionChange={onSelectionChange}
+           selectionMode={selectionMode}
+           onSelectionModeChange={onSelectionModeChange}
+           faceSelectMode={faceSelectMode}
+           faceSelectionTool={faceSelectionTool}
+           selectedFaceIds={selectedFaceIds}
+           onFaceSelectionChange={onFaceSelectionChange}
+           onFaceSelectionModeChange={onFaceSelectionModeChange}
+           onFaceSelectionToolChange={onFaceSelectionToolChange}
+          onMultiObjectTransform={onMultiObjectTransform}
+           objectName={objectName}
+           onObjectNameChange={onObjectNameChange}
+           gizmo={showGizmo}
+           booleanToolObjectId={booleanToolObjectId}
+           forceObjectsUpdate={forceUpdate}
+          objectTransform={
+           sceneObjects.find((o) => o.id === selectedObjectId)?.transform
+         }
+         onObjectTransform={handleObjectTransform}
+         onVerticesChange={handleVerticesChange}
+         showVerticesDefault={false}
+         showLatheAxis={showLatheAxis}
+         textureProjection={viewerProjection}
+         textureHelper={textureHelper}
+          textureHelperTransform={textureHelperTransform}
+          onTextureHelperTransform={setTextureHelperTransform}
+          textureRepeat={textureRepeat}
+         lightConfig={lightConfig}
+         showLightHelpers={showLightHelpers}
+         showGround={showGround}
+          groundTexture={groundTexture}
+           groundTextureRepeat={groundTextureRepeat}
+           groundTextureFinish={groundTextureFinish}
+          objectTextureFinish={objectTextureFinish}
+         skyboxImage={skyboxImage}
+         showGrid={showGrid}
+         onShowGridChange={setShowGrid}
+         fxConfig={fxConfig}
+         onFxChange={(fx) => setFxConfig((prev) => ({ ...prev, ...fx }))}
+         onLightConfigChange={setLightConfig}
+         camera3D={panelCameras[viewName]}
+         onCameraChange={(cam) => handleCameraChange(viewName, cam)}
+          onCameraMove={onCameraMove}
+         showCameraPathGizmo={showCameraPathGizmo}
+         showCameraPath={showCameraPath}
+         cameraViewMode={cameraViewMode}
+         onCameraGizmoMove={onCameraGizmoMove}
+         selectedKeyframeIndex={selectedKeyframeIndex}
+         animationTracks={animationTracks}
+         animationTime={animationTime}
+         onAnimationComplete={onAnimationComplete}
+         smoothShading={viewerSmooth}
+         exportMp4Trigger={exportMp4Trigger}
+         onExportProgress={onExportProgress}
+         onExportComplete={onExportComplete}
+       />
+       {viewName !== '3d' && (
+         <div className="absolute bottom-2 left-2 flex items-center gap-2 pointer-events-none z-10">
+           <div className="flex items-center gap-0.5 text-xs text-green-400 font-mono">
+             <span>→</span>
+             <span>{viewName === 'front' ? 'X' : viewName === 'side' ? 'Z' : 'X'}</span>
+           </div>
+           <div className="flex items-center gap-0.5 text-xs text-pink-400 font-mono">
+             <span>↑</span>
+             <span>{viewName === 'front' || viewName === 'side' ? 'Y' : 'Z'}</span>
+           </div>
+         </div>
+       )}
+     </div>
+   </div>
 );

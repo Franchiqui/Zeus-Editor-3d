@@ -2508,7 +2508,6 @@ export default function Viewer3D({
             }
           }
         } else if (!faceSelectModeRef.current) {
-          console.log('[FaceSelect] animate loop hiding overlays, faceSelectModeRef =', faceSelectModeRef.current);
           // Only hide 3D overlay when NOT in face select mode
           if (faceSelectionOverlayRef.current) {
             faceSelectionOverlayRef.current.traverse((child) => {
@@ -2790,7 +2789,6 @@ export default function Viewer3D({
 
         // --- Face selection: update overlay during drag ---
         if (faceSelectionStartRef.current && faceSelectModeRef.current) {
-          console.log('[FaceSelect] onPointerMove: updating overlay, tool =', faceSelectionToolRef.current);
           const start = faceSelectionStartRef.current;
           const startRect = start.rect;
           const canvasRect = startRect;
@@ -2804,7 +2802,6 @@ export default function Viewer3D({
             const width = Math.abs(dx);
             const height = Math.abs(dy);
           const rectDiv = faceSelectionRectDivRef.current;
-          console.log('[FaceSelect] rectDiv found:', !!rectDiv, 'width:', width, 'height:', height);
           if (rectDiv) {
               if (width > 2 && height > 2) {
                 rectDiv.style.display = 'block';
@@ -3458,8 +3455,7 @@ export default function Viewer3D({
        }
 
         // --- Face selection: start drag ---
-        if (faceSelectModeRef.current && !gizmoDragRef.current) {
-          console.log('[FaceSelect] onPointerDown: faceSelectModeRef =', faceSelectModeRef.current, 'mountEl =', !!mountRef.current);
+         if (faceSelectModeRef.current && !gizmoDragRef.current) {
           const rect = renderer.domElement.getBoundingClientRect();
           faceSelectionStartRef.current = {
             x: e.clientX,
@@ -3471,9 +3467,8 @@ export default function Viewer3D({
           faceSelectionPointsRef.current = [];
 
           // Create / ensure HTML overlays for selection shapes
-          const mountEl = mountRef.current;
-          console.log('[FaceSelect] creating overlays, mountEl =', !!mountEl);
-          if (mountEl) {
+           const mountEl = mountRef.current;
+           if (mountEl) {
             if (!faceSelectionRectDivRef.current) {
               const div = document.createElement('div');
               div.style.position = 'absolute';
@@ -5761,12 +5756,59 @@ export default function Viewer3D({
   const resetCamera = useCallback(() => {
     const cam = cameraRef.current;
     const ctrl = controlsRef.current;
-    if (cam && ctrl) {
+    if (!cam || !ctrl) return;
+
+    const camConfig = camera3D;
+    const baseDistance = 5.5;
+
+    if (camConfig) {
+      const isFrontView =
+        Math.abs(camConfig.rotationY) < 0.01 && Math.abs(camConfig.rotationX) < 0.01;
+      const isTopView =
+        Math.abs(camConfig.rotationY) < 0.01 &&
+        Math.abs(camConfig.rotationX - Math.PI / 2) < 0.01;
+      const isSideView =
+        Math.abs(camConfig.rotationY - Math.PI / 2) < 0.01 &&
+        Math.abs(camConfig.rotationX) < 0.01;
+
+      if (isFrontView) {
+        cam.position.set(camConfig.offsetX, camConfig.offsetY, baseDistance);
+        ctrl.target.set(camConfig.offsetX, camConfig.offsetY, 0);
+      } else if (isTopView) {
+        cam.position.set(camConfig.offsetX, baseDistance, camConfig.offsetY);
+        ctrl.target.set(camConfig.offsetX, 0, camConfig.offsetY);
+      } else if (isSideView) {
+        cam.position.set(baseDistance, camConfig.offsetY, camConfig.offsetX);
+        ctrl.target.set(0, camConfig.offsetY, camConfig.offsetX);
+      } else {
+        cam.position.set(3, 2.5, 4);
+        ctrl.target.set(0, 0, 0);
+      }
+    } else {
       cam.position.set(3, 2.5, 4);
       ctrl.target.set(0, 0, 0);
-      ctrl.update();
     }
-  }, []);
+
+    ctrl.update();
+
+    const onCamChange = onCameraChangeRef.current;
+    if (onCamChange) {
+      const pos = cam.position;
+      const tgt = ctrl.target;
+      const dist = pos.distanceTo(tgt);
+      const zoom = Math.max(0.1, Math.min(5, dist > 0 ? baseDistance / dist : 1));
+      const dir = pos.clone().sub(tgt).normalize();
+      const rotX = Math.asin(Math.max(-1, Math.min(1, dir.y)));
+      const rotY = Math.atan2(dir.x, dir.z);
+      onCamChange({
+        zoom,
+        offsetX: tgt.x,
+        offsetY: tgt.y,
+        rotationX: Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, rotX)),
+        rotationY: rotY,
+      });
+    }
+  }, [camera3D]);
 
   return (
     <div className="flex flex-col h-full">

@@ -80,6 +80,7 @@ import {
   readProject,
   saveProject,
 } from '@/lib/electron-fs';
+import { useI18n, LANGUAGES } from '@/lib/i18n';
 import {
   Boxes,
   BoxSelect,
@@ -105,9 +106,10 @@ import {
   Redo2,
   Image as ImageIcon,
   X,
-  RotateCw,
-  RotateCcw,
-  ChevronUp,
+   RotateCw,
+   RotateCcw,
+   Globe,
+   ChevronUp,
   ChevronDown,
   Copy,
   ClipboardPaste,
@@ -179,6 +181,12 @@ type EditorClipboard = {
 
 type MultiObjectClipboard = {
   objects: SceneObject[];
+};
+
+type ObjectGroup = {
+  id: string;
+  name: string;
+  objectIds: string[];
 };
 
 type SceneObject = {
@@ -299,18 +307,12 @@ type HistoryState = {
   sceneObjects: SceneObject[];
   selectedObjectId: string | null;
   configObjectId: string | null;
+  /** Grupos de objetos definidos por el usuario */
+  groups: ObjectGroup[];
   /** Polilíneas libres de los lienzos 2D, por lienzo (solo 2D) */
   polylines: PolylinesByCanvas;
 };
 
-const VIEW_LABELS: Record<keyof Views, { label: string; axisLabel: string }> = {
-  front: { label: 'Frente', axisLabel: 'X·Y' },
-  side: { label: 'Costado', axisLabel: 'Z·Y' },
-  top: { label: 'Superior', axisLabel: 'X·Z' },
-};
-
-const NO_FOLDER_3D_MSG =
-  'Configura primero la carpeta de Objetos 3D en Archivos → Configurar Carpetas Multimedia';
 const DEFAULT_LATHE_PROFILE: Polygon = [
   { x: 0.3, y: -0.6 },
   { x: 0.8, y: -0.6 },
@@ -628,6 +630,7 @@ function SectionTools({
   sectionY?: number;
   onMoveY?: (delta: number) => void;
 }) {
+  const { t } = useI18n();
   // El campo de vértices se confirma al pulsar Enter o al salir del
   // campo, para que escribir un número de dos cifras no vaya aplicando
   // cada dígito.
@@ -646,11 +649,11 @@ function SectionTools({
   return (
     <div className="flex items-center gap-3 text-[10px]">
       <div className="flex items-center gap-1">
-        <span className="text-muted-foreground">Escala</span>
+        <span className="text-muted-foreground">{t('')}</span>
         <button
           type="button"
           className={btn}
-          title="Hacer la plantilla un 5% más pequeña, sin deformarla"
+          title={t('editor3D.sectionTools.shrink')}
           onClick={() => onChange(scalePolygonUniform(polygon, 0.95))}
         >
           <Minus className="w-3 h-3" />
@@ -658,18 +661,18 @@ function SectionTools({
         <button
           type="button"
           className={btn}
-          title="Hacer la plantilla un 5% más grande, sin deformarla"
+          title={t('editor3D.sectionTools.grow')}
           onClick={() => onChange(scalePolygonUniform(polygon, 1.05))}
         >
           <Plus className="w-3 h-3" />
         </button>
       </div>
       <div className="flex items-center gap-1">
-        <span className="text-muted-foreground">Girar</span>
+        <span className="text-muted-foreground">{t('')}</span>
         <button
           type="button"
           className={btn}
-          title="Girar la plantilla 15° a la izquierda (gira sobre sí misma)"
+          title={t('editor3D.sectionTools.rotateLeft')}
           onClick={() => onChange(rotatePolygonInPlace(polygon, -Math.PI / 12))}
         >
           <RotateCcw className="w-3 h-3" />
@@ -677,7 +680,7 @@ function SectionTools({
         <button
           type="button"
           className={btn}
-          title="Girar la plantilla 15° a la derecha (gira sobre sí misma)"
+          title={t('editor3D.sectionTools.rotateRight')}
           onClick={() => onChange(rotatePolygonInPlace(polygon, Math.PI / 12))}
         >
           <RotateCw className="w-3 h-3" />
@@ -685,7 +688,7 @@ function SectionTools({
       </div>
       {typeof sectionY === 'number' && onMoveY && (
         <div className="flex items-center gap-1">
-          <span className="text-muted-foreground">Altura</span>
+          <span className="text-muted-foreground">{t('editor3D.sectionTools.height')}</span>
           <span className="font-mono text-[10px] text-green-400">
             Y = {sectionY.toFixed(2)}
           </span>
@@ -693,7 +696,7 @@ function SectionTools({
           <button
             type="button"
             className={btn}
-            title="Subir la plantilla (altura Y)"
+            title={t('editor3D.raiseTemplate')}
             disabled={sectionY <= 0}
             onClick={() => onMoveY(-0.05)}
           >
@@ -702,7 +705,7 @@ function SectionTools({
           <button
             type="button"
             className={btn}
-            title="Bajar la plantilla (altura Y)"
+            title={t('editor3D.lowerTemplate')}
             disabled={sectionY >= 1}
             onClick={() => onMoveY(0.05)}
           >
@@ -711,11 +714,11 @@ function SectionTools({
         </div>
       )}
       <div className="flex items-center gap-1">
-        <span className="text-muted-foreground">Vértices</span>
+        <span className="text-muted-foreground">{t('')}</span>
         <button
           type="button"
           className={btn}
-          title="Quitar el vértice que menos cambia la forma"
+          title={t('editor3D.sectionTools.removeVertex')}
           onClick={() =>
             onChange(setPolygonVertexCount(polygon, polygon.length - 1))
           }
@@ -732,13 +735,13 @@ function SectionTools({
           onKeyDown={(e) => {
             if (e.key === 'Enter') commitVertices();
           }}
-          title="Número de vértices: súmale o réstale sin cambiar la forma (Enter para aplicar)"
+          title={t('editor3D.sectionTools.vertexCount')}
           className="w-11 px-1 py-0.5 rounded bg-black/60 border border-white/10 text-foreground font-mono"
         />
         <button
           type="button"
           className={btn}
-          title="Añadir un vértice en la arista más larga, sin cambiar la forma"
+          title={t('editor3D.sectionTools.addVertex')}
           onClick={() =>
             onChange(setPolygonVertexCount(polygon, polygon.length + 1))
           }
@@ -751,6 +754,7 @@ function SectionTools({
 }
 
 export default function Home() {
+  const { t, locale, setLocale } = useI18n();
   const [views, setViews] = useState<Views>(DEFAULT_VIEWS);
   const [editedVertices, setEditedVertices] = useState<Vertex3D[] | null>(null);
   const [resolution, setResolution] = useState(32);
@@ -1101,7 +1105,7 @@ export default function Home() {
     );
     if (!section) return null;
     return {
-      name: `la Plantilla ${meshSections.indexOf(section) + 1}`,
+       name: t('editor3D.templateN', { n: meshSections.indexOf(section) + 1 }),
       polygon: section.polygon,
       apply: (poly: Polygon) => {
         replaceMeshSectionPolygon(section.id, poly);
@@ -1196,7 +1200,10 @@ export default function Home() {
   // fotografía en cada paso.
   const [sceneObjects, setSceneObjects] = useState<SceneObject[]>([]);
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
-  const [selectedObjectIds, setSelectedObjectIds] = useState<string[]>([]);
+    const [selectedObjectIds, setSelectedObjectIds] = useState<string[]>([]);
+    const [groups, setGroups] = useState<ObjectGroup[]>([]);
+  const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState('');
    const [selectionMode, setSelectionMode] = useState(false);
    const [faceSelectMode, setFaceSelectMode] = useState(false);
    const [faceSelectionTool, setFaceSelectionTool] = useState<'rectangle' | 'circle' | 'polygon'>('rectangle');
@@ -1256,6 +1263,7 @@ export default function Home() {
    const [playing, setPlaying] = useState(false);
     const [currentTime, setCurrentTime] = useState(0.1);
     const [showKeyframeEditor, setShowKeyframeEditor] = useState(false);
+    const [showGroupsPanel, setShowGroupsPanel] = useState(true);
 
     useEffect(() => {
       if (cameraViewMode && animationTracks.length > 0) {
@@ -1430,6 +1438,7 @@ export default function Home() {
       sceneObjects,
       selectedObjectId,
       configObjectId,
+      groups,
       polylines,
     });
 
@@ -1487,6 +1496,7 @@ export default function Home() {
           lastState.latheSegments === currentState.latheSegments &&
           lastState.latheClamp === currentState.latheClamp &&
           lastState.latheFigureColor === currentState.latheFigureColor &&
+          same(lastState.groups, currentState.groups) &&
           same(lastState.polylines, currentState.polylines);
 
         if (isSame) return;
@@ -1590,6 +1600,7 @@ export default function Home() {
     setSceneObjects(state.sceneObjects);
     setSelectedObjectId(state.selectedObjectId);
     setConfigObjectId(state.configObjectId);
+    setGroups(state.groups ?? []);
     // Fotos antiguas sin polilíneas: se restauran como lienzo vacío
     setPolylines(state.polylines ?? {});
   }, []);
@@ -1809,7 +1820,7 @@ export default function Home() {
     }));
        const newTrack: AnimationTrack = {
        id: `camerapath_${Date.now()}`,
-       name: 'Recorrido de cámara',
+        name: t('editor3D.cameraPathTrack'),
        objectId: null,
         duration: duration * 1000,
        looping: false,
@@ -1904,7 +1915,7 @@ export default function Home() {
     } catch {
       setImportMsg({
         ok: false,
-        text: 'No se encontró esa fuente en Google Fonts',
+         text: t('editor3D.fontNotFound'),
       });
     } finally {
       setImporting(false);
@@ -1938,7 +1949,7 @@ export default function Home() {
         file.name
           .replace(/\.[^.]*$/, '')
           .replace(/[^\w\s-]/g, '')
-          .trim() || 'Fuente local';
+           .trim() || t('editor3D.localFont');
       const familyName = `LocalFont-${baseName.replace(/\s+/g, '')}`;
 
       const styleId = `local-font-${familyName}`;
@@ -1972,7 +1983,7 @@ export default function Home() {
     } catch {
       setLocalFontMsg({
         ok: false,
-        text: 'No se pudo cargar la fuente (formato no soportado)',
+         text: t('editor3D.fontLoadFailed'),
       });
     } finally {
       setLocalFontLoading(false);
@@ -2943,6 +2954,7 @@ export default function Home() {
       }),
       configObjectId,
       selectedObjectId,
+      groups,
       editorGridResolution,
       editorCanvasZoom,
       meshSilhouette,
@@ -2982,22 +2994,22 @@ export default function Home() {
         a.download = `${name}.zeus`;
         a.click();
         URL.revokeObjectURL(url);
-        setSaveMsg({ ok: true, text: `Descargado como ${name}.zeus` });
+        setSaveMsg({ ok: true, text: t('editor3D.downloadedAs', { name }) });
       } else {
         const paths = await getLocalPaths();
         const folder = paths?.objetos_3d;
         if (!folder) {
-          setSaveMsg({ ok: false, text: NO_FOLDER_3D_MSG });
+          setSaveMsg({ ok: false, text: t('editor3D.noFolder3dMsg') });
           return;
         }
         const ok = await saveProject(`${folder}/${name}.zeus`, projectData);
-        if (!ok) throw new Error('No se pudo escribir el archivo');
-        setSaveMsg({ ok: true, text: `Guardado como ${name}.zeus` });
+        if (!ok) throw new Error(t('editor3D.cannotWriteFile'));
+        setSaveMsg({ ok: true, text: t('editor3D.savedAs', { name }) });
       }
     } catch (e: unknown) {
       setSaveMsg({
         ok: false,
-        text: e instanceof Error ? e.message : 'Error al guardar',
+        text: e instanceof Error ? e.message : t('editor3D.errorSaving'),
       });
     } finally {
       setSavingObject(false);
@@ -3164,7 +3176,7 @@ export default function Home() {
           setSceneObjects(
             data.sceneObjects.map((obj: Partial<SceneObject>, i: number) => ({
               ...obj,
-              name: obj.name ?? `Objeto ${i + 1}`,
+              name: obj.name ?? t('editor3D.objectN', { n: i + 1 }),
             }))
           );
           const loadedSelected =
@@ -3177,13 +3189,32 @@ export default function Home() {
           // objeto activo, como siempre). Los demás se reconstruyen con
           // su propia figura guardada.
           setConfigObjectId(
-            typeof data.configObjectId === 'string' &&
-              data.sceneObjects.some(
-                (o: { id?: string }) => o.id === data.configObjectId
-              )
-              ? data.configObjectId
-              : loadedSelected
+              typeof data.configObjectId === 'string' &&
+                data.sceneObjects.some(
+                  (o: { id?: string }) => o.id === data.configObjectId
+                )
+                ? data.configObjectId
+                : loadedSelected
           );
+          // Restore groups (filter out any object IDs that no longer exist)
+          if (Array.isArray(data.groups)) {
+            const validIds = new Set(
+              data.sceneObjects.map((o: { id?: string }) => o.id)
+            );
+            setGroups(
+              data.groups
+                .map((g: Partial<ObjectGroup>, i: number) => ({
+                  id: g.id ?? `group-${i}`,
+                  name: g.name ?? t('editor3D.groupN', { n: i + 1 }),
+                  objectIds: Array.isArray(g.objectIds)
+                    ? g.objectIds.filter((oid: string) => validIds.has(oid))
+                    : [],
+                }))
+                .filter((g: ObjectGroup) => g.objectIds.length > 0)
+            );
+          } else {
+            setGroups([]);
+          }
           // Los controles de textura muestran los ajustes del objeto que
           // estaba seleccionado al guardar (los suyos guardados en su
           // figura), no los del dueño.
@@ -3242,6 +3273,7 @@ export default function Home() {
           setSceneObjects([]);
           setSelectedObjectId(null);
           setConfigObjectId(null);
+          setGroups([]);
         }
         if (typeof data.editorGridResolution === 'number')
           setEditorGridResolution(data.editorGridResolution);
@@ -3295,7 +3327,7 @@ export default function Home() {
       } catch (e: unknown) {
         setObj3dMsg({
           ok: false,
-          text: e instanceof Error ? e.message : 'Error al cargar',
+          text: e instanceof Error ? e.message : t('editor3D.errorLoading'),
         });
       }
     },
@@ -3315,7 +3347,7 @@ export default function Home() {
       } catch (e: unknown) {
         setObj3dMsg({
           ok: false,
-          text: e instanceof Error ? e.message : 'Error al cargar',
+          text: e instanceof Error ? e.message : t('editor3D.errorLoading'),
         });
       } finally {
         setObj3dCreating(false);
@@ -3330,19 +3362,19 @@ export default function Home() {
       setModelImportMsg(null);
       // Límite de tamaño de archivo: 500 MB
       if (file.size > 500 * 1024 * 1024) {
-        setModelImportMsg({ ok: false, text: 'El archivo es demasiado grande (máx. 500 MB)' });
+        setModelImportMsg({ ok: false, text: t('editor3D.fileTooLarge') });
         return;
       }
       const format = getFormatFromExtension(file.name);
       if (!format) {
-        setModelImportMsg({ ok: false, text: 'Formato no soportado' });
+        setModelImportMsg({ ok: false, text: t('editor3D.unsupportedFormat') });
         return;
       }
       try {
         const arrayBuffer = await file.arrayBuffer();
         const result = await importModelFile(format, arrayBuffer);
         if (!result) {
-          setModelImportMsg({ ok: false, text: 'No se pudieron extraer vértices del modelo' });
+          setModelImportMsg({ ok: false, text: t('editor3D.cannotExtractVertices') });
           return;
         }
         const { meshes } = result;
@@ -3350,13 +3382,13 @@ export default function Home() {
         let totalVertices = 0;
         for (const m of meshes) {
           if (m.vertices.length === 0) {
-            setModelImportMsg({ ok: false, text: 'El modelo no contiene vértices' });
+            setModelImportMsg({ ok: false, text: t('editor3D.noVertices') });
             return;
           }
           totalVertices += m.vertices.length;
         }
         if (totalVertices > 10000000) {
-          setModelImportMsg({ ok: false, text: `Demasiados vértices (${totalVertices}). Máximo 10.000,000.` });
+          setModelImportMsg({ ok: false, text: t('editor3D.tooManyVertices', { total: totalVertices }) });
           return;
         }
         // Normalizamos y centramos todas las piezas juntas
@@ -3367,7 +3399,7 @@ export default function Home() {
           ...objects,
           ...meshes.map((mesh, i) => ({
             id: i === 0 ? baseId : `${baseId}-${i}`,
-            name: `Pieza ${i + 1}`,
+            name: t('editor3D.pieceN', { n: i + 1 }),
             transform: { px: 0, py: 0, pz: 0, sx: 1, sy: 1, sz: 1, rx: 0, ry: 0, rz: 0 },
             mesh: structuredClone(mesh),
             smooth: true,
@@ -3375,11 +3407,11 @@ export default function Home() {
         ]);
         // Seleccionamos la primera pieza
         setSelectedObjectId(baseId);
-        setModelImportMsg({ ok: true, text: `Importado: ${meshes.length} pieza(s), ${totalVertices} vértices` });
+        setModelImportMsg({ ok: true, text: t('editor3D.importedMsg', { pieces: meshes.length, vertices: totalVertices }) });
       } catch (e: unknown) {
         setModelImportMsg({
           ok: false,
-          text: e instanceof Error ? e.message : 'Error al importar el modelo',
+          text: e instanceof Error ? e.message : t('editor3D.errorImportModel'),
         });
       }
     },
@@ -3474,10 +3506,8 @@ export default function Home() {
           );
         }
       } catch {
-        setObj3dMsg({
-          ok: false,
-          text: 'No se pudo leer la carpeta public/Obj-3D',
-        });
+        // Si no se puede leer public/Obj-3D, mostrar la lista vacía
+        // sin interrumpir la experiencia del usuario
       }
     } finally {
       setObj3dLoading(false);
@@ -3495,18 +3525,18 @@ export default function Home() {
         const res = await fetch(`/Obj-3D/${encodeURIComponent(file.name)}`, {
           cache: 'no-store',
         });
-        if (!res.ok) throw new Error('No se pudo leer el archivo');
+        if (!res.ok) throw new Error(t('editor3D.cannotReadFile'));
         const data = await res.json();
         if (!data || data.type !== 'editor3d') {
           throw new Error(
-            `"${file.name}" no es un objeto 3D guardado desde este editor`
+            t('editor3D.notA3dObject', { name: file.name })
           );
         }
         // Figura a crear: la del dueño de la configuración guardada (o la
         // primera con malla que traiga el archivo).
         const source = extractObj3dMesh(data);
         if (!source) {
-          throw new Error(`"${file.name}" no trae ninguna figura guardada`);
+          throw new Error(t('editor3D.noSavedShape', { name: file.name }));
         }
         const current = sceneObjects.find(
           (object) => object.id === selectedObjectId
@@ -3516,7 +3546,7 @@ export default function Home() {
           ...objects,
           {
             id: newId,
-            name: `Copia de ${source.name ?? 'objeto'}`,
+            name: t('editor3D.copyOf', { name: source.name ?? t('editor3D.defaultObjectName') }),
             mode, // Solo visible en esta pestaña
             transform: {
               ...(current?.transform ?? IDENTITY_TRANSFORM),
@@ -3531,7 +3561,7 @@ export default function Home() {
       } catch (e: unknown) {
         setObj3dMsg({
           ok: false,
-          text: e instanceof Error ? e.message : 'Error al crear el objeto',
+          text: e instanceof Error ? e.message : t('editor3D.errorCreatingObject'),
         });
       } finally {
         setObj3dCreating(false);
@@ -3845,9 +3875,9 @@ export default function Home() {
        setViewRefreshTick((t) => t + 1);
      },
      []
-   );
+     );
 
-  const handleObjectSelect = useCallback(
+    const handleObjectSelect = useCallback(
     (id: string | null) => {
       // Clic sobre el objeto que ya estaba seleccionado: no cambia
       // nada. (Sin esto, re-congelaría al dueño con la configuración
@@ -3915,9 +3945,81 @@ export default function Home() {
       mode,
       selectedObjectIds,
     ]
+     );
+
+    const createGroupFromSelection = useCallback(() => {
+      if (selectedObjectIds.length === 0) {
+        toast.warning(t('editor3D.selectObjectToGroup'));
+        return;
+      }
+      const groupName = t('editor3D.groupN', { n: groups.length + 1 });
+      const newGroup: ObjectGroup = {
+        id: `group-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        name: groupName,
+        objectIds: [...selectedObjectIds],
+      };
+      setGroups((prev) => [...prev, newGroup]);
+      toast.success(t('editor3D.groupCreated', { name: groupName, count: selectedObjectIds.length }));
+    }, [selectedObjectIds, groups.length]);
+
+    const selectGroup = useCallback(
+      (groupId: string) => {
+        const group = groups.find((g) => g.id === groupId);
+        if (!group) return;
+        const existingIds = sceneObjects
+          .filter((o) => group.objectIds.includes(o.id))
+          .map((o) => o.id);
+        if (existingIds.length === 0) return;
+        setSelectedObjectIds(existingIds);
+        if (existingIds.length === 1) {
+          handleObjectSelect(existingIds[0]);
+        } else {
+          setSelectedObjectId(existingIds[0]);
+        }
+      },
+      [groups, sceneObjects, handleObjectSelect]
     );
 
-  const handleMultiObjectTransform = useCallback(
+    const renameGroup = useCallback(
+      (groupId: string, newName: string) => {
+        setGroups((prev) =>
+          prev.map((g) =>
+            g.id === groupId ? { ...g, name: newName || t('editor3D.groupN', { n: groups.findIndex((gg) => gg.id === groupId) + 1 }) } : g
+          )
+        );
+      },
+      [groups]
+    );
+
+    const removeGroup = useCallback((groupId: string) => {
+      setGroups((prev) => prev.filter((g) => g.id !== groupId));
+    }, []     );
+
+    const toggleGroupHidden = useCallback(
+      (groupId: string) => {
+        const group = groups.find((g) => g.id === groupId);
+        if (!group) return;
+        group.objectIds.forEach((oid) => {
+          const obj = sceneObjects.find((o) => o.id === oid);
+          if (obj) toggleObjectHidden(oid);
+        });
+      },
+      [groups, sceneObjects, toggleObjectHidden]
+    );
+
+    const toggleGroupFrozen = useCallback(
+      (groupId: string) => {
+        const group = groups.find((g) => g.id === groupId);
+        if (!group) return;
+        group.objectIds.forEach((oid) => {
+          const obj = sceneObjects.find((o) => o.id === oid);
+          if (obj) toggleObjectFrozen(oid);
+        });
+      },
+      [groups, sceneObjects, toggleObjectFrozen]
+    );
+
+    const handleMultiObjectTransform = useCallback(
     (transforms: { id: string; transform: ObjectTransform }[]) => {
       setSceneObjects((prev) =>
         prev.map((obj) => {
@@ -3963,7 +4065,7 @@ export default function Home() {
         const pastedObjects: SceneObject[] = copiedObjects.map((obj, i) => ({
           ...structuredClone(obj),
           id: `object-${Date.now()}-${i}`,
-          name: `Copia de ${obj.name ?? 'objeto'}`,
+          name: t('editor3D.copyOf', { name: obj.name ?? t('editor3D.defaultObjectName') }),
           transform: {
             ...obj.transform,
             px: baseTransform.px + (obj.transform.px - centerX) + offsetX,
@@ -3999,7 +4101,7 @@ export default function Home() {
         ...objects,
         {
           id: `object-${Date.now()}`,
-          name: `Objeto ${sceneObjects.length + 1}`,
+          name: t('editor3D.objectN', { n: sceneObjects.length + 1 }),
           mode: mode, // Solo visible en esta pestaña
           transform: {
             ...(current?.transform ?? IDENTITY_TRANSFORM),
@@ -4034,7 +4136,7 @@ export default function Home() {
       ...current,
       {
         id: duplicateId,
-        name: `Copia de ${selected?.name ?? 'objeto'}`,
+        name: t('editor3D.copyOf', { name: selected?.name ?? t('editor3D.defaultObjectName') }),
         transform: { ...baseTransform, px: baseTransform.px + 1.5 },
          mesh: structuredClone(cb.mesh),
          smooth: cb.smooth,
@@ -4202,7 +4304,7 @@ export default function Home() {
       const toolObj = sceneObjects.find((o) => o.id === toolObjectId);
 
       if (!baseObj || !toolObj) {
-        toast.error('No se encontraron los objetos seleccionados.');
+        toast.error(t('editor3D.objectsNotFound'));
         return false;
       }
 
@@ -4223,12 +4325,12 @@ export default function Home() {
             : null;
 
       if (!baseMesh || !baseMesh.vertices.length) {
-        toast.error('El objeto base no tiene una geometría 3D válida.');
+        toast.error(t('editor3D.baseObjectNoGeometry'));
         return false;
       }
 
       if (!toolMesh || !toolMesh.vertices.length) {
-        toast.error('El objeto cortador no tiene una geometría 3D válida.');
+        toast.error(t('editor3D.toolObjectNoGeometry'));
         return false;
       }
 
@@ -4241,7 +4343,7 @@ export default function Home() {
       );
 
       if (!res.success || !res.resultMesh) {
-        toast.error(res.error || 'Error al calcular la operación booleana.');
+         toast.error(res.error || t('editor3D.booleanError'));
         return false;
       }
 
@@ -4321,11 +4423,11 @@ export default function Home() {
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
-                title="Más acciones"
+                title={t('editor3D.moreActions')}
                 className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 transition-colors"
               >
                 <Plus className="w-3.5 h-3.5" />
-                Acciones
+                {t('editor3D.actions')}
                 <ChevronDown className="w-3 h-3" />
               </button>
             </DropdownMenuTrigger>
@@ -4354,8 +4456,8 @@ export default function Home() {
                 className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5 disabled:opacity-40"
               >
                 <span className="text-sm font-bold flex items-center gap-1.5">
-                  <Trash2 className="w-3.5 h-3.5 text-red-400" />
-                  Eliminar objeto
+                   <Trash2 className="w-3.5 h-3.5 text-red-400" />
+                   {t('editor3D.deleteObject')}
                 </span>
               </DropdownMenuItem>
               <DropdownMenuItem
@@ -4367,13 +4469,13 @@ export default function Home() {
                 className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5 disabled:opacity-40"
                 title={
                   visibleSceneObjects.length < 2
-                    ? 'Necesitas al menos 2 objetos en la escena para sustraer una forma'
-                    : 'Sustraerle a un objeto la forma de otro'
+                    ? t('editor3D.needTwoObjects')
+                    : t('editor3D.subtractOther')
                 }
               >
                 <span className="text-sm font-bold flex items-center gap-1.5">
                   <Scissors className="w-3.5 h-3.5 text-amber-400" />
-                  Sustraer forma
+                  {t('editor3D.subtractShape')}
                 </span>
               </DropdownMenuItem>
               <DropdownMenuItem
@@ -4385,7 +4487,7 @@ export default function Home() {
               >
                 <span className="text-sm font-bold flex items-center gap-1.5">
                   <Box className="w-3.5 h-3.5" />
-                  Objeto 3D
+                  {t('editor3D.object3d')}
                 </span>
               </DropdownMenuItem>
               <DropdownMenuItem
@@ -4397,7 +4499,7 @@ export default function Home() {
               >
                 <span className="text-sm font-bold flex items-center gap-1.5">
                   <Save className="w-3.5 h-3.5" />
-                  Guardar
+                  {t('editor3D.save')}
                 </span>
               </DropdownMenuItem>
               <DropdownMenuItem
@@ -4409,9 +4511,9 @@ export default function Home() {
               >
                 <span className="text-sm font-bold flex items-center gap-1.5">
                   <Sun className="w-3.5 h-3.5" />
-                 {lightConfig
-                     ? `Luces (${lightConfig.spotlights.filter((s) => s.enabled).length})`
-                     : 'Luces'}
+                  {lightConfig
+                      ? t('editor3D.lightsCount', { count: lightConfig.spotlights.filter((s) => s.enabled).length })
+                      : t('editor3D.lights')}
                  </span>
                </DropdownMenuItem>
                 <DropdownMenuItem
@@ -4423,7 +4525,7 @@ export default function Home() {
                 >
                   <span className="text-sm font-bold flex items-center gap-1.5">
                     <Grid3x3 className={`w-3.5 h-3.5 ${showGround ? 'text-green-400' : ''}`} />
-                    {showGround ? 'Ocultar suelo' : 'Mostrar suelo'}
+                    {showGround ? t('editor3D.hideGround') : t('editor3D.showGround')}
                   </span>
                 </DropdownMenuItem>
                 <DropdownMenuItem
@@ -4435,12 +4537,12 @@ export default function Home() {
                   className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5"
                 >
                    <span className="text-sm font-bold flex items-center gap-1.5">
-                     <ImageIcon className="w-3.5 h-3.5" />
-                     Textura del suelo
+                      <ImageIcon className="w-3.5 h-3.5" />
+                      {t('editor3D.groundTexture')}
                    </span>
                    {groundTexture && (
                      <div className="flex items-center gap-1 mt-0.5" onClick={(e) => e.stopPropagation()}>
-                       <img src={groundTexture} alt="Suelo" className="w-6 h-6 object-cover rounded border border-white/20" />
+                        <img src={groundTexture} alt={t('editor3D.groundTexture')} className="w-6 h-6 object-cover rounded border border-white/20" />
                        <input
                          type="number"
                          min={1}
@@ -4463,8 +4565,18 @@ export default function Home() {
                      className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5"
                    >
                    <span className="text-sm font-bold flex items-center gap-1.5">
-                     <Palette className="w-3.5 h-3.5" />
-                       Acabado: {groundTextureFinish === 'matte' ? 'Mate' : groundTextureFinish === 'semi-matte' ? 'Semimate' : groundTextureFinish === 'metallic' ? 'Brillo metalizado' : groundTextureFinish === 'glossy' ? 'Espejo' : groundTextureFinish === 'mirror' ? 'Espejo Suelo' : 'Brillo'}
+                      <Palette className="w-3.5 h-3.5" />
+                        {t('editor3D.textureFinish')}: {groundTextureFinish === 'matte'
+                          ? t('editor3D.finish.matte')
+                          : groundTextureFinish === 'semi-matte'
+                          ? t('editor3D.finish.semiMatte')
+                          : groundTextureFinish === 'metallic'
+                          ? t('editor3D.finish.metallic')
+                          : groundTextureFinish === 'glossy'
+                          ? t('editor3D.finish.glossy')
+                          : groundTextureFinish === 'mirror'
+                          ? t('editor3D.finish.mirror')
+                          : t('editor3D.finish.glossyFallback')}
                     </span>
                     </DropdownMenuItem>
                   )}
@@ -4478,7 +4590,7 @@ export default function Home() {
                       className="hover:bg-gray-800 cursor-pointer p-2 flex items-center text-red-300"
                     >
                       <X className="w-3.5 h-3.5 mr-1.5" />
-                      Quitar textura
+                      {t('editor3D.removeTexture')}
                     </DropdownMenuItem>
                   )}
                  <DropdownMenuItem
@@ -4491,10 +4603,10 @@ export default function Home() {
                 >
                   <span className="text-sm font-bold flex items-center gap-1.5">
                     <ImageIcon className="w-3.5 h-3.5" />
-                    Fondo (cielo)
+                    {t('editor3D.background')}
                   </span>
                   {skyboxImage && (
-                    <img src={skyboxImage} alt="Cielo" className="w-6 h-6 object-cover rounded border border-white/20 mt-0.5" />
+                    <img src={skyboxImage} alt={t('editor3D.sky')} className="w-6 h-6 object-cover rounded border border-white/20 mt-0.5" />
                   )}
                 </DropdownMenuItem>
                 {skyboxImage && (
@@ -4507,7 +4619,7 @@ export default function Home() {
                     className="hover:bg-gray-800 cursor-pointer p-2 flex items-center text-red-300"
                   >
                     <X className="w-3.5 h-3.5 mr-1.5" />
-                    Quitar texturas
+                    {t('editor3D.removeTextures')}
                   </DropdownMenuItem>
                 )}
              </DropdownMenuContent>
@@ -4519,24 +4631,24 @@ export default function Home() {
                  ? 'bg-blue-500/20 text-blue-300 border-blue-500/30 hover:bg-blue-500/30'
                  : 'bg-white/5 text-muted-foreground hover:text-foreground border-white/10 hover:bg-white/10'
              }`}
-             title={cameraViewMode ? 'Salir de la vista de cámara' : 'Entrar en vista de cámara'}
+              title={cameraViewMode ? t('editor3D.exitCameraView') : t('editor3D.enterCameraView')}
            >
              <Camera className="w-3.5 h-3.5" />
-             <span>Vista cámara</span>
+              <span>{t('editor3D.cameraView')}</span>
            </button>
             <button
              onClick={copyCurrentObject}
              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground border border-white/10 transition-colors"
-             title={
-               fullScreenCanvas
-                 ? `Copiar la forma de ${fullScreenCanvas.name} para pegarla en otro lienzo abierto a pantalla completa`
-                 : selectedObjectIds.length > 1
-                   ? `Copiar ${selectedObjectIds.length} objetos seleccionados`
-                   : 'Copiar la configuración del objeto actual'
-             }
+              title={
+                fullScreenCanvas
+                  ? t('editor3D.copyShapeFullScreen', { name: fullScreenCanvas.name })
+                  : selectedObjectIds.length > 1
+                    ? t('editor3D.copyObjects', { count: selectedObjectIds.length })
+                    : t('editor3D.copyObjectConfig')
+              }
           >
-            <Copy className="w-3.5 h-3.5" />
-            Copiar
+             <Copy className="w-3.5 h-3.5" />
+             {t('editor3D.copy')}
           </button>
           <button
             onClick={pasteCurrentObject}
@@ -4546,24 +4658,24 @@ export default function Home() {
                   : !editorClipboard && !multiObjectClipboard
               }
             className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground border border-white/10 transition-colors disabled:opacity-30 disabled:hover:bg-white/5"
-             title={
-               fullScreenCanvas
-                 ? polygonClipboard
-                   ? `Pegar en ${fullScreenCanvas.name} la forma copiada`
-                   : 'Copia antes una forma: abre una plantilla (o la silueta/costado) a pantalla completa y pulsa Copiar'
-                 : multiObjectClipboard
-                   ? `Pegar ${multiObjectClipboard.objects.length} objetos copiados`
-                   : editorClipboard && editorClipboard.mode !== mode
-                     ? 'Pegar el objeto copiado en esta pestaña (entra como objeto nuevo)'
-                     : 'Pegar como otra configuración del mismo tipo'
-             }
+              title={
+                fullScreenCanvas
+                  ? polygonClipboard
+                    ? t('editor3D.pasteShape', { name: fullScreenCanvas.name })
+                    : t('editor3D.pasteShapeHint')
+                  : multiObjectClipboard
+                    ? t('editor3D.pasteObjects', { count: multiObjectClipboard.objects.length })
+                    : editorClipboard && editorClipboard.mode !== mode
+                      ? t('editor3D.pasteObjectNewTab')
+                      : t('editor3D.pasteAsConfig')
+              }
           >
-            <ClipboardPaste className="w-3.5 h-3.5" />
-            Pegar
+             <ClipboardPaste className="w-3.5 h-3.5" />
+             {t('editor3D.paste')}
           </button>
            {sceneObjects.length > 1 && (
               <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <span>Objeto activo</span>
+                <span>{t('editor3D.activeObject')}</span>
                  <select
                    value={selectedObjectIds.includes(selectedObjectId ?? '') ? (selectedObjectId ?? '') : ''}
                    onChange={(e) => handleObjectSelect(e.target.value || null)}
@@ -4571,7 +4683,7 @@ export default function Home() {
                 >
                    {sceneObjects.map((object, index) => (
                      <option key={object.id} value={object.id}>
-                       {object.name || `Objeto ${index + 1}`}
+                        {object.name || t('editor3D.objectN', { n: index + 1 })}
                      </option>
                    ))}
                 </select>
@@ -4581,85 +4693,159 @@ export default function Home() {
              <DropdownMenu>
                <DropdownMenuTrigger asChild>
                  <button
-                   title="Seleccionar múltiples objetos"
+                   title={t('editor3D.selectMultipleObjects')}
                   className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium border transition-colors ${
                     selectedObjectIds.length > 0
                       ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30 hover:bg-cyan-500/25'
                       : 'bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 border border-white/10'
                   }`}
                 >
-                  <BoxSelect className="w-3.5 h-3.5" />
-                  Multi ({selectedObjectIds.length})
+                   <BoxSelect className="w-3.5 h-3.5" />
+                   {t('editor3D.multi', { count: selectedObjectIds.length })}
                 </button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent className="bg-gray-900 border-gray-800 text-white min-w-[200px] max-h-[300px] overflow-y-auto [&::-webkit-scrollbar]:w-[3px] [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-gray-600/50 hover:[&::-webkit-scrollbar-thumb]:bg-gray-500/50">
-                {sceneObjects.map((object, index) => {
-                  const checked = selectedObjectIds.includes(object.id);
-                  const color = object.hidden
-                    ? 'text-red-400'
-                    : object.frozen
-                      ? 'text-gray-400'
-                      : 'text-foreground';
-                  return (
-                      <DropdownMenuCheckboxItem
-                       key={object.id}
-                       checked={checked}
-                       onCheckedChange={(v) => {
-                          if (v) {
-                            setSelectedObjectIds((prev) => [...prev, object.id]);
-                            // Set this object as the active one for the name input
-                            setSelectedObjectId(object.id);
-                          } else {
-                            setSelectedObjectIds((prev) => {
-                              const next = prev.filter((id) => id !== object.id);
-                              // If we're removing the active object, pick another from the remaining
-                              if (selectedObjectId === object.id && next.length > 0) {
-                                setSelectedObjectId(next[0]);
-                              } else if (next.length === 0) {
-                                setSelectedObjectId(null);
-                              }
-                              return next;
-                            });
-                          }
-                        }}
-                       className={`hover:bg-gray-800 cursor-pointer text-xs ${object.hidden ? 'opacity-60' : ''}`}
-                     >
-                       <span className="flex items-center gap-1.5">
-                         <span className={`w-2 h-2 rounded-full ${object.hidden ? 'bg-red-400' : object.frozen ? 'bg-gray-400' : 'bg-green-400'}`} />
-                         <span className={color}>
-                           {object.name || `Objeto ${index + 1}`}
-                         </span>
-                       </span>
-                       <button
-                         onClick={(e) => {
-                           e.stopPropagation();
-                           toggleObjectHidden(object.id);
+                <DropdownMenuContent className="bg-gray-900 border-gray-800 text-white min-w-[200px] max-h-[400px] overflow-y-auto [&::-webkit-scrollbar]:w-[3px] [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-gray-600/50 hover:[&::-webkit-scrollbar-thumb]:bg-gray-500/50">
+                 {sceneObjects.map((object, index) => {
+                   const checked = selectedObjectIds.includes(object.id);
+                   const color = object.hidden
+                     ? 'text-red-400'
+                     : object.frozen
+                       ? 'text-gray-400'
+                       : 'text-foreground';
+                   const objectGroups = groups.filter((g) =>
+                     g.objectIds.includes(object.id)
+                   );
+                   return (
+                       <DropdownMenuCheckboxItem
+                        key={object.id}
+                        checked={checked}
+                        onCheckedChange={(v) => {
+                           if (v) {
+                             setSelectedObjectIds((prev) => [...prev, object.id]);
+                             // Set this object as the active one for the name input
+                             setSelectedObjectId(object.id);
+                           } else {
+                             setSelectedObjectIds((prev) => {
+                               const next = prev.filter((id) => id !== object.id);
+                               // If we're removing the active object, pick another from the remaining
+                               if (selectedObjectId === object.id && next.length > 0) {
+                                 setSelectedObjectId(next[0]);
+                               } else if (next.length === 0) {
+                                 setSelectedObjectId(null);
+                               }
+                               return next;
+                             });
+                           }
                          }}
-                         title={object.hidden ? 'Mostrar objeto' : 'Ocultar objeto'}
-                         className="ml-auto px-1 py-0.5 rounded text-[10px] hover:bg-gray-700"
-                       >
-                         {object.hidden ? '🟢' : '🔴'}
-                       </button>
-                       <button
-                         onClick={(e) => {
-                           e.stopPropagation();
-                           toggleObjectFrozen(object.id);
-                         }}
-                         title={object.frozen ? 'Descongelar objeto' : 'Congelar objeto'}
-                         className="ml-auto px-1 py-0.5 rounded text-[10px] hover:bg-gray-700"
-                       >
-                         {object.frozen ? '🔓' : '🔒'}
-                       </button>
-                     </DropdownMenuCheckboxItem>
-                  );
-                })}
+                        className={`hover:bg-gray-800 cursor-pointer text-xs ${object.hidden ? 'opacity-60' : ''}`}
+                      >
+                        <span className="flex flex-col gap-0.5">
+                          <span className="flex items-center gap-1.5">
+                            <span className={`w-2 h-2 rounded-full ${object.hidden ? 'bg-red-400' : object.frozen ? 'bg-gray-400' : 'bg-green-400'}`} />
+                            <span className={color}>
+                              {object.name || t('editor3D.objectN', { n: index + 1 })}
+                            </span>
+                          </span>
+                          {objectGroups.length > 0 && (
+                            <span className="flex items-center gap-1 pl-3 text-[9px] text-cyan-400/70">
+                              <FolderOpen className="w-2.5 h-2.5" />
+                              {objectGroups.map((g) => g.name).join(', ')}
+                            </span>
+                          )}
+                        </span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleObjectHidden(object.id);
+                          }}
+                          title={object.hidden ? t('editor3D.showObject') : t('editor3D.hideObject')}
+                          className="ml-auto px-1 py-0.5 rounded text-[10px] hover:bg-gray-700"
+                        >
+                          {object.hidden ? '🟢' : '🔴'}
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleObjectFrozen(object.id);
+                          }}
+                          title={object.frozen ? t('editor3D.unfreezeObject') : t('editor3D.freezeObject')}
+                          className="ml-auto px-1 py-0.5 rounded text-[10px] hover:bg-gray-700"
+                        >
+                          {object.frozen ? '🔓' : '🔒'}
+                        </button>
+                      </DropdownMenuCheckboxItem>
+                    );
+                  })}
+                  {groups.length > 0 && (
+                    <>
+                      <DropdownMenuSeparator className="border-white/10" />
+                      {groups
+                        .filter((g) => g.objectIds.length > 0)
+                        .map((grp) => {
+                          const validCount = grp.objectIds.filter((oid) =>
+                            sceneObjects.some((o) => o.id === oid)
+                          ).length;
+                          if (validCount === 0) return null;
+                          const groupObjs = sceneObjects.filter((o) =>
+                            grp.objectIds.includes(o.id)
+                          );
+                          const allHidden =
+                            groupObjs.length > 0 &&
+                            groupObjs.every((o) => o.hidden);
+                          const allFrozen =
+                            groupObjs.length > 0 &&
+                            groupObjs.every((o) => o.frozen);
+                          return (
+                            <div
+                              key={grp.id}
+                              className="flex items-center gap-1 px-1 rounded-md hover:bg-gray-800 text-xs"
+                                title={t('editor3D.selectGroup', { name: grp.name })}
+                            >
+                              <div
+                                className="flex items-center gap-1.5 flex-1 cursor-pointer py-1 pl-2"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  selectGroup(grp.id);
+                                }}
+                              >
+                                <FolderOpen className="w-3 h-3 text-green-400" />
+                                <span className="truncate">{grp.name}</span>
+                                <span className="text-[9px] text-muted-foreground/60">
+                                  {validCount} / {grp.objectIds.length}
+                                </span>
+                              </div>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  toggleGroupHidden(grp.id);
+                                }}
+                                title={allHidden ? t('editor3D.showGroup') : t('editor3D.hideGroup')}
+                                className="px-1 py-0.5 rounded text-[10px] hover:bg-gray-700 text-muted-foreground"
+                              >
+                                {allHidden ? '🟢' : '🔴'}
+                              </button>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  toggleGroupFrozen(grp.id);
+                                }}
+                                title={allFrozen ? t('editor3D.unfreezeGroup') : t('editor3D.freezeGroup')}
+                                className="px-1 py-0.5 rounded text-[10px] hover:bg-gray-700 text-muted-foreground"
+                              >
+                                {allFrozen ? '🔓' : '🔒'}
+                              </button>
+                            </div>
+                          );
+                        })}
+                    </>
+                  )}
               </DropdownMenuContent>
             </DropdownMenu>
           )}
          {lightConfig && lightConfig.spotlights.length > 0 && (
             <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <Sun className="w-3.5 h-3.5" />
-              <span>Foco activo</span>
+               <span>{t('editor3D.activeSpotlight')}</span>
               <select
                 value={0}
                 onChange={() => {}}
@@ -4667,7 +4853,7 @@ export default function Home() {
               >
                 {lightConfig.spotlights.filter((s) => s.enabled).map((_, index) => (
                   <option key={index} value={index}>
-                    Foco {index + 1}
+                    {t('editor3D.spotlightN', { n: index + 1 })}
                   </option>
                 ))}
               </select>
@@ -4681,16 +4867,16 @@ export default function Home() {
                   ? 'bg-white/10 text-foreground border-white/20 hover:bg-white/15'
                   : 'bg-white/5 text-muted-foreground hover:text-foreground border-white/10 hover:bg-white/10'
               }`}
-              title={showLightHelpers ? 'Ocultar ayudantes de luz' : 'Mostrar ayudantes de luz'}
+               title={showLightHelpers ? t('editor3D.hideLightHelpers') : t('editor3D.showLightHelpers')}
             >
               <Sun className="w-3.5 h-3.5" />
-              <span>Aro foco</span>
+               <span>{t('editor3D.spotlightRing')}</span>
              </button>
            )}
             {(mode === 'views' || mode === 'mesh' || mode === 'extrude') && (
             <>
               <div className="flex items-center gap-1 text-xs text-muted-foreground mr-2">
-                <span>Resolución</span>
+                <span>{t('editor3D.resolution')}</span>
                 <Slider
                   min={8}
                   max={120}
@@ -4707,30 +4893,30 @@ export default function Home() {
               </div>
               <div
                 className="flex items-center rounded-md border border-white/10 overflow-hidden mr-2"
-                title="Estilo de malla con el que se reconstruye el objeto"
+                 title={t('editor3D.meshStyleReconstruct')}
               >
                 {(
                   [
                     {
                       key: 'suave',
-                      label: 'Suave',
+                      label: t('editor3D.smooth'),
                       icon: Spline,
                       title:
-                        'Malla editable construida por cortes a partir de las plantillas: las curvas salen exactas y redondas, cubierta por la rejilla de la malla',
+                        t('editor3D.smoothDesc'),
                     },
                     {
                       key: 'fusionada',
-                      label: 'Fusionada',
+                      label: t('editor3D.merged'),
                       icon: Grid3x3,
                       title:
-                        'Vóxeles reconstruidos a alta resolución (96³) con las caras coplanares fusionadas: superficie pareja e igual por todos lados',
+                        t('editor3D.mergedDesc'),
                     },
                     {
                       key: 'voxeles',
-                      label: 'Vóxeles',
+                      label: t('editor3D.voxels'),
                       icon: Box,
                       title:
-                        'Vóxeles vistos vóxel a vóxel a la resolución del slider',
+                        t('editor3D.voxelsDesc'),
                     },
                   ] as const
                 ).map(({ key, label, icon: Icon, title }) => (
@@ -4759,12 +4945,12 @@ export default function Home() {
              <DropdownMenuTrigger asChild>
                <button
                  disabled={mesh.vertices.length === 0}
-                 title="Exportar/Importar el objeto 3D (STL, OBJ, PLY, GLB, GLTF)"
+                 title={t('editor3D.exportImportTitle')}
                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 disabled:opacity-40 transition-colors"
                >
                  <Download className="w-3.5 h-3.5" />
-                 Export/Import
-                 <ChevronDown className="w-3 h-3" />
+                  {t('editor3D.exportImport')}
+                  <ChevronDown className="w-3 h-3" />
                </button>
              </DropdownMenuTrigger>
              <DropdownMenuContent
@@ -4774,30 +4960,30 @@ export default function Home() {
                <DropdownMenuItem
                  className="cursor-default p-2 flex flex-col items-start gap-0.5"
                >
-                 <span className="text-xs font-semibold text-gray-400">Exportar</span>
+                  <span className="text-xs font-semibold text-gray-400">{t('editor3D.exportLabel')}</span>
                </DropdownMenuItem>
                {(
                  [
-                   {
-                     key: 'stl',
-                     label: 'STL',
-                     desc: 'Impresión 3D (estereolitografía)',
-                   },
-                   {
-                     key: 'obj',
-                     label: 'OBJ',
-                     desc: 'Wavefront: lo abre casi todo',
-                   },
-                   {
-                     key: 'ply',
-                     label: 'PLY',
-                     desc: 'Polígonos con color por cara',
-                   },
-                   {
-                     key: 'glb',
-                     label: 'GLB',
-                     desc: 'glTF binario para web y visores 3D',
-                   },
+                    {
+                      key: 'stl',
+                      label: 'STL',
+                      desc: t('editor3D.exportFormats.stl.desc'),
+                    },
+                    {
+                      key: 'obj',
+                      label: 'OBJ',
+                      desc: t('editor3D.exportFormats.obj.desc'),
+                    },
+                    {
+                      key: 'ply',
+                      label: 'PLY',
+                      desc: t('editor3D.exportFormats.ply.desc'),
+                    },
+                    {
+                      key: 'glb',
+                      label: 'GLB',
+                      desc: t('editor3D.exportFormats.glb.desc'),
+                    },
                  ] as const
                ).map(({ key, label, desc }) => (
                  <DropdownMenuItem
@@ -4813,19 +4999,19 @@ export default function Home() {
                <DropdownMenuItem
                  className="cursor-default p-2 flex flex-col items-start gap-0.5"
                >
-                 <span className="text-xs font-semibold text-gray-400">Importar</span>
+                  <span className="text-xs font-semibold text-gray-400">{t('editor3D.importLabel')}</span>
                </DropdownMenuItem>
-               {IMPORT_FORMATS.map(({ ext, label, desc, format }) => (
-                 <DropdownMenuItem
-                   key={format}
-                   onSelect={(e) => {
-                     e.preventDefault();
-                     modelFileInputRef.current?.click();
-                   }}
-                   className="hover:bg-gray-800 cursor-pointer p-3 flex flex-col items-start gap-0.5"
-                 >
-                   <span className="text-sm font-bold">{label}</span>
-                   <span className="text-xs text-gray-400">{desc}</span>
+                {IMPORT_FORMATS.map(({ ext, label, descKey, format }) => (
+                  <DropdownMenuItem
+                    key={format}
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      modelFileInputRef.current?.click();
+                    }}
+                    className="hover:bg-gray-800 cursor-pointer p-3 flex flex-col items-start gap-0.5"
+                  >
+                    <span className="text-sm font-bold">{label}</span>
+                    <span className="text-xs text-gray-400">{t(descKey)}</span>
                  </DropdownMenuItem>
                ))}
                <input
@@ -4856,27 +5042,66 @@ export default function Home() {
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 transition-colors"
           >
             <RefreshCw className="w-3.5 h-3.5" />
-            Reset
+            {t('editor3D.reset')}
           </button>
           <button
             onClick={undo}
             disabled={historyIndex <= 0}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 disabled:opacity-40 transition-colors"
-            title="Deshacer (Ctrl+Z)"
+            title={t('editor3D.undoTitle')}
           >
             <Undo2 className="w-3.5 h-3.5" />
-            Deshacer
+              {t('editor3D.undo')}
           </button>
 
           <button
             onClick={redo}
             disabled={historyIndex >= history.length - 1}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 disabled:opacity-40 transition-colors"
-            title="Rehacer (Ctrl+Y)"
+            title={t('editor3D.redoTitle')}
           >
             <Redo2 className="w-3.5 h-3.5" />
-            Rehacer
+              {t('editor3D.redo')}
           </button>
+
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                title={t('languageSelector.title')}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground border border-white/10 transition-colors"
+              >
+                <Globe className="w-3.5 h-3.5" />
+                <span>{t('language.' + locale)}</span>
+                <ChevronDown className="w-3 h-3" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="end"
+              className="bg-gray-900 border-gray-800 text-white min-w-[160px]"
+            >
+              {LANGUAGES.map((lang) => (
+                <DropdownMenuItem
+                  key={lang.code}
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    setLocale(lang.code);
+                  }}
+                  className={`cursor-pointer p-2 flex items-center gap-1.5 ${
+                    locale === lang.code
+                      ? 'bg-green-500/20 text-green-300'
+                      : 'hover:bg-gray-800'
+                  }`}
+                >
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      locale === lang.code ? 'bg-green-400' : 'bg-gray-500'
+                    }`}
+                  />
+                  {t('language.' + lang.code)}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </header>
 
@@ -4911,7 +5136,7 @@ export default function Home() {
                 }`}
               >
                 
-                Vistas
+                {t('editor3D.tabs.views')}
               </button>
               <button
                 onClick={() => {
@@ -4940,7 +5165,7 @@ export default function Home() {
                 }`}
               >
                 
-                Mallas
+                {t('editor3D.tabs.mesh')}
               </button>
               <button
                 onClick={() => {
@@ -4969,11 +5194,11 @@ export default function Home() {
                 }`}
               >
                 
-                Texto
-              </button>
-              <button
-                onClick={() => {
-                  setMode('lathe');
+                {t('editor3D.tabs.text')}
+               </button>
+               <button
+                 onClick={() => {
+                   setMode('lathe');
                   setEditedVertices(null);
                   setEditingView(null);
                   setEditingLathe(false);
@@ -4999,7 +5224,7 @@ export default function Home() {
                 }`}
               >
                 
-                Torno
+                {t('editor3D.tabs.lathe')}
               </button>
               <button
                 onClick={() => {
@@ -5029,7 +5254,7 @@ export default function Home() {
                 }`}
               >
                 
-                Extruir
+                {t('editor3D.tabs.extrude')}
               </button>
             </div>
           </div>
@@ -5040,7 +5265,7 @@ export default function Home() {
               className="w-full flex items-center gap-1 text-xs font-semibold text-green-300 hover:text-green-200"
             >
               <span className="transform transition-transform">{showKeyframeEditor ? '▼' : '▶'}</span>
-              Editor de animación
+              {t('editor3D.animationEditor')}
             </button>
             {showKeyframeEditor && (
               <div className="pt-1">
@@ -5070,29 +5295,151 @@ export default function Home() {
                  />
               </div>
             )}
-          </div>
+           </div>
 
-          {mode === 'views' || mode === 'extrude' ? (
+           <div className="border-t border-white/5">
+             <button
+               onClick={() => setShowGroupsPanel(!showGroupsPanel)}
+               className="w-full flex items-center justify-between px-3 py-2 text-xs font-semibold text-green-300 hover:text-green-200"
+             >
+               <span className="flex items-center gap-2">
+                 <Layers className="w-3.5 h-3.5" />
+                  {t('editor3D.objectGroups')}
+               </span>
+               <span className="transform transition-transform">{showGroupsPanel ? '▼' : '▶'}</span>
+             </button>
+           </div>
+
+           {showGroupsPanel && (
+             <div className="px-3 py-2 space-y-2">
+               {selectedObjectIds.length > 0 && (
+                 <button
+                   onClick={createGroupFromSelection}
+                   className="w-full flex items-center justify-center gap-1 px-2 py-1.5 rounded-md text-xs font-medium bg-green-500/10 hover:bg-green-500/20 text-green-300 border border-green-500/30 transition-colors"
+                 >
+                    <Plus className="w-3 h-3" />
+                    {t('editor3D.createSelectionGroup')}
+                 </button>
+               )}
+
+               {groups.length === 0 ? (
+                 <p className="text-[10px] text-muted-foreground/60 text-center py-2">
+                    {t('editor3D.noGroups')}
+                 </p>
+               ) : (
+                 <div className="space-y-1.5">
+                   {groups.map((grp) => {
+                     const isActive =
+                       grp.objectIds.length > 0 &&
+                       selectedObjectIds.every((oid) =>
+                         grp.objectIds.includes(oid)
+                       ) &&
+                       selectedObjectIds.length > 0;
+                     const groupObjCount = grp.objectIds.filter((oid) =>
+                       sceneObjects.some((o) => o.id === oid)
+                     ).length;
+                     return (
+                       <div
+                         key={grp.id}
+                         className={`rounded-md border transition-colors ${
+                           isActive
+                             ? 'bg-green-500/10 border-green-500/30'
+                             : 'bg-black/40 border-white/10 hover:bg-white/5'
+                         }`}
+                       >
+                         <div className="flex items-center gap-1">
+                           <button
+                             onClick={() => selectGroup(grp.id)}
+                             className="flex-1 text-left px-2 py-1.5 rounded-md text-xs text-foreground"
+                              title={t('editor3D.selectGroup', { name: grp.name, count: groupObjCount })}
+                           >
+                             <div className="flex items-center gap-1.5">
+                               <FolderOpen className="w-3 h-3 text-green-400" />
+                               <span className="truncate">{grp.name}</span>
+                             </div>
+                             <div className="text-[9px] text-muted-foreground/70 mt-0.5">
+                               {groupObjCount} / {grp.objectIds.length} objeto(s)
+                             </div>
+                           </button>
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <button className="ml-[-8px] p-1.5 rounded text-sm hover:bg-white/5 text-muted-foreground">
+                                  …
+                                </button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent className="bg-gray-900 border-gray-800 text-white min-w-[120px]" align="end">
+                                {renamingGroupId === grp.id ? (
+                                  <div className="p-1.5 flex items-center gap-1">
+                                    <input
+                                      type="text"
+                                      value={renameDraft}
+                                      onChange={(e) => setRenameDraft(e.target.value)}
+                                      onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                          renameGroup(grp.id, renameDraft);
+                                          setRenamingGroupId(null);
+                                          setRenameDraft('');
+                                        } else if (e.key === 'Escape') {
+                                          setRenamingGroupId(null);
+                                          setRenameDraft('');
+                                        }
+                                      }}
+                                      onBlur={() => {
+                                        renameGroup(grp.id, renameDraft);
+                                        setRenamingGroupId(null);
+                                        setRenameDraft('');
+                                      }}
+                                      className="flex-1 text-xs px-1 py-0.5 rounded bg-gray-800 border border-gray-600 text-white outline-none"
+                                      autoFocus
+                                    />
+                                  </div>
+                                ) : (
+                                  <DropdownMenuItem
+                                    onSelect={(e) => {
+                                      e.preventDefault();
+                                      setRenamingGroupId(grp.id);
+                                      setRenameDraft(grp.name);
+                                    }}
+                                  >
+                                    {t('editor3D.rename')}
+                                  </DropdownMenuItem>
+                                )}
+                                <DropdownMenuItem
+                                  onClick={() => removeGroup(grp.id)}
+                                  className="text-red-400"
+                                >
+                                   {t('editor3D.delete')}
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                           </DropdownMenu>
+                         </div>
+                       </div>
+                     );
+                   })}
+                 </div>
+               )}
+             </div>
+           )}
+
+           {mode === 'views' || mode === 'extrude' ? (
             <>
               <div className="px-3 py-2 border-b border-white/5">
-                <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
+<h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
                   <span className="w-1 h-3 rounded-full bg-green-500" />
-                  Lienzos de dibujo
+                  {t('editor3D.drawingCanvases')}
                 </h2>
                 <p className="text-[10px] text-muted-foreground/60 mt-0.5 flex items-center gap-1">
                   <Info className="w-2.5 h-2.5" />
-                  Clic añade (en arista, inserta ahí) · Arrastra vértices ·
-                  Doble clic elimina · Mantén pulsado para curvar · Lápiz =
-                  editar en grande
+                    {t('editor3D.drawingHint')}
                 </p>
               </div>
 
               {mode === 'extrude' ? (
                    <div className="flex-1 overflow-y-auto grid grid-rows-[320px_auto] gap-3 p-3 min-h-0 custom-scrollbar">
-                   <DrawingCanvas
-                     label="Frente"
-                     axisLabel="X·Y"
-                     polygon={views.front}
+                    <DrawingCanvas
+                     label={t('editor3D.panelLabels.front')}
+                     axisLabel={t('editor3D.panelLabels.frontAxis')}
+                      polygon={views.front}
                      onChange={updateView('front')}
                      resolution={resolution}
                      onEdit={() => setEditingViewProfile('front')}
@@ -5101,7 +5448,7 @@ export default function Home() {
                    <div className="flex flex-col gap-3">
                      <div className="flex flex-col gap-1.5">
                      <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
-                       <span>Profundidad de extrusión</span>
+                        <span>{t('editor3D.extrusionDepth')}</span>
                        <span className="font-mono text-[10px] text-green-400">
                          {extrudeDepth.toFixed(2)}
                        </span>
@@ -5119,8 +5466,7 @@ export default function Home() {
                      />
                      <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
                        <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
-                       La figura se extruye hacia atrás desde el lienzo Frente
-                       una distancia de {extrudeDepth.toFixed(2)} unidades.
+                        {t('editor3D.extrusionHint', { depth: extrudeDepth.toFixed(2) })}
                      </p>
                    </div>
                    
@@ -5158,10 +5504,10 @@ export default function Home() {
                           );
                         }}
                         className="flex-1 px-3 py-1.5 text-[10px] font-medium rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/30 transition-colors flex items-center justify-center gap-1"
-                        title="Sustraer forma dibujada dentro del objeto"
-                      >
-                        <Scissors className="w-3 h-3" />
-                        Sustraer
+                         title={t('editor3D.subtractDrawn')}
+                       >
+                         <Scissors className="w-3 h-3" />
+                         {t('editor3D.subtract')}
                       </button>
 
                       {/* Slider de redimensionamiento uniforme */}
@@ -5195,27 +5541,27 @@ export default function Home() {
                   </div>
               ) : (
                 <div className="flex-1 overflow-y-auto grid grid-rows-[320px_320px_320px] gap-2 p-3 min-h-0 custom-scrollbar">
-                  <DrawingCanvas
-                    label="Frente"
-                    axisLabel="X·Y"
-                    polygon={views.front}
+                   <DrawingCanvas
+                     label={t('editor3D.panelLabels.front')}
+                     axisLabel={t('editor3D.panelLabels.frontAxis')}
+                     polygon={views.front}
                     onChange={updateView('front')}
                     resolution={resolution}
                     onEdit={() => setEditingViewProfile('front')}
                     polylines={getPolylines('views:front')}
                   />
-                  <DrawingCanvas
-                    label="Costado"
-                    axisLabel="Z·Y"
+                   <DrawingCanvas
+                    label={t('editor3D.panelLabels.side')}
+                    axisLabel={t('editor3D.panelLabels.sideAxis')}
                     polygon={views.side}
                     onChange={updateView('side')}
                     resolution={resolution}
                     onEdit={() => setEditingViewProfile('side')}
                     polylines={getPolylines('views:side')}
                   />
-                  <DrawingCanvas
-                    label="Superior"
-                    axisLabel="X·Z"
+                   <DrawingCanvas
+                    label={t('editor3D.panelLabels.top')}
+                    axisLabel={t('editor3D.panelLabels.topAxis')}
                     polygon={views.top}
                     onChange={updateView('top')}
                     resolution={resolution}
@@ -5228,12 +5574,12 @@ export default function Home() {
               <div className="border-t border-white/5 px-3 py-3 space-y-3 bg-[hsl(224_50%_6%)]">
                 <h3 className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center gap-2">
                   <Palette className="w-3.5 h-3.5 text-green-400" />
-                  Apariencia de la figura
+                  {t('editor3D.shapeAppearance')}
                 </h3>
 
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
-                    <span>Color de la figura</span>
+                    <span>{t('editor3D.shapeColor')}</span>
                     <span className="font-mono text-[10px] text-green-400">
                       {figureColor}
                     </span>
@@ -5246,7 +5592,7 @@ export default function Home() {
                         setFigureColor(e.target.value);
                         setEditedVertices(null);
                       }}
-                      title="Color de la figura 3D"
+                       title={t('editor3D.shapeColor3d')}
                       className="w-8 h-8 rounded cursor-pointer bg-transparent border border-white/10 p-0.5"
                     />
                     <button
@@ -5255,7 +5601,7 @@ export default function Home() {
                         setEditedVertices(null);
                       }}
                       className="text-[10px] text-muted-foreground/60 hover:text-foreground transition-colors"
-                      title="Restablecer color por defecto"
+                       title={t('editor3D.restore')}
                     >
                       Restablecer
                     </button>
@@ -5263,22 +5609,22 @@ export default function Home() {
                       type="text"
                       value={textureFileName}
                       readOnly
-                      placeholder="Ninguna textura seleccionada"
+                      placeholder={t('editor3D.noTextureSelected')}
                       className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 text-foreground placeholder:text-muted-foreground/40 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap"
                       onClick={openTexturePicker}
                     />
                     <button
                       onClick={() => setTextureBrowserOpen(true)}
-                      title="Explorar texturas de la carpeta local"
+                      title={t('editor3D.browse')}
                       className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 transition-colors"
                     >
                       <ImageIcon className="w-3.5 h-3.5" />
-                      Explorar
+                      {t('editor3D.browse')}
                     </button>
                     {texture && (
                       <button
                         onClick={clearTexture}
-                        title="Eliminar textura"
+                         title={t('editor3D.removeTextureLabel')}
                         className="shrink-0 flex items-center gap-1.5 px-2 py-2 rounded-md text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/30 transition-colors"
                       >
                         <X className="w-3.5 h-3.5" />
@@ -5300,8 +5646,7 @@ export default function Home() {
                   />
                    <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
                      <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
-                     La textura se aplica sobre el color de la figura. Formatos:
-                     JPG, PNG, WebP, SVG.
+                    {t('editor3D.textureHint')}
                    </p>
                    {texture && (
                      <div className="mt-1 rounded-md border border-white/10 overflow-hidden w-16 h-16 bg-black/40">
@@ -5315,7 +5660,7 @@ export default function Home() {
                     {texture && (
                       <div className="flex items-center gap-2 mt-1">
                         <label className="text-[10px] text-muted-foreground/80">
-                          Repetición:
+                           {t('editor3D.textureRepeat')}
                         </label>
                         <input
                           type="number"
@@ -5328,22 +5673,22 @@ export default function Home() {
                         />
                       </div>
                     )}
-                   <label className="text-[10px] text-muted-foreground/80 mt-1">
-                     Proyección de la textura
-                   </label>
-                  <select
-                    value={textureProjection}
-                    onChange={(event) =>
-                      setTextureProjection(
-                        event.target.value as LatheTextureProjection
-                      )
-                    }
-                    className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
-                  >
-                    <option value="cylindrical">Envolvente cilíndrica</option>
-                    <option value="planar">Plana</option>
-                    <option value="spherical">Esférica</option>
-                  </select>
+                    <label className="text-[10px] text-muted-foreground/80 mt-1">
+                      {t('editor3D.textureProjection')}
+                    </label>
+                   <select
+                     value={textureProjection}
+                     onChange={(event) =>
+                       setTextureProjection(
+                         event.target.value as LatheTextureProjection
+                       )
+                     }
+                     className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
+                   >
+                     <option value="cylindrical">{t('editor3D.projection.cylindrical')}</option>
+                     <option value="planar">{t('editor3D.projection.planar')}</option>
+                     <option value="spherical">{t('editor3D.projection.spherical')}</option>
+                   </select>
                   <label className="flex items-center gap-1.5 mt-1 cursor-pointer text-[10px] text-muted-foreground/80">
                     <input
                       type="checkbox"
@@ -5351,7 +5696,7 @@ export default function Home() {
                       onChange={(e) => setTextureHelper(e.target.checked)}
                       className="accent-yellow-400"
                     />
-                    Ayuda de textura
+                    {t('editor3D.textureHelper')}
                     {(textureHelper || textureHelperDirty) && (
                       <button
                         type="button"
@@ -5375,14 +5720,14 @@ export default function Home() {
                     }
                     className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
                   >
-                     <option value="metallic">Brillo metalizado</option>
-                     <option value="semi-matte">Semimate</option>
-                     <option value="matte">Mate</option>
-                     <option value="glossy">Espejo</option>
-                     <option value="mirror">Espejo Suelo</option>
+                     <option value="metallic">{t('editor3D.finish.metallic')}</option>
+                     <option value="semi-matte">{t('editor3D.finish.semiMatte')}</option>
+                     <option value="matte">{t('editor3D.finish.matte')}</option>
+                     <option value="glossy">{t('editor3D.finish.glossy')}</option>
+                     <option value="mirror">{t('editor3D.finish.mirror')}</option>
                   </select>
                   <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
-                    <span>Relieve de la textura</span>
+                    <span>{t('editor3D.textureRelief')}</span>
                     <span className="font-mono text-green-400">
                       {Math.round(textureRelief * 100)}%
                     </span>
@@ -5401,7 +5746,7 @@ export default function Home() {
                     lienzos de dibujo, afecta a la figura completa */}
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
-                    <span>Transparencia del objeto</span>
+                    <span>{t('editor3D.object3dOpacity')}</span>
                     <span className="font-mono text-[10px] text-green-400">
                       {Math.round((1 - viewsOpacity) * 100)}%
                     </span>
@@ -5414,9 +5759,7 @@ export default function Home() {
                     onValueChange={([v]) => setViewsOpacity(1 - v / 100)}
                   />
                   <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
-                    <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />A 0% la
-                    figura es sólida; a 95% casi invisible. Sirve para ver la
-                    escena a través del objeto.
+                    <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />{t('editor3D.opacityHint')}
                   </p>
                 </div>
               </div>
@@ -5437,7 +5780,7 @@ export default function Home() {
               <div className="flex-1 flex flex-col gap-4 p-3 overflow-y-auto custom-scrollbar">
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
-                    Texto
+                {t('editor3D.tabs.text')}
                   </label>
                   <input
                     type="text"
@@ -5446,14 +5789,14 @@ export default function Home() {
                       setText(e.target.value);
                       setEditedVertices(null);
                     }}
-                    placeholder="Escribe algo..."
+                    placeholder={t('editor3D.writeText')}
                     className="w-full px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 focus:border-green-500/50 focus:ring-1 focus:ring-green-500/30 outline-none text-foreground placeholder:text-muted-foreground/40"
                   />
                 </div>
 
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
-                    Fuente
+                    {t('editor3D.fontLabel')}
                   </label>
                   <select
                     value={fontCss}
@@ -5474,24 +5817,24 @@ export default function Home() {
                       </option>
                     ))}
                     {customFonts.length > 0 && (
-                      <optgroup label="Importadas">
-                        {customFonts.map((f) => (
-                          <option
-                            key={f.label}
-                            value={f.css}
-                            style={{ fontFamily: f.css }}
-                          >
-                            {f.label}
-                          </option>
-                        ))}
-                      </optgroup>
+                    <optgroup label={t('editor3D.importedFonts')}>
+                      {customFonts.map((f) => (
+                        <option
+                          key={f.label}
+                          value={f.css}
+                          style={{ fontFamily: f.css }}
+                        >
+                          {f.label}
+                        </option>
+                      ))}
+                    </optgroup>
                     )}
                   </select>
                 </div>
 
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
-                    Importar fuente de Google Fonts
+                    {t('editor3D.importGoogleFont')}
                   </label>
                   <div className="flex gap-1.5">
                     <input
@@ -5504,13 +5847,13 @@ export default function Home() {
                       onKeyDown={(e) => {
                         if (e.key === 'Enter') importFont();
                       }}
-                      placeholder="Ej: Press Start 2P"
+                       placeholder={t('editor3D.fontExample')}
                       className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 focus:border-green-500/50 focus:ring-1 focus:ring-green-500/30 outline-none text-foreground placeholder:text-muted-foreground/40"
                     />
                     <button
                       onClick={importFont}
                       disabled={!customFontName.trim() || importing}
-                      title="Importar esta fuente"
+                      title={t('editor3D.importFontBtn')}
                       className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 disabled:opacity-40 transition-colors"
                     >
                       {importing ? (
@@ -5518,7 +5861,7 @@ export default function Home() {
                       ) : (
                         <Plus className="w-3.5 h-3.5" />
                       )}
-                      Importar
+                       {t('editor3D.importFontBtn')}
                     </button>
                   </div>
                   <button
@@ -5526,7 +5869,7 @@ export default function Home() {
                     className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 transition-colors"
                   >
                     <ExternalLink className="w-3.5 h-3.5" />
-                    Abrir catálogo de Google Fonts
+                    {t('editor3D.openGoogleFonts')}
                   </button>
                   {importMsg && (
                     <p
@@ -5546,21 +5889,21 @@ export default function Home() {
 
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
-                    Cargar fuente del almacenamiento
+                    {t('editor3D.loadFontFromStorage')}
                   </label>
                   <div className="flex gap-1.5">
                     <input
                       type="text"
                       value={localFontFileName}
                       readOnly
-                      placeholder="Ningún archivo seleccionado"
+                      placeholder={t('editor3D.noFileSelected')}
                       className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 text-foreground placeholder:text-muted-foreground/40 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap"
                       onClick={openLocalFontPicker}
                     />
                     <button
                       onClick={openLocalFontPicker}
                       disabled={localFontLoading}
-                      title="Explorar archivos del dispositivo"
+                      title={t('editor3D.browse')}
                       className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 disabled:opacity-40 transition-colors"
                     >
                       {localFontLoading ? (
@@ -5568,7 +5911,7 @@ export default function Home() {
                       ) : (
                         <FolderOpen className="w-3.5 h-3.5" />
                       )}
-                      Explorar
+                      {t('editor3D.browse')}
                     </button>
                   </div>
                   <input
@@ -5604,7 +5947,7 @@ export default function Home() {
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center justify-between">
                     <span>
-                      {textMode === 'plane' ? 'Nitidez' : 'Resolución'}
+                       {textMode === 'plane' ? t('editor3D.textModeLabel.plane') : t('editor3D.textModeLabel.voxel')}
                     </span>
                     <span className="font-mono text-green-400">{textRes}</span>
                   </label>
@@ -5622,7 +5965,7 @@ export default function Home() {
                 {textMode !== 'plane' && (
                   <div className="flex flex-col gap-1.5">
                     <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center justify-between">
-                      <span>Profundidad</span>
+                      <span>{t('editor3D.depthLabel')}</span>
                       <span className="font-mono text-green-400">
                         {textDepth}
                       </span>
@@ -5642,7 +5985,7 @@ export default function Home() {
                 {textMode === 'smooth' && (
                   <div className="flex flex-col gap-1.5">
                     <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center justify-between">
-                      <span>Opacidad del costado</span>
+                      <span>{t('editor3D.sideOpacity')}</span>
                       <span className="font-mono text-green-400">
                         {Math.round(textOpacity * 100)}%
                       </span>
@@ -5673,13 +6016,12 @@ export default function Home() {
                         className="w-3.5 h-3.5 accent-green-500 cursor-pointer"
                       />
                       <span className="text-xs text-foreground">
-                        Letras huecas (solo contorno)
+                       {t('editor3D.hollowText')}
                       </span>
-                    </label>
-                    <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
-                      <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
-                      Solo el borde del trazo: muchos menos vóxeles, vértices y
-                      caras. Notable sobre todo en resoluciones altas.
+                     </label>
+                     <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
+                       <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
+                       {t('editor3D.hollowTextDesc')}
                     </p>
                   </div>
                 )}
@@ -5697,21 +6039,19 @@ export default function Home() {
                         className="w-3.5 h-3.5 accent-green-500 cursor-pointer"
                       />
                       <span className="text-xs text-foreground">
-                        Malla optimizada (sin divisiones internas)
+                       {t('editor3D.optimizedMesh')}
                       </span>
                     </label>
                     <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
                       <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
-                      La letra sigue sólida: las caras planas se fusionan en
-                      rectángulos grandes y el interior no genera vértices ni
-                      aristas. Muchísimos menos vértices y caras.
+                       {t('editor3D.greedyMeshDesc')}
                     </p>
                   </div>
                 )}
 
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
-                    Modo de salida
+                    {t('editor3D.outputMode')}
                   </label>
                   <div className="flex p-1 rounded-lg bg-black/40 border border-white/5">
                     <button
@@ -5723,12 +6063,12 @@ export default function Home() {
                         textMode === 'voxel'
                           ? 'bg-green-500/20 text-green-300'
                           : 'text-muted-foreground hover:text-foreground'
-                      }`}
-                      title="Rasteriza el texto a una rejilla y extruye cada celda: curvas y diagonales con escalones de vóxeles"
-                    >
-                      <Boxes className="w-3.5 h-3.5" />
-                      Vóxeles 3D
-                    </button>
+                       }`}
+                       title={t('editor3D.greedyMeshTooltip')}
+                     >
+                       <Boxes className="w-3.5 h-3.5" />
+                       {t('editor3D.voxels3d')}
+                     </button>
                     <button
                       onClick={() => {
                         setTextMode('smooth');
@@ -5739,10 +6079,10 @@ export default function Home() {
                           ? 'bg-green-500/20 text-green-300'
                           : 'text-muted-foreground hover:text-foreground'
                       }`}
-                      title="Igual que el estilo Suave de las figuras: traza el contorno real de la letra y lo extruye, con curvas y diagonales lisas, sin escalones"
+                       title={t('editor3D.smoothTextDesc')}
                     >
                       <Spline className="w-3.5 h-3.5" />
-                      Suave
+                      {t('editor3D.smoothTextLabel')}
                     </button>
                     <button
                       onClick={() => {
@@ -5756,23 +6096,23 @@ export default function Home() {
                       }`}
                     >
                       <Layers className="w-3.5 h-3.5" />
-                      Vista plana
+                      {t('editor3D.flatView')}
                     </button>
                   </div>
                   <p className="text-[10px] text-muted-foreground/60">
                     {textMode === 'plane'
-                      ? 'Copia el color exacto del texto tal como se ve en pantalla (textura píxel a píxel).'
+                      ? t('editor3D.planeDesc')
                       : textMode === 'smooth'
-                        ? 'Extruye el contorno real de la letra: curvas y diagonales lisas, sin escalones, con color por cara.'
+                        ? t('editor3D.smoothDesc')
                         : hollowText
-                          ? 'Extruye solo el contorno: letras huecas, malla mucho más ligera.'
-                          : 'Extruye el texto en vóxeles 3D con color por cara.'}
+                          ? t('editor3D.hollowDesc')
+                          : t('editor3D.voxelDesc')}
                   </p>
                 </div>
 
                 <div className="flex flex-col gap-1.5">
-                  <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
-                    Color
+<label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
+                    <span>{t('editor3D.textColor')}</span>
                   </label>
                   <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-black/40 border border-white/10">
                     <input
@@ -5782,14 +6122,14 @@ export default function Home() {
                         setBaseColor(e.target.value);
                         setEditedVertices(null);
                       }}
-                      title="Color base del texto"
+                      title={t('editor3D.baseColor')}
                       className="w-8 h-8 rounded cursor-pointer bg-transparent border border-white/10 p-0.5"
                     />
                     <span className="text-xs font-mono text-muted-foreground">
                       {baseColor}
                     </span>
                     <span className="text-[10px] text-muted-foreground/60 ml-auto">
-                      fuentes sin color
+                     {t('editor3D.fontOwnColor')}
                     </span>
                   </div>
                   <label className="flex items-center gap-2 px-3 py-2 rounded-md bg-black/40 border border-white/10 cursor-pointer select-none">
@@ -5803,42 +6143,41 @@ export default function Home() {
                       className="w-3.5 h-3.5 accent-green-500 cursor-pointer"
                     />
                     <span className="text-xs text-foreground">
-                      Usar color propio de la fuente
+                     {t('editor3D.useFontColor')}
                     </span>
                   </label>
                   <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
                     <Palette className="w-2.5 h-2.5 shrink-0 mt-0.5" />
-                    Si la fuente trae color o textura (emojis, fuentes de
-                    color), el modelo reproduce esos colores exactos.
+                    {t('editor3D.useFontColorHint')}
                   </p>
                 </div>
 
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center gap-2">
                     <ImageIcon className="w-3.5 h-3.5 text-green-400" />
-                    Textura (imagen)
+                    {t('editor3D.textureImage')}
                   </label>
                   <div className="flex gap-1.5">
                     <input
                       type="text"
                       value={textureFileName}
                       readOnly
-                      placeholder="Ninguna textura seleccionada"
+                      placeholder={t('editor3D.noTextureSelected')}
                       className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 text-foreground placeholder:text-muted-foreground/40 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap"
                       onClick={() => setTextureBrowserOpen(true)}
                     />
                     <button
                       onClick={() => setTextureBrowserOpen(true)}
-                      title="Seleccionar imagen como textura"
+                      title={t('editor3D.selectImageAsTexture')}
                       className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 transition-colors"
                     >
                       <ImageIcon className="w-3.5 h-3.5" />
-                      Explorar
+                      {t('editor3D.browse')}
                     </button>
                     {texture && (
                       <button
                         onClick={clearTexture}
-                        title="Eliminar textura"
+                         title={t('editor3D.removeTextureLabel')}
                         className="shrink-0 flex items-center gap-1.5 px-2 py-2 rounded-md text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/30 transition-colors"
                       >
                         <X className="w-3.5 h-3.5" />
@@ -5860,8 +6199,7 @@ export default function Home() {
                   />
                   <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
                     <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
-                    La textura se aplica sobre el texto. Formatos: JPG, PNG,
-                    WebP, SVG.
+                    {t('editor3D.textureOnText')}
                   </p>
                   {texture && (
                     <div className="mt-1 rounded-md border border-white/10 overflow-hidden w-16 h-16 bg-black/40">
@@ -5873,7 +6211,7 @@ export default function Home() {
                     </div>
                   )}
                   <label className="text-[10px] text-muted-foreground/80 mt-1">
-                    Proyección de la textura
+                    {t('editor3D.textureProjection')}
                   </label>
                   <select
                     value={textureProjection}
@@ -5884,9 +6222,9 @@ export default function Home() {
                     }
                     className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
                   >
-                    <option value="cylindrical">Envolvente cilíndrica</option>
-                    <option value="planar">Plana</option>
-                    <option value="spherical">Esférica</option>
+<option value="cylindrical">{t('editor3D.projection.cylindrical')}</option>
+                     <option value="planar">{t('editor3D.projection.planar')}</option>
+                     <option value="spherical">{t('editor3D.projection.spherical')}</option>
                   </select>
                   <label className="flex items-center gap-1.5 mt-1 cursor-pointer text-[10px] text-muted-foreground/80">
                     <input
@@ -5895,7 +6233,7 @@ export default function Home() {
                       onChange={(e) => setTextureHelper(e.target.checked)}
                       className="accent-yellow-400"
                     />
-                    Ayuda de textura
+                    {t('editor3D.textureHelper')}
                     {(textureHelper || textureHelperDirty) && (
                       <button
                         type="button"
@@ -5919,14 +6257,14 @@ export default function Home() {
                     }
                     className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
                   >
-                     <option value="metallic">Brillo metalizado</option>
-                     <option value="semi-matte">Semimate</option>
-                     <option value="matte">Mate</option>
-                     <option value="glossy">Espejo</option>
-                     <option value="mirror">Espejo Suelo</option>
+                     <option value="metallic">{t('editor3D.finish.metallic')}</option>
+                     <option value="semi-matte">{t('editor3D.finish.semiMatte')}</option>
+                     <option value="matte">{t('editor3D.finish.matte')}</option>
+                     <option value="glossy">{t('editor3D.finish.glossy')}</option>
+                     <option value="mirror">{t('editor3D.finish.mirror')}</option>
                   </select>
                   <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
-                    <span>Relieve de la textura</span>
+                    <span>{t('editor3D.textureRelief')}</span>
                     <span className="font-mono text-green-400">
                       {Math.round(textureRelief * 100)}%
                     </span>
@@ -5971,19 +6309,19 @@ export default function Home() {
             <div className="flex-1 flex flex-col min-h-0 overflow-y-auto custom-scrollbar">
               <div className="px-3 py-2 border-b border-white/5 shrink-0">
                 <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
-                  <span className="w-1 h-3 rounded-full bg-green-500" />
-                  Mallas por silueta y plantillas 2D
-                </h2>
-                <p className="text-[10px] text-muted-foreground/60 mt-0.5 flex items-center gap-1">
-                  <Info className="w-2.5 h-2.5" />
-                  Dibuja la silueta en X·Y y los cortes horizontales en X·Z
+                <span className="w-1 h-3 rounded-full bg-green-500" />
+                {t('editor3D.meshBySilhouette')}
+              </h2>
+              <p className="text-[10px] text-muted-foreground/60 mt-0.5 flex items-center gap-1">
+                <Info className="w-2.5 h-2.5" />
+                {t('editor3D.meshDrawHint')}
                 </p>
               </div>
 
               <div className="p-3 space-y-4">
                 <div className="h-56">
                   <DrawingCanvas
-                    label="Silueta"
+                    label={t('editor3D.panelLabels.silhouette')}
                     axisLabel="X·Y"
                     polygon={
                       meshSilhouette && meshSilhouette.length > 0
@@ -6002,7 +6340,7 @@ export default function Home() {
                 </div>
                 <div className="h-56">
                   <DrawingCanvas
-                    label="Costado"
+                    label={t('editor3D.panelLabels.side')}
                     axisLabel="Z·Y"
                     polygon={meshSideView}
                     onChange={setMeshSideView}
@@ -6018,14 +6356,14 @@ export default function Home() {
                 {/* ▼ Selector de vista de la silueta ▼ */}
                 <div className="flex items-center gap-2 pt-2">
                   <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
-                    Aplicar silueta en:
+                    {t('editor3D.applySilhouetteTo')}
                   </span>
                   <div className="flex items-center rounded-md border border-white/10 overflow-hidden">
                     {(
                       [
-                        { key: 'front', label: 'Frente' },
-                        { key: 'side', label: 'Costado' },
-                        { key: 'both', label: 'Ambas' },
+                        { key: 'front', label: t('editor3D.applyToFront') },
+                        { key: 'side', label: t('editor3D.applyToSide') },
+                        { key: 'both', label: t('editor3D.applyToBoth') },
                       ] as const
                     ).map(({ key, label }) => (
                       <button
@@ -6047,14 +6385,14 @@ export default function Home() {
                   <div className="flex items-center justify-between">
                     <h3 className="text-xs font-semibold text-muted-foreground flex items-center gap-1.5">
                       <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
-                      Plantillas 2D ({meshSections.length})
+                      {t('editor3D.templates2d', { count: meshSections.length })}
                     </h3>
                     <button
                       onClick={addMeshSection}
                       className="flex items-center gap-1 px-2 py-1 rounded bg-green-500/20 text-green-300 hover:bg-green-500/30 text-[11px] font-medium border border-green-500/30 transition-colors"
                     >
                       <Plus className="w-3 h-3" />
-                      Añadir plantilla
+                      {t('editor3D.addTemplate')}
                     </button>
                   </div>
 
@@ -6066,7 +6404,7 @@ export default function Home() {
                       <div className="flex items-center justify-between text-[11px]">
                         <div className="flex items-center gap-2">
                           <span className="font-semibold text-foreground">
-                            Plantilla {index + 1}
+                            {t('editor3D.templateN', { n: index + 1 })}
                           </span>
                           <span className="font-mono text-[10px] text-green-400">
                             Y = {section.y.toFixed(2)}
@@ -6078,7 +6416,7 @@ export default function Home() {
                             <button
                               type="button"
                               className="flex items-center justify-center w-5 h-5 rounded bg-white/5 border border-white/10 text-foreground hover:bg-white/15 transition-colors disabled:opacity-30 disabled:hover:bg-white/5"
-                              title="Subir la plantilla (altura Y)"
+                              title={t('editor3D.raiseTemplate')}
                               disabled={section.y <= 0}
                               onClick={() =>
                                 moveMeshSectionY(section.id, -0.05)
@@ -6089,7 +6427,7 @@ export default function Home() {
                             <button
                               type="button"
                               className="flex items-center justify-center w-5 h-5 rounded bg-white/5 border border-white/10 text-foreground hover:bg-white/15 transition-colors disabled:opacity-30 disabled:hover:bg-white/5"
-                              title="Bajar la plantilla (altura Y)"
+                              title={t('editor3D.lowerTemplate')}
                               disabled={section.y >= 1}
                               onClick={() => moveMeshSectionY(section.id, 0.05)}
                             >
@@ -6101,13 +6439,13 @@ export default function Home() {
                           <button
                             onClick={() => removeMeshSection(section.id)}
                             className="p-1 text-muted-foreground hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
-                            title="Eliminar plantilla"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        )}
-                      </div>
-                      <SectionTools
+                             title={t('editor3D.deleteTemplate')}
+                           >
+                             <Trash2 className="w-3.5 h-3.5" />
+                           </button>
+                         )}
+                       </div>
+<SectionTools
                         polygon={section.polygon}
                         onChange={(poly) =>
                           updateMeshSectionPolygon(section.id, poly)
@@ -6115,7 +6453,7 @@ export default function Home() {
                       />
                       <div className="h-60">
                         <DrawingCanvas
-                          label={`Plantilla ${index + 1}`}
+                          label={t('editor3D.templateN', { n: index + 1 })}
                           axisLabel="X·Z"
                           polygon={section.polygon}
                           onChange={(poly) => {
@@ -6136,13 +6474,13 @@ export default function Home() {
                   <div className="mt-2 pt-3 border-t border-white/10 space-y-3">
                     <h3 className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center gap-2">
                       <Palette className="w-3.5 h-3.5 text-green-400" />
-                      Apariencia de la figura
+                      {t('editor3D.shapeAppearance')}
                     </h3>
 
                     {/* Color de la figura */}
                     <div className="flex flex-col gap-1.5">
                       <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
-                        <span>Color de la figura</span>
+                     <span>{t('editor3D.shapeColor')}</span>
                         <span className="font-mono text-[10px] text-green-400">
                           {figureColor}
                         </span>
@@ -6164,7 +6502,7 @@ export default function Home() {
                           }}
                           className="text-[10px] text-muted-foreground/60 hover:text-foreground transition-colors"
                         >
-                          Restablecer
+                       {t('editor3D.restore')}
                         </button>
                       </div>
                     </div>
@@ -6173,7 +6511,7 @@ export default function Home() {
                         plantillas, afecta a la figura completa */}
                     <div className="flex flex-col gap-1.5">
                       <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center justify-between">
-                        <span>Transparencia del objeto 3D</span>
+                        <span>{t('editor3D.object3dOpacity')}</span>
                         <span className="font-mono text-green-400">
                           {Math.round((1 - meshOpacity) * 100)}%
                         </span>
@@ -6189,38 +6527,36 @@ export default function Home() {
                         }}
                       />
                       <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
-                        <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />A 0% la
-                        figura es sólida; a 95% casi invisible. Sirve para ver
-                        el interior o las plantillas a través del objeto.
+                        <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />{t('editor3D.opacityHint')}
                       </p>
                     </div>
 
                     {/* Textura */}
                     <div className="flex flex-col gap-1.5">
                       <label className="text-[10px] text-muted-foreground/80">
-                        Textura (imagen)
+                        {t('editor3D.textureImage')}
                       </label>
                       <div className="flex gap-1.5">
                         <input
                           type="text"
                           value={textureFileName}
                           readOnly
-                          placeholder="Ninguna textura seleccionada"
+                       placeholder={t('editor3D.noTextureSelected')}
                           className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 text-foreground placeholder:text-muted-foreground/40 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap"
                           onClick={openTexturePicker}
                         />
                         <button
                           onClick={() => setTextureBrowserOpen(true)}
-                          title="Explorar texturas de la carpeta local"
+                      title={t('editor3D.browse')}
                           className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 transition-colors"
                         >
-                          <ImageIcon className="w-3.5 h-3.5" />
-                          Explorar
+                      <ImageIcon className="w-3.5 h-3.5" />
+                      {t('editor3D.browse')}
                         </button>
                         {texture && (
                           <button
                             onClick={clearTexture}
-                            title="Eliminar textura"
+                            title={t('editor3D.removeTextureLabel')}
                             className="shrink-0 flex items-center gap-1.5 px-2 py-2 rounded-md text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/30 transition-colors"
                           >
                             <X className="w-3.5 h-3.5" />
@@ -6240,21 +6576,20 @@ export default function Home() {
                       />
                       <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
                         <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
-                        La textura se aplica sobre el color de la figura.
-                        Formatos: JPG, PNG, WebP, SVG.
+                        {t('editor3D.textureHint')}
                       </p>
                       {texture && (
                         <div className="mt-1 rounded-md border border-white/10 overflow-hidden w-16 h-16 bg-black/40">
                           <img
                             src={texture}
-                            alt="Textura cargada"
+                          alt={t('editor3D.textureAlt')}
                             className="w-full h-full object-cover"
                           />
                         </div>
                       )}
 
                       <label className="text-[10px] text-muted-foreground/80 mt-1">
-                        Proyección de la textura
+                      {t('editor3D.textureProjection')}
                       </label>
                       <select
                         value={textureProjection}
@@ -6266,10 +6601,10 @@ export default function Home() {
                         className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
                       >
                         <option value="cylindrical">
-                          Envolvente cilíndrica
+                          {t('editor3D.projection.cylindrical')}
                         </option>
-                        <option value="planar">Plana</option>
-                        <option value="spherical">Esférica</option>
+                        <option value="planar">{t('editor3D.projection.planar')}</option>
+                        <option value="spherical">{t('editor3D.projection.spherical')}</option>
                       </select>
                       <label className="flex items-center gap-1.5 mt-1 cursor-pointer text-[10px] text-muted-foreground/80">
                         <input
@@ -6278,7 +6613,7 @@ export default function Home() {
                           onChange={(e) => setTextureHelper(e.target.checked)}
                           className="accent-yellow-400"
                         />
-                        Ayuda de textura
+                     {t('editor3D.textureHelper')}
                         {(textureHelper || textureHelperDirty) && (
                           <button
                             type="button"
@@ -6286,7 +6621,7 @@ export default function Home() {
                               setTextureHelperTransform(IDENTITY_TRANSFORM)
                             }
                             className="ml-auto px-1.5 py-0.5 rounded border border-white/10 bg-black/40 hover:bg-white/10"
-                            title="Restablecer la pieza"
+                         title={t('editor3D.restore')}
                           >
                             ↺
                           </button>
@@ -6294,7 +6629,7 @@ export default function Home() {
                       </label>
 
                       <label className="text-[10px] text-muted-foreground/80 mt-1">
-                        Acabado de la textura
+                     {t('editor3D.textureFinish')}
                       </label>
                       <select
                         value={textureFinish}
@@ -6303,15 +6638,15 @@ export default function Home() {
                         }
                         className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
                       >
-                     <option value="metallic">Brillo metalizado</option>
-                     <option value="semi-matte">Semimate</option>
-                     <option value="matte">Mate</option>
-                     <option value="glossy">Espejo</option>
-                     <option value="mirror">Espejo Suelo</option>
+                     <option value="metallic">{t('editor3D.finish.metallic')}</option>
+                     <option value="semi-matte">{t('editor3D.finish.semiMatte')}</option>
+                     <option value="matte">{t('editor3D.finish.matte')}</option>
+                     <option value="glossy">{t('editor3D.finish.glossy')}</option>
+                     <option value="mirror">{t('editor3D.finish.mirror')}</option>
                    </select>
 
                       <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
-                        <span>Relieve de la textura</span>
+                    <span>{t('editor3D.textureRelief')}</span>
                         <span className="font-mono text-green-400">
                           {Math.round(textureRelief * 100)}%
                         </span>
@@ -6335,18 +6670,18 @@ export default function Home() {
               <div className="px-3 py-2 border-b border-white/5 shrink-0">
                 <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
                   <span className="w-1 h-3 rounded-full bg-green-500" />
-                  Perfil del torno
+                  {t('editor3D.latheProfile')}
                 </h2>
                 <p className="text-[10px] text-muted-foreground/60 mt-0.5 flex items-center gap-1">
                   <Info className="w-2.5 h-2.5" />
-                  Dibuja el perfil a la derecha del eje (línea central)
+                  {t('editor3D.profileDrawHint')}
                 </p>
                 <div className="flex items-center rounded-md border border-white/10 overflow-hidden mt-2">
                   {(
                     [
-                      { key: 'suave', label: 'Suave', icon: Spline },
-                      { key: 'fusionada', label: 'Fusionada', icon: Grid3x3 },
-                      { key: 'voxeles', label: 'Vóxeles', icon: Box },
+                      { key: 'suave', label: t('editor3D.smooth'), icon: Spline },
+                      { key: 'fusionada', label: t('editor3D.merged'), icon: Grid3x3 },
+                      { key: 'voxeles', label: t('editor3D.voxels'), icon: Box },
                     ] as const
                   ).map(({ key, label, icon: Icon }) => (
                     <button
@@ -6357,7 +6692,7 @@ export default function Home() {
                           ? 'bg-green-500/25 text-green-300'
                           : 'bg-white/5 text-muted-foreground hover:bg-white/10'
                       }`}
-                      title={`Usar malla ${label.toLowerCase()} en el torno`}
+                      title={t('editor3D.useMeshInLathe', { style: label.toLowerCase() })}
                     >
                       <Icon className="w-3 h-3" />
                       {label}
@@ -6368,7 +6703,7 @@ export default function Home() {
 
               <div className="flex-none h-56 p-3 flex">
                 <DrawingCanvas
-                  label="Perfil"
+                  label={t('editor3D.panelLabels.profile')}
                   axisLabel="X·Y"
                   polygon={latheProfile}
                   onChange={setLatheProfile}
@@ -6386,7 +6721,7 @@ export default function Home() {
               <div className="px-3 py-2 border-t border-white/5 space-y-3">
                 <div className="flex flex-col gap-1.5">
                   <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center justify-between">
-                    <span>Segmentos de rotación</span>
+                    <span>{t('editor3D.rotationSegments')}</span>
                     <span className="font-mono text-green-400">
                       {latheSegments}
                     </span>
@@ -6406,12 +6741,12 @@ export default function Home() {
                 <div className="border-t border-white/5 pt-3 space-y-3">
                   <h3 className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center gap-2">
                     <Palette className="w-3.5 h-3.5 text-green-400" />
-                    Apariencia de la figura
+                    {t('editor3D.shapeAppearance')}
                   </h3>
 
                    <div className="flex flex-col gap-1.5">
                      <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
-                       <span>Color de la figura</span>
+                       <span>{t('editor3D.shapeColor')}</span>
                        <span className="font-mono text-[10px] text-green-400">
                          {latheFigureColor}
                        </span>
@@ -6439,22 +6774,22 @@ export default function Home() {
                          type="text"
                          value={latheTextureFileName}
                          readOnly
-                         placeholder="Ninguna textura seleccionada"
+                         placeholder={t('editor3D.noTextureSelected')}
                          className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 text-foreground placeholder:text-muted-foreground/40 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap"
                          onClick={openTexturePicker}
                        />
                        <button
                          onClick={() => setTextureBrowserOpen(true)}
-                         title="Explorar texturas de la carpeta local"
+                         title={t('editor3D.browse')}
                          className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 transition-colors"
                        >
-                         <ImageIcon className="w-3.5 h-3.5" />
-                         Explorar
-                       </button>
+                          <ImageIcon className="w-3.5 h-3.5" />
+                          {t('editor3D.browse')}
+                        </button>
                        {latheTexture && (
                          <button
                            onClick={clearTexture}
-                           title="Quitar textura"
+                            title={t('editor3D.removeTexture')}
                            className="shrink-0 flex items-center gap-1.5 px-2 py-2 rounded-md text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/30 transition-colors"
                          >
                            <X className="w-3.5 h-3.5" />
@@ -6482,7 +6817,7 @@ export default function Home() {
                       </div>
                     )}
                     <label className="text-[10px] text-muted-foreground/80 mt-1">
-                      Proyección de la textura
+                      {t('editor3D.textureProjection')}
                     </label>
                     <select
                       value={textureProjection}
@@ -6493,9 +6828,9 @@ export default function Home() {
                       }
                       className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
                     >
-                      <option value="cylindrical">Envolvente cilíndrica</option>
-                      <option value="planar">Plana</option>
-                      <option value="spherical">Esférica</option>
+                     <option value="cylindrical">{t('editor3D.projection.cylindrical')}</option>
+                     <option value="planar">{t('editor3D.projection.planar')}</option>
+                     <option value="spherical">{t('editor3D.projection.spherical')}</option>
                     </select>
                     <label className="flex items-center gap-1.5 mt-1 cursor-pointer text-[10px] text-muted-foreground/80">
                       <input
@@ -6504,7 +6839,7 @@ export default function Home() {
                         onChange={(e) => setTextureHelper(e.target.checked)}
                         className="accent-yellow-400"
                       />
-                      Ayuda de textura
+                      {t('editor3D.textureHelper')}
                       {(textureHelper || textureHelperDirty) && (
                         <button
                           type="button"
@@ -6512,14 +6847,14 @@ export default function Home() {
                             setTextureHelperTransform(IDENTITY_TRANSFORM)
                           }
                           className="ml-auto px-1.5 py-0.5 rounded border border-white/10 bg-black/40 hover:bg-white/10"
-                          title="Restablecer la pieza"
+                          title={t('editor3D.restore')}
                         >
                           ↺
                         </button>
                       )}
                     </label>
                     <label className="text-[10px] text-muted-foreground/80 mt-1">
-                      Acabado de la textura
+                      {t('editor3D.textureFinish')}
                     </label>
                     <select
                       value={textureFinish}
@@ -6528,13 +6863,13 @@ export default function Home() {
                       }
                       className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
                     >
-                      <option value="glossy">Brillo metalizado</option>
-                      <option value="semi-matte">Semimate</option>
-                      <option value="matte">Mate</option>
-                      <option value="mirror">Espejo</option>
+                      <option value="glossy">{t('editor3D.finish.metallic')}</option>
+                      <option value="semi-matte">{t('editor3D.finish.semiMatte')}</option>
+                      <option value="matte">{t('editor3D.finish.matte')}</option>
+                      <option value="mirror">{t('editor3D.finish.glossy')}</option>
                     </select>
                     <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
-                      <span>Relieve de la textura</span>
+                      <span>{t('editor3D.textureRelief')}</span>
                       <span className="font-mono text-green-400">
                         {Math.round(textureRelief * 100)}%
                       </span>
@@ -6548,7 +6883,7 @@ export default function Home() {
                       className="w-full"
                     />
                     <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
-                      <span>Opacidad del torno</span>
+                      <span>{t('editor3D.latheOpacity')}</span>
                       <span className="font-mono text-green-400">
                         {Math.round(latheOpacity * 100)}%
                       </span>
@@ -6599,14 +6934,14 @@ export default function Home() {
                      ? 'bg-green-500/20 text-green-300'
                      : 'bg-blue-500/20 hover:bg-blue-500/30 text-blue-300'
                  }`}
-                 title={playing ? 'Pausar' : 'Reproducir'}
+                  title={playing ? t('editor3D.pause') : t('editor3D.play')}
                >
                  {playing ? '⏸' : '▶'}
                </button>
                <button
                  onClick={() => { setPlaying(false); setCurrentTime(0.1); }}
                  className="p-1 rounded text-xs bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground"
-                 title="Detener"
+                  title={t('editor3D.stop')}
                >
                  ⏹
                </button>
@@ -6629,7 +6964,7 @@ export default function Home() {
           >
             {mode === 'lathe' && editingLatheProfile ? (
               <EditorCanvasComponent
-                label="Perfil del torno"
+                label={t('editor3D.panelLabels.latheProfile')}
                 axisLabel="X·Y"
                 polygon={latheProfile}
                 onChange={(poly: Polygon) => {
@@ -6654,19 +6989,19 @@ export default function Home() {
             ) : editingViewProfile &&
               (mode === 'views' || mode === 'extrude') ? (
               <EditorCanvasComponent
-                label={
-                  editingViewProfile === 'front'
-                    ? 'Frente'
-                    : editingViewProfile === 'side'
-                      ? 'Costado'
-                      : 'Superior'
-                }
+                 label={
+                   editingViewProfile === 'front'
+                     ? t('editor3D.views.front')
+                     : editingViewProfile === 'side'
+                       ? t('editor3D.views.side')
+                       : t('editor3D.views.top')
+                 }
                 axisLabel={
-                  editingViewProfile === 'front'
-                    ? 'X·Y'
-                    : editingViewProfile === 'side'
-                      ? 'Z·Y'
-                      : 'X·Z'
+                   editingViewProfile === 'front'
+                     ? t('editor3D.views.frontAxis')
+                     : editingViewProfile === 'side'
+                       ? t('editor3D.views.sideAxis')
+                       : t('editor3D.views.topAxis')
                 }
                 polygon={views[editingViewProfile]}
                 onChange={(poly: Polygon) => {
@@ -6692,7 +7027,7 @@ export default function Home() {
                 {(!editingView || editingView === 'front') && (
         <ViewerPanel
           viewName="front"
-          label="Frente · X·Y"
+          label={t('editor3D.panelLabels.frontAxis')}
           editingState={editingView === 'front'}
           onSetEditing={(v: boolean) => setEditingView(v ? 'front' : null)}
           onActiveView={() => setActiveView('front')}
@@ -6767,7 +7102,7 @@ export default function Home() {
                 {(!editingView || editingView === 'top') && (
         <ViewerPanel
           viewName="top"
-          label="Superior · X·Z"
+          label={t('editor3D.panelLabels.topAxis')}
           editingState={editingView === 'top'}
           onSetEditing={(v: boolean) => setEditingView(v ? 'top' : null)}
           onActiveView={() => setActiveView('top')}
@@ -6842,7 +7177,7 @@ export default function Home() {
                 {(!editingView || editingView === 'side') && (
         <ViewerPanel
           viewName="side"
-          label="Costado · Z·Y"
+          label={t('editor3D.panelLabels.sideAxis')}
           editingState={editingView === 'side'}
           onSetEditing={(v: boolean) => setEditingView(v ? 'side' : null)}
           onActiveView={() => setActiveView('side')}
@@ -6994,7 +7329,7 @@ export default function Home() {
                 {(!editingTextPanel || editingTextPanel === 'front') && (
         <ViewerPanel
           viewName="front"
-          label="Frente"
+          label={t('editor3D.panelLabels.front')}
           editingState={editingTextPanel === 'front'}
           onSetEditing={(v: boolean) => setEditingTextPanel(v ? 'front' : null)}
           onActiveView={() => setActiveView('front')}
@@ -7069,7 +7404,7 @@ export default function Home() {
                 {(!editingTextPanel || editingTextPanel === 'top') && (
         <ViewerPanel
           viewName="top"
-          label="Superior"
+          label={t('editor3D.panelLabels.top')}
           editingState={editingTextPanel === 'top'}
           onSetEditing={(v: boolean) => setEditingTextPanel(v ? 'top' : null)}
           onActiveView={() => setActiveView('top')}
@@ -7144,7 +7479,7 @@ export default function Home() {
                 {(!editingTextPanel || editingTextPanel === 'side') && (
         <ViewerPanel
           viewName="side"
-          label="Costado"
+          label={t('editor3D.panelLabels.side')}
           editingState={editingTextPanel === 'side'}
           onSetEditing={(v: boolean) => setEditingTextPanel(v ? 'side' : null)}
           onActiveView={() => setActiveView('side')}
@@ -7296,7 +7631,7 @@ export default function Home() {
                 {(!editingLathePanel || editingLathePanel === 'front') && (
         <ViewerPanel
           viewName="front"
-          label="Frente"
+          label={t('editor3D.panelLabels.front')}
           editingState={editingLathePanel === 'front'}
           onSetEditing={(v: boolean) => setEditingLathePanel(v ? 'front' : null)}
           onActiveView={() => setActiveView('front')}
@@ -7371,7 +7706,7 @@ export default function Home() {
                 {(!editingLathePanel || editingLathePanel === 'top') && (
         <ViewerPanel
           viewName="top"
-          label="Superior"
+          label={t('editor3D.panelLabels.top')}
           editingState={editingLathePanel === 'top'}
           onSetEditing={(v: boolean) => setEditingLathePanel(v ? 'top' : null)}
           onActiveView={() => setActiveView('top')}
@@ -7446,7 +7781,7 @@ export default function Home() {
                 {(!editingLathePanel || editingLathePanel === 'side') && (
         <ViewerPanel
           viewName="side"
-          label="Costado"
+          label={t('editor3D.panelLabels.side')}
           editingState={editingLathePanel === 'side'}
           onSetEditing={(v: boolean) => setEditingLathePanel(v ? 'side' : null)}
           onActiveView={() => setActiveView('side')}
@@ -7598,7 +7933,7 @@ export default function Home() {
               editingMeshProfile === 'silhouette' ? (
                 <div className="w-full h-full min-h-0">
                   <EditorCanvasComponent
-                    label="Silueta"
+                    label={t('editor3D.panelLabels.silhouette')}
                     axisLabel="X·Y"
                     polygon={
                       meshSilhouette && meshSilhouette.length > 0
@@ -7629,7 +7964,7 @@ export default function Home() {
               ) : editingMeshProfile === 'side' ? (
                 <div className="w-full h-full min-h-0">
                   <EditorCanvasComponent
-                    label="Costado"
+                    label={t('editor3D.panelLabels.side')}
                     axisLabel="Z·Y"
                     polygon={meshSideView}
                     onChange={(poly: Polygon) => {
@@ -7676,7 +8011,7 @@ export default function Home() {
                         />
                       </div>
                       <EditorCanvasComponent
-                        label={`Plantilla ${meshSections.indexOf(section) + 1}`}
+                        label={t('editor3D.templateN', { n: meshSections.indexOf(section) + 1 })}
                         axisLabel="X·Z"
                         polygon={section.polygon}
                         onChange={(poly: Polygon) => {
@@ -7707,7 +8042,7 @@ export default function Home() {
                 {/* Mitad izquierda: la silueta */}
                 <div className="flex-1 min-w-0 min-h-0 h-full flex flex-col">
                   <EditorCanvasComponent
-                    label="Silueta"
+                    label={t('editor3D.panelLabels.silhouette')}
                     compact
                     axisLabel="X·Y"
                     polygon={
@@ -7739,7 +8074,7 @@ export default function Home() {
                 {/* Mitad izquierda 2: el costado */}
                 <div className="flex-1 min-w-0 min-h-0 h-full flex flex-col">
                   <EditorCanvasComponent
-                    label="Costado"
+                    label={t('editor3D.panelLabels.side')}
                     compact
                     axisLabel="Z·Y"
                     polygon={meshSideView}
@@ -7770,7 +8105,7 @@ export default function Home() {
                   <div className="flex items-center justify-between pb-2 border-b border-white/10">
                     <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-1.5">
                       <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
-                      Plantillas horizontales 2D ({meshSections.length})
+                      {t('editor3D.horizontalTemplates', { count: meshSections.length })}
                     </h3>
                     <button
                       onClick={addMeshSection}
@@ -7782,12 +8117,12 @@ export default function Home() {
                   </div>
                   {meshSections.length === 0 ? (
                     <div className="p-6 text-center rounded-lg bg-black/30 border border-dashed border-white/10 text-muted-foreground/60 text-xs space-y-2">
-                      <p>No hay plantillas creadas.</p>
+                      <p>{t('editor3D.noTemplatesCreated')}</p>
                       <button
                         onClick={addMeshSection}
                         className="px-3 py-1.5 rounded bg-green-500/20 text-green-300 hover:bg-green-500/30 text-xs font-medium border border-green-500/30 transition-colors"
                       >
-                        Crear primera plantilla 2D
+                        {t('editor3D.createFirstTemplate')}
                       </button>
                     </div>
                   ) : (
@@ -7799,7 +8134,7 @@ export default function Home() {
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-2">
                             <span className="text-xs font-semibold text-foreground">
-                              Plantilla {index + 1}
+                            {t('editor3D.templateN', { n: index + 1 })}
                             </span>
                             <span className="text-[10px] font-mono text-green-300 bg-green-500/10 px-1.5 py-0.5 rounded border border-green-500/20">
                               Y = {section.y.toFixed(2)} ·{' '}
@@ -7808,7 +8143,7 @@ export default function Home() {
                           </div>
                           <div className="flex items-center gap-2">
                             <label className="text-[10px] text-muted-foreground flex items-center gap-1">
-                              <span>Altura Y:</span>
+                              <span>{t('editor3D.heightY')}</span>
                               <input
                                 type="number"
                                 min={0}
@@ -7842,7 +8177,7 @@ export default function Home() {
                               <button
                                 type="button"
                                 className="flex items-center justify-center w-5 h-5 rounded bg-white/5 border border-white/10 text-foreground hover:bg-white/15 transition-colors disabled:opacity-30 disabled:hover:bg-white/5"
-                                title="Subir la plantilla (altura Y)"
+            title={t('editor3D.sectionTools.raise')}
                                 disabled={section.y <= 0}
                                 onClick={() =>
                                   moveMeshSectionY(section.id, -0.05)
@@ -7853,7 +8188,7 @@ export default function Home() {
                               <button
                                 type="button"
                                 className="flex items-center justify-center w-5 h-5 rounded bg-white/5 border border-white/10 text-foreground hover:bg-white/15 transition-colors disabled:opacity-30 disabled:hover:bg-white/5"
-                                title="Bajar la plantilla (altura Y)"
+            title={t('editor3D.sectionTools.lower')}
                                 disabled={section.y >= 1}
                                 onClick={() =>
                                   moveMeshSectionY(section.id, 0.05)
@@ -7866,7 +8201,7 @@ export default function Home() {
                               <button
                                 onClick={() => removeMeshSection(section.id)}
                                 className="p-1 rounded text-muted-foreground hover:text-red-400 hover:bg-red-500/10 transition-colors"
-                                title="Eliminar plantilla"
+                                title={t('editor3D.deleteTemplate')}
                               >
                                 <Trash2 className="w-3.5 h-3.5" />
                               </button>
@@ -7903,7 +8238,7 @@ export default function Home() {
                           return (
                             <div style={{ height: `${containerHeight}px` }}>
                               <DrawingCanvas
-                                label={`Plantilla ${index + 1}`}
+                                label={t('editor3D.templateN', { n: index + 1 })}
                                 axisLabel="X·Z"
                                 polygon={section.polygon}
                                 onChange={(poly) => {
@@ -7931,7 +8266,7 @@ export default function Home() {
                 {(!editingMeshPanel || editingMeshPanel === 'front') && (
         <ViewerPanel
           viewName="front"
-          label="Frente · X·Y"
+          label={t('editor3D.panelLabels.frontAxis')}
           editingState={editingMeshPanel === 'front'}
           onSetEditing={(v: boolean) => setEditingMeshPanel(v ? 'front' : null)}
           onActiveView={() => setActiveView('front')}
@@ -8006,7 +8341,7 @@ export default function Home() {
                 {(!editingMeshPanel || editingMeshPanel === 'top') && (
         <ViewerPanel
           viewName="top"
-          label="Superior · X·Z"
+          label={t('editor3D.panelLabels.topAxis')}
           editingState={editingMeshPanel === 'top'}
           onSetEditing={(v: boolean) => setEditingMeshPanel(v ? 'top' : null)}
           onActiveView={() => setActiveView('top')}
@@ -8081,7 +8416,7 @@ export default function Home() {
                 {(!editingMeshPanel || editingMeshPanel === 'side') && (
         <ViewerPanel
           viewName="side"
-          label="Costado · Z·Y"
+          label={t('editor3D.panelLabels.sideAxis')}
           editingState={editingMeshPanel === 'side'}
           onSetEditing={(v: boolean) => setEditingMeshPanel(v ? 'side' : null)}
           onActiveView={() => setActiveView('side')}
@@ -8234,7 +8569,7 @@ export default function Home() {
           {/* Botones flotantes de preview boolean: aparecen sobre los viewports */}
           {booleanPreviewLive && pendingBooleanOp && (
             <div className="absolute top-4 right-4 z-50 flex items-center gap-2 bg-gray-900/90 rounded-lg border border-amber-500/30 px-3 py-2 shadow-lg">
-              <span className="text-xs text-amber-300">Corte en preview — mueve el cortador para ajustar</span>
+              <span className="text-xs text-amber-300">{t('editor3D.previewCut')}</span>
               <button
                 onClick={async () => {
                   if (pendingBooleanOp) {
@@ -8264,7 +8599,7 @@ export default function Home() {
                 }}
                 className="px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-white/5 border border-white/10"
               >
-                Cancelar preview
+                {t('editor3D.cancelPreview')}
               </button>
             </div>
           )}
@@ -8289,13 +8624,13 @@ export default function Home() {
               <button
                 onClick={() => pngImportInputRef.current?.click()}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-green-500/15 hover:bg-green-500/25 text-green-200 border border-green-500/30 transition-colors"
-                title="Importar contorno desde PNG al lienzo activo"
+                title={t('editor3D.importPngTitle')}
               >
                 <ImageIcon className="w-3.5 h-3.5" />
-                Importar PNG
+                {t('editor3D.importPng')}
               </button>
               <div className="flex items-center gap-2">
-                <span className="text-xs text-muted-foreground">Detalle:</span>
+                <span className="text-xs text-muted-foreground">{t('editor3D.detailLabel')}</span>
                 <Slider
                   min={0}
                   max={100}
@@ -8310,10 +8645,10 @@ export default function Home() {
               </div>
               <span className="text-xs text-muted-foreground/60">
                 {importDetailLevel < 30
-                  ? 'Pocos vértices'
+                  ? t('editor3D.fewVertices')
                   : importDetailLevel > 80
-                    ? 'Muchos vértices'
-                    : 'Calidad media'}
+                    ? t('editor3D.manyVertices')
+                    : t('editor3D.mediumQuality')}
               </span>
 
               {/* Plantilla de referencia */}
@@ -8338,15 +8673,15 @@ export default function Home() {
               <button
                 onClick={() => templateInputRef.current?.click()}
                 className="flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 transition-colors"
-                title="Cargar imagen de referencia/plantilla"
+                title={t('editor3D.loadTemplateImg')}
               >
                 <ImageIcon className="w-3 h-3" />
-                {templateImage ? 'Cambiar' : 'Plantilla'}
+                {templateImage ? t('editor3D.changeTemplate') : t('editor3D.templateBtn')}
               </button>
               {templateImage && (
                 <>
                   <div className="flex items-center gap-1">
-                    <span className="text-xs text-muted-foreground">Opac:</span>
+                    <span className="text-xs text-muted-foreground">{t('editor3D.opacityLabel')}</span>
                     <Slider
                       min={0}
                       max={100}
@@ -8360,7 +8695,7 @@ export default function Home() {
                     </span>
                   </div>
                   <div className="flex items-center gap-1">
-                    <span className="text-xs text-muted-foreground">Tama:</span>
+                    <span className="text-xs text-muted-foreground">{t('editor3D.sizeLabel')}</span>
                     <Slider
                       min={10}
                       max={300}
@@ -8380,7 +8715,7 @@ export default function Home() {
                       setTemplateScale(1);
                     }}
                     className="px-2 py-1 rounded-md text-xs font-medium bg-red-500/10 hover:bg-red-500/20 text-red-300 border border-red-500/30 transition-colors"
-                    title="Quitar plantilla"
+                    title={t('editor3D.removeTemplate')}
                   >
                     Quitar
                   </button>
@@ -8395,25 +8730,25 @@ export default function Home() {
         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-4 py-2 rounded-lg bg-red-950/80 border border-red-800/50 text-red-200 text-xs backdrop-blur-sm shadow-lg z-50">
           <AlertCircle className="w-3.5 h-3.5" />
           {mode === 'text'
-            ? 'Escribe un texto para generarlo en 3D'
+            ? t('editor3D.drawTextHint')
             : mode === 'lathe'
-              ? 'Dibuja al menos 3 puntos en el perfil del torno'
-              : 'Agrega plantillas y dibuja una silueta para generar la malla'}
+              ? t('editor3D.drawLatheHint')
+              : t('editor3D.drawSilhouetteHint')}
         </div>
       )}
 
       <Modal
         isOpen={saveModalOpen}
         onClose={() => setSaveModalOpen(false)}
-        title="Guardar objeto 3D"
-        description="Se guarda en la carpeta de Objetos 3D (Archivos → Configurar Carpetas Multimedia)."
+        title={t('editor3D.save3dObject')}
+        description={t('editor3D.saveToFolder')}
         size="md"
       >
         <div className="space-y-4 py-4">
           <div className="space-y-2">
             <label className="flex items-center gap-2 text-sm font-medium text-gray-300">
               <Box className="w-4 h-4 text-green-400" />
-              Nombre del objeto
+               {t('editor3D.objectNameLabel')}
             </label>
             <input
               type="text"
@@ -8421,23 +8756,23 @@ export default function Home() {
               onChange={(e) => setObjectName(e.target.value)}
               placeholder={
                 mode === 'text'
-                  ? 'texto-3d'
+                  ? t('editor3D.textDefaultName')
                   : mode === 'mesh'
                     ? 'malla-3d'
                     : mode === 'extrude'
                       ? 'extrusion-3d'
-                      : 'figura-3d'
+                      : t('editor3D.figureDefaultName')
               }
               className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-green-500"
             />
             <p className="text-[11px] text-muted-foreground">
               {mode === 'text'
-                ? 'Guarda el texto 3D con su fuente, profundidad, color y modo (vóxeles, suave o vista plana).'
+                ? t('editor3D.saveTextDesc')
                 : mode === 'mesh'
-                  ? 'Guarda la malla 3D con sus plantillas y silueta.'
+                  ? t('editor3D.saveMeshDesc')
                   : mode === 'extrude'
-                    ? 'Guarda la figura extruida con su perfil frontal, profundidad y estilo de malla.'
-                    : 'Guarda la figura con sus tres vistas dibujadas, resolución y estilo de malla.'}
+                    ? t('editor3D.saveExtrudeDesc')
+                    : t('editor3D.saveViewsDesc')}
             </p>
           </div>
 
@@ -8458,7 +8793,7 @@ export default function Home() {
               onClick={() => setSaveModalOpen(false)}
               className="px-6 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-gray-300 text-sm font-bold transition-colors"
             >
-              Cerrar
+              {t('editor3D.cancel')}
             </button>
             <button
               onClick={saveObject}
@@ -8470,7 +8805,7 @@ export default function Home() {
               ) : (
                 <Save className="w-4 h-4" />
               )}
-              Guardar
+              {t('editor3D.save')}
             </button>
           </div>
         </div>
@@ -8479,13 +8814,13 @@ export default function Home() {
       <Modal
         isOpen={obj3dModalOpen}
         onClose={() => setObj3dModalOpen(false)}
-        title="Objeto 3D"
-        description="Los de tu carpeta de Objetos 3D se cargan en el editor; los de public/Obj-3D se crean en la escena actual."
+        title={t('editor3D.object3d')}
+        description={t('editor3D.obj3dModalDesc')}
         size="md"
         bodyClassName="modal-scrollbar"
       >
         <div className="space-y-3 py-4">
-          {obj3dMsg && (
+          {obj3dMsg && obj3dMsg.ok && (
             <div
               className={`rounded-lg px-4 py-2 text-sm border ${
                 obj3dMsg.ok
@@ -8505,7 +8840,7 @@ export default function Home() {
                 className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-md text-sm font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 transition-colors disabled:opacity-50"
               >
                 <FolderOpen className="w-4 h-4" />
-                Seleccionar archivo .zeus
+                {t('editor3D.selectZeusFile')}
               </button>
               <input
                 ref={obj3dFileInputRef}
@@ -8539,12 +8874,12 @@ export default function Home() {
                   <Object3DPreview mesh={obj3dPreview?.mesh ?? null} />
                 </div>
                 <p className="text-[10px] text-muted-foreground/70 text-center">
-                  {obj3dPreview ? (
+                    {obj3dPreview ? (
                     <span className="text-green-400/80 font-mono">
                       {obj3dPreview.name}
                     </span>
                   ) : (
-                    'Pasa el ratón por un objeto para verlo girando'
+                    t('editor3D.hoverToRotate')
                   )}
                 </p>
               </div>
@@ -8557,10 +8892,10 @@ export default function Home() {
                   <div>
                     <div className="flex items-center justify-between mb-1.5">
                       <h4 className="text-xs font-bold text-foreground">
-                        Tu carpeta de Objetos 3D
+                        {t('editor3D.your3dFolder')}
                       </h4>
                       <span className="text-[10px] text-muted-foreground/70">
-                        al pinchar se carga en el editor
+                        {t('editor3D.clickToLoadInEditor')}
                       </span>
                     </div>
                     <div className="grid grid-cols-3 gap-2">
@@ -8573,7 +8908,7 @@ export default function Home() {
                             onMouseEnter={() => loadObj3dPreview(f)}
                             disabled={obj3dCreating}
                             className="group relative aspect-square rounded-md overflow-hidden border border-white/10 bg-black/20 hover:border-green-500/50 transition-all disabled:opacity-50"
-                            title={`Cargar "${f.name.replace(/\.zeus$/i, '')}" en el editor`}
+                            title={t('editor3D.loadInEditor', { name: f.name.replace(/\.zeus$/i, '') })}
                           >
                             <Object3DThumbnail mesh={f.mesh} />
                             {obj3dCreating && (
@@ -8596,10 +8931,10 @@ export default function Home() {
                   <div>
                     <div className="flex items-center justify-between mb-1.5">
                       <h4 className="text-xs font-bold text-foreground">
-                        public/Obj-3D
+                        {t('editor3D.publicObj3d')}
                       </h4>
                       <span className="text-[10px] text-muted-foreground/70">
-                        al pinchar se crea en la escena
+                        {t('editor3D.clickToCreateInScene')}
                       </span>
                     </div>
                     <div className="grid grid-cols-3 gap-2">
@@ -8612,7 +8947,7 @@ export default function Home() {
                             onMouseEnter={() => loadObj3dPreview(f)}
                             disabled={obj3dCreating}
                             className="group relative aspect-square rounded-md overflow-hidden border border-white/10 bg-black/20 hover:border-green-500/50 transition-all disabled:opacity-50"
-                            title={`Crear "${f.name.replace(/\.zeus$/i, '')}" en la escena`}
+                            title={t('editor3D.createInScene', { name: f.name.replace(/\.zeus$/i, '') })}
                           >
                             <Object3DThumbnail mesh={f.mesh} />
                             {obj3dCreating && (
@@ -8636,10 +8971,10 @@ export default function Home() {
 
           <div className="flex justify-end">
             <button
-              onClick={() => setObj3dModalOpen(false)}
-              className="px-6 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-gray-300 text-sm font-bold transition-colors"
-            >
-              Cerrar
+            onClick={() => setObj3dModalOpen(false)}
+            className="px-6 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-gray-300 text-sm font-bold transition-colors"
+          >
+            {t('editor3D.cancel')}
             </button>
           </div>
         </div>
@@ -8681,29 +9016,24 @@ export default function Home() {
                 <Trash2 className="w-4 h-4 text-red-400" />
               </div>
               <h3 className="text-base font-bold text-foreground">
-                Eliminar objeto
+                {t('editor3D.deleteObject')}
               </h3>
             </div>
             <p className="text-sm text-muted-foreground mb-5">
-              ¿Seguro que quieres eliminar{' '}
-              <strong className="text-foreground">
-                Objeto{' '}
-                {sceneObjects.findIndex((o) => o.id === objectToDelete) + 1}
-              </strong>
-              ? Esta acción no se puede deshacer.
+              {t('editor3D.deleteObjectConfirm', { name: `Objeto ${sceneObjects.findIndex((o) => o.id === objectToDelete) + 1}` })}
             </p>
             <div className="flex justify-end gap-2">
               <button
                 onClick={() => setObjectToDelete(null)}
                 className="px-4 py-2 rounded-md text-sm font-medium bg-white/5 hover:bg-white/10 text-muted-foreground border border-white/10 transition-colors"
               >
-                Cancelar
+                {t('editor3D.cancel')}
               </button>
               <button
                 onClick={confirmDeleteObject}
                 className="px-4 py-2 rounded-md text-sm font-bold bg-red-500 hover:bg-red-600 text-white transition-colors"
               >
-                Eliminar
+                {t('editor3D.delete')}
               </button>
             </div>
           </div>
@@ -8769,6 +9099,7 @@ export function PanelButtons({
   isEditing?: boolean;
   viewName?: 'front' | 'top' | 'side' | '3d';
 }) {
+  const { t } = useI18n();
   const btn =
     'w-5 h-5 flex items-center justify-center text-[10px] rounded bg-white/5 hover:bg-white/15 border border-white/10 text-white transition-colors';
   const editBtn = isEditing
@@ -8785,10 +9116,10 @@ export function PanelButtons({
   const isSide = viewName === 'side';
   const isTopOrFront = isTop || isFront;
 
-  const upTitle = isTop ? 'Arriba' : isTopOrFront ? 'Arriba' : isSide ? 'Arriba' : 'Arriba';
-  const downTitle = isTop ? 'Abajo' : isTopOrFront ? 'Abajo' : isSide ? 'Abajo' : 'Abajo';
-  const leftTitle = isTop ? 'Izquierda' : isSide ? 'Izquierda' : 'Izquierda';
-  const rightTitle = isTop ? 'Derecha' : isSide ? 'Derecha' : 'Derecha';
+  const upTitle = isTop ? t('editor3D.panelButtons.up') : isTopOrFront ? t('editor3D.panelButtons.up') : isSide ? t('editor3D.panelButtons.up') : t('editor3D.panelButtons.up');
+  const downTitle = isTop ? t('editor3D.panelButtons.down') : isTopOrFront ? t('editor3D.panelButtons.down') : isSide ? t('editor3D.panelButtons.down') : t('editor3D.panelButtons.down');
+  const leftTitle = isTop ? t('editor3D.panelButtons.left') : isSide ? t('editor3D.panelButtons.left') : t('editor3D.panelButtons.left');
+  const rightTitle = isTop ? t('editor3D.panelButtons.right') : isSide ? t('editor3D.panelButtons.right') : t('editor3D.panelButtons.right');
 
   // onPan deltas for each button (dx, dy)
   // Top view: ▶=Derecha(+X), ◀=Izquierda(-X), ▲=Arriba(-Z), ▼=Abajo(+Z)
@@ -8831,14 +9162,14 @@ export function PanelButtons({
       <button
         className={btn}
         onClick={(e) => stop(e, () => onZoom(1.15))}
-        title="Acercar"
+        title={t('editor3D.panelButtons.zoomIn')}
       >
         ＋
       </button>
       <button
         className={btn}
         onClick={(e) => stop(e, () => onZoom(1 / 1.15))}
-        title="Alejar"
+        title={t('editor3D.panelButtons.zoomOut')}
       >
         −
       </button>
@@ -8847,14 +9178,14 @@ export function PanelButtons({
           <button
             className={btn}
             onClick={(e) => stop(e, () => onRotateLeft?.())}
-            title="Rotar izq"
+            title={t('editor3D.panelButtons.rotateLeft')}
           >
             ↺
           </button>
           <button
             className={btn}
             onClick={(e) => stop(e, () => onRotateRight?.())}
-            title="Rotar der"
+            title={t('editor3D.panelButtons.rotateRight')}
           >
             ↻
           </button>
@@ -8864,7 +9195,7 @@ export function PanelButtons({
         <button
           className={editBtn}
           onClick={(e) => stop(e, () => onEdit())}
-          title={isEditing ? 'Cerrar vista expandida' : 'Editar en grande'}
+          title={isEditing ? t('editor3D.panelButtons.closeExpanded') : t('editor3D.panelButtons.editLarge')}
         >
           ◻️
         </button>
@@ -8872,3 +9203,5 @@ export function PanelButtons({
     </div>
   );
 }
+
+
