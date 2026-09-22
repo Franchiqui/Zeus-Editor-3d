@@ -21,7 +21,9 @@ import { createDefaultCameraData, evaluateCameraKeyframes, EASING_OPTIONS } from
 import LightingModal from '@/components/LightingModal';
 import TextureBrowserModal from '@/components/texture-browser-modal';
 import BooleanCSGModal from './BooleanCSGModal';
+import PluginsModal from './PluginsModal';
 import { performCSGOperation, type BooleanOperationType } from '@/lib/csg-mesh';
+import { obtenerPlugin, type PluginParams } from '@/lib/plugins';
 import { toast } from 'sonner';
 import MeshEditor from './MeshEditor';
 import { buildLoftMesh } from '@/lib/loft-mesh';
@@ -155,6 +157,7 @@ import {
    Video,
    Eye,
    EyeOff,
+   Puzzle,
 } from 'lucide-react';
 
 const EditorCanvasComponent = EditorCanvas as unknown as ComponentType<any>;
@@ -2612,6 +2615,8 @@ export default function Home({
   const [objectToDelete, setObjectToDelete] = useState<string | null>(null);
   // Modal para operaciones booleanas (sustraer, unir, intersecar)
   const [booleanModalOpen, setBooleanModalOpen] = useState<boolean>(false);
+  // Modal de plugins (deformadores y utilidades registrados en lib/plugins)
+  const [pluginsModalOpen, setPluginsModalOpen] = useState<boolean>(false);
   const [booleanPreview, setBooleanPreview] = useState<boolean>(false);
   const [booleanToolObjectId, setBooleanToolObjectId] = useState<string | null>(null);
   const [booleanPreviewLive, setBooleanPreviewLive] = useState<boolean>(false);
@@ -5496,6 +5501,92 @@ export default function Home({
     [sceneObjects, configObjectId, triMesh]
   );
 
+  /**
+   * Ejecuta un plugin (lib/plugins) sobre un objeto de la escena: resuelve
+   * su malla (instantánea propia, o la viva del dueño del panel), llama a
+   * `aplicar` y guarda la malla resultante en el objeto. La escena queda
+   * en el historial, así que el resultado se deshace con Ctrl+Z.
+   */
+  const handleApplyPlugin = useCallback(
+    ({
+      pluginId,
+      targetObjectId,
+      valores,
+    }: {
+      pluginId: string;
+      targetObjectId: string;
+      valores: PluginParams;
+    }) => {
+      const plugin = obtenerPlugin(pluginId);
+      const obj = sceneObjects.find((o) => o.id === targetObjectId);
+
+      if (!plugin) {
+        toast.error(t('editor3D.plugins.errNotRegistered'));
+        return false;
+      }
+      if (!obj) {
+        toast.error(t('editor3D.objectsNotFound'));
+        return false;
+      }
+
+      const meshObjetivo =
+        obj.mesh && obj.mesh.vertices.length > 0
+          ? obj.mesh
+          : obj.id === configObjectId
+            ? triMesh
+            : null;
+
+      if (!meshObjetivo || !meshObjetivo.vertices.length) {
+        toast.error(t('editor3D.baseObjectNoGeometry'));
+        return false;
+      }
+
+      try {
+        const resultado = plugin.aplicar(meshObjetivo, valores);
+        if (!resultado || !resultado.vertices.length) {
+          toast.error(t('editor3D.plugins.errInvalidMesh'));
+          return false;
+        }
+
+        // Si el objeto era dueño de la configuración, se desvincula para
+        // que el visor muestre permanentemente la malla deformada (igual
+        // que en las booleanas).
+        if (configObjectId === targetObjectId) {
+          setConfigObjectId(null);
+        }
+
+        setSceneObjects((current) =>
+          current.map((o) =>
+            o.id === targetObjectId
+              ? {
+                  ...o,
+                  mesh: resultado,
+                  // La deformación rompe el estilo original: la malla
+                  // resultante se muestra tal cual.
+                  smooth: false,
+                }
+              : o
+          )
+        );
+
+        setSelectedObjectId(targetObjectId);
+        toast.success(
+          t('editor3D.plugins.applied', { plugin: plugin.nombre })
+        );
+        return true;
+      } catch (err) {
+        console.error('[plugins] Error al aplicar:', err);
+        toast.error(
+          err instanceof Error
+            ? err.message
+            : t('editor3D.plugins.errUnexpected')
+        );
+        return false;
+      }
+    },
+    [sceneObjects, configObjectId, triMesh, t]
+  );
+
   // Las 4 ventanas (Frente, Superior, Costado y 3D) son las mismas para
   // todas las herramientas: siempre muestran la escena completa (objeto
   // seleccionado en vivo + resto congelado). Solo el panel lateral cambia
@@ -5710,6 +5801,22 @@ export default function Home({
                 <span className="text-sm font-bold flex items-center gap-1.5">
                   <Scissors className="w-3.5 h-3.5 text-amber-400" />
                   {t('editor3D.subtractShape')}
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => {
+                  // Sin preventDefault: el menú se cierra solo al abrir el
+                  // modal (mismo motivo que en el modal «Objeto 3D»).
+                  setPluginsModalOpen(true);
+                }}
+                disabled={visibleSceneObjects.length < 1}
+                data-testid="open-plugins-modal"
+                className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5 disabled:opacity-40"
+                title={t('editor3D.plugins.menuDesc')}
+              >
+                <span className="text-sm font-bold flex items-center gap-1.5">
+                  <Puzzle className="w-3.5 h-3.5 text-violet-400" />
+                  {t('editor3D.plugins.menuTitle')}
                 </span>
               </DropdownMenuItem>
               <DropdownMenuItem
@@ -9259,6 +9366,13 @@ export default function Home({
    setBooleanModalOpen(false);
    }}
  />
+       <PluginsModal
+          isOpen={pluginsModalOpen}
+          onClose={() => setPluginsModalOpen(false)}
+          sceneObjects={visibleSceneObjects}
+          selectedObjectId={selectedObjectId}
+          onApply={handleApplyPlugin}
+        />
        <TextureBrowserModal
         isOpen={showTextureModal}
         onClose={() => {
