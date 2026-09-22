@@ -281,3 +281,272 @@ export function evaluateCameraKeyframes(
   }
   return poseOf(sorted[sorted.length - 1]);
 }
+
+// ---------------------------------------------------------------------------
+// Editor de movimiento: pistas de TRANSFORMADA de objetos y de PARÁMETROS de
+// plugin. Todo en SEGUNDOS (el legacy AnimationTrack usa ms; queda aislado).
+// ---------------------------------------------------------------------------
+
+/** Propiedades animables de la transformada de un objeto (ObjectTransform). */
+export type TransformProperty =
+  | 'px' | 'py' | 'pz'
+  | 'rx' | 'ry' | 'rz'
+  | 'sx' | 'sy' | 'sz';
+
+export interface TransformKeyframe {
+  time: number;
+  /** Solo las propiedades que cambian en este fotograma. */
+  values: Partial<Record<TransformProperty, number>>;
+  easing: EasingFunction;
+}
+
+export interface TransformTrack {
+  id: string;
+  objectId: string;
+  name: string;
+  /** Duración en segundos. */
+  duration: number;
+  looping: boolean;
+  keyframes: TransformKeyframe[];
+  /**
+   * Pistas de grupo: cuando se está, esta pista controla SIMULTÁNEAMENTE
+   * la transformada de todos los objetos listados aquí (además del
+   * objectId principal). Permite animar un grupo de objetos como si
+   * fueran un único objeto.
+   */
+  objectIds?: string[];
+}
+
+/** Fotograma de un parámetro de plugin (solo deslizadores son animables). */
+export interface PluginParamKeyframe {
+  time: number;
+  value: number;
+  easing: EasingFunction;
+}
+
+export interface PluginParamTrack {
+  id: string;
+  objectId: string;
+  pluginId: string;
+  paramId: string;
+  /** Duración en segundos. */
+  duration: number;
+  looping: boolean;
+  keyframes: PluginParamKeyframe[];
+}
+
+export const TRANSFORM_PROPERTIES: TransformProperty[] = [
+  'px', 'py', 'pz', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz',
+];
+
+export const TRANSFORM_PROPERTY_LABELS: Record<TransformProperty, string> = {
+  px: 'Posición X',
+  py: 'Posición Y',
+  pz: 'Posición Z',
+  rx: 'Rotación X',
+  ry: 'Rotación Y',
+  rz: 'Rotación Z',
+  sx: 'Escala X',
+  sy: 'Escala Y',
+  sz: 'Escala Z',
+};
+
+/**
+ * Evalúa una pista de transformada en un instante (segundos). Devuelve solo
+ * las propiedades presentes en los fotogramas; el resto lo resuelve quien
+ * llama mezclando con el transform estático del objeto.
+ */
+export function evaluateTransformTrack(
+  track: TransformTrack,
+  time: number
+): Partial<Record<TransformProperty, number>> | null {
+  if (track.keyframes.length === 0) return null;
+  const sorted = [...track.keyframes].sort((a, b) => a.time - b.time);
+  const effectiveTime = track.looping && track.duration > 0
+    ? ((time % track.duration) + track.duration) % track.duration
+    : time;
+
+  if (effectiveTime <= sorted[0].time) {
+    return { ...(sorted[0].values ?? {}) };
+  }
+  if (effectiveTime >= sorted[sorted.length - 1].time) {
+    return { ...(sorted[sorted.length - 1].values ?? {}) };
+  }
+
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const start = sorted[i];
+    const end = sorted[i + 1];
+    if (effectiveTime >= start.time && effectiveTime <= end.time) {
+      const segDur = end.time - start.time;
+      const progress = segDur > 0 ? (effectiveTime - start.time) / segDur : 0;
+      const eased = getEasingFunction(end.easing)(progress);
+      const props = Array.from(
+        new Set([...Object.keys(start.values ?? {}), ...Object.keys(end.values ?? {})])
+      ) as TransformProperty[];
+      const result: Partial<Record<TransformProperty, number>> = {};
+      for (const prop of props) {
+        const from = (start.values ?? {})[prop];
+        const to = (end.values ?? {})[prop];
+        if (from === undefined && to === undefined) continue;
+        result[prop] = from !== undefined && to !== undefined
+          ? from + (to - from) * eased
+          : (to ?? from);
+      }
+      return result;
+    }
+  }
+  return { ...(sorted[sorted.length - 1].values ?? {}) };
+}
+
+/** Evalúa una pista de parámetro de plugin en un instante (segundos). */
+export function evaluatePluginParamTrack(
+  track: PluginParamTrack,
+  time: number
+): number | null {
+  if (track.keyframes.length === 0) return null;
+  const sorted = [...track.keyframes].sort((a, b) => a.time - b.time);
+  const effectiveTime = track.looping && track.duration > 0
+    ? ((time % track.duration) + track.duration) % track.duration
+    : time;
+
+  if (effectiveTime <= sorted[0].time) return sorted[0].value;
+  if (effectiveTime >= sorted[sorted.length - 1].time) {
+    return sorted[sorted.length - 1].value;
+  }
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const start = sorted[i];
+    const end = sorted[i + 1];
+    if (effectiveTime >= start.time && effectiveTime <= end.time) {
+      const segDur = end.time - start.time;
+      const progress = segDur > 0 ? (effectiveTime - start.time) / segDur : 0;
+      const eased = getEasingFunction(end.easing)(progress);
+      return start.value + (end.value - start.value) * eased;
+    }
+  }
+  return sorted[sorted.length - 1].value;
+}
+
+/**
+ * Inserta un fotograma o REEMPLAZA el que cae en el mismo tiempo
+ * (tolerancia `epsilon`). Devuelve un array nuevo ordenado por tiempo.
+ */
+export function upsertKeyframeAt<T extends { time: number }>(
+  keyframes: T[],
+  kf: T,
+  epsilon: number = 1e-4
+): T[] {
+  const existing = keyframes.findIndex((k) => Math.abs(k.time - kf.time) < epsilon);
+  if (existing >= 0) {
+    const next = [...keyframes];
+    next[existing] = kf;
+    return next.sort((a, b) => a.time - b.time);
+  }
+  return [...keyframes, kf].sort((a, b) => a.time - b.time);
+}
+
+/**
+ * Diff de transformadas: solo las propiedades cuyo delta supera `eps`.
+ * `ObjectTransform` (viewer-3d.tsx) cumple la forma de `Record<TransformProperty, number>`.
+ */
+export function diffTransform(
+  from: Record<TransformProperty, number>,
+  to: Record<TransformProperty, number>,
+  eps: number = 1e-4
+): Partial<Record<TransformProperty, number>> {
+  const result: Partial<Record<TransformProperty, number>> = {};
+  for (const prop of TRANSFORM_PROPERTIES) {
+    const a = from[prop];
+    const b = to[prop];
+    if (a === undefined || b === undefined) continue;
+    if (Math.abs(b - a) > eps) result[prop] = b;
+  }
+  return result;
+}
+
+export function createTransformTrack(
+  objectId: string,
+  transform: Record<TransformProperty, number>,
+  duration: number = 5
+): TransformTrack {
+  return {
+    id: `ttrack-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    objectId,
+    name: 'Transformación',
+    duration,
+    looping: false,
+    keyframes: [
+      {
+        time: 0,
+        values: TRANSFORM_PROPERTIES.reduce((acc, p) => {
+          if (transform[p] !== undefined) acc[p] = transform[p];
+          return acc;
+        }, {} as Partial<Record<TransformProperty, number>>),
+        easing: 'linear',
+      },
+    ],
+  };
+}
+
+/**
+ * Crea una pista de transformada de GRUPO: controla al objeto principal
+ * (objectId) y a todos los listados en objectIds con un único set de
+ * fotogramas. Útil para animar varios objetos como un solo cuerpo.
+ */
+export function createGroupTransformTrack(
+  objectIds: string[],
+  transform: Record<TransformProperty, number>,
+  duration: number = 5
+): TransformTrack {
+  if (objectIds.length === 0) {
+    return createTransformTrack('', transform, duration);
+  }
+  const mainId = objectIds[0];
+  const rest = objectIds.slice(1);
+  return {
+    id: `ttrack-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    objectId: mainId,
+    name: 'Grupo',
+    duration,
+    looping: false,
+    keyframes: [
+      {
+        time: 0,
+        values: TRANSFORM_PROPERTIES.reduce((acc, p) => {
+          if (transform[p] !== undefined) acc[p] = transform[p];
+          return acc;
+        }, {} as Partial<Record<TransformProperty, number>>),
+        easing: 'linear',
+      },
+    ],
+    objectIds: rest.length > 0 ? rest : undefined,
+  };
+}
+
+export function createPluginParamTrack(
+  objectId: string,
+  pluginId: string,
+  paramId: string,
+  value: number,
+  duration: number = 5
+): PluginParamTrack {
+  return {
+    id: `ptrack-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    objectId,
+    pluginId,
+    paramId,
+    duration,
+    looping: false,
+    keyframes: [{ time: 0, value, easing: 'linear' }],
+  };
+}
+
+/** Duración global del sistema de movimiento (segundos). */
+export function motionMaxDuration(
+  transformTracks: TransformTrack[],
+  pluginTracks: PluginParamTrack[]
+): number {
+  let max = 0;
+  for (const t of transformTracks) max = Math.max(max, t.duration);
+  for (const t of pluginTracks) max = Math.max(max, t.duration);
+  return max;
+}

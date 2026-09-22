@@ -24,6 +24,8 @@ export type PluginParam =
       valor: number;
       /** Unidad mostrada junto al valor (°, %, cm…). */
       unidad?: string;
+      /** Texto de ayuda opcional mostrado bajo el control. */
+      descripcion?: string;
     }
   /** Lista de opciones (el valor viaja como string). */
   | {

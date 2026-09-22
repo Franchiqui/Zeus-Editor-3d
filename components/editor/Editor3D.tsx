@@ -16,12 +16,27 @@ import type {
   CameraData,
   CameraKeyframe,
   Vec3,
+  TransformTrack,
+  PluginParamTrack,
 } from '@/lib/animation';
-import { createDefaultCameraData, evaluateCameraKeyframes, EASING_OPTIONS } from '@/lib/animation';
+import {
+  createDefaultCameraData,
+  evaluateCameraKeyframes,
+  evaluateTransformTrack,
+  evaluatePluginParamTrack,
+  motionMaxDuration,
+  diffTransform,
+  upsertKeyframeAt,
+  createTransformTrack,
+  createPluginParamTrack,
+  EASING_OPTIONS,
+} from '@/lib/animation';
 import LightingModal from '@/components/LightingModal';
 import TextureBrowserModal from '@/components/texture-browser-modal';
 import BooleanCSGModal from './BooleanCSGModal';
 import PluginsModal from './PluginsModal';
+import { MotionEditor } from './MotionEditor';
+import { cloneMesh } from '@/lib/plugins/clone';
 import { performCSGOperation, type BooleanOperationType } from '@/lib/csg-mesh';
 import { obtenerPlugin, type PluginParams } from '@/lib/plugins';
 import { toast } from 'sonner';
@@ -94,7 +109,7 @@ import {
   type FontOption,
 } from '@/lib/text-voxel';
 import { buildSmoothTextMesh } from '@/lib/text-outline';
-import { exportSTL, exportOBJ, exportPLY, exportGLB } from '@/lib/mesh-export';
+import { exportSTL, exportOBJ, exportPLY, exportGLB, mergeMeshes } from '@/lib/mesh-export';
 import { importModelFile, getFormatFromExtension, IMPORT_FORMATS, normalizeAndCenterMeshes } from '@/lib/mesh-import';
 import { Modal } from '@/components/ui/modal';
 import { Slider } from '@/components/ui/slider';
@@ -158,6 +173,7 @@ import {
    Eye,
    EyeOff,
    Puzzle,
+   Clapperboard,
 } from 'lucide-react';
 
 const EditorCanvasComponent = EditorCanvas as unknown as ComponentType<any>;
@@ -341,6 +357,12 @@ type HistoryState = {
   groups: ObjectGroup[];
   /** Polilíneas libres de los lienzos 2D, por lienzo (solo 2D) */
   polylines: PolylinesByCanvas;
+  /** Editor de movimiento: pistas de transformada (auto-key). */
+  transformTracks: TransformTrack[];
+  /** Editor de movimiento: pistas de parámetros de plugin. */
+  pluginTracks: PluginParamTrack[];
+  /** Mallas base congeladas para las pistas de plugin, por objectId. */
+  pluginBaseMeshes: Record<string, Mesh>;
 };
 
 // Plantillas por defecto: vacías. Los lienzos 2D arrancan en blanco
@@ -1321,6 +1343,86 @@ export default function Home({
     const [showKeyframeEditor, setShowKeyframeEditor] = useState(false);
     const [showGroupsPanel, setShowGroupsPanel] = useState(true);
 
+    // Editor de movimiento: pistas de transformada (auto-key) y de
+    // parámetros de plugin. Todo en segundos; las mallas base se congelan
+    // al crear la primera pista de plugin del objeto.
+    const [transformTracks, setTransformTracks] = useState<TransformTrack[]>([]);
+    const [pluginTracks, setPluginTracks] = useState<PluginParamTrack[]>([]);
+    const [pluginBaseMeshes, setPluginBaseMeshes] = useState<Record<string, Mesh>>({});
+    const [motionEditorOpen, setMotionEditorOpen] = useState(false);
+    const [autoKey, setAutoKey] = useState(false);
+    // Altura del editor de movimiento en px (null = 40vh por defecto).
+    // Se cambia arrastrando el separador entre visor y línea de tiempo.
+    const [motionEditorHeight, setMotionEditorHeight] = useState<number | null>(null);
+    const motionResizeRef = useRef<{ startY: number; startH: number } | null>(null);
+    const handleMotionResizeStart = (e: React.PointerEvent<HTMLDivElement>) => {
+      motionResizeRef.current = {
+        startY: e.clientY,
+        startH:
+          motionEditorHeight ?? Math.round(window.innerHeight * 0.4),
+      };
+      e.currentTarget.setPointerCapture(e.pointerId);
+    };
+    const handleMotionResizeMove = (e: React.PointerEvent<HTMLDivElement>) => {
+      const drag = motionResizeRef.current;
+      if (!drag) return;
+      // Arrastrar hacia arriba agranda el editor (el visor cede espacio).
+      const next = drag.startH + (drag.startY - e.clientY);
+      setMotionEditorHeight(
+        Math.min(Math.max(next, 140), Math.round(window.innerHeight * 0.8))
+      );
+    };
+    const handleMotionResizeEnd = () => {
+      motionResizeRef.current = null;
+    };
+    // Recorrido editable del objeto seleccionado en el visor (curva + asas
+    // violetas, como el de la cámara). Se puede ocultar desde el editor.
+    const [showMotionPath, setShowMotionPath] = useState(true);
+    const handleMotionKeyframeMove = useCallback(
+      (index: number, pos: { x: number; y: number; z: number }) => {
+        setTransformTracks((prev) =>
+          prev.map((tr) => {
+            if (tr.objectId !== selectedObjectId) return tr;
+            if (!tr.keyframes[index]) return tr;
+            return {
+              ...tr,
+              keyframes: tr.keyframes.map((kf, i) =>
+                i === index
+                  ? {
+                      ...kf,
+                      values: { ...kf.values, px: pos.x, py: pos.y, pz: pos.z },
+                    }
+                  : kf
+              ),
+            };
+          })
+        );
+      },
+      [selectedObjectId]
+    );
+    // Restaurar objeto en el editor de movimiento: transforma estático de
+    // vuelta (nunca se tocó, es solo visual), borra sus pistas y libera
+    // la malla base congelada.
+    const handleRestoreMotionObject = useCallback((objectId: string) => {
+      setTransformTracks((prev) => prev.filter((tr) => tr.objectId !== objectId));
+      setPluginTracks((prev) => prev.filter((tr) => tr.objectId !== objectId));
+      setPluginBaseMeshes((prev) => {
+        if (!(objectId in prev)) return prev;
+        const next = { ...prev };
+        delete next[objectId];
+        return next;
+      });
+      // Por si el visor quedó con el transplante de geometría activo.
+      setPlaying(false);
+      setViewRefreshTick((v) => v + 1);
+    }, []);
+    const autoKeyRef = useRef(autoKey);
+    autoKeyRef.current = autoKey;
+    const transformTracksRef = useRef(transformTracks);
+    transformTracksRef.current = transformTracks;
+    const currentTimeRef = useRef(currentTime);
+    currentTimeRef.current = currentTime;
+
     const animationStartTimeRef = useRef<number | null>(null);
    const animIdRef = useRef<number | null>(null);
     // Espejo de sceneObjects para la duración de reproducción: leerlo por
@@ -1342,7 +1444,8 @@ export default function Home({
         animationTracks.length > 0
           ? Math.max(...animationTracks.map((t) => t.duration)) / 1000
           : 0,
-        camSpan
+        camSpan,
+        motionMaxDuration(transformTracks, pluginTracks)
       );
       if (!playing || maxDuration <= 0) {
         animationStartTimeRef.current = null;
@@ -1355,7 +1458,10 @@ export default function Home({
         const elapsed = (performance.now() - animationStartTimeRef.current) / 1000;
         let t = elapsed;
         if (t >= maxDuration) {
-          const loop = animationTracks.some((track) => track.looping);
+          const loop =
+            animationTracks.some((track) => track.looping) ||
+            transformTracks.some((track) => track.looping) ||
+            pluginTracks.some((track) => track.looping);
           if (!loop) {
             setPlaying(false);
             animationStartTimeRef.current = null;
@@ -1376,7 +1482,17 @@ export default function Home({
         }
         animationStartTimeRef.current = null;
       };
-    }, [playing, animationTracks]);
+    }, [playing, animationTracks, transformTracks, pluginTracks]);
+
+    // Al parar la reproducción, los visores restauran sus visuales
+    // estáticos: las mallas deformadas por pistas de plugin eran solo un
+    // override del render (la escena nunca se tocó).
+    useEffect(() => {
+      if (!playing && pluginTracks.length > 0) {
+        setViewRefreshTick((v) => v + 1);
+      }
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [playing]);
 
    useEffect(() => {
     if (mode === 'text') {
@@ -1475,6 +1591,9 @@ export default function Home({
       mode,
       groups,
       polylines,
+      transformTracks,
+      pluginTracks,
+      pluginBaseMeshes,
     });
 
     if (history.length === 0 && historyIndex === -1) {
@@ -1496,7 +1615,12 @@ export default function Home({
           lastState.sceneObjects === currentState.sceneObjects &&
           lastState.selectedObjectId === currentState.selectedObjectId &&
           lastState.configObjectId === currentState.configObjectId &&
-          lastState.mode === currentState.mode;
+          lastState.mode === currentState.mode &&
+          // Editor de movimiento: también por referencia (las mallas
+          // base son enormes; stringify sería muy costoso).
+          lastState.transformTracks === currentState.transformTracks &&
+          lastState.pluginTracks === currentState.pluginTracks &&
+          lastState.pluginBaseMeshes === currentState.pluginBaseMeshes;
         const isSame =
           sceneSame &&
           same(lastState.views, currentState.views) &&
@@ -1590,6 +1714,9 @@ export default function Home({
     configObjectId,
     mode,
     polylines,
+    transformTracks,
+    pluginTracks,
+    pluginBaseMeshes,
     history,
     historyIndex,
     isUndoRedo,
@@ -1644,6 +1771,10 @@ export default function Home({
     setGroups(state.groups ?? []);
     // Fotos antiguas sin polilíneas: se restauran como lienzo vacío
     setPolylines(state.polylines ?? {});
+    // Editor de movimiento: fotos antiguas sin pistas nuevas, vacío.
+    setTransformTracks(state.transformTracks ?? []);
+    setPluginTracks(state.pluginTracks ?? []);
+    setPluginBaseMeshes(state.pluginBaseMeshes ?? {});
   }, []);
 
   const undo = useCallback(() => {
@@ -3005,6 +3136,11 @@ export default function Home({
         objectTextureFinish,
         skyboxImage,
         animationTracks,
+        // Editor de movimiento: pistas de transformada y de parámetros
+        // de plugin, con sus mallas base congeladas.
+        transformTracks,
+        pluginTracks,
+        pluginBaseMeshes,
         panelCamerasObjeto,
         // Fuentes importadas (Google Fonts y locales): viajan con el
         // proyecto para volver al reabrirlo
@@ -3786,6 +3922,60 @@ export default function Home({
               data.animationTracks.filter((t: { objectId: string | null }) => t.objectId !== null)
             );
           }
+          // Editor de movimiento: pistas nuevas (segundos). Se valida el
+          // shape; las pistas de plugin sin plugin registrado se descartan.
+          if (Array.isArray(data.transformTracks)) {
+            const idsValidos = new Set(
+              (Array.isArray(data.sceneObjects) ? data.sceneObjects : []).map(
+                (o: { id?: string }) => o.id
+              )
+            );
+            setTransformTracks(
+              data.transformTracks.filter(
+                (t: { id?: unknown; objectId?: unknown; objectIds?: unknown; keyframes?: unknown }) => {
+                  if (typeof t.id !== 'string') return false;
+                  if (typeof t.objectId !== 'string') return false;
+                  if (!idsValidos.has(t.objectId)) return false;
+                  if (!Array.isArray(t.keyframes)) return false;
+                  if (t.objectIds !== undefined) {
+                    if (!Array.isArray(t.objectIds)) return false;
+                    if (t.objectIds.some((id: unknown) => typeof id !== 'string' || !idsValidos.has(id)))
+                      return false;
+                  }
+                  return true;
+                }
+              )
+            );
+          }
+          if (Array.isArray(data.pluginTracks)) {
+            const idsValidos = new Set(
+              (Array.isArray(data.sceneObjects) ? data.sceneObjects : []).map(
+                (o: { id?: string }) => o.id
+              )
+            );
+            setPluginTracks(
+              data.pluginTracks.filter(
+                (t: { id?: unknown; objectId?: unknown; pluginId?: unknown; paramId?: unknown; keyframes?: unknown }) =>
+                  typeof t.id === 'string' &&
+                  (typeof t.objectId === 'string' && idsValidos.has(t.objectId)) &&
+                  typeof t.pluginId === 'string' &&
+                  typeof t.paramId === 'string' &&
+                  Array.isArray(t.keyframes) &&
+                  obtenerPlugin(t.pluginId) !== undefined
+              )
+            );
+          }
+          if (data.pluginBaseMeshes && typeof data.pluginBaseMeshes === 'object') {
+            const bases: Record<string, Mesh> = {};
+            for (const [id, m] of Object.entries(
+              data.pluginBaseMeshes as Record<string, Mesh>
+            )) {
+              if (m && Array.isArray(m.vertices) && Array.isArray(m.faces) && m.vertices.length > 0) {
+                bases[id] = m;
+              }
+            }
+            setPluginBaseMeshes(bases);
+          }
           // Cámara-objeto activa por ventana: solo ids que existen.
           if (data.panelCamerasObjeto && typeof data.panelCamerasObjeto === 'object') {
             const idsValidos = new Set(
@@ -4225,29 +4415,55 @@ export default function Home({
     }
   }, [mode]);
 
-  // Exporta el objeto actual a un formato de archivo común. Se exporta
-  // la misma malla triangulada que ve el visor 3D. En la pestaña neutra
-  // no hay figura viva (triMesh vacío), así que se exporta la
-  // instantánea del objeto seleccionado.
-  const exportModel = useCallback(
-    (format: 'stl' | 'obj' | 'ply' | 'glb') => {
-      // En Escena (o sin dueño) el triMesh está vacío: usar la
-      // instantánea del seleccionado, que es justo lo que ve el usuario.
-      const meshToExport =
-        triMesh.vertices.length > 0
-          ? triMesh
-          : frozenSelected?.mesh && frozenSelected.mesh.vertices.length > 0
-            ? frozenSelected.mesh
-            : null;
-      if (!meshToExport) return;
-      const name = 'modelo-3d';
-      if (format === 'stl') exportSTL(meshToExport, name);
-      else if (format === 'obj') exportOBJ(meshToExport, name);
-      else if (format === 'ply') exportPLY(meshToExport, name);
-      else exportGLB(meshToExport, name);
-    },
-    [triMesh, frozenSelected]
-  );
+   // Exporta el objeto actual a un formato de archivo común. Se exporta
+   // la misma malla triangulada que ve el visor 3D. En la pestaña neutra
+   // no hay figura viva (triMesh vacío), así que se exporta la
+   // instantánea del objeto seleccionado.
+   // En la pestaña Escena se unen TODOS los objetos visibles en un único
+   // archivo (aplicando su transformada a los vértices), no solo el
+   // seleccionado.
+   const exportModel = useCallback(
+     (format: 'stl' | 'obj' | 'ply' | 'glb') => {
+       // En Escena: unir todos los objetos visibles con malla.
+       if (mode === 'scene') {
+         const visibleWithMesh = sceneObjects.filter(
+           (o) => !o.hidden && o.mesh && o.mesh.vertices.length > 0
+         );
+         if (visibleWithMesh.length === 0) return;
+         const meshToExport =
+           visibleWithMesh.length === 1
+             ? visibleWithMesh[0].mesh!
+             : mergeMeshes(
+                 visibleWithMesh.map((o) => ({
+                   mesh: o.mesh!,
+                   transform: o.transform,
+                   name: o.name,
+                 }))
+               );
+         const name = 'modelo-3d';
+         if (format === 'stl') exportSTL(meshToExport, name);
+         else if (format === 'obj') exportOBJ(meshToExport, name);
+         else if (format === 'ply') exportPLY(meshToExport, name);
+         else exportGLB(meshToExport, name);
+         return;
+       }
+       // En otras pestañas: exportar la figura viva o la instantánea del
+       // seleccionado (comportamiento previo).
+       const meshToExport =
+         triMesh.vertices.length > 0
+           ? triMesh
+           : frozenSelected?.mesh && frozenSelected.mesh.vertices.length > 0
+             ? frozenSelected.mesh
+             : null;
+       if (!meshToExport) return;
+       const name = 'modelo-3d';
+       if (format === 'stl') exportSTL(meshToExport, name);
+       else if (format === 'obj') exportOBJ(meshToExport, name);
+       else if (format === 'ply') exportPLY(meshToExport, name);
+       else exportGLB(meshToExport, name);
+     },
+     [triMesh, frozenSelected, mode, sceneObjects]
+   );
 
   // En la pestaña neutra no se construye ninguna figura: no hay nada
   // que "poder construir", la barra de aviso tampoco tiene sentido ahí.
@@ -5003,6 +5219,68 @@ export default function Home({
            return { ...object, transform };
          })
        );
+
+       // AUTO-KEY: con la grabación armada, un gesto del gizmo registra
+       // un fotograma de la pista de transformada en el tiempo actual
+       // (solo las propiedades que cambian). El debounce del historial
+       // agrupa el patch estático y el fotograma en un solo lote.
+       if (autoKeyRef.current) {
+         const objetoAnterior = sceneObjectsPlaybackRef.current.find(
+           (o) => o.id === selectedObjectId
+         );
+         const estatico = objetoAnterior?.transform;
+         if (!estatico) return;
+         const prevTrack = transformTracksRef.current.find(
+           (tr) => tr.objectId === selectedObjectId
+         );
+         // Base = último valor animado en el playhead (si ya hay pista)
+         // o la transformada estática previa al gesto.
+         const animado = prevTrack
+           ? evaluateTransformTrack(prevTrack, currentTimeRef.current)
+           : null;
+         const base = {
+           px: animado?.px ?? estatico.px,
+           py: animado?.py ?? estatico.py,
+           pz: animado?.pz ?? estatico.pz,
+           rx: animado?.rx ?? estatico.rx,
+           ry: animado?.ry ?? estatico.ry,
+           rz: animado?.rz ?? estatico.rz,
+           sx: animado?.sx ?? estatico.sx,
+           sy: animado?.sy ?? estatico.sy,
+           sz: animado?.sz ?? estatico.sz,
+         };
+         const values = diffTransform(base, transform);
+         if (Object.keys(values).length === 0) return;
+         setTransformTracks((current) => {
+           const prev = current.find((tr) => tr.objectId === selectedObjectId);
+           if (!prev) {
+             const track = createTransformTrack(
+               selectedObjectId,
+               estatico,
+               Math.max(5, currentTimeRef.current)
+             );
+             track.keyframes = upsertKeyframeAt(track.keyframes, {
+               time: currentTimeRef.current,
+               values,
+               easing: 'linear',
+             });
+             return [...current, track];
+           }
+           return current.map((tr) =>
+             tr.objectId === selectedObjectId
+               ? {
+                   ...tr,
+                   duration: Math.max(tr.duration, currentTimeRef.current),
+                   keyframes: upsertKeyframeAt(tr.keyframes, {
+                     time: currentTimeRef.current,
+                     values,
+                     easing: 'linear',
+                   }),
+                 }
+               : tr
+           );
+         });
+       }
      },
      [selectedObjectId, cameraKeyframeIndex]
    );
@@ -5502,6 +5780,24 @@ export default function Home({
   );
 
   /**
+   * Resuelve la malla base de un objeto para pistas de plugin animadas:
+   * instantánea propia, o la viva del dueño del panel (misma regla que
+   * handleApplyPlugin). Se congelará con cloneMesh al crear la pista.
+   */
+  const resolverMallaBase = useCallback(
+    (objectId: string): Mesh | null => {
+      const obj = sceneObjects.find((o) => o.id === objectId);
+      if (!obj) return null;
+      if (obj.mesh && obj.mesh.vertices.length > 0) return obj.mesh;
+      if (obj.id === configObjectId && triMesh && triMesh.vertices.length > 0) {
+        return triMesh;
+      }
+      return null;
+    },
+    [sceneObjects, configObjectId, triMesh]
+  );
+
+  /**
    * Ejecuta un plugin (lib/plugins) sobre un objeto de la escena: resuelve
    * su malla (instantánea propia, o la viva del dueño del panel), llama a
    * `aplicar` y guarda la malla resultante en el objeto. La escena queda
@@ -5708,6 +6004,12 @@ export default function Home({
       animationTracks={animationTracks}
       animationTime={currentTime}
       onAnimationComplete={() => {}}
+      transformTracks={transformTracks}
+      pluginTracks={pluginTracks}
+      pluginBaseMeshes={pluginBaseMeshes}
+      motionPlaying={playing || motionEditorOpen}
+      showMotionPath={showMotionPath}
+      onMotionKeyframeMove={handleMotionKeyframeMove}
       viewerSmooth={viewerSmooth}
       pan3D={pan3D}
       zoom3D={zoom3D}
@@ -5817,6 +6119,22 @@ export default function Home({
                 <span className="text-sm font-bold flex items-center gap-1.5">
                   <Puzzle className="w-3.5 h-3.5 text-violet-400" />
                   {t('editor3D.plugins.menuTitle')}
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => {
+                  // Sin preventDefault: el menú se cierra solo al abrir
+                  // el editor de movimiento.
+                  setMotionEditorOpen(true);
+                }}
+                disabled={visibleSceneObjects.length < 1}
+                data-testid="open-motion-editor"
+                className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5 disabled:opacity-40"
+                title={t('editor3D.motion.menuDesc')}
+              >
+                <span className="text-sm font-bold flex items-center gap-1.5">
+                  <Clapperboard className="w-3.5 h-3.5 text-sky-400" />
+                  {t('editor3D.motion.menuTitle')}
                 </span>
               </DropdownMenuItem>
               <DropdownMenuItem
@@ -8257,9 +8575,53 @@ export default function Home({
 
          <div className="flex-1 flex flex-col min-w-0 min-h-0">
            <div
-            className={`relative flex-1 ${isEditingCanvas ? 'grid grid-cols-1 grid-rows-1' : 'grid grid-cols-2 grid-rows-2'} gap-1.5 p-1.5 min-w-0 min-h-0`}
+            className={`relative flex-1 ${motionEditorOpen ? 'flex flex-col' : isEditingCanvas ? 'grid grid-cols-1 grid-rows-1' : 'grid grid-cols-2 grid-rows-2'} gap-1.5 p-1.5 min-w-0 min-h-0`}
           >
-            {mode === 'lathe' && editingLatheProfile ? (
+            {motionEditorOpen ? (
+              <>
+                {/* Editor de movimiento: un visor vivo arriba, la línea
+                    de tiempo abajo. Al cerrar vuelve la rejilla 2x2. */}
+                {/* [&>*]:h-full estira el ViewerPanel: en la rejilla 2x2 la
+                    celda lo estira, pero aquí su padre es un bloque y sin
+                    altura definida el visor colapsa a la barra de título. */}
+                <div className="flex-1 min-h-0 min-w-0 [&>*]:h-full">{renderViewerPanel(activeView)}</div>
+                <div
+                  data-testid="motion-resizer"
+                  title={t('editor3D.motion.resize')}
+                  onPointerDown={handleMotionResizeStart}
+                  onPointerMove={handleMotionResizeMove}
+                  onPointerUp={handleMotionResizeEnd}
+                  onPointerCancel={handleMotionResizeEnd}
+                  className="shrink-0 h-2 cursor-ns-resize bg-white/5 hover:bg-green-500/30 transition-colors flex items-center justify-center select-none touch-none"
+                >
+                  <div className="w-16 h-0.5 rounded-full bg-white/25 pointer-events-none" />
+                </div>
+                <MotionEditor
+                  sceneObjects={sceneObjects}
+                  selectedObjectId={selectedObjectId}
+                  onSelectObject={handleObjectSelect}
+                  groups={groups}
+                  transformTracks={transformTracks}
+                  setTransformTracks={setTransformTracks}
+                  pluginTracks={pluginTracks}
+                  setPluginTracks={setPluginTracks}
+                  pluginBaseMeshes={pluginBaseMeshes}
+                  setPluginBaseMeshes={setPluginBaseMeshes}
+                  playing={playing}
+                  setPlaying={setPlaying}
+                  currentTime={currentTime}
+                  setCurrentTime={setCurrentTime}
+                  autoKey={autoKey}
+                  setAutoKey={setAutoKey}
+                  showMotionPath={showMotionPath}
+                  setShowMotionPath={setShowMotionPath}
+                  onRestoreObject={handleRestoreMotionObject}
+                  resolverMallaBase={resolverMallaBase}
+                  height={motionEditorHeight ?? undefined}
+                  onClose={() => setMotionEditorOpen(false)}
+                />
+              </>
+            ) : mode === 'lathe' && editingLatheProfile ? (
               <EditorCanvasComponent
                 label={t('editor3D.panelLabels.latheProfile')}
                 axisLabel="X·Y"

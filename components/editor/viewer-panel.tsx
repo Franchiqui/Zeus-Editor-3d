@@ -4,7 +4,13 @@ import type { FC } from 'react';
 import Viewer3D, { type ObjectTransform } from '@/components/viewer-3d';
 import { PanelButtons } from '@/components/editor/Editor3D';
 import { useI18n } from '@/lib/i18n';
-import type { AnimationTrack, CameraKeyframe, Vec3 } from '@/lib/animation';
+import type {
+  AnimationTrack,
+  CameraKeyframe,
+  Vec3,
+  TransformTrack,
+  PluginParamTrack,
+} from '@/lib/animation';
 
 interface ViewerPanelProps {
   viewName: 'front' | 'top' | 'side' | '3d';
@@ -75,6 +81,18 @@ interface ViewerPanelProps {
   animationTracks?: AnimationTrack[];
   animationTime?: number;
   onAnimationComplete?: (trackId: string) => void;
+  /** Pistas de transformada del editor de movimiento (segundos). */
+  transformTracks?: TransformTrack[];
+  /** Pistas de parámetros de plugin del editor de movimiento. */
+  pluginTracks?: PluginParamTrack[];
+  /** Malla base congelada por objectId para las pistas de plugin. */
+  pluginBaseMeshes?: Record<string, unknown>;
+  /** Reproducción o scrub del editor de movimiento activo: el visor aplica override. */
+  motionPlaying?: boolean;
+  /** Recorrido editable del objeto seleccionado visible en el visor. */
+  showMotionPath?: boolean;
+  /** Mueve la posición de un fotograma del recorrido del objeto. */
+  onMotionKeyframeMove?: (index: number, pos: Vec3) => void;
   viewerSmooth: boolean;
   pan3D: (view: any, dx: number, dy: number) => void;
   zoom3D: (view: any, f: number) => void;
@@ -183,6 +201,12 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
   animationTracks,
   animationTime,
   onAnimationComplete,
+  transformTracks,
+  pluginTracks,
+  pluginBaseMeshes,
+  motionPlaying,
+  showMotionPath,
+  onMotionKeyframeMove,
   viewerSmooth,
   pan3D,
   zoom3D,
@@ -342,6 +366,12 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
          animationTracks={animationTracks}
          animationTime={animationTime}
          onAnimationComplete={onAnimationComplete}
+         transformTracks={transformTracks}
+         pluginTracks={pluginTracks}
+         pluginBaseMeshes={pluginBaseMeshes}
+         motionPlaying={motionPlaying}
+         showMotionPath={showMotionPath}
+         onMotionKeyframeMove={onMotionKeyframeMove}
          smoothShading={viewerSmooth}
          exportMp4Trigger={exportMp4Trigger}
          onExportProgress={onExportProgress}

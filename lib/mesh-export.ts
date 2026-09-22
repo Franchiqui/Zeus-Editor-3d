@@ -1,4 +1,5 @@
-import type { Mesh } from '@/lib/geometry';
+import type { Mesh, ObjectTransform, Vertex3D } from '@/lib/geometry';
+import * as THREE from 'three';
 
 /**
  * Exportadores del objeto 3D a formatos de archivo comunes. Todos reciben
@@ -51,8 +52,7 @@ function hasFaceColors(mesh: Mesh): mesh is Mesh & {
 }
 
 /** STL ASCII: igual que siempre exportaba el botón STL del editor. */
-export function exportSTL(mesh: Mesh, baseName: string) {
-  let stl = '';
+export function exportSTL(mesh: Mesh, baseName: string) {  let stl = '';
   for (const { tri } of validTriangles(mesh)) {
     const v0 = mesh.vertices[tri[0]]!;
     const v1 = mesh.vertices[tri[1]]!;
@@ -280,4 +280,70 @@ export function exportGLB(mesh: Mesh, baseName: string) {
     new Blob([glb], { type: 'model/gltf-binary' }),
     `${baseName}.glb`
   );
+}
+
+/**
+ * Combina varias mallas en una única malla, aplicando la transformada
+ * (posición, rotación, escala) de cada objeto a sus vértices. Útil para
+ * exportar todos los objetos de la escena como un único archivo.
+ */
+export function mergeMeshes(
+  items: Array<{ mesh: Mesh; transform: ObjectTransform; name?: string }>
+): Mesh {
+  const vertices: Vertex3D[] = [];
+  const faces: number[][] = [];
+  const faceColors: (string | null)[] = [];
+  const faceOpacities: number[] = [];
+
+  let hasAnyColors = false;
+  let hasAnyOpacities = false;
+  let texture: string | undefined;
+
+  const pos = new THREE.Vector3();
+
+  for (const item of items) {
+    const { mesh, transform } = item;
+    if (!mesh.vertices.length) continue;
+
+    // Matriz de transformación: escala → rotación → traslación
+    const matrix = new THREE.Matrix4().compose(
+      new THREE.Vector3(transform.px, transform.py, transform.pz),
+      new THREE.Quaternion().setFromEuler(
+        new THREE.Euler(transform.rx, transform.ry, transform.rz)
+      ),
+      new THREE.Vector3(transform.sx, transform.sy, transform.sz)
+    );
+
+    const startVertex = vertices.length;
+
+    // Transformar y añadir vértices
+    for (const v of mesh.vertices) {
+      pos.set(v.x, v.y, v.z);
+      pos.applyMatrix4(matrix);
+      vertices.push({ x: pos.x, y: pos.y, z: pos.z });
+    }
+
+    // Añadir caras con índices ajustados
+    const meshHasColors = !!mesh.faceColors && mesh.faceColors.length > 0;
+    const meshHasOpacities = !!mesh.faceOpacities && mesh.faceOpacities.length > 0;
+
+    for (let i = 0; i < mesh.faces.length; i++) {
+      const face = mesh.faces[i];
+      if (face.length < 3) continue;
+      faces.push(face.map((idx) => idx + startVertex));
+      faceColors.push(meshHasColors ? (mesh.faceColors![i] ?? null) : null);
+      faceOpacities.push(meshHasOpacities ? (mesh.faceOpacities![i] ?? 1) : 1);
+    }
+
+    if (meshHasColors) hasAnyColors = true;
+    if (meshHasOpacities) hasAnyOpacities = true;
+    if (!texture && mesh.texture) texture = mesh.texture;
+  }
+
+  const result: Mesh = { vertices, faces };
+  if (hasAnyColors) result.faceColors = faceColors;
+  if (hasAnyOpacities) result.faceOpacities = faceOpacities;
+  if (texture) result.texture = texture;
+
+  return result;
 }

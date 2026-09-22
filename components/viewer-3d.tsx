@@ -6,8 +6,22 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { Mesh, Vertex3D, LatheTextureProjection } from '@/lib/geometry';
-import { evaluateCameraKeyframes } from '@/lib/animation';
-import type { AnimationTrack, Keyframe, KeyframeProperty, CameraData, CameraKeyframe, Vec3 } from '@/lib/animation';
+import {
+  evaluateCameraKeyframes,
+  evaluateTransformTrack,
+  evaluatePluginParamTrack,
+} from '@/lib/animation';
+import type {
+  AnimationTrack,
+  Keyframe,
+  KeyframeProperty,
+  CameraData,
+  CameraKeyframe,
+  Vec3,
+  TransformTrack,
+  PluginParamTrack,
+} from '@/lib/animation';
+import { obtenerPlugin, type PluginParams } from '@/lib/plugins';
 import { smoothVoxelMesh } from '@/lib/mesh-smooth';
 import { Slider } from '@/components/ui/slider';
 import {
@@ -329,6 +343,18 @@ interface Viewer3DProps {
    animationTime?: number;
     /** Called when a non-looping animation track completes. */
     onAnimationComplete?: (trackId: string) => void;
+    /** Pistas de transformada del editor de movimiento (segundos). */
+    transformTracks?: TransformTrack[];
+    /** Pistas de parámetros de plugin del editor de movimiento. */
+    pluginTracks?: PluginParamTrack[];
+    /** Malla base congelada por objectId para las pistas de plugin. */
+    pluginBaseMeshes?: Record<string, unknown>;
+    /** Reproducción o scrub del editor de movimiento: aplica override visual. */
+    motionPlaying?: boolean;
+    /** Muestra el recorrido editable del objeto seleccionado (pistas de transformada). */
+    showMotionPath?: boolean;
+    /** Mueve la posición (px/py/pz) del fotograma `index` del recorrido. */
+    onMotionKeyframeMove?: (index: number, pos: Vec3) => void;
     /** Cámara-objeto activa de ESTA ventana: la que maneja el visor cuando
      *  tiene ≥1 fotograma (pose estática con 1, recorrido con ≥2). */
     activeCamera?: { id: string; keyframes: CameraKeyframe[]; fov: number } | null;
@@ -1779,6 +1805,12 @@ export default function Viewer3D({
       animationTracks,
       animationTime = 0,
       onAnimationComplete,
+      transformTracks,
+      pluginTracks,
+      pluginBaseMeshes,
+      motionPlaying,
+      showMotionPath,
+      onMotionKeyframeMove,
       activeCamera,
       exportCamera,
       cameraEditor,
@@ -1816,6 +1848,20 @@ export default function Viewer3D({
    animationTracksRef.current = animationTracks;
     const animationTimeRef = useRef(animationTime);
     animationTimeRef.current = animationTime;
+    // Editor de movimiento: espejos para el bucle animate.
+    const transformTracksRef = useRef<TransformTrack[] | undefined>(transformTracks);
+    transformTracksRef.current = transformTracks;
+    const pluginTracksRef = useRef<PluginParamTrack[] | undefined>(pluginTracks);
+    pluginTracksRef.current = pluginTracks;
+    const pluginBaseMeshesRef = useRef<Record<string, unknown> | undefined>(pluginBaseMeshes);
+    pluginBaseMeshesRef.current = pluginBaseMeshes;
+    const motionPlayingRef = useRef(motionPlaying);
+    motionPlayingRef.current = motionPlaying;
+    // Recorrido editable del objeto seleccionado.
+    const showMotionPathRef = useRef(showMotionPath);
+    showMotionPathRef.current = showMotionPath;
+    const onMotionKeyframeMoveRef = useRef(onMotionKeyframeMove);
+    onMotionKeyframeMoveRef.current = onMotionKeyframeMove;
     // Cámara-objeto activa de ESTA ventana: espejo para el bucle animate.
     const activeCameraRef = useRef(activeCamera);
     activeCameraRef.current = activeCamera;
@@ -2121,6 +2167,23 @@ export default function Viewer3D({
     focus: Vec3 | null;
     visible: boolean;
   }) => void>(() => {});
+  // Recorrido editable del objeto seleccionado (pistas de transformada del
+  // editor de movimiento): curva violeta + asas arrastrables por fotograma.
+  const objectMotionPathRef = useRef<{
+    group: THREE.Group;
+    tube: THREE.Mesh;
+    handles: THREE.Group;
+  } | null>(null);
+  const motionPathDragRef = useRef<{
+    index: number;
+    plane: THREE.Plane;
+    startPos: THREE.Vector3;
+    original: THREE.Vector3;
+  } | null>(null);
+  const rebuildObjectMotionPathRef = useRef<(path: {
+    keyframes: { time: number; position: Vec3 }[];
+    visible: boolean;
+  } | null) => void>(() => {});
   const startMp4ExportRef = useRef<() => void>();
   const latheAxisRef = useRef<THREE.Group | null>(null);
   const ambientLightRef = useRef<THREE.AmbientLight | null>(null);
@@ -2283,6 +2346,9 @@ export default function Viewer3D({
       orientCameraBodyVisual(cuerpoCam, cameraEditorRef.current?.focus ?? null);
     }
   }, []);
+  // Espejo para el bucle animate (override del editor de movimiento).
+  const applyObjectTransformRef = useRef(applyObjectTransform);
+  applyObjectTransformRef.current = applyObjectTransform;
 
   // Aplica el transform de la pieza de textura: al marco entero
   // (posición, rotación y escala — la escala ES el tamaño de la pieza) y
@@ -2748,11 +2814,11 @@ export default function Viewer3D({
             'chordal'
           ),
           1,
-          0.035,
+          0.012,
           6,
           false
         ),
-        new THREE.MeshBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0.85 })
+        new THREE.MeshBasicMaterial({ color: 0xfacc15, transparent: true, opacity: 0.85 })
       );
       camObjectPathGroup.add(camObjectTube);
       const camObjectHandles = new THREE.Group();
@@ -2761,6 +2827,35 @@ export default function Viewer3D({
         group: camObjectPathGroup,
         tube: camObjectTube,
         handles: camObjectHandles,
+      };
+
+      // Recorrido del objeto seleccionado (editor de movimiento): igual
+      // mecánica que el de la cámara pero en violeta, para distinguirlos.
+      const objMotionPathGroup = new THREE.Group();
+      objMotionPathGroup.name = 'objectMotionPath';
+      objMotionPathGroup.visible = false;
+      scene.add(objMotionPathGroup);
+      const objMotionTube = new THREE.Mesh(
+        new THREE.TubeGeometry(
+          new THREE.CatmullRomCurve3(
+            [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0.001, 0)],
+            false,
+            'chordal'
+          ),
+          1,
+          0.012,
+          6,
+          false
+        ),
+        new THREE.MeshBasicMaterial({ color: 0xff3b30, transparent: true, opacity: 0.85 })
+      );
+      objMotionPathGroup.add(objMotionTube);
+      const objMotionHandles = new THREE.Group();
+      objMotionPathGroup.add(objMotionHandles);
+      objectMotionPathRef.current = {
+        group: objMotionPathGroup,
+        tube: objMotionTube,
+        handles: objMotionHandles,
       };
 
       const meshGroup = new THREE.Group();
@@ -2899,18 +2994,18 @@ export default function Viewer3D({
       tube.geometry = new THREE.TubeGeometry(
         curva,
         Math.max(puntos.length * 12, 24),
-        0.035,
+        0.012,
         6,
         false
       );
 
-      const asaGeo = new THREE.SphereGeometry(0.09, 10, 8);
-      const cian = new THREE.MeshBasicMaterial({ color: 0x22d3ee });
-      const cianSel = new THREE.MeshBasicMaterial({ color: 0xa5f3fc });
+      const asaGeo = new THREE.SphereGeometry(0.035, 10, 8);
+      const negro = new THREE.MeshBasicMaterial({ color: 0x111111 });
+      const amarilloSel = new THREE.MeshBasicMaterial({ color: 0xfde047 });
       for (const k of ordenados) {
         const idxOriginal = cam.keyframes.indexOf(k);
         const seleccionado = idxOriginal === cam.selected;
-        const asa = new THREE.Mesh(asaGeo, seleccionado ? cianSel : cian);
+        const asa = new THREE.Mesh(asaGeo, seleccionado ? amarilloSel : negro);
         asa.position.copy(
           new THREE.Vector3(k.position.x, k.position.y, k.position.z)
         );
@@ -2927,6 +3022,281 @@ export default function Viewer3D({
         handles.add(focoAsa);
       }
       group.visible = !activeCameraRef.current;
+    };
+
+    // Recorrido del objeto seleccionado: reconstruye tubo + asas a partir
+    // de los fotogramas de la pista de transformada (posiciones absolutas,
+    // ya resueltas por el padre sobre el transform estático).
+    rebuildObjectMotionPathRef.current = (path) => {
+      const entry = objectMotionPathRef.current;
+      if (!entry) return;
+      const { group, tube, handles } = entry;
+      for (const h of [...handles.children]) {
+        handles.remove(h);
+        h.traverse((item) => {
+          const m = item as THREE.Mesh;
+          m.geometry?.dispose();
+          if (m.material) disposeMaterial(m.material);
+        });
+      }
+      if (!path || !path.visible || path.keyframes.length === 0) {
+        group.visible = false;
+        return;
+      }
+      const puntos = path.keyframes.map(
+        (k) => new THREE.Vector3(k.position.x, k.position.y, k.position.z)
+      );
+      const curva =
+        puntos.length === 1
+          ? new THREE.CatmullRomCurve3([puntos[0], puntos[0].clone().add(new THREE.Vector3(0, 0.001, 0))], false, 'chordal')
+          : new THREE.CatmullRomCurve3(puntos, false, 'chordal');
+      tube.geometry.dispose();
+      tube.geometry = new THREE.TubeGeometry(
+        curva,
+        Math.max(puntos.length * 12, 24),
+        0.012,
+        6,
+        false
+      );
+      const asaGeo = new THREE.SphereGeometry(0.035, 10, 8);
+      const negro = new THREE.MeshBasicMaterial({ color: 0x111111 });
+      for (let i = 0; i < path.keyframes.length; i++) {
+        const k = path.keyframes[i];
+        const asa = new THREE.Mesh(asaGeo, negro);
+        asa.position.set(k.position.x, k.position.y, k.position.z);
+        asa.userData.motionKeyframe = i;
+        handles.add(asa);
+      }
+      group.visible = !activeCameraRef.current;
+    };
+
+    // --- Editor de movimiento: override visual por fotograma ------------
+    // Las pistas de transformada y de parámetros de plugin NO tocan el
+    // estado de la escena: el visor aplica los valores evaluados sobre
+    // sus grupos THREE cada frame y, al parar, restaura todo.
+    const motionParamsCache = new Map<string, Record<string, number>>();
+    // Geometría original del seleccionado (transplante de plugin) y la
+    // geometría animada en curso (para disponerla al reemplazarla).
+    const motionOrigGeometry: { mesh: THREE.Mesh | null; geo: THREE.BufferGeometry | null } = {
+      mesh: null,
+      geo: null,
+    };
+    const motionAnimatedGeo: { geo: THREE.BufferGeometry | null } = { geo: null };
+    // Hijos originales de los duplicados con visual plugin (por objectId).
+    const motionOrigChildren = new Map<string, THREE.Object3D[]>();
+    const motionWarnedMissingBase = new Set<string>();
+    let motionPrev = false;
+
+    const restoreMotionVisuals = () => {
+      // Transformada estática de vuelta (el arrastre del gizmo manda: si
+      // hay gesto en curso no se toca, el soltar ya la aplica).
+      if (!gizmoDragRef.current) {
+        applyObjectTransformRef.current(transformRef.current);
+      }
+      // Geometría transplantada del seleccionado: devolver la original.
+      if (motionOrigGeometry.mesh && motionOrigGeometry.geo) {
+        if (motionAnimatedGeo.geo) motionAnimatedGeo.geo.dispose();
+        motionAnimatedGeo.geo = null;
+        motionOrigGeometry.mesh.geometry = motionOrigGeometry.geo;
+      }
+      motionOrigGeometry.mesh = null;
+      motionOrigGeometry.geo = null;
+      // Duplicados con visuales plugin: reponer los hijos originales.
+      const meshGroup = meshGroupRef.current;
+      if (meshGroup) {
+        for (const [oid, originales] of motionOrigChildren) {
+          const dup = meshGroup.children.find(
+            (c) => c.userData.sceneObjectDuplicate && c.userData.sceneObjectId === oid
+          );
+          if (!dup) continue;
+          for (const hijo of [...dup.children]) {
+            dup.remove(hijo);
+            hijo.traverse?.((item) => {
+              const m = item as THREE.Mesh;
+              m.geometry?.dispose?.();
+              if (m.material) disposeMaterial(m.material as THREE.Material);
+            });
+          }
+          for (const hijo of originales) dup.add(hijo);
+        }
+      }
+      motionOrigChildren.clear();
+      motionParamsCache.clear();
+      motionWarnedMissingBase.clear();
+    };
+
+    const applyMotionOverride = (time: number) => {
+      const meshGroup = meshGroupRef.current;
+      if (!meshGroup) return;
+
+      // 1) Transformada del objeto seleccionado (el arrastre del gizmo
+      // manda: durante un gesto el override NO toca este objeto).
+      const selId = selectedObjectIdRef.current;
+      const drag = gizmoDragRef.current;
+      const dragObjeto = !!drag && drag.target !== 'texture';
+      const selTrack = selId
+        ? transformTracksRef.current?.find((tr) => tr.objectId === selId)
+        : undefined;
+      const evaluadoSel = selTrack && !dragObjeto
+        ? evaluateTransformTrack(selTrack, time)
+        : null;
+      const selMerged: ObjectTransform = evaluadoSel
+        ? ({ ...transformRef.current, ...evaluadoSel } as ObjectTransform)
+        : { ...transformRef.current };
+      if (evaluadoSel) {
+        applyObjectTransformRef.current(selMerged);
+      }
+
+      // 2) Duplicados con pista de transformada: su matriz es relativa al
+      // seleccionado (animado), igual que en el efecto de duplicados.
+      if (transformTracksRef.current?.length) {
+        const inverseSel = new THREE.Matrix4()
+          .compose(
+            new THREE.Vector3(selMerged.px, selMerged.py, selMerged.pz),
+            new THREE.Quaternion().setFromEuler(
+              new THREE.Euler(selMerged.rx, selMerged.ry, selMerged.rz)
+            ),
+            new THREE.Vector3(selMerged.sx, selMerged.sy, selMerged.sz)
+          )
+          .invert();
+         for (const child of meshGroup.children) {
+           if (!child.userData.sceneObjectDuplicate) continue;
+           const oid = child.userData.sceneObjectId as string;
+           let tr = transformTracksRef.current?.find(
+             (tk) => tk.objectId === oid
+           );
+           if (!tr) {
+             // Miembro de un grupo: usa la pista de grupo si existe.
+             tr = transformTracksRef.current?.find(
+               (tk) => tk.objectIds && tk.objectIds.includes(oid)
+             );
+           }
+           if (!tr) continue;
+          const evaluadoDup = evaluateTransformTrack(tr, time);
+          if (!evaluadoDup) continue;
+          const obj = objectsRef.current?.find((o) => o.id === oid);
+          if (!obj) continue;
+          const merged = { ...obj.transform, ...evaluadoDup } as ObjectTransform;
+          const objectMatrix = new THREE.Matrix4().compose(
+            new THREE.Vector3(merged.px, merged.py, merged.pz),
+            new THREE.Quaternion().setFromEuler(
+              new THREE.Euler(merged.rx, merged.ry, merged.rz)
+            ),
+            new THREE.Vector3(merged.sx, merged.sy, merged.sz)
+          );
+          child.matrix.copy(inverseSel).multiply(objectMatrix);
+          child.matrixAutoUpdate = false;
+        }
+      }
+
+      // 3) Parámetros de plugin agrupados por objeto (un plugin por objeto).
+      const pTracks = pluginTracksRef.current;
+      if (pTracks && pTracks.length > 0) {
+        const porObjeto = new Map<string, PluginParamTrack[]>();
+        for (const tr of pTracks) {
+          const lista = porObjeto.get(tr.objectId) ?? [];
+          lista.push(tr);
+          porObjeto.set(tr.objectId, lista);
+        }
+        for (const [oid, tracks] of porObjeto) {
+          const pluginIds = [...new Set(tracks.map((t) => t.pluginId))];
+          if (pluginIds.length !== 1) continue;
+          const def = obtenerPlugin(pluginIds[0]);
+          if (!def) continue;
+          const base = pluginBaseMeshesRef.current?.[oid] as Mesh | undefined;
+          if (!base) {
+            if (!motionWarnedMissingBase.has(oid)) {
+              console.warn('[motion] Sin malla base congelada para', oid);
+              motionWarnedMissingBase.add(oid);
+            }
+            continue;
+          }
+          // Parámetros completos: defaults del plugin + valores evaluados.
+          const params: PluginParams = {};
+          for (const p of def.params) params[p.id] = p.valor;
+          let cambio = false;
+          for (const tr of tracks) {
+            const v = evaluatePluginParamTrack(tr, time);
+            if (v === null) continue;
+            const pDef = def.params.find((p) => p.id === tr.paramId);
+            const tol =
+              pDef && pDef.tipo === 'slider' && typeof pDef.valor === 'number'
+                ? (pDef.paso ?? Math.abs(pDef.max - pDef.min) / 200)
+                : 1e-4;
+            const anterior = motionParamsCache.get(oid)?.[tr.paramId];
+            if (anterior === undefined || Math.abs(anterior - v) > tol) cambio = true;
+            params[tr.paramId] = v;
+          }
+          if (!cambio) continue;
+          try {
+            const resultado = def.aplicar(base as Mesh, params);
+            if (!resultado || !resultado.vertices.length || !resultado.faces.length) continue;
+            const obj = objectsRef.current?.find((o) => o.id === oid);
+            const visual = buildSnapshotObjectVisual(
+              resultado,
+              obj?.smooth ?? false,
+              obj?.textureProjection ?? 'planar',
+              undefined,
+              resultado.textureRepeat ?? 1
+            );
+            if (visual.children.length === 0) continue;
+            if (oid === selId) {
+              // Transplante de geometría a la malla principal.
+              const main = findMainMesh(meshGroup);
+              const nuevaGeo = findMainMesh(visual)?.geometry;
+              if (main && nuevaGeo) {
+                if (motionOrigGeometry.mesh && motionOrigGeometry.mesh !== main) {
+                  // La selección cambió durante la reproducción: devolver
+                  // la geometría original a la malla anterior y empezar
+                  // de cero con la nueva.
+                  motionOrigGeometry.mesh.geometry = motionOrigGeometry.geo!;
+                  motionAnimatedGeo.geo = null;
+                  motionOrigGeometry.mesh = null;
+                  motionOrigGeometry.geo = null;
+                }
+                if (!motionOrigGeometry.mesh) {
+                  motionOrigGeometry.mesh = main;
+                  motionOrigGeometry.geo = main.geometry;
+                }
+                if (motionAnimatedGeo.geo) motionAnimatedGeo.geo.dispose();
+                motionAnimatedGeo.geo = nuevaGeo;
+                main.geometry = nuevaGeo;
+              }
+              // La geometría del visual se queda en la malla principal:
+              // solo se disponen sus materiales (prestados y temporales).
+              visual.traverse((item) => {
+                const m = item as THREE.Mesh;
+                if (m.material) disposeMaterial(m.material as THREE.Material);
+              });
+            } else {
+              // Duplicado: sustituir sus hijos por el visual nuevo.
+              const dup = meshGroup.children.find(
+                (c) =>
+                  c.userData.sceneObjectDuplicate &&
+                  c.userData.sceneObjectId === oid
+              );
+              if (!dup) continue;
+              if (!motionOrigChildren.has(oid)) {
+                // Primera vez: los hijos actuales SON los originales.
+                motionOrigChildren.set(oid, [...dup.children]);
+              }
+              for (const hijo of [...dup.children]) {
+                dup.remove(hijo);
+                if (motionOrigChildren.has(oid)) {
+                  hijo.traverse?.((item) => {
+                    const m = item as THREE.Mesh;
+                    m.geometry?.dispose?.();
+                    if (m.material) disposeMaterial(m.material as THREE.Material);
+                  });
+                }
+              }
+              dup.add(visual);
+            }
+          } catch (err) {
+            console.error('[motion] Error al aplicar plugin animado:', err);
+          }
+        }
+      }
     };
 
     const clock = new THREE.Clock();
@@ -2948,6 +3318,8 @@ export default function Viewer3D({
         if (gizmoGroupRef.current) gizmoGroupRef.current.visible = false;
         if (cameraObjectPathRef.current)
           cameraObjectPathRef.current.group.visible = false;
+        if (objectMotionPathRef.current)
+          objectMotionPathRef.current.group.visible = false;
         if (lightGizmoGroupRef.current) lightGizmoGroupRef.current.visible = false;
         // Los ayudantes de luz (cono, bola amarilla, aros) también son
         // ayudas de edición: fuera del vídeo. Al terminar se restaura
@@ -2972,6 +3344,9 @@ export default function Viewer3D({
         }
         if (cameraObjectPathRef.current)
           cameraObjectPathRef.current.group.visible = !activeCameraRef.current;
+        if (objectMotionPathRef.current)
+          objectMotionPathRef.current.group.visible =
+            !!showMotionPathRef.current;
         if (lightGizmoGroupRef.current)
           lightGizmoGroupRef.current.visible = !!lightConfigRef.current?.spotlights.find(
             (s) => s.enabled
@@ -2990,6 +3365,18 @@ export default function Viewer3D({
       const effectiveTime = exportState
         ? Math.min((performance.now() - exportState.startTime) / 1000, exportState.duration)
         : animationTimeRef.current;
+      // Editor de movimiento: aplicar el override visual (transformadas y
+      // parámetros de plugin) y detectar la transición a reposo para
+      // restaurar los visuales estáticos.
+      const motionActivo =
+        !!motionPlayingRef.current &&
+        ((transformTracksRef.current?.length ?? 0) +
+          (pluginTracksRef.current?.length ?? 0)) > 0;
+      if (motionActivo !== motionPrev) {
+        motionPrev = motionActivo;
+        if (!motionActivo) restoreMotionVisuals();
+      }
+      if (motionActivo) applyMotionOverride(effectiveTime);
       // Cámara-objeto: la cámara elegida en ESTA ventana maneja el visor
       // con SU pose (estática con 1 fotograma, recorrido con ≥2); durante
       // la exportación manda la cámara de exportación. OrbitControls queda
@@ -3536,6 +3923,15 @@ export default function Viewer3D({
       renderer.setSize(mount.clientWidth, mount.clientHeight);
     };
     window.addEventListener('resize', handleResize);
+    // El contenedor también puede cambiar de tamaño sin que cambie la
+    // ventana (p. ej. al arrastrar el separador del editor de
+    // movimiento): el listener de window no se entera, así que se
+    // observa el propio div del visor.
+    const mountResizeObserver =
+      typeof ResizeObserver !== 'undefined' && mount
+        ? new ResizeObserver(() => handleResize())
+        : null;
+    if (mountResizeObserver) mountResizeObserver.observe(mount);
 
     if (camera3D) {
       applyCamera(camera, controls, camera3D);
@@ -3826,6 +4222,24 @@ export default function Viewer3D({
             z: nuevo.z,
           });
         }
+        return;
+      }
+
+      // Arrastre de un asa del recorrido del objeto (editor de
+      // movimiento): mismo plano perpendicular a la vista, avisa al padre
+      // en vivo con la nueva posición del fotograma.
+      if (motionPathDragRef.current) {
+        const drag = motionPathDragRef.current;
+        raycasterRef.current.setFromCamera(pointerRef.current, camera);
+        const hit = new THREE.Vector3();
+        if (!raycasterRef.current.ray.intersectPlane(drag.plane, hit)) return;
+        const delta = hit.clone().sub(drag.startPos);
+        const nuevo = drag.original.clone().add(delta);
+        onMotionKeyframeMoveRef.current?.(drag.index, {
+          x: nuevo.x,
+          y: nuevo.y,
+          z: nuevo.z,
+        });
         return;
       }
 
@@ -4838,6 +5252,42 @@ export default function Viewer3D({
           }
         }
       }
+      // Asas del recorrido del objeto (editor de movimiento): mismo
+      // arrastre en plano perpendicular a la vista que las de la cámara.
+      if (objectMotionPathRef.current?.group.visible) {
+        const rect = renderer.domElement.getBoundingClientRect();
+        pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        raycasterRef.current.setFromCamera(pointerRef.current, camera);
+        const asaHits = raycasterRef.current.intersectObjects(
+          objectMotionPathRef.current.handles.children,
+          true
+        );
+        if (asaHits.length > 0) {
+          let asa: THREE.Object3D | null = asaHits[0].object;
+          while (asa && asa.userData.motionKeyframe === undefined) {
+            asa = asa.parent;
+          }
+          if (asa) {
+            const punto = asa.getWorldPosition(new THREE.Vector3());
+            const normal = camera
+              .getWorldDirection(new THREE.Vector3())
+              .negate();
+            motionPathDragRef.current = {
+              index: asa.userData.motionKeyframe as number,
+              plane: new THREE.Plane().setFromNormalAndCoplanarPoint(
+                normal,
+                punto
+              ),
+              startPos: punto.clone(),
+              original: punto.clone(),
+            };
+            controls.enabled = false;
+            renderer.domElement.style.cursor = 'grabbing';
+            return;
+          }
+        }
+      }
       if (meshGroupRef.current) {
         const rect = renderer.domElement.getBoundingClientRect();
         pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -5398,6 +5848,14 @@ export default function Viewer3D({
         return;
       }
 
+      // Release object motion path handle drag
+      if (motionPathDragRef.current) {
+        motionPathDragRef.current = null;
+        controls.enabled = true;
+        renderer.domElement.style.cursor = '';
+        return;
+      }
+
       // Release light gizmo drag (3-axis arrows)
       if (lightGizmoDragRef.current) {
         lightGizmoDragRef.current = null;
@@ -5548,6 +6006,7 @@ export default function Viewer3D({
     faceSelectionStartRef.current = null;
     faceSelectionPointsRef.current = [];
       window.removeEventListener('resize', handleResize);
+      if (mountResizeObserver) mountResizeObserver.disconnect();
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('pointerup', onPointerUp);
@@ -6366,6 +6825,30 @@ export default function Viewer3D({
       visible: !!activa,
     });
   }, [objects, selectedObjectId, cameraEditor]);
+
+  // Recorrido 3D del objeto seleccionado (pistas de transformada del
+  // editor de movimiento): la posición de cada asa es el transform
+  // estático del objeto con los valores del fotograma encima.
+  useEffect(() => {
+    const track = transformTracks?.find(
+      (tr) => tr.objectId === selectedObjectId
+    );
+    const obj = (objects ?? []).find((o) => o.id === selectedObjectId);
+    if (!track || !obj || !showMotionPath) {
+      rebuildObjectMotionPathRef.current(null);
+      return;
+    }
+    const keyframes = track.keyframes.map((kf) => {
+      const vals = evaluateTransformTrack(track, kf.time) ?? {};
+      const merged = { ...obj.transform, ...vals };
+      return {
+        time: kf.time,
+        position: { x: merged.px ?? 0, y: merged.py ?? 0, z: merged.pz ?? 0 },
+      };
+    });
+    rebuildObjectMotionPathRef.current({ keyframes, visible: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transformTracks, objects, selectedObjectId, showMotionPath]);
 
    useEffect(() => {
    const meshGroup = meshGroupRef.current;
