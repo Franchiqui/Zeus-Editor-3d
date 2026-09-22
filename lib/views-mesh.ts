@@ -785,3 +785,4 @@ function earClip(poly: Point2D[]): number[] {
   }
   return tris;
 }
+

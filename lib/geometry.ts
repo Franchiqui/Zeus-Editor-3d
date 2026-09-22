@@ -30,10 +30,24 @@ export type Mesh = {
   /** Opacidad por cara, alineada con `faces` (0..1). */
   faceOpacities?: number[];
   /**
+   * Textura (data URL o URL) por cara, alineada con `faces`. null o
+   * ausente = esa cara usa el material general del objeto.
+   */
+  faceTextures?: (string | null)[];
+  /**
    * Textura PNG (data URL) para el modo "vista plana": reproduce la
    * apariencia exacta del texto renderizado en pantalla.
    */
   texture?: string;
+  /**
+   * La textura actual la puso el panel de la escena (no está horneada en
+   * la figura): al quitar la del panel debe eliminarse de la malla. En
+   * los textos el trazo de la fuente va horneado en `texture`; sin esta
+   * marca no se puede distinguir de una imagen aplicada después.
+   */
+  texturePanela?: boolean;
+  /** Textura horneada original que el panel sustituyó (textos). */
+  textureOriginal?: string;
   /** Color configurado para teñir la textura sin sustituirla. */
   textureColor?: string;
    /** Intensidad del relieve de la textura (0 = plano). */
@@ -42,6 +56,10 @@ export type Mesh = {
    textureRepeat?: number;
   /** Acabado de la superficie texturizada. */
   textureFinish?: TextureFinish;
+  /** Si la guía de textura está visible para este objeto. */
+  textureHelper?: boolean;
+  /** Transform de la guía de textura para este objeto. */
+  textureHelperTransform?: ObjectTransform;
   /**
    * Coordenadas UV por vértice (alineadas con `vertices`), para mapear
    * la textura. Si está ausente, el visor no aplica textura.
@@ -56,6 +74,18 @@ export type Mesh = {
 
 export type LatheTextureProjection = 'planar' | 'cylindrical' | 'spherical';
 export type TextureFinish = 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
+
+export type ObjectTransform = {
+  px: number;
+  py: number;
+  pz: number;
+  rx: number;
+  ry: number;
+  rz: number;
+  sx: number;
+  sy: number;
+  sz: number;
+};
 
 export type Views = {
   front: Polygon;
@@ -688,6 +718,79 @@ export function voxelsToMesh(
   return { vertices, faces };
 }
 
+/**
+ * Voxeliza la SUPERFICIE de una malla arbitraria: encaja la caja envolvente
+ * del objeto en una rejilla cúbica y marca los vóxeles que toca cada
+ * triángulo (muestreo barycéntrico denso). El resultado alimenta
+ * voxelsToBoxMesh para «mostrar como voxeles» una figura que no nació de
+ * vistas 2D. El vóxel (0,0,0) es la esquina mínima; la malla sale centrada.
+ */
+export function meshToVoxels(
+  mesh: Mesh,
+  resolution: number = 24
+): { voxels: boolean[][][]; resolution: number } {
+  const empty = { voxels: [] as boolean[][][], resolution: 0 };
+  if (!mesh.vertices.length || !mesh.faces.length || resolution < 2) return empty;
+
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (const v of mesh.vertices) {
+    if (v.x < minX) minX = v.x;
+    if (v.y < minY) minY = v.y;
+    if (v.z < minZ) minZ = v.z;
+    if (v.x > maxX) maxX = v.x;
+    if (v.y > maxY) maxY = v.y;
+    if (v.z > maxZ) maxZ = v.z;
+  }
+  // La rejilla es cúbica: el eje más largo manda y los otros centrados.
+  const spanX = maxX - minX, spanY = maxY - minY, spanZ = maxZ - minZ;
+  const size = Math.max(spanX, spanY, spanZ);
+  if (size <= 1e-9) return empty;
+  const scale = (resolution - 1) / size;
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  const cz = (minZ + maxZ) / 2;
+  const voxels: boolean[][][] = Array.from({ length: resolution }, () =>
+    Array.from({ length: resolution }, () => Array(resolution).fill(false))
+  );
+  let marcados = 0;
+  const marcar = (x: number, y: number, z: number) => {
+    const ix = Math.round((x - cx) * scale + (resolution - 1) / 2);
+    const iy = Math.round((y - cy) * scale + (resolution - 1) / 2);
+    const iz = Math.round((z - cz) * scale + (resolution - 1) / 2);
+    if (ix < 0 || iy < 0 || iz < 0 || ix >= resolution || iy >= resolution || iz >= resolution) return;
+    if (!voxels[ix][iy][iz]) { voxels[ix][iy][iz] = true; marcados++; }
+  };
+
+  for (const face of mesh.faces) {
+    for (let i = 1; i + 1 < face.length; i++) {
+      const a = mesh.vertices[face[0]];
+      const b = mesh.vertices[face[i]];
+      const c = mesh.vertices[face[i + 1]];
+      if (!a || !b || !c) continue;
+      // Densidad de muestreo: la arista mayor medida en vóxeles.
+      const lenAB = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z) * scale;
+      const lenAC = Math.hypot(c.x - a.x, c.y - a.y, c.z - a.z) * scale;
+      const lenBC = Math.hypot(c.x - b.x, c.y - b.y, c.z - b.z) * scale;
+      const pasos = Math.min(64, Math.max(1, Math.ceil(Math.max(lenAB, lenAC, lenBC) * 1.5)));
+      for (let u = 0; u <= pasos; u++) {
+        for (let v = 0; v + u <= pasos; v++) {
+          const pu = u / pasos;
+          const pv = v / pasos;
+          const pw = 1 - pu - pv;
+          marcar(
+            a.x * pw + b.x * pu + c.x * pv,
+            a.y * pw + b.y * pu + c.y * pv,
+            a.z * pw + b.z * pu + c.z * pv
+          );
+        }
+      }
+    }
+  }
+  if (marcados === 0) return empty;
+  return { voxels, resolution };
+}
+
 export function voxelsToBoxMesh(
   voxels: boolean[][][],
   resolution: number,
@@ -767,29 +870,14 @@ export function meshToTriangles(mesh: Mesh): Mesh {
 }
 
 
+// Plantillas de las tres vistas por defecto: vacías. Los lienzos 2D
+// arrancan en blanco — el usuario dibuja desde cero o inserta una
+// forma de un clic. La reconstrucción 3D necesita ≥3 vértices por
+// vista, así que sin dibujo no hay figura (área de trabajo vacío).
 export const DEFAULT_VIEWS: Views = {
-  front: [
-    { x: 0.5, y: 0.85 },     // Pico superior
-    { x: 0.1, y: 0.1 },      // Esquina inferior izquierda
-    { x: 0.9, y: 0.1 },      // Esquina inferior derecha
-  ],
-  side: [
-    { x: 0.5, y: 0.85 },     // Pico superior
-    { x: 0.1, y: 0.1 },      // Esquina inferior izquierda
-    { x: 0.9, y: 0.1 },      // Esquina inferior derecha
-  ],
-  top: [
-    { x: 0.5, y: 0.85 },     // Punta superior
-    { x: 0.62, y: 0.55 },    // Valle superior derecho
-    { x: 0.9, y: 0.55 },     // Punta derecha
-    { x: 0.68, y: 0.35 },    // Valle derecho
-    { x: 0.78, y: 0.05 },    // Punta inferior derecha
-    { x: 0.5, y: 0.25 },     // Valle inferior
-    { x: 0.22, y: 0.05 },    // Punta inferior izquierda
-    { x: 0.32, y: 0.35 },    // Valle izquierdo
-    { x: 0.1, y: 0.55 },     // Punta izquierda
-    { x: 0.38, y: 0.55 },    // Valle superior izquierdo
-  ],
+  front: [],
+  side: [],
+  top: [],
 };
 
 /**

@@ -6,8 +6,8 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { Mesh, Vertex3D, LatheTextureProjection } from '@/lib/geometry';
-import { evaluateTrack } from '@/lib/animation';
-import type { AnimationTrack, Keyframe, KeyframeProperty } from '@/lib/animation';
+import { evaluateCameraKeyframes } from '@/lib/animation';
+import type { AnimationTrack, Keyframe, KeyframeProperty, CameraData, CameraKeyframe, Vec3 } from '@/lib/animation';
 import { smoothVoxelMesh } from '@/lib/mesh-smooth';
 import { Slider } from '@/components/ui/slider';
 import {
@@ -145,6 +145,9 @@ export interface SpotlightConfig {
   castShadow: boolean;
   shadowIntensity: number;
   shadowColor: number;
+  /** Si los ayudantes visuales del foco (cono, aros, esfera de posición)
+   *  se muestran en la escena. El foco sigue iluminando aunque esté a false. */
+  helperVisible?: boolean;
 }
 
 export interface LightConfig {
@@ -185,6 +188,10 @@ interface Viewer3DProps {
     hidden?: boolean;
     /** Si el objeto está congelado (gris, no interactivo) */
     frozen?: boolean;
+    /** Clase de objeto: figura normal (por defecto) o cámara */
+    kind?: 'figure' | 'camera';
+    /** Datos de la cámara-objeto (FOV + fotogramas del recorrido) */
+    camera?: CameraData;
   }>;
   /**
    * Objeto dueño de la configuración actual: su figura es la malla que
@@ -200,8 +207,12 @@ interface Viewer3DProps {
    forceObjectsUpdate?: number;
   /** El dueño de la configuración se ve con normales suaves */
   configSmooth?: boolean;
-  /** Proyección con la que se mapea la textura del dueño */
-  configProjection?: LatheTextureProjection;
+   /** Proyección con la que se mapea la textura del dueño */
+   configProjection?: LatheTextureProjection;
+   /** Acabado de la textura del dueño (para el visor 3D en tiempo real) */
+   configFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
+   /** Relieve de la textura del dueño */
+   configRelief?: number;
    selectedObjectId?: string;
    onObjectSelect?: (id: string) => void;
    /** IDs de objetos seleccionados en modo multi-selección */
@@ -214,16 +225,32 @@ interface Viewer3DProps {
     onSelectionModeChange?: (active: boolean) => void;
     /** Activar modo de selección de caras de la figura activa */
     faceSelectMode?: boolean;
-    /** Herramienta de selección de caras: rectángulo, círculo o polígono (línea) */
-    faceSelectionTool?: 'rectangle' | 'circle' | 'polygon';
+    /** Herramienta de selección: rectángulo, círculo o línea (segmento en pantalla) */
+    faceSelectionTool?: 'rectangle' | 'circle' | 'line';
+    /** Qué se selecciona: caras, vértices o segmentos (aristas) */
+    faceSelectionTarget?: 'cara' | 'vertice' | 'segmento';
+    /** Solo capturar lo visible (caras frontales, no lo que está detrás) */
+    faceSelectVisibleOnly?: boolean;
+    /** Al incrementarse, apaga la vista de alambre (fin del ciclo de textura por caras) */
+    wireframeOffSignal?: number;
     /** Índices de caras seleccionadas en el modo de selección de caras */
     selectedFaceIds?: number[];
     /** Notifica al padre del cambio en la selección de caras */
     onFaceSelectionChange?: (faceIds: number[]) => void;
+    /** Índices de vértices seleccionados (objetivo «vértice») */
+    selectedVertexIds?: number[];
+    /** Notifica al padre del cambio en la selección de vértices */
+    onVertexSelectionChange?: (vertexIds: number[]) => void;
+    /** Aristas seleccionadas (objetivo «segmento»), clave «a-b» con a < b */
+    selectedEdgeIds?: string[];
+    /** Notifica al padre del cambio en la selección de segmentos */
+    onEdgeSelectionChange?: (edgeIds: string[]) => void;
     /** Notifica al padre del cambio en el modo de selección de caras */
     onFaceSelectionModeChange?: (active: boolean) => void;
-    /** Notifica al padre del cambio en la herramienta de selección de caras */
-    onFaceSelectionToolChange?: (tool: 'rectangle' | 'circle' | 'polygon') => void;
+    /** Notifica al padre del cambio en la herramienta de selección */
+    onFaceSelectionToolChange?: (tool: 'rectangle' | 'circle' | 'line') => void;
+    /** Notifica al padre del cambio en el objetivo de selección */
+    onFaceSelectionTargetChange?: (target: 'cara' | 'vertice' | 'segmento') => void;
   onVerticesChange?: (vertices: Vertex3D[]) => void;
   showVerticesDefault?: boolean;
   camera3D?: Camera3D;
@@ -231,8 +258,6 @@ interface Viewer3DProps {
    *  para que pueda mantener su estado (panelCameras) sincronizado con la
    *  posición real de la cámara. Sin esto, los botones de pan saltan al origen. */
   onCameraChange?: (cam: Camera3D) => void;
-  /** Called continuously while recording a camera path */
-  onCameraMove?: (cam: Camera3D) => void;
   /**
    * Sombreado suave (normales por vértice): para mallas generadas por
    * cortes a partir de las plantillas, cuyas caras son cuadriláteros de
@@ -304,16 +329,44 @@ interface Viewer3DProps {
    animationTime?: number;
     /** Called when a non-looping animation track completes. */
     onAnimationComplete?: (trackId: string) => void;
-     /** Show path and camera gizmo for camera animation tracks */
-    showCameraPathGizmo?: boolean;
-    /** Show the green camera path curve (recorrido) for camera animation tracks */
-    showCameraPath?: boolean;
-    /** When true, the 3D view follows the animated camera (camera view mode) */
-    cameraViewMode?: boolean;
-    /** Called when the camera gizmo is moved, returns updated track keyframes */
-    onCameraGizmoMove?: (keyframes: Keyframe[]) => void;
-     /** Currently selected keyframe (index) being edited via gizmo */
-    selectedKeyframeIndex?: number;
+    /** Cámara-objeto activa de ESTA ventana: la que maneja el visor cuando
+     *  tiene ≥1 fotograma (pose estática con 1, recorrido con ≥2). */
+    activeCamera?: { id: string; keyframes: CameraKeyframe[]; fov: number } | null;
+    /** Cámara de EXPORTACIÓN MP4 (primera con ≥2 fotogramas): durante la
+     *  exportación maneja el visor aunque la ventana no tenga cámara. */
+    exportCamera?: { id: string; keyframes: CameraKeyframe[]; fov: number } | null;
+    /**
+     * Cámara-objeto en edición: la cámara seleccionada de la Escena y el
+     * índice de fotograma activo. El foco (target) del fotograma seleccionado
+     * —o camera.target si no hay ninguno— se usa para orientar el cuerpo.
+     */
+    cameraEditor?: {
+      objectId: string;
+      keyframeIndex: number | null;
+      focus: Vec3 | null;
+      /** Recorrido completo (fotogramas) de la cámara en edición */
+      keyframes: CameraKeyframe[];
+      /** Ángulo de visión actual (FOV en grados) */
+      fov: number;
+    };
+    /** Mueve la posición de un fotograma del recorrido (asa cian) */
+    onCameraKeyframeMove?: (index: number, pos: Vec3) => void;
+    /** Mueve el foco del fotograma seleccionado (asa naranja) */
+    onCameraTargetMove?: (pos: Vec3) => void;
+    /** Orbita el foco alrededor del cuerpo al ROTAR la cámara con el gizmo */
+    onCameraTargetOrbit?: (target: Vec3) => void;
+    /** Modo grabación en ESTA ventana: OrbitControls sigue activo (el bucle
+     *  no evalúa keyframes) y cada arrastre soltado captura un fotograma. */
+    grabacionActiva?: boolean;
+    /** Suelta de un arrastre de la vista grabando: captura la pose actual */
+    onGrabacionCaptura?: (pose: {
+      position: Vec3;
+      target: Vec3;
+      fov: number;
+    }) => void;
+    /** Id de la cámara-objeto en grabación (global a todas las ventanas):
+     *  soltar el gizmo sobre ella en cualquier ventana captura un kf. */
+    grabacionCamaraId?: string | null;
     /** Trigger to export the current animation as MP4 (increment to start export) */
     exportMp4Trigger?: number;
     /** Called during MP4 export with progress (0-100) */
@@ -412,26 +465,114 @@ function disposeMaterial(material: THREE.Material | THREE.Material[]): void {
   material.dispose();
 }
 
-/** Crea una copia visual autónoma: ni su geometría ni sus materiales se
- * comparten con el objeto que estaba activo al pegar. */
-function cloneObjectVisual(source: THREE.Object3D): THREE.Object3D {
-  const clone = source.clone(true);
-  clone.traverse((item) => {
-    if (!(item instanceof THREE.Mesh)) return;
-    item.geometry = item.geometry.clone();
-    item.material = Array.isArray(item.material)
-      ? item.material.map((material) => material.clone())
-      : item.material.clone();
-  });
-  return clone;
-}
-
 /**
  * Construye el visual de un objeto a partir de su instantánea de malla
  * (la copia que se guarda al pegarlo en otra pestaña). Reproduce los
  * mismos materiales que la malla principal: textura con su acabado y su
  * relieve, colores por cara y normales planas o suaves según viniera.
  */
+/**
+ * Cuerpo visual de una cámara-objeto: caja + visor + lente morada y un
+ * cono de visión translúcido cuya abertura depende del FOV. La lente
+ * mira hacia -Z local (la convención de una cámara three.js); el
+ * orientado hacia el foco lo hace orientCameraBodyVisual.
+ */
+export function buildCameraObjectVisual(camera?: CameraData): THREE.Group {
+  const group = new THREE.Group();
+  const body = new THREE.Group();
+  body.name = 'cameraBody';
+
+  const bodyMat = new THREE.MeshStandardMaterial({
+    color: 0xa855f7,
+    roughness: 0.45,
+    metalness: 0.2,
+  });
+  const darkMat = new THREE.MeshStandardMaterial({
+    color: 0x4c1d95,
+    roughness: 0.3,
+    metalness: 0.5,
+  });
+
+  const box = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.26, 0.5), bodyMat);
+  box.castShadow = true;
+  body.add(box);
+
+  // Visor superior
+  const viewfinder = new THREE.Mesh(
+    new THREE.BoxGeometry(0.18, 0.08, 0.14),
+    darkMat
+  );
+  viewfinder.position.set(0, 0.17, 0.06);
+  body.add(viewfinder);
+
+  // Lente: cilindro apuntando a -Z (delante de la caja)
+  const lens = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.1, 0.13, 0.18, 24),
+    darkMat
+  );
+  lens.rotation.x = -Math.PI / 2;
+  lens.position.set(0, 0, -0.32);
+  body.add(lens);
+
+  group.add(body);
+
+  // Cono de visión: pirámide translúcida desde la lente hacia -Z
+  const fovDeg = camera?.fov ?? 45;
+  const fov = (fovDeg * Math.PI) / 180;
+  const largo = 1.6;
+  const radio = largo * Math.tan(fov / 2);
+  const coneGeo = new THREE.ConeGeometry(radio, largo, 4, 1, true);
+  // Punta (+Y) hacia la cámara en el origen, base abierta hacia -Z
+  coneGeo.rotateX(Math.PI / 2);
+  coneGeo.translate(0, 0, -largo / 2);
+  const coneMat = new THREE.MeshBasicMaterial({
+    color: 0xa855f7,
+    transparent: true,
+    opacity: 0.1,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  const cone = new THREE.Mesh(coneGeo, coneMat);
+  const coneEdges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(coneGeo),
+    new THREE.LineBasicMaterial({ color: 0xa855f7, transparent: true, opacity: 0.5 })
+  );
+  const cono = new THREE.Group();
+  cono.name = 'cameraViewCone';
+  cono.add(cone, coneEdges);
+  group.add(cono);
+
+  return group;
+}
+
+/**
+ * Orienta el cuerpo de una cámara-objeto para que su lente (-Z local)
+ * mire al foco, en coordenadas de MUNDO (compensa la rotación del
+ * padre: duplicados viven en el espacio del objeto activo).
+ */
+export function orientCameraBodyVisual(root: THREE.Object3D, focus?: Vec3 | null): void {
+  const body = root.getObjectByName('cameraBody');
+  if (!body || !focus) return;
+  root.updateWorldMatrix(true, false);
+  const worldPos = new THREE.Vector3();
+  root.matrixWorld.decompose(worldPos, new THREE.Quaternion(), new THREE.Vector3());
+  const dir = new THREE.Vector3(focus.x, focus.y, focus.z).sub(worldPos);
+  if (dir.lengthSq() < 1e-10) return;
+  dir.normalize();
+  // Convención de cámara three.js: -Z mira al objetivo.
+  const worldQuat = new THREE.Quaternion().setFromRotationMatrix(
+    new THREE.Matrix4().lookAt(new THREE.Vector3(0, 0, 0), dir, new THREE.Vector3(0, 1, 0))
+  );
+  const parentQuat = new THREE.Quaternion();
+  root.matrixWorld.decompose(new THREE.Vector3(), parentQuat, new THREE.Vector3());
+  parentQuat.invert().multiply(worldQuat);
+  // El cuerpo Y el cono de visión son hermanos directos bajo la raíz con
+  // transformada identidad: el mismo cuaternión orienta a ambos.
+  const cono = root.getObjectByName('cameraViewCone');
+  body.quaternion.copy(parentQuat);
+  if (cono) cono.quaternion.copy(parentQuat);
+}
+
 export function buildSnapshotObjectVisual(
   mesh: Mesh,
   smooth: boolean,
@@ -460,7 +601,9 @@ export function buildSnapshotObjectVisual(
   const finalOpacity = Math.min(opacity, sideOpacity);
 
   // --- Con textura: triángulos planos con UV, como la malla principal ---
-  if (mesh.texture) {
+  // También entra una malla sin textura general pero con texturas por cara.
+  const tieneTexturasPorCara = (mesh.faceTextures ?? []).some((tx) => !!tx);
+  if (mesh.texture || tieneTexturasPorCara) {
     const positions: number[] = [];
     const normals: number[] = [];
     const uvs: number[] = [];
@@ -487,7 +630,11 @@ export function buildSnapshotObjectVisual(
       }
       return [u, 1 - (v.y - minY) / rangeY];
     };
+    const faceEntries: Array<{ triCount: number; tex: string | null }> = [];
+    const faceTexturesList = mesh.faceTextures ?? null;
+    let faceCount = 0;
     for (const face of mesh.faces) {
+      const faceIdx = faceCount++;
       if (face.length < 3) continue;
       const v0 = mesh.vertices[face[0]];
       const v1 = mesh.vertices[face[1]];
@@ -511,6 +658,10 @@ export function buildSnapshotObjectVisual(
       for (let i = 1; i < face.length - 1; i++) {
         indices.push(baseIdx, baseIdx + i, baseIdx + i + 1);
       }
+      faceEntries.push({
+        triCount: face.length - 2,
+        tex: faceTexturesList?.[faceIdx] ?? null,
+      });
     }
     if (positions.length === 0) return group;
 
@@ -537,13 +688,76 @@ export function buildSnapshotObjectVisual(
         alphaTest: 0,
         envMapIntensity: finish === 'mirror' ? 1.5 : 0,
     });
-    const meshObj = new THREE.Mesh(geometry, material);
+    // Texturas por cara: material extra por textura distinta + grupos de
+    // índices por tramo contiguo (mismo esquema que la malla principal).
+    let meshMaterials: THREE.Material | THREE.Material[] = material;
+    if (faceEntries.some((e) => e.tex)) {
+      const texMatIndex = new Map<string, number>();
+      const extraMaterials: THREE.MeshPhysicalMaterial[] = [];
+      const faceLoader = new THREE.TextureLoader();
+      const loadFaceTexture = (mat: THREE.MeshPhysicalMaterial, url: string) => {
+        faceLoader.load(
+          url,
+          (texture) => {
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.anisotropy = 4;
+            texture.needsUpdate = true;
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            mat.map = texture;
+            mat.color.set(0xffffff);
+            mat.needsUpdate = true;
+          },
+          undefined,
+          () => {
+            // Sin imagen disponible: teñir la cara de rojo para que el
+            // fallo se note en vez de quedar invisible.
+            mat.color.set(0xff3333);
+            mat.needsUpdate = true;
+          }
+        );
+      };
+      for (const entry of faceEntries) {
+        if (!entry.tex || texMatIndex.has(entry.tex)) continue;
+        const faceMat = new THREE.MeshPhysicalMaterial({
+          color: 0xcccccc,
+          side: THREE.DoubleSide,
+          transparent: true,
+          opacity: finalOpacity,
+          map: null,
+          metalness: material.metalness,
+          roughness: material.roughness,
+        });
+        loadFaceTexture(faceMat, entry.tex);
+        texMatIndex.set(entry.tex, 1 + extraMaterials.length);
+        extraMaterials.push(faceMat);
+      }
+      let runStart = 0;
+      let runMat = -1;
+      let idxCursor = 0;
+      for (const entry of faceEntries) {
+        const matIndex = entry.tex ? (texMatIndex.get(entry.tex) ?? 0) : 0;
+        if (matIndex !== runMat) {
+          if (runMat >= 0 && idxCursor > runStart) {
+            geometry.addGroup(runStart, idxCursor - runStart, runMat);
+          }
+          runStart = idxCursor;
+          runMat = matIndex;
+        }
+        idxCursor += entry.triCount * 3;
+      }
+      if (runMat >= 0 && idxCursor > runStart) {
+        geometry.addGroup(runStart, idxCursor - runStart, runMat);
+      }
+      meshMaterials = [material, ...extraMaterials];
+    }
+    const meshObj = new THREE.Mesh(geometry, meshMaterials);
     meshObj.castShadow = true;
     meshObj.receiveShadow = true;
     group.add(meshObj);
 
     new THREE.TextureLoader().load(
-      mesh.texture,
+      mesh.texture ?? '',
        (texture) => {
          texture.colorSpace = THREE.SRGBColorSpace;
          texture.anisotropy = 4;
@@ -1188,6 +1402,35 @@ function isPointInPolygon(px: number, py: number, polygon: Array<{ x: number; y:
 }
 
 /**
+ * Malla principal editable del grupo: la construye el efecto de
+ * geometría, que no siempre la nombra 'mesh' (solo las instantáneas del
+ * constructor la nombran). Busca por nombre y, si no aparece, toma el
+ * primer Mesh propio del grupo (sin ser copia pegada ni cuerpo de
+ * cámara-objeto).
+ */
+function findMainMesh(meshGroup: THREE.Group | null): THREE.Mesh | undefined {
+  if (!meshGroup) return undefined;
+  const named = meshGroup.getObjectByName('mesh');
+  if (
+    named instanceof THREE.Mesh &&
+    !named.userData.sceneObjectDuplicate &&
+    !named.userData.cameraBodyActive
+  ) {
+    return named;
+  }
+  for (const child of meshGroup.children) {
+    if (
+      child instanceof THREE.Mesh &&
+      !child.userData.sceneObjectDuplicate &&
+      !child.userData.cameraBodyActive
+    ) {
+      return child;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Construye un mesh de overlay (malla de resaltado) para las caras
  * seleccionadas: geometría de triángulos de esas caras con material
  * semitransparente de color cyan brillante.
@@ -1229,18 +1472,246 @@ function buildFaceSelectionOverlay(
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geometry.setIndex(indices);
 
+  // Tinte sólido y contrastado para que el cambio de color se note claro
+  // AUNQUE el objeto tenga textura: magenta casi opaco.
   const material = new THREE.MeshBasicMaterial({
-    color: 0x00ffff,
+    color: 0xff00ff,
     transparent: true,
-    opacity: 0.35,
+    opacity: 0.9,
     depthWrite: false,
     depthTest: true,
     side: THREE.DoubleSide,
+    // Coplanar con la malla original: ganar el test de profundidad.
+    polygonOffset: true,
+    polygonOffsetFactor: -4,
+    polygonOffsetUnits: -4,
   });
 
   const overlay = new THREE.Mesh(geometry, material);
+
+  // Contorno amarillo sólido del borde de cada cara seleccionada: visible
+  // sobre cualquier textura, con el mismo empuje de profundidad.
+  const linePos: number[] = [];
+  let idxFace = 0;
+  for (const face of mesh.faces) {
+    const seleccionada = faceIds.has(idxFace);
+    idxFace++;
+    if (!seleccionada || face.length < 3) continue;
+    const primero = mesh.vertices[face[0]];
+    if (!primero) continue;
+    for (let j = 1; j < face.length; j++) {
+      const v1 = mesh.vertices[face[j]];
+      const v2 = mesh.vertices[face[(j + 1) % face.length]];
+      if (!v1 || !v2) continue;
+      linePos.push(v1.x, v1.y, v1.z, v2.x, v2.y, v2.z);
+    }
+  }
+  if (linePos.length > 0) {
+    const lineGeo = new THREE.BufferGeometry();
+    lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(linePos, 3));
+    const lineMat = new THREE.LineBasicMaterial({
+      color: 0xffff00,
+      transparent: true,
+      opacity: 1,
+      depthWrite: false,
+      depthTest: true,
+      polygonOffset: true,
+      polygonOffsetFactor: -8,
+      polygonOffsetUnits: -8,
+    });
+    overlay.add(new THREE.LineSegments(lineGeo, lineMat));
+  }
+
   overlay.renderOrder = 997;
   return overlay;
+}
+
+/** Aristas únicas de la malla, derivadas de los bucles de las caras
+ * (clave normalizada «a-b» con a < b, sin duplicados). */
+export function deriveMeshEdges(mesh: Mesh): Array<{ a: number; b: number; key: string }> {
+  const seen = new Set<string>();
+  const edges: Array<{ a: number; b: number; key: string }> = [];
+  for (const face of mesh.faces) {
+    for (let i = 0; i < face.length; i++) {
+      const va = face[i];
+      const vb = face[(i + 1) % face.length];
+      if (va === vb) continue;
+      const a = Math.min(va, vb);
+      const b = Math.max(va, vb);
+      const key = `${a}-${b}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({ a, b, key });
+    }
+  }
+  return edges;
+}
+
+/** Distancia de un punto a un segmento de pantalla (en píxeles). */
+function distanceToSegment(
+  px: number, py: number,
+  x1: number, y1: number, x2: number, y2: number
+): number {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq < 1e-6) return Math.hypot(px - x1, py - y1);
+  let t = ((px - x1) * dx + (py - y1) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
+/** Umbral en píxeles para la herramienta Línea (y para agarrar la selección). */
+const FACE_LINE_TOLERANCE = 12;
+
+/**
+ * Overlay de vértices seleccionados: una esfera pequeña por vértice, en el
+ * espacio LOCAL de la malla (el grupo ya sigue la transform del objeto).
+ */
+function buildVertexSelectionOverlay(
+  mesh: Mesh,
+  vertexIds: Set<number>
+): THREE.Group | null {
+  if (vertexIds.size === 0) return null;
+  const geometry = new THREE.SphereGeometry(0.06, 10, 8);
+  const material = new THREE.MeshBasicMaterial({
+    color: 0x00ffff,
+    depthWrite: false,
+    transparent: true,
+    opacity: 0.95,
+  });
+  const group = new THREE.Group();
+  let created = 0;
+  for (const id of vertexIds) {
+    const v = mesh.vertices[id];
+    if (!v) continue;
+    const sphere = new THREE.Mesh(geometry, material);
+    sphere.position.set(v.x, v.y, v.z);
+    sphere.renderOrder = 997;
+    group.add(sphere);
+    created++;
+  }
+  if (created === 0) {
+    geometry.dispose();
+    material.dispose();
+    return null;
+  }
+  return group;
+}
+
+/**
+ * Overlay de segmentos seleccionados: LineSegments brillantes con las
+ * aristas seleccionadas, en el espacio LOCAL de la malla.
+ */
+function buildEdgeSelectionOverlay(
+  mesh: Mesh,
+  edgeKeys: Set<string>
+): THREE.LineSegments | null {
+  if (edgeKeys.size === 0) return null;
+  const positions: number[] = [];
+  for (const edge of deriveMeshEdges(mesh)) {
+    if (!edgeKeys.has(edge.key)) continue;
+    const va = mesh.vertices[edge.a];
+    const vb = mesh.vertices[edge.b];
+    if (!va || !vb) continue;
+    positions.push(va.x, va.y, va.z, vb.x, vb.y, vb.z);
+  }
+  if (positions.length === 0) return null;
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  const material = new THREE.LineBasicMaterial({
+    color: 0x00ffff,
+    depthWrite: false,
+    transparent: true,
+    opacity: 1,
+  });
+  const overlay = new THREE.LineSegments(geometry, material);
+  overlay.renderOrder = 997;
+  return overlay;
+}
+
+/**
+ * Guías del modo selección: muestran TODOS los elementos del objetivo
+ * activo (no solo los seleccionados) para que el objeto muestre algo en
+ * cuanto se elige vértices/segmentos/caras. Viven en el espacio LOCAL de
+ * la malla, como los overlays de selección.
+ */
+function buildVertexGuideOverlay(mesh: Mesh): THREE.Points | null {
+  if (mesh.vertices.length === 0) return null;
+  const positions = new Float32Array(mesh.vertices.length * 3);
+  for (let i = 0; i < mesh.vertices.length; i++) {
+    const v = mesh.vertices[i];
+    positions[i * 3] = v.x;
+    positions[i * 3 + 1] = v.y;
+    positions[i * 3 + 2] = v.z;
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const material = new THREE.PointsMaterial({
+    color: 0x06b7a3,
+    size: 5,
+    sizeAttenuation: false,
+    depthWrite: false,
+    transparent: true,
+    opacity: 0.65,
+  });
+  const points = new THREE.Points(geometry, material);
+  points.renderOrder = 996;
+  return points;
+}
+
+function buildEdgeGuideOverlay(mesh: Mesh): THREE.LineSegments | null {
+  const edges = deriveMeshEdges(mesh);
+  if (edges.length === 0) return null;
+  const positions = new Float32Array(edges.length * 6);
+  for (let i = 0; i < edges.length; i++) {
+    const va = mesh.vertices[edges[i].a];
+    const vb = mesh.vertices[edges[i].b];
+    if (!va || !vb) continue;
+    positions[i * 6] = va.x;
+    positions[i * 6 + 1] = va.y;
+    positions[i * 6 + 2] = va.z;
+    positions[i * 6 + 3] = vb.x;
+    positions[i * 6 + 4] = vb.y;
+    positions[i * 6 + 5] = vb.z;
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const material = new THREE.LineBasicMaterial({
+    color: 0x06b7a3,
+    depthWrite: false,
+    transparent: true,
+    opacity: 0.5,
+  });
+  const wire = new THREE.LineSegments(geometry, material);
+  wire.renderOrder = 996;
+  return wire;
+}
+
+function buildFaceGuideOverlay(mesh: Mesh): THREE.Points | null {
+  if (mesh.faces.length === 0) return null;
+  // Un punto por centroide de cara (espacio local: matriz identidad).
+  const centroids = computeFaceCentroids(mesh, new THREE.Matrix4());
+  if (centroids.length === 0) return null;
+  const positions = new Float32Array(centroids.length * 3);
+  centroids.forEach((c, i) => {
+    positions[i * 3] = c.x;
+    positions[i * 3 + 1] = c.y;
+    positions[i * 3 + 2] = c.z;
+  });
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const material = new THREE.PointsMaterial({
+    color: 0x8be9e0,
+    size: 4,
+    sizeAttenuation: false,
+    depthWrite: false,
+    transparent: true,
+    opacity: 0.8,
+  });
+  const points = new THREE.Points(geometry, material);
+  points.renderOrder = 996;
+  return points;
 }
 
 export default function Viewer3D({
@@ -1251,8 +1722,10 @@ export default function Viewer3D({
    configMesh,
    booleanToolObjectId = null,
    forceObjectsUpdate = 0,
-   configSmooth,
-  configProjection,
+    configSmooth,
+    configProjection,
+    configFinish,
+    configRelief,
   onObjectSelect,
   selectedObjectIds,
   onSelectionChange,
@@ -1260,10 +1733,18 @@ export default function Viewer3D({
     onSelectionModeChange,
     faceSelectMode,
     faceSelectionTool,
+    faceSelectionTarget,
+    faceSelectVisibleOnly,
+    wireframeOffSignal,
     selectedFaceIds,
     onFaceSelectionChange,
+    selectedVertexIds,
+    onVertexSelectionChange,
+    selectedEdgeIds,
+    onEdgeSelectionChange,
     onFaceSelectionModeChange,
     onFaceSelectionToolChange,
+    onFaceSelectionTargetChange,
     onVerticesChange,
    showVerticesDefault = true,
   smoothShading = false,
@@ -1277,7 +1758,6 @@ export default function Viewer3D({
   objectTransform,
    camera3D,
     onCameraChange,
-    onCameraMove,
      onObjectTransform,
      onMultiObjectTransform,
    objectName,
@@ -1299,12 +1779,16 @@ export default function Viewer3D({
       animationTracks,
       animationTime = 0,
       onAnimationComplete,
-       showCameraPathGizmo = false,
-       showCameraPath = true,
-      cameraViewMode = false,
-      onCameraGizmoMove,
-       selectedKeyframeIndex,
-       exportMp4Trigger = 0,
+      activeCamera,
+      exportCamera,
+      cameraEditor,
+      onCameraKeyframeMove,
+      onCameraTargetMove,
+      onCameraTargetOrbit,
+      grabacionActiva,
+      onGrabacionCaptura,
+      grabacionCamaraId = null,
+      exportMp4Trigger = 0,
        onExportProgress,
        onExportComplete,
     }: Viewer3DProps) {
@@ -1328,20 +1812,95 @@ export default function Viewer3D({
   onObjectSelectRef.current = onObjectSelect;
    const onCameraChangeRef = useRef(onCameraChange);
     onCameraChangeRef.current = onCameraChange;
-    const onCameraMoveRef = useRef(onCameraMove);
-    onCameraMoveRef.current = onCameraMove;
    const animationTracksRef = useRef<AnimationTrack[] | undefined>(animationTracks);
    animationTracksRef.current = animationTracks;
     const animationTimeRef = useRef(animationTime);
     animationTimeRef.current = animationTime;
-    const cameraViewModeRef = useRef(cameraViewMode);
-    cameraViewModeRef.current = cameraViewMode;
-    const showCameraPathGizmoRef = useRef(showCameraPathGizmo);
-    showCameraPathGizmoRef.current = showCameraPathGizmo;
-    const onCameraGizmoMoveRef = useRef(onCameraGizmoMove);
-    onCameraGizmoMoveRef.current = onCameraGizmoMove;
-    const selectedKeyframeIndexRef = useRef(selectedKeyframeIndex);
-    selectedKeyframeIndexRef.current = selectedKeyframeIndex;
+    // Cámara-objeto activa de ESTA ventana: espejo para el bucle animate.
+    const activeCameraRef = useRef(activeCamera);
+    activeCameraRef.current = activeCamera;
+    // Cámara de exportación MP4: espejo para el bucle animate.
+    const exportCameraRef = useRef(exportCamera);
+    exportCameraRef.current = exportCamera;
+    // Bandera: el visor lo está manejando la cámara-objeto (vista de
+    // cámara o exportación). OrbitControls queda deshabilitado y sus
+    // eventos NO se emiten a los paneles.
+    const camaraObjetoManejandoRef = useRef(false);
+    // Última vista del panel emitida por el usuario: se restaura al salir
+    // del manejo de la cámara-objeto.
+    const vistaPanelRef = useRef<Camera3D | null>(null);
+    // Visuales del cuerpo de la cámara que maneja esta ventana: quedan
+    // ocultos mientras maneja (su lente taparía la imagen) y vuelven al
+    // salir.
+    const cuerposOcultosRef = useRef<THREE.Object3D[]>([]);
+    // Modo grabación: espejos para el bucle animate y los handlers de
+    // puntero (que corren fuera del ciclo de render) y estado del arrastre
+    // que captura. `grabacionCamaraIdRef` es global: cualquier ventana que
+    // suelte el gizmo sobre esa cámara captura un fotograma.
+    const grabacionActivaRef = useRef(grabacionActiva);
+    grabacionActivaRef.current = grabacionActiva;
+    const onGrabacionCapturaRef = useRef(onGrabacionCaptura);
+    onGrabacionCapturaRef.current = onGrabacionCaptura;
+    const grabacionCamaraIdRef = useRef(grabacionCamaraId);
+    grabacionCamaraIdRef.current = grabacionCamaraId;
+    const recDownRef = useRef<{ x: number; y: number; moved: boolean } | null>(
+      null
+    );
+    // ZOOM en grabación: la rueda y los botones «Acercar/Alejar» también son
+    // gestos de la vista grabadora. `recZoomRef` guarda el último instante
+    // de zoom: pausa la evaluación del recorrido (si no, el frame siguiente
+    // desharía el acercamiento) y al quedar la vista quieta se captura el
+    // fotograma, igual que al soltar un arrastre.
+    const recZoomRef = useRef(0);
+    const recZoomTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // Estado de la exportación en el frame anterior: al pasar a falso se
+    // restauran las ayudas visuales ocultas durante el vídeo.
+    const exportPrevioRef = useRef(false);
+    // Cámara-objeto en edición: espejo para los manejadores de arrastre que
+    // corren fuera del ciclo de render (gizmo, raycast).
+    const cameraEditorRef = useRef(cameraEditor);
+    cameraEditorRef.current = cameraEditor;
+    // Zoom anterior recibido por la prop camera3D: para convertir el cambio
+    // de zoom del panel en un dolly proporcional durante la grabación.
+    const zoomAnteriorRef = useRef<number | null>(null);
+    cameraEditorRef.current = cameraEditor;
+    const onCameraTargetOrbitRef = useRef(onCameraTargetOrbit);
+    onCameraTargetOrbitRef.current = onCameraTargetOrbit;
+    const onCameraKeyframeMoveRef = useRef(onCameraKeyframeMove);
+    onCameraKeyframeMoveRef.current = onCameraKeyframeMove;
+    // Gestos de ZOOM durante la grabación (rueda del ratón, botones del
+    // panel): pausan la evaluación del recorrido — si no, el frame
+    // siguiente devolvería la cámara a la pose evaluada y el acercamiento
+    // no se vería — y al quedar la vista quieta (~600 ms) capturan un
+    // fotograma encadenado al final, como al soltar un arrastre.
+    const gestoZoomGrabacion = useCallback(() => {
+      if (!grabacionActivaRef.current || !activeCameraRef.current) return;
+      recZoomRef.current = performance.now();
+      if (recZoomTimerRef.current) clearTimeout(recZoomTimerRef.current);
+      recZoomTimerRef.current = setTimeout(() => {
+        recZoomTimerRef.current = null;
+        if (!grabacionActivaRef.current || !activeCameraRef.current) return;
+        recZoomRef.current = 0;
+        const camera = cameraRef.current;
+        const controls = controlsRef.current;
+        if (!camera || !controls || !onGrabacionCapturaRef.current) return;
+        onGrabacionCapturaRef.current({
+          position: {
+            x: camera.position.x,
+            y: camera.position.y,
+            z: camera.position.z,
+          },
+          target: {
+            x: controls.target.x,
+            y: controls.target.y,
+            z: controls.target.z,
+          },
+          fov: camera.fov,
+        });
+      }, 620);
+    }, []);
+    const onCameraTargetMoveRef = useRef(onCameraTargetMove);
+    onCameraTargetMoveRef.current = onCameraTargetMove;
    const onAnimationCompleteRef = useRef(onAnimationComplete);
    onAnimationCompleteRef.current = onAnimationComplete;
     const completedTracksRef = useRef<Set<string>>(new Set());
@@ -1383,66 +1942,63 @@ export default function Viewer3D({
     faceSelectModeRef.current = faceSelectMode ?? false;
     const faceSelectionToolRef = useRef(faceSelectionTool ?? 'rectangle');
     faceSelectionToolRef.current = faceSelectionTool ?? 'rectangle';
+    const faceSelectionTargetRef = useRef(faceSelectionTarget ?? 'cara');
+    faceSelectionTargetRef.current = faceSelectionTarget ?? 'cara';
+    // Solo capturar elementos VISIBLES (caras frontales; vértices y
+    // segmentos de caras frontales): sin esto un rectángulo atraviesa el
+    // objeto y selecciona también lo que está detrás.
+    const faceSelectVisibleOnlyRef = useRef(faceSelectVisibleOnly ?? true);
+    faceSelectVisibleOnlyRef.current = faceSelectVisibleOnly ?? true;
     const selectedFaceIdsRef = useRef(selectedFaceIds ?? []);
     selectedFaceIdsRef.current = selectedFaceIds ?? [];
     const onFaceSelectionChangeRef = useRef(onFaceSelectionChange);
     onFaceSelectionChangeRef.current = onFaceSelectionChange;
+    const selectedVertexIdsRef = useRef<number[]>(selectedVertexIds ?? []);
+    selectedVertexIdsRef.current = selectedVertexIds ?? [];
+    const onVertexSelectionChangeRef = useRef(onVertexSelectionChange);
+    onVertexSelectionChangeRef.current = onVertexSelectionChange;
+    const selectedEdgeIdsRef = useRef<string[]>(selectedEdgeIds ?? []);
+    selectedEdgeIdsRef.current = selectedEdgeIds ?? [];
+    const onEdgeSelectionChangeRef = useRef(onEdgeSelectionChange);
+    onEdgeSelectionChangeRef.current = onEdgeSelectionChange;
     const onFaceSelectionModeChangeRef = useRef(onFaceSelectionModeChange);
     onFaceSelectionModeChangeRef.current = onFaceSelectionModeChange;
     const onFaceSelectionToolChangeRef = useRef(onFaceSelectionToolChange);
     onFaceSelectionToolChangeRef.current = onFaceSelectionToolChange;
+    const onFaceSelectionTargetChangeRef = useRef(onFaceSelectionTargetChange);
+    onFaceSelectionTargetChangeRef.current = onFaceSelectionTargetChange;
     const faceSelectionOverlayRef = useRef<THREE.Group | null>(null);
     const faceSelectionStartRef = useRef<{ x: number; y: number; rect: DOMRect } | null>(null);
     const faceSelectionPointsRef = useRef<Array<{ x: number; y: number }>>([]);
     const faceSelectionPolyDivRef = useRef<SVGPolygonElement | null>(null);
     const faceSelectionRectDivRef = useRef<HTMLDivElement | null>(null);
     const faceSelectionCircleDivRef = useRef<HTMLDivElement | null>(null);
+    const faceSelectionLineRef = useRef<SVGLineElement | null>(null);
+    // Arrastre de MOVER la selección (vértices/segmentos/caras): el plano
+    // de arrastre (mundo), el punto inicial en mundo y en espacio local de
+    // la malla, los vértices originales y los índices afectados; en cada
+    // movimiento se emiten los vértices ya desplazados por onVerticesChange.
+    const faceMoveDragRef = useRef<{
+      plane: THREE.Plane;
+      worldStart: THREE.Vector3;
+      localStart: THREE.Vector3;
+      originalVerts: Vertex3D[];
+      vertIdx: number[];
+      latestVerts?: Vertex3D[];
+      lastEmit?: number;
+    } | null>(null);
+    // Grupo persistente con la GUÍA del objetivo activo (todos los
+    // vértices/segmentos/centroides, no solo los seleccionados).
+    const faceGuideRef = useRef<THREE.Group | null>(null);
+    const faceGuideCacheRef = useRef<{ mesh: Mesh | null; target: string }>({
+      mesh: null,
+      target: '',
+    });
+    // Espejo de showLightHelpers para el bucle animate (ocultar/restaurar
+    // los ayudantes de luz durante la exportación de vídeo).
+    const showLightHelpersRef = useRef(showLightHelpers);
+    showLightHelpersRef.current = showLightHelpers;
 
-
-    const buildUpdatedCameraKeyframes = useCallback(
-      (tracks: AnimationTrack[] | undefined, camState: Camera3D): Keyframe[] | null => {
-        if (!tracks?.length) return null;
-        const camTrack = tracks.find((t) => t.objectId === null);
-        if (!camTrack?.keyframes.length) return null;
-
-        const idx = selectedKeyframeIndexRef.current;
-        let targetKf: Keyframe | null = null;
-
-        if (idx !== undefined && idx !== null && idx >= 0 && idx < camTrack.keyframes.length) {
-          targetKf = camTrack.keyframes[idx];
-        } else {
-          const sorted = [...camTrack.keyframes].sort((a, b) => a.time - b.time);
-          const effectiveTimeMs = (animationTimeRef.current ?? 0) * 1000;
-          let best: Keyframe = sorted[0];
-          let bestDist = Math.abs((sorted[0]?.time ?? 0) - effectiveTimeMs);
-          for (let i = 1; i < sorted.length; i++) {
-            const d = Math.abs((sorted[i]?.time ?? 0) - effectiveTimeMs);
-            if (d < bestDist) {
-              bestDist = d;
-              best = sorted[i];
-            }
-          }
-          targetKf = best;
-        }
-
-        const updated: Keyframe = {
-          ...targetKf,
-          values: {
-            ...targetKf.values,
-            zoom: camState.zoom,
-            offsetX: camState.offsetX,
-            offsetY: camState.offsetY,
-            rotationX: camState.rotationX,
-            rotationY: camState.rotationY,
-          },
-        };
-
-        return camTrack.keyframes.map((kf) =>
-          kf === targetKf ? updated : kf
-        );
-      },
-      []
-    );
 
     const [showVertices, setShowVertices] = useState(showVerticesDefault);
     const [smoothCapture, setSmoothCapture] = useState(true);
@@ -1495,7 +2051,41 @@ export default function Viewer3D({
    }, [showGridProp, onShowGridChange, showGridInternal]);
   const [gridScale, setGridScale] = useState(1);
   const [wireframe, setWireframe] = useState(false);
+  /** Al activar el selector de caras se encienden automáticamente los
+   *  vértices y la vista de alambre; al desactivarlo se devuelven los
+   *  valores que tenían antes (null = el modo no está activo). */
+  const vizAnteriorRef = useRef<{ vertices: boolean; alambre: boolean } | null>(null);
+  useEffect(() => {
+    if (faceSelectMode) {
+      if (!vizAnteriorRef.current) {
+        vizAnteriorRef.current = { vertices: showVertices, alambre: wireframe };
+        setShowVertices(true);
+        setWireframe(true);
+      }
+    } else if (vizAnteriorRef.current) {
+      setShowVertices(vizAnteriorRef.current.vertices);
+      // El alambre se apaga SIEMPRE al salir: el estado correcto final es
+      // el objeto con su textura, sin vista de alambre.
+      setWireframe(false);
+      vizAnteriorRef.current = null;
+    }
+    // Solo reacciona al entrar/salir del modo; los valores guardados no.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [faceSelectMode]);
+  // Señal externa para apagar el alambre (p. ej., tras asignar una textura
+  // por caras): sin ella, la textura asignada no se ve hasta pulsar a mano
+  // el botón «Vista de alambre».
+  useEffect(() => {
+    if (wireframeOffSignal) setWireframe(false);
+  }, [wireframeOffSignal]);
   const [autoRotate, setAutoRotate] = useState(false);
+  /** Firma del último estado de cámara que este visor EMITIÓ al padre.
+   *  Sirve para no re-aplicar nuestro propio eco: applyCamera llama
+   *  controls.update(), que con auto-rotar (o al reproducir una
+   *  trayectoria) dispara otro 'change' → otro estado del padre → el
+   *  efecto volvería a aplicar → bucle anidado infinito
+   *  ("Maximum update depth exceeded"). */
+  const ultimaCamEmitidaRef = useRef<string | null>(null);
   const [lightPreset, setLightPreset] = useState(0);
   const lightPresetRef = useRef(lightPreset);
   lightPresetRef.current = lightPreset;
@@ -1511,30 +2101,26 @@ export default function Viewer3D({
    const gridGroupRef = useRef<THREE.Group | null>(null);
    const groundRef = useRef<THREE.Mesh | null>(null);
    const skyboxRef = useRef<THREE.Mesh | null>(null);
-  const cameraPathRef = useRef<THREE.Group | null>(null);
-  const cameraGizmoRef = useRef<THREE.Group | null>(null);
-  const cameraGizmoHandleGroupRef = useRef<THREE.Group | null>(null);
-  const cameraGizmoHandlesRef = useRef<THREE.Mesh[]>([]);
-  const cameraGizmoDragRef = useRef<{
-    axis: GizmoAxis;
-    axisWorld: THREE.Vector3;
-    startPos: THREE.Vector3;
-    startQuat: THREE.Quaternion;
-    startDir: THREE.Vector3;
-    startT: number;
-    mode: 'move' | 'rotate';
-    startAngle: number;
-    plane: THREE.Plane;
-    basisU: THREE.Vector3;
-    basisV: THREE.Vector3;
-    startOffsetX: number;
-    startOffsetY: number;
-    startZoom: number;
-    startRotationX: number;
-    startRotationY: number;
+  // Recorrido de la cámara-objeto (curva + asas arrastrables por fotograma)
+  const cameraObjectPathRef = useRef<{
+    group: THREE.Group;
+    tube: THREE.Mesh;
+    handles: THREE.Group;
   } | null>(null);
-  const getCameraPositionFromStateRef = useRef<(camState: Camera3D) => THREE.Vector3>();
-  const drawCameraPathRef = useRef<(track: AnimationTrack) => void>();
+  // Arrastre activo de un asa del recorrido de la cámara-objeto
+  const cameraPathDragRef = useRef<{
+    kind: 'keyframe' | 'target';
+    index: number;
+    plane: THREE.Plane;
+    startPos: THREE.Vector3;
+    original: THREE.Vector3;
+  } | null>(null);
+  const rebuildCameraObjectPathRef = useRef<(cam: {
+    keyframes: CameraKeyframe[];
+    selected: number | null;
+    focus: Vec3 | null;
+    visible: boolean;
+  }) => void>(() => {});
   const startMp4ExportRef = useRef<() => void>();
   const latheAxisRef = useRef<THREE.Group | null>(null);
   const ambientLightRef = useRef<THREE.AmbientLight | null>(null);
@@ -1690,6 +2276,12 @@ export default function Viewer3D({
     if (lightGizmoGroupRef.current) {
       lightGizmoGroupRef.current.visible = false;
     }
+    // El cuerpo de la cámara-objeto activa SIEMPRE mira a su foco: el
+    // gizmo cambia su posición/escala, no la dirección de la mirada.
+    const cuerpoCam = meshGroupRef.current?.getObjectByName('cameraBodyRoot');
+    if (cuerpoCam) {
+      orientCameraBodyVisual(cuerpoCam, cameraEditorRef.current?.focus ?? null);
+    }
   }, []);
 
   // Aplica el transform de la pieza de textura: al marco entero
@@ -1713,8 +2305,40 @@ export default function Viewer3D({
     const camera = cameraRef.current;
     const controls = controlsRef.current;
     if (!camera || !controls || !camera3D) return;
+    // No re-aplicar el estado que ESTE visor emitió (el eco del
+    // OrbitControls): applyCamera → controls.update() → 'change' →
+    // el padre emite de nuevo → bucle anidado con auto-rotar o al
+    // reproducir una trayectoria de cámara.
+    if (
+      ultimaCamEmitidaRef.current !== null &&
+      JSON.stringify(camera3D) === ultimaCamEmitidaRef.current
+    ) {
+      return;
+    }
+    const prevZoom = zoomAnteriorRef.current;
+    zoomAnteriorRef.current = camera3D.zoom;
+    ultimaCamEmitidaRef.current = JSON.stringify(camera3D);
+    // En grabación los botones «Acercar/Alejar» del panel acercan la vista
+    // EN MANO (dolly hacia el foco actual) en vez de saltar a la vista
+    // guardada del panel: el recorrido la pisaría al frame siguiente y el
+    // gesto no se vería. Luego se captura el fotograma del zoom.
+    if (grabacionActivaRef.current && activeCameraRef.current) {
+      if (prevZoom && camera3D.zoom && prevZoom !== camera3D.zoom) {
+        // zoom mayor = más cerca → la distancia al foco se reduce por
+        // prevZoom / zoom.
+        const factor = prevZoom / camera3D.zoom;
+        const dir = camera.position
+          .clone()
+          .sub(controls.target)
+          .multiplyScalar(factor);
+        camera.position.copy(controls.target).add(dir);
+        controls.update();
+      }
+      gestoZoomGrabacion();
+      return;
+    }
     applyCamera(camera, controls, camera3D);
-  }, [camera3D]);
+  }, [camera3D, gestoZoomGrabacion]);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -1761,6 +2385,10 @@ export default function Viewer3D({
     // mueve la cámara con el ratón/scroll. Sin esto, los botones de pan
     // usan el offset inicial (0,0) en vez de la posición actual.
     const handleControlsChange = () => {
+      // Durante el manejo de la cámara-objeto, los eventos residuales de
+      // OrbitControls NO escriben la vista del panel (evita el eco que
+      // pisa la pose de la cámara animada).
+      if (camaraObjetoManejandoRef.current) return;
       const onCamChange = onCameraChangeRef.current;
       if (!onCamChange) return;
       const pos = camera.position;
@@ -1779,9 +2407,14 @@ export default function Viewer3D({
          rotationX: Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, rotX)),
          rotationY: rotY,
        };
+      // Solo emitir al padre si el estado CAMBIÓ de verdad: con
+      // auto-rotar 'change' vuela por cada frame, y re-emitir el mismo
+      // estado solo provocaría renders y ecos inútiles.
+      const firma = JSON.stringify(camState);
+      if (firma === ultimaCamEmitidaRef.current) return;
+      ultimaCamEmitidaRef.current = firma;
+      vistaPanelRef.current = camState;
       onCamChange(camState);
-      const onCamMove = onCameraMoveRef.current;
-      if (onCamMove) onCamMove(camState);
     };
     controls.addEventListener('change', handleControlsChange);
 
@@ -1887,9 +2520,12 @@ export default function Viewer3D({
       if (config) {
         config.spotlights.forEach((sp, idx) => {
           if (!sp.enabled) return;
-
           const spotlight = spotlightRefs.current[idx];
           if (!spotlight) return; // spotlights may not be created yet on first build
+
+          // Skip visual helpers when helperVisible is false: the light keeps
+          // illuminating but its handles/cone are hidden from the viewport.
+          if (sp.helperVisible === false) return;
 
           // Cone visualization using LineSegments - a wireframe cone outline
           // that's always visible (depthTest false). Blue by default.
@@ -2098,58 +2734,34 @@ export default function Viewer3D({
       skyboxRef.current.visible = false;
       scene.add(skyboxRef.current);
 
- 
-      const pathGroup = new THREE.Group();
-      const pathTubeMat = new THREE.MeshBasicMaterial({
-        color: 0x4ade80,
-        transparent: true,
-        opacity: 0.8,
-        side: THREE.DoubleSide,
-      });
-      const initialCurve = new THREE.CatmullRomCurve3(
-        [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0.001, 0)],
-        false,
-        'chordal'
+      // Recorrido de la cámara-objeto: tubo Catmull-Rom + asas esfera.
+      // Las asas se crean y destruyen por fotograma en el reconstructor.
+      const camObjectPathGroup = new THREE.Group();
+      camObjectPathGroup.name = 'cameraObjectPath';
+      camObjectPathGroup.visible = false;
+      scene.add(camObjectPathGroup);
+      const camObjectTube = new THREE.Mesh(
+        new THREE.TubeGeometry(
+          new THREE.CatmullRomCurve3(
+            [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0.001, 0)],
+            false,
+            'chordal'
+          ),
+          1,
+          0.035,
+          6,
+          false
+        ),
+        new THREE.MeshBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0.85 })
       );
-      const pathTubeGeo = new THREE.TubeGeometry(initialCurve, 1, 0.05, 8, false);
-      const pathTube = new THREE.Mesh(pathTubeGeo, pathTubeMat);
-      pathGroup.add(pathTube);
-
-      const markerMat = new THREE.MeshBasicMaterial({
-        color: 0x4ade80,
-        transparent: true,
-        opacity: 0.9,
-      });
-      const markerGeo = new THREE.SphereGeometry(0.12, 8, 6);
-      const marker1 = new THREE.Mesh(markerGeo, markerMat);
-      const marker2 = new THREE.Mesh(markerGeo, markerMat);
-      pathGroup.add(marker1);
-      pathGroup.add(marker2);
-
-      cameraPathRef.current = pathGroup;
-      pathGroup.visible = false;
-      scene.add(pathGroup);
-
-      const cameraGizmoGroup = new THREE.Group();
-      const gizmoCamGeo = new THREE.ConeGeometry(0.3, 0.5, 8);
-      const gizmoCamMat = new THREE.MeshBasicMaterial({ color: 0x3b82f6 });
-      const gizmoCam = new THREE.Mesh(gizmoCamGeo, gizmoCamMat);
-      gizmoCam.rotation.z = Math.PI;
-      const gizmoBodyGeo = new THREE.CylinderGeometry(0.15, 0.15, 0.8, 8);
-      const gizmoBody = new THREE.Mesh(gizmoBodyGeo, gizmoCamMat);
-      gizmoBody.position.y = -0.65;
-      cameraGizmoGroup.add(gizmoCam);
-      cameraGizmoGroup.add(gizmoBody);
-      cameraGizmoGroup.visible = false;
-      scene.add(cameraGizmoGroup);
-      cameraGizmoRef.current = cameraGizmoGroup;
-
-      const cameraGizmoHandleGroup = new THREE.Group();
-      cameraGizmoHandleGroup.visible = false;
-      cameraGizmoHandleGroup.scale.set(0.5, 0.5, 0.5);
-      scene.add(cameraGizmoHandleGroup);
-      cameraGizmoHandleGroupRef.current = cameraGizmoHandleGroup;
-      cameraGizmoHandlesRef.current = buildLightGizmoHandles(cameraGizmoHandleGroup);
+      camObjectPathGroup.add(camObjectTube);
+      const camObjectHandles = new THREE.Group();
+      camObjectPathGroup.add(camObjectHandles);
+      cameraObjectPathRef.current = {
+        group: camObjectPathGroup,
+        tube: camObjectTube,
+        handles: camObjectHandles,
+      };
 
       const meshGroup = new THREE.Group();
     meshGroup.receiveShadow = true;
@@ -2196,6 +2808,11 @@ export default function Viewer3D({
     const faceSelectOverlayGroup = new THREE.Group();
     meshGroup.add(faceSelectOverlayGroup);
     faceSelectionOverlayRef.current = faceSelectOverlayGroup;
+
+    // Guía persistente del modo selección (también hija de meshGroup).
+    const faceGuideGroup = new THREE.Group();
+    meshGroup.add(faceGuideGroup);
+    faceGuideRef.current = faceGuideGroup;
 
     const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
     planeRef.current = plane;
@@ -2248,75 +2865,71 @@ export default function Viewer3D({
       const v = m.vertices[(Math.random() * m.vertices.length) | 0];
       return new THREE.Vector3(v.x, v.y, v.z);
     };
- 
-    getCameraPositionFromStateRef.current = (camState: Camera3D): THREE.Vector3 => {
-     const dir = new THREE.Vector3();
-     dir.x = Math.sin(camState.rotationY) * Math.cos(camState.rotationX);
-     dir.y = Math.sin(camState.rotationX);
-     dir.z = Math.cos(camState.rotationY) * Math.cos(camState.rotationX);
-     dir.normalize();
-     const dist = 5.5 / (camState.zoom || 1);
-     return new THREE.Vector3(
-       camState.offsetX + dir.x * dist,
-       camState.offsetY + dir.y * dist,
-       dir.z * dist
-     );
-   };
- 
-   const getCameraQuaternionFromState = (camState: Camera3D): THREE.Quaternion => {
-     const rotX = camState.rotationX;
-     const rotY = camState.rotationY;
-     const quaternion = new THREE.Quaternion();
-     quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), rotX);
-     const qY = new THREE.Quaternion();
-     qY.setFromAxisAngle(new THREE.Vector3(0, 1, 1), rotY);
-     quaternion.multiply(qY);
-      return quaternion;
+
+    // Reconstruye el recorrido de la cámara-objeto: curva sobre las
+    // posiciones de los fotogramas + UN asa esfera por fotograma (cian;
+    // la del fotograma seleccionado, más clara y grande) + asa naranja
+    // en el foco del fotograma seleccionado. userData.cameraKeyframe /
+    // cameraTarget guían el raycast de arrastre.
+    rebuildCameraObjectPathRef.current = (cam) => {
+      const entry = cameraObjectPathRef.current;
+      if (!entry) return;
+      const { group, tube, handles } = entry;
+      for (const h of [...handles.children]) {
+        handles.remove(h);
+        h.traverse((item) => {
+          const m = item as THREE.Mesh;
+          m.geometry?.dispose();
+          if (m.material) disposeMaterial(m.material);
+        });
+      }
+      const ordenados = [...cam.keyframes].sort((a, b) => a.time - b.time);
+      if (!cam.visible || ordenados.length === 0) {
+        group.visible = false;
+        return;
+      }
+      const puntos = ordenados.map(
+        (k) => new THREE.Vector3(k.position.x, k.position.y, k.position.z)
+      );
+      const curva =
+        puntos.length === 1
+          ? new THREE.CatmullRomCurve3([puntos[0], puntos[0].clone().add(new THREE.Vector3(0, 0.001, 0))], false, 'chordal')
+          : new THREE.CatmullRomCurve3(puntos, false, 'chordal');
+      tube.geometry.dispose();
+      tube.geometry = new THREE.TubeGeometry(
+        curva,
+        Math.max(puntos.length * 12, 24),
+        0.035,
+        6,
+        false
+      );
+
+      const asaGeo = new THREE.SphereGeometry(0.09, 10, 8);
+      const cian = new THREE.MeshBasicMaterial({ color: 0x22d3ee });
+      const cianSel = new THREE.MeshBasicMaterial({ color: 0xa5f3fc });
+      for (const k of ordenados) {
+        const idxOriginal = cam.keyframes.indexOf(k);
+        const seleccionado = idxOriginal === cam.selected;
+        const asa = new THREE.Mesh(asaGeo, seleccionado ? cianSel : cian);
+        asa.position.copy(
+          new THREE.Vector3(k.position.x, k.position.y, k.position.z)
+        );
+        if (seleccionado) asa.scale.setScalar(1.6);
+        asa.userData.cameraKeyframe = idxOriginal;
+        handles.add(asa);
+      }
+      // Asa del foco del fotograma seleccionado (naranja)
+      if (cam.selected !== null && cam.focus) {
+        const focoMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b });
+        const focoAsa = new THREE.Mesh(asaGeo, focoMat);
+        focoAsa.position.set(cam.focus.x, cam.focus.y, cam.focus.z);
+        focoAsa.userData.cameraTarget = true;
+        handles.add(focoAsa);
+      }
+      group.visible = !activeCameraRef.current;
     };
-  
-    drawCameraPathRef.current = (track: AnimationTrack) => {
-    if (!cameraPathRef.current) return;
-    const pathGroup = cameraPathRef.current;
-    const sortedKeys = [...track.keyframes].sort((a, b) => a.time - b.time);
-    if (sortedKeys.length === 0) return;
-
-    const positions: THREE.Vector3[] = [];
-    for (const kf of sortedKeys) {
-      const camState: Camera3D = {
-        zoom: kf.values?.zoom ?? 1,
-        offsetX: kf.values?.offsetX ?? 0,
-        offsetY: kf.values?.offsetY ?? 0,
-        rotationX: kf.values?.rotationX ?? 0,
-        rotationY: kf.values?.rotationY ?? 0,
-      };
-      positions.push(getCameraPositionFromStateRef.current?.(camState) ?? new THREE.Vector3());
-    }
-
-    // Draw curve path (Catmull-Rom for smooth curve)
-    const curve = new THREE.CatmullRomCurve3(positions, false, 'chordal');
-    const segments = Math.max(positions.length * 10, 20);
-    const tubeGeo = pathGroup.children[0] as THREE.Mesh;
-    tubeGeo.geometry.dispose();
-    tubeGeo.geometry = new THREE.TubeGeometry(curve, segments, 0.05, 8, false);
-    tubeGeo.visible = true;
-
-    // Position markers at keyframes
-    const markerMat = pathGroup.children[1] as THREE.Mesh;
-    const markerGeo = pathGroup.children[2] as THREE.Mesh;
-    if (positions.length >= 1) {
-      markerMat.position.copy(positions[0]);
-      markerMat.visible = true;
-    }
-    if (positions.length >= 2) {
-      markerGeo.position.copy(positions[positions.length - 1]);
-      markerGeo.visible = true;
-    }
-
-    pathGroup.visible = true;
-  };
 
     const clock = new THREE.Clock();
-    const animStartTime = performance.now();
     let animId: number;
     const animate = () => {
       animId = requestAnimationFrame(animate);
@@ -2324,12 +2937,198 @@ export default function Viewer3D({
       const dt = Math.min(clock.getDelta(), 0.05);
 
       const exportState = exportStateRef.current;
-      const hasCameraTrack = animationTracksRef.current?.some((t) => t.objectId === null) ?? false;
+      // Durante la exportación no deben salir ayudas de edición en el
+      // vídeo: el gizmo del objeto (con su bola amarilla de estirar), el
+      // recorrido de la cámara con sus asas y su bola de foco, el gizmo
+      // del foco de luz y las esferas de vértice. Se mantienen ocultas
+      // cada frame (otros efectos podrían reactivarlas) y, al terminar,
+      // una sola vez se restauran a su visibilidad normal.
+      const exportActivo = !!exportState;
+      if (exportActivo) {
+        if (gizmoGroupRef.current) gizmoGroupRef.current.visible = false;
+        if (cameraObjectPathRef.current)
+          cameraObjectPathRef.current.group.visible = false;
+        if (lightGizmoGroupRef.current) lightGizmoGroupRef.current.visible = false;
+        // Los ayudantes de luz (cono, bola amarilla, aros) también son
+        // ayudas de edición: fuera del vídeo. Al terminar se restaura
+        // su visibilidad desde la casilla showLightHelpers.
+        if (lightHelpersGroupRef.current)
+          lightHelpersGroupRef.current.visible = false;
+        if (vertexHelpersRef.current) vertexHelpersRef.current.visible = false;
+        // El resaltado de caras/vértices/segmentos también es ayuda de
+        // edición: fuera del vídeo.
+        if (faceSelectionOverlayRef.current)
+          faceSelectionOverlayRef.current.visible = false;
+        if (faceGuideRef.current) faceGuideRef.current.visible = false;
+      } else if (exportPrevioRef.current) {
+        if (gizmoGroupRef.current) {
+          const esCamara =
+            (objectsRef.current ?? []).find(
+              (o) => o.id === selectedObjectIdRef.current
+            )?.kind === 'camera';
+          gizmoGroupRef.current.visible =
+            gizmoOnRef.current &&
+            ((meshRef.current?.vertices?.length ?? 0) > 0 || esCamara);
+        }
+        if (cameraObjectPathRef.current)
+          cameraObjectPathRef.current.group.visible = !activeCameraRef.current;
+        if (lightGizmoGroupRef.current)
+          lightGizmoGroupRef.current.visible = !!lightConfigRef.current?.spotlights.find(
+            (s) => s.enabled
+          );
+        if (lightHelpersGroupRef.current)
+          lightHelpersGroupRef.current.visible = showLightHelpersRef.current;
+        if (vertexHelpersRef.current) vertexHelpersRef.current.visible = true;
+        if (faceSelectionOverlayRef.current)
+          faceSelectionOverlayRef.current.visible = true;
+        if (faceGuideRef.current) faceGuideRef.current.visible = true;
+      }
+      exportPrevioRef.current = exportActivo;
+      // El tiempo efectivo SIEMPRE viene del reloj de la animación
+      // (scrubbing): el reloj-de-pared rompía el scrubbing con pistas de
+      // cámara. Durante la exportación, el reloj real acota la duración.
       const effectiveTime = exportState
         ? Math.min((performance.now() - exportState.startTime) / 1000, exportState.duration)
-        : (hasCameraTrack && cameraViewModeRef.current
-          ? (performance.now() - animStartTime) / 1000
-          : animationTimeRef.current);
+        : animationTimeRef.current;
+      // Cámara-objeto: la cámara elegida en ESTA ventana maneja el visor
+      // con SU pose (estática con 1 fotograma, recorrido con ≥2); durante
+      // la exportación manda la cámara de exportación. OrbitControls queda
+      // deshabilitado y sus eventos no llegan a los paneles; al salir se
+      // restaura la vista del panel.
+      const camVentana = activeCameraRef.current;
+      const camExport = exportState ? exportCameraRef.current ?? camVentana : null;
+      const camObjeto = exportState ? camExport : camVentana;
+      const manejaCamara =
+        !!camObjeto &&
+        camObjeto.keyframes.length >= (exportState ? 2 : 1);
+      // Modo grabación: la vista grabadora SÍ sigue a la cámara en vivo
+      // (evaluación de keyframes como en el manejo) — mover la cámara es
+      // ver el mundo moverse, «la cámara en la mano». La evaluación se
+      // pausa solo durante un arrastre de la vista: OrbitControls orbita
+      // en mano alrededor del foco y al soltar se captura el fotograma.
+      const grabaVista =
+        !exportState && !!grabacionActivaRef.current && !!camVentana;
+      if (grabaVista && camVentana) {
+        const kfs = camVentana.keyframes;
+        // La maquinaria de restauración al salir sigue funcionando igual
+        // cuando la cámara tiene recorrido que maneje la vista.
+        camaraObjetoManejandoRef.current = kfs.length >= 1;
+        // El gesto de vista debe enganchar al pulsar: con el manejador
+        // activo desde el primer frame el arrastre de grabación funciona.
+        controls.enabled = true;
+        if (kfs.length >= 1) {
+          // Sin arrastre ni gesto de zoom en curso, la vista viaja con la
+          // cámara evaluada (el zoom en grabación pausa la evaluación
+          // hasta capturar el fotograma del acercamiento).
+          if (
+            !recDownRef.current &&
+            performance.now() - recZoomRef.current > 600
+          ) {
+            const pose = evaluateCameraKeyframes(
+              kfs,
+              effectiveTime * 1000,
+              camVentana.fov
+            );
+            if (pose) {
+              camera.position.set(
+                pose.position.x,
+                pose.position.y,
+                pose.position.z
+              );
+              camera.lookAt(pose.target.x, pose.target.y, pose.target.z);
+              if (Math.abs(camera.fov - pose.fov) > 0.01) {
+                camera.fov = pose.fov;
+                camera.updateProjectionMatrix();
+              }
+              // El pivote de órbita sigue al foco evaluado: arrastrar la
+              // vista orbita alrededor del foco, como llevar la cámara
+              // en la mano mirando al objeto.
+              controls.target.set(
+                pose.target.x,
+                pose.target.y,
+                pose.target.z
+              );
+            }
+          }
+          // Con recorrido, el ojo sigue dentro del cuerpo: se oculta igual
+          // que en la rama de manejo (acumulado para restaurarlo al salir).
+          const cuerpo = meshGroupRef.current?.children.find(
+            (c) =>
+              c.userData.sceneObjectId === camVentana.id &&
+              (c.userData.cameraBodyActive || c.userData.sceneObjectDuplicate)
+          );
+          if (cuerpo) {
+            if (!cuerposOcultosRef.current.includes(cuerpo)) {
+              cuerposOcultosRef.current.push(cuerpo);
+            }
+            cuerpo.visible = false;
+          }
+        }
+        // El gizmo queda fuera: con recorrido el cuerpo está oculto (el
+        // ojo vive dentro) y sus drags no deben disputar el gesto.
+        if (gizmoGroupRef.current) gizmoGroupRef.current.visible = false;
+      } else if (manejaCamara && camObjeto) {
+        const pose = evaluateCameraKeyframes(
+          camObjeto.keyframes,
+          effectiveTime * 1000,
+          camObjeto.fov
+        );
+        if (pose) {
+          camera.position.set(pose.position.x, pose.position.y, pose.position.z);
+          camera.lookAt(pose.target.x, pose.target.y, pose.target.z);
+          if (Math.abs(camera.fov - pose.fov) > 0.01) {
+            camera.fov = pose.fov;
+            camera.updateProjectionMatrix();
+          }
+          if (controls.enabled) controls.enabled = false;
+          camaraObjetoManejandoRef.current = true;
+          // El ojo queda DENTRO del cuerpo de la cámara-objeto: su lente y
+          // su cono de visión taparían la imagen. Se oculta el visual de
+          // ESA cámara (el root activo en meshGroup o su duplicado) y
+          // vuelve al salir.
+          const cuerpo = meshGroupRef.current?.children.find(
+            (c) =>
+              c.userData.sceneObjectId === camObjeto.id &&
+              (c.userData.cameraBodyActive || c.userData.sceneObjectDuplicate)
+          );
+          if (cuerpo) {
+            // Acumulado entre fotogramas: si ya está oculto de un frame
+            // anterior hay que recordarlo igual para restaurarlo al salir.
+            if (!cuerposOcultosRef.current.includes(cuerpo)) {
+              cuerposOcultosRef.current.push(cuerpo);
+            }
+            cuerpo.visible = false;
+          }
+          // Durante la exportación el recorrido no sale en el vídeo.
+          if (exportState && cameraObjectPathRef.current) {
+            cameraObjectPathRef.current.group.visible = false;
+          }
+        }
+      } else if (camaraObjetoManejandoRef.current) {
+        camaraObjetoManejandoRef.current = false;
+        controls.enabled = true;
+        // El cuerpo de la cámara vuelve a verse (si el objeto no está oculto).
+        for (const r of cuerposOcultosRef.current) {
+          const oculto = (objectsRef.current ?? []).find(
+            (o) => o.id === r.userData.sceneObjectId
+          )?.hidden;
+          r.visible = !oculto;
+        }
+        cuerposOcultosRef.current = [];
+        // Restaura la vista del panel que había antes del manejo.
+        const vista = vistaPanelRef.current ?? camera3D;
+        if (vista) applyCamera(camera, controls, vista);
+        // Devuelve el manipulador a su visibilidad normal.
+        if (gizmoGroupRef.current) {
+          const esCamara =
+            (objectsRef.current ?? []).find(
+              (o) => o.id === selectedObjectIdRef.current
+            )?.kind === 'camera';
+          gizmoGroupRef.current.visible =
+            gizmoOnRef.current &&
+            ((meshRef.current?.vertices?.length ?? 0) > 0 || esCamara);
+        }
+      }
       if (sparksRef.current?.points.visible) {
         updateSparks(sparksRef.current, dt, randomSurfacePoint);
       }
@@ -2375,7 +3174,7 @@ export default function Viewer3D({
         fireLightRef.current.intensity = smokeEnabledRef.current ? base * 0.35 : base;
       }
 
-      // Update light helper visuals each frame so cones follow lights
+       // Update light helper visuals each frame so cones follow lights
       const cfg = lightConfigRef.current;
       if (lightHelpersGroupRef.current && cfg) {
         for (const child of lightHelpersGroupRef.current.children) {
@@ -2384,6 +3183,12 @@ export default function Viewer3D({
           const idx = ud.spotlightIdx;
           const sp = cfg.spotlights[idx];
           if (!sp) continue;
+          // Sync visibility: hidden when light is off or helperVisible is false
+          const helperShouldShow = sp.enabled && sp.helperVisible !== false;
+          if (child.visible !== helperShouldShow) {
+            child.visible = helperShouldShow;
+          }
+          if (!helperShouldShow) continue;
           const lightPos = new THREE.Vector3(sp.position.x, sp.position.y, sp.position.z);
           const lightDir = new THREE.Vector3(
             (sp.target?.x ?? 0) - lightPos.x,
@@ -2421,44 +3226,13 @@ export default function Viewer3D({
       if (animationTracksRef.current && effectiveTime >= 0 && animationTracksRef.current.length > 0) {
         const tracks = animationTracksRef.current;
         for (const track of tracks) {
-          const evaluated = evaluateTrack(track, effectiveTime * 1000);
-          if (!evaluated) continue;
-          const isCameraTrack = track.objectId === null;
-          if (isCameraTrack) {
-            const baseCam = camera3D ?? { zoom: 1, offsetX: 0, offsetY: 0, rotationX: 0, rotationY: 0 };
-            const interpolated: Camera3D = {
-              zoom: evaluated.zoom ?? baseCam.zoom,
-              offsetX: evaluated.offsetX ?? baseCam.offsetX,
-              offsetY: evaluated.offsetY ?? baseCam.offsetY,
-              rotationX: evaluated.rotationX ?? baseCam.rotationX,
-              rotationY: evaluated.rotationY ?? baseCam.rotationY,
-            };
-              if (cameraViewModeRef.current) {
-                applyCamera(camera, controls, interpolated);
-              } else if (showCameraPathGizmoRef.current) {
-                const camPos = getCameraPositionFromStateRef.current?.(interpolated) ?? new THREE.Vector3();
-                const camQuat = getCameraQuaternionFromState(interpolated);
-                cameraGizmoRef.current!.position.copy(camPos);
-                cameraGizmoRef.current!.quaternion.copy(camQuat);
-                cameraGizmoRef.current!.visible = true;
-                cameraGizmoHandleGroupRef.current!.position.copy(camPos);
-                cameraGizmoHandleGroupRef.current!.visible = !cameraGizmoDragRef.current;
-              }
-            if (!track.looping && effectiveTime * 1000 >= track.duration && !completedTracksRef.current.has(track.id)) {
-              completedTracksRef.current.add(track.id);
-              onAnimationCompleteRef.current?.(track.id);
-          }
-          }
-        }
-        // Hide camera gizmo handles if not in edit mode (not cameraViewMode,
-        // showCameraPathGizmo active, and a camera track exists)
-        if (cameraGizmoHandleGroupRef.current) {
-          const shouldShow = showCameraPathGizmoRef.current
-            && !cameraViewModeRef.current
-            && animationTracksRef.current
-            && animationTracksRef.current.some((t) => t.objectId === null);
-          if (!shouldShow && !cameraGizmoDragRef.current) {
-            cameraGizmoHandleGroupRef.current.visible = false;
+          // Pistas de OBJETO: solo el aviso de fin (el visor aplica el
+          // valor evaluado por pista en flujos posteriores). La cámara
+          // animada ya no es una pista: es una cámara-objeto (activeCamera)
+          // y la maneja la rama de arriba.
+          if (!track.looping && effectiveTime * 1000 >= track.duration && !completedTracksRef.current.has(track.id)) {
+            completedTracksRef.current.add(track.id);
+            onAnimationCompleteRef.current?.(track.id);
           }
         }
         }
@@ -2472,40 +3246,86 @@ export default function Viewer3D({
 
         // Update face selection overlay and HTML elements
         const m = meshRef.current;
-        const meshObj = meshGroupRef.current?.getObjectByName('mesh') as THREE.Mesh | undefined;
+        // El cuerpo de la cámara-objeto no es una malla editable: ignora
+        // cualquier hijo llamado 'mesh' que no lo sea de verdad.
+        const meshObj = findMainMesh(meshGroupRef.current);
         if (faceSelectModeRef.current && m && meshObj) {
           const worldMatrix = meshObj.matrixWorld;
+          const target = faceSelectionTargetRef.current;
 
-          // Update 3D overlay of selected faces
-          const group = faceSelectionOverlayRef.current;
-          if (group) {
-            // Remove old overlay meshes
-            while (group.children.length) {
-              const child = group.children[0];
-              group.remove(child);
-              if (child instanceof THREE.Mesh) {
-                child.geometry?.dispose?.();
-                (child.material as THREE.Material)?.dispose?.();
+          // Guía del objetivo activo: todos los vértices/segmentos/
+          // centroides de caras (no solo los seleccionados). Se reconstruye
+          // solo cuando cambia la malla o el objetivo.
+          const guideGroup = faceGuideRef.current;
+          if (guideGroup) {
+            const cached = faceGuideCacheRef.current;
+            if (cached.mesh !== m || cached.target !== target) {
+              while (guideGroup.children.length) {
+                const child = guideGroup.children[0];
+                guideGroup.remove(child);
+                child.traverse?.((o) => {
+                  if (o instanceof THREE.Points || o instanceof THREE.LineSegments) {
+                    o.geometry?.dispose?.();
+                    (o.material as THREE.Material)?.dispose?.();
+                  }
+                });
               }
-            }
-            const faceSet = new Set(selectedFaceIdsRef.current);
-            const overlay = buildFaceSelectionOverlay(m, faceSet);
-            if (overlay) {
-              group.add(overlay);
+              faceGuideCacheRef.current = { mesh: m, target };
+              const guide =
+                target === 'vertice'
+                  ? buildVertexGuideOverlay(m)
+                  : target === 'segmento'
+                    ? buildEdgeGuideOverlay(m)
+                    : buildFaceGuideOverlay(m);
+              if (guide) guideGroup.add(guide);
             }
           }
 
-          // Update HTML overlay for freehand polygon lines (only visible during drawing)
-          if (faceSelectionPolyDivRef.current) {
-            const polyDiv = faceSelectionPolyDivRef.current;
-            polyDiv.style.display = faceSelectionPointsRef.current.length > 0 && faceSelectionToolRef.current === 'polygon' ? 'block' : 'none';
-            if (polyDiv.style.display === 'block') {
-              const pts = faceSelectionPointsRef.current;
-              if (pts.length >= 2) {
-                const ptsString = pts.map(p => `${p.x},${p.y}`).join(' ');
-                polyDiv.setAttribute('points', ptsString);
+          // Update 3D overlay of selected faces/vertices/edges
+          const group = faceSelectionOverlayRef.current;
+          if (group) {
+            // Remove old overlay meshes (los grupos anidan esferas: recorrer)
+            while (group.children.length) {
+              const child = group.children[0];
+              group.remove(child);
+              child.traverse?.((o) => {
+                if (o instanceof THREE.Mesh || o instanceof THREE.LineSegments) {
+                  o.geometry?.dispose?.();
+                  (o.material as THREE.Material)?.dispose?.();
+                }
+              });
+            }
+            if (target === 'cara') {
+              const overlay = buildFaceSelectionOverlay(
+                m,
+                new Set(selectedFaceIdsRef.current)
+              );
+              if (overlay) {
+                group.add(overlay);
+              }
+            } else if (target === 'vertice') {
+              const overlay = buildVertexSelectionOverlay(
+                m,
+                new Set(selectedVertexIdsRef.current)
+              );
+              if (overlay) {
+                group.add(overlay);
+              }
+            } else {
+              const overlay = buildEdgeSelectionOverlay(
+                m,
+                new Set(selectedEdgeIdsRef.current)
+              );
+              if (overlay) {
+                group.add(overlay);
               }
             }
+          }
+
+          // El polígono libre ya no existe (la herramienta es «línea», que
+          // se dibuja con su propio SVG en pointermove): mantenerlo oculto.
+          if (faceSelectionPolyDivRef.current) {
+            faceSelectionPolyDivRef.current.style.display = 'none';
           }
         } else if (!faceSelectModeRef.current) {
           // Only hide 3D overlay when NOT in face select mode
@@ -2516,7 +3336,23 @@ export default function Viewer3D({
               }
             });
           }
+          // Sin modo selección no hay guía: vaciarla hasta la próxima vez.
+          const guideGroup = faceGuideRef.current;
+          if (guideGroup && guideGroup.children.length > 0) {
+            while (guideGroup.children.length) {
+              const child = guideGroup.children[0];
+              guideGroup.remove(child);
+              child.traverse?.((o) => {
+                if (o instanceof THREE.Points || o instanceof THREE.LineSegments) {
+                  o.geometry?.dispose?.();
+                  (o.material as THREE.Material)?.dispose?.();
+                }
+              });
+            }
+            faceGuideCacheRef.current = { mesh: null, target: '' };
+          }
           if (faceSelectionPolyDivRef.current) faceSelectionPolyDivRef.current.style.display = 'none';
+          if (faceSelectionLineRef.current) faceSelectionLineRef.current.style.display = 'none';
           if (faceSelectionRectDivRef.current) faceSelectionRectDivRef.current.style.display = 'none';
           if (faceSelectionCircleDivRef.current) faceSelectionCircleDivRef.current.style.display = 'none';
         }
@@ -2537,37 +3373,51 @@ export default function Viewer3D({
       startMp4ExportRef.current = () => {
         if (mp4ExportActive) return;
         const renderer = rendererRef.current;
-        const tracks = animationTracksRef.current;
-        if (!renderer || !tracks || tracks.length === 0) {
+        if (!renderer) {
           onExportCompleteRef.current?.({ success: false, error: 'No hay animación para exportar' });
           return;
         }
         mp4ExportActive = true;
         const canvas = renderer.domElement;
         if (!canvas.captureStream || !(window as any).MediaRecorder) {
+          mp4ExportActive = false;
           onExportCompleteRef.current?.({ success: false, error: 'No se pudo iniciar la grabación (MediaRecorder no disponible)' });
           return;
         }
-        const hasCameraTrack = tracks.some((t) => t.objectId === null);
-        if (!hasCameraTrack) {
-          onExportCompleteRef.current?.({ success: false, error: 'No hay pista de cámara para exportar' });
+        // La exportación sigue la primera cámara-objeto con recorrido (≥2 fotogramas)
+        const camObj = (objectsRef.current ?? []).find(
+          (o) => o.kind === 'camera' && (o.camera?.keyframes.length ?? 0) >= 2
+        );
+        const camKfs = camObj?.camera?.keyframes ?? [];
+        if (!camObj || camKfs.length === 0) {
+          mp4ExportActive = false;
+          onExportCompleteRef.current?.({ success: false, error: 'No hay cámara con recorrido para exportar' });
           return;
         }
-        const maxDuration = Math.max(...tracks.map((t) => t.duration)) / 1000;
+        const maxDuration = Math.max(Math.max(...camKfs.map((k) => k.time)) / 1000, 1);
 
-        // Temporarily set a high canvas resolution for the capture.
-        // The canvas may be small in a multi-panel UI, so we render at a
-        // higher fixed resolution and restore the original afterward.
+        // Exportación en ALTA CALIDAD: se renderiza a 1920×1080 (16:9) con
+        // el aspecto de cámara ajustado a ese tamaño (si no, la imagen saldría
+        // deformada) y se graba con VP9 a un bitrate alto; el VP8 queda de
+        // respaldo. El transcode final usa CRF bajo (electron/main.js).
         const exportWidth = 1920;
         const exportHeight = 1080;
         const originalPixelRatio = renderer.getPixelRatio();
+        const originalAspect = camera.aspect;
         renderer.setPixelRatio(1);
         renderer.setSize(exportWidth, exportHeight, false);
+        camera.aspect = exportWidth / exportHeight;
+        camera.updateProjectionMatrix();
         renderer.setAnimationLoop(null);
         renderer.render(scene, camera);
         const fps = 30;
         const stream = canvas.captureStream(fps);
-        const mediaRecorder = new (window as any).MediaRecorder(stream, { mimeType: 'video/webm;codec=vp8' });
+        const MediaRecorderCtor = (window as any).MediaRecorder;
+        const usaVp9 = MediaRecorderCtor?.isTypeSupported?.('video/webm;codecs=vp9');
+        const mediaRecorder = new MediaRecorderCtor(stream, {
+          mimeType: usaVp9 ? 'video/webm;codecs=vp9' : 'video/webm;codecs=vp8',
+          videoBitsPerSecond: 20_000_000,
+        });
 
         const chunks: BlobPart[] = [];
         mediaRecorder.ondataavailable = (e: BlobEvent) => chunks.push(e.data);
@@ -2666,6 +3516,8 @@ export default function Viewer3D({
             // Restore original renderer resolution and pixel ratio
             renderer.setPixelRatio(originalPixelRatio);
             renderer.setSize(mount.clientWidth, mount.clientHeight, false);
+            camera.aspect = originalAspect;
+            camera.updateProjectionMatrix();
           }
         };
         mediaRecorder.start();
@@ -2708,6 +3560,34 @@ export default function Viewer3D({
           : raycasterRef.current.ray;
       let next: ObjectTransform;
       if (drag.mode === 'rotate') {
+        // Cámara-objeto: rotar NO gira el cuerpo (su mirada es siempre
+        // lookAt al foco); el mismo ángulo ÓRBITA el foco alrededor del
+        // cuerpo. El resultado lo reporta el padre vía onCameraTargetOrbit.
+        const camActiva = cameraEditorRef.current;
+        if (
+          camActiva?.objectId &&
+          camActiva.objectId === selectedObjectIdRef.current &&
+          camActiva.focus &&
+          !isHelper
+        ) {
+          const hit = new THREE.Vector3();
+          if (!ray.intersectPlane(drag.plane, hit)) return;
+          const d = hit.sub(drag.startPos);
+          const ang = Math.atan2(d.dot(drag.basisV), d.dot(drag.basisU));
+          const dq = new THREE.Quaternion().setFromAxisAngle(
+            drag.axisWorld,
+            ang - drag.startAngle
+          );
+          const cuerpo = new THREE.Vector3(t.px, t.py, t.pz);
+          const radio = new THREE.Vector3(
+            camActiva.focus.x - cuerpo.x,
+            camActiva.focus.y - cuerpo.y,
+            camActiva.focus.z - cuerpo.z
+          ).applyQuaternion(dq);
+          const nuevo = cuerpo.add(radio);
+          onCameraTargetOrbitRef.current?.({ x: nuevo.x, y: nuevo.y, z: nuevo.z });
+          return;
+        }
         const hit = new THREE.Vector3();
         if (!ray.intersectPlane(drag.plane, hit)) return;
         const d = hit.sub(drag.startPos);
@@ -2787,6 +3667,59 @@ export default function Viewer3D({
        pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
        pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 
+      // Modo grabación: marcar el arrastre como movimiento real (umbral
+      // de 4 px) para no capturar un mero clic sin arrastre.
+      if (
+        recDownRef.current &&
+        !gizmoDragRef.current &&
+        !cameraPathDragRef.current &&
+        !dragRef.current
+      ) {
+        const dx = e.clientX - recDownRef.current.x;
+        const dy = e.clientY - recDownRef.current.y;
+        if (Math.hypot(dx, dy) > 4) recDownRef.current.moved = true;
+      }
+
+        // --- Mover la selección de caras/vértices/segmentos ---
+        if (faceMoveDragRef.current && faceSelectModeRef.current) {
+          const move = faceMoveDragRef.current;
+          raycasterRef.current.setFromCamera(pointerRef.current, camera);
+          const intersection = new THREE.Vector3();
+          if (move.plane && raycasterRef.current.ray.intersectPlane(move.plane, intersection)) {
+            // El delta se lleva al espacio LOCAL de la malla (donde viven
+            // los vértices): misma inversa de matrixWorld con la que se
+            // convirtió el ancla inicial.
+            const meshObj = findMainMesh(meshGroupRef.current);
+            if (meshObj) {
+              meshObj.updateWorldMatrix(true, false);
+              const invMatrix = new THREE.Matrix4().copy(meshObj.matrixWorld).invert();
+              const localNow = intersection.clone().applyMatrix4(invMatrix);
+              const dx = localNow.x - move.localStart.x;
+              const dy = localNow.y - move.localStart.y;
+              const dz = localNow.z - move.localStart.z;
+              const verts = move.originalVerts.map((v) => ({ ...v }));
+              for (const idx of move.vertIdx) {
+                const v = verts[idx];
+                if (!v) continue;
+                v.x += dx;
+                v.y += dy;
+                v.z += dz;
+              }
+              // Con selecciones grandes (miles de vértices) emitir en CADA
+              // pointermove reconstruye la figura decenas de veces por
+              // segundo y cuelga la página: como mucho una emisión cada
+              // 80 ms; al soltar se emite la posición final exacta.
+              move.latestVerts = verts;
+              const ahora = performance.now();
+              if (move.lastEmit === undefined || ahora - move.lastEmit >= 80) {
+                move.lastEmit = ahora;
+                onVerticesChangeRef.current?.(verts);
+              }
+            }
+          }
+          return;
+        }
+
         // --- Face selection: update overlay during drag ---
         if (faceSelectionStartRef.current && faceSelectModeRef.current) {
           const start = faceSelectionStartRef.current;
@@ -2827,19 +3760,14 @@ export default function Viewer3D({
                 circleDiv.style.display = 'none';
               }
             }
-          } else if (tool === 'polygon') {
-            // Add a point every ~8px of drag distance
-            const pts = faceSelectionPointsRef.current;
-            const lastPt = pts.length > 0 ? pts[pts.length - 1] : null;
-            if (!lastPt || Math.hypot(e.clientX - lastPt.x, e.clientY - lastPt.y) > 8) {
-              pts.push({ x: e.clientX, y: e.clientY });
-            }
-            const polyDiv = faceSelectionPolyDivRef.current;
-            if (polyDiv) {
-              if (pts.length >= 2) {
-                polyDiv.style.display = 'block';
-                polyDiv.setAttribute('points', pts.map(p => `${p.x},${p.y}`).join(' '));
-              }
+          } else if (tool === 'line') {
+            const lineEl = faceSelectionLineRef.current;
+            if (lineEl) {
+              lineEl.style.display = 'block';
+              lineEl.setAttribute('x1', String(start.x - canvasRect.left));
+              lineEl.setAttribute('y1', String(start.y - canvasRect.top));
+              lineEl.setAttribute('x2', String(e.clientX - canvasRect.left));
+              lineEl.setAttribute('y2', String(e.clientY - canvasRect.top));
             }
           }
           controls.enabled = false;
@@ -2876,6 +3804,28 @@ export default function Viewer3D({
 
        if (gizmoDragRef.current) {
         updateGizmoDrag();
+        return;
+      }
+
+      // Arrastre de un asa del recorrido de la cámara-objeto: aplica el
+      // delta sobre el plano perpendicular a la vista y avisa al padre en
+      // vivo (escribe el fotograma o el foco mientras se arrastra).
+      if (cameraPathDragRef.current) {
+        const drag = cameraPathDragRef.current;
+        raycasterRef.current.setFromCamera(pointerRef.current, camera);
+        const hit = new THREE.Vector3();
+        if (!raycasterRef.current.ray.intersectPlane(drag.plane, hit)) return;
+        const delta = hit.clone().sub(drag.startPos);
+        const nuevo = drag.original.clone().add(delta);
+        if (drag.kind === 'target') {
+          onCameraTargetMoveRef.current?.({ x: nuevo.x, y: nuevo.y, z: nuevo.z });
+        } else {
+          onCameraKeyframeMoveRef.current?.(drag.index, {
+            x: nuevo.x,
+            y: nuevo.y,
+            z: nuevo.z,
+          });
+        }
         return;
       }
 
@@ -3126,100 +4076,6 @@ export default function Viewer3D({
          return;
        }
 
-        // Camera gizmo drag update: move/rotate the camera gizmo and sync
-        // position/rotation back to the Camera3D state + callbacks.
-        if (cameraGizmoDragRef.current) {
-          raycasterRef.current.setFromCamera(pointerRef.current, camera);
-          const drag = cameraGizmoDragRef.current;
-
-          if (drag.mode === 'move') {
-            const tc = closestPointOnAxis(raycasterRef.current.ray, drag.startPos, drag.axisWorld);
-            if (tc !== null) {
-              const delta = tc - drag.startT;
-              const newPos = drag.startPos.clone().addScaledVector(drag.axisWorld, delta);
-
-              const target = new THREE.Vector3(drag.startOffsetX, drag.startOffsetY, 0);
-              const dir = new THREE.Vector3().subVectors(newPos, target).normalize();
-              const distance = newPos.distanceTo(target);
-              const newZoom = 5.5 / Math.max(distance, 0.01);
-
-              const clampedDirY = Math.max(-1, Math.min(1, dir.y));
-              const newRotX = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, Math.asin(clampedDirY)));
-              const newRotY = Math.atan2(dir.x, dir.z);
-
-              const newCamState: Camera3D = {
-                zoom: newZoom,
-                offsetX: drag.startOffsetX,
-                offsetY: drag.startOffsetY,
-                rotationX: newRotX,
-                rotationY: newRotY,
-              };
-
-              // Visual update: place the gizmo at the new camera position
-              const newCamPos = getCameraPositionFromStateRef.current?.(newCamState) ?? newPos;
-               cameraGizmoRef.current!.position.copy(newCamPos);
-               cameraGizmoHandleGroupRef.current!.position.copy(newCamPos);
-
-              // Notify parent of the updated camera state (for recording)
-              const onCamMove = onCameraMoveRef.current;
-              if (onCamMove) onCamMove(newCamState);
-
-              // Build updated keyframes for the animation track
-              const onGizmoMove = onCameraGizmoMoveRef.current;
-              if (onGizmoMove && animationTracksRef.current) {
-                const updatedKeyframes = buildUpdatedCameraKeyframes(
-                  animationTracksRef.current,
-                  newCamState
-                );
-                if (updatedKeyframes) onGizmoMove(updatedKeyframes);
-              }
-            }
-          } else if (drag.mode === 'rotate') {
-            const hit = new THREE.Vector3();
-            if (raycasterRef.current.ray.intersectPlane(drag.plane, hit)) {
-              const d = hit.clone().sub(drag.startPos);
-              d.projectOnPlane(drag.axisWorld);
-              if (d.lengthSq() > 1e-6) {
-                const deltaAngle = Math.atan2(
-                  d.dot(drag.basisV),
-                  d.dot(drag.basisU)
-                ) - drag.startAngle;
-
-                const dq = new THREE.Quaternion().setFromAxisAngle(drag.axisWorld, deltaAngle);
-                const newDir = drag.startDir.clone().applyQuaternion(dq).normalize();
-
-                 const clampedY = Math.max(-1, Math.min(1, newDir.y));
-                 const newRotX = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, Math.asin(clampedY)));
-                 const newRotY = Math.atan2(newDir.x, newDir.z);
-
-                const newCamState: Camera3D = {
-                  zoom: drag.startZoom,
-                  offsetX: drag.startOffsetX,
-                  offsetY: drag.startOffsetY,
-                  rotationX: newRotX,
-                  rotationY: newRotY,
-                };
-
-                const newQuat = getCameraQuaternionFromState(newCamState);
-                cameraGizmoRef.current!.quaternion.copy(newQuat);
-
-                const onCamMove = onCameraMoveRef.current;
-                if (onCamMove) onCamMove(newCamState);
-
-                const onGizmoMove = onCameraGizmoMoveRef.current;
-                 if (onGizmoMove && animationTracksRef.current) {
-                   const updatedKeyframes = buildUpdatedCameraKeyframes(
-                     animationTracksRef.current,
-                     newCamState
-                   );
-                   if (updatedKeyframes) onGizmoMove(updatedKeyframes);
-                 }
-              }
-            }
-          }
-          return;
-        }
-
         // Cursor de mano al pasar por encima de un asa del manipulador o de
       // la pieza de textura
       const hoverHandles =
@@ -3269,17 +4125,6 @@ export default function Viewer3D({
           }
         }
       }
-      // Hover for camera gizmo handles
-      if (cameraGizmoHandleGroupRef.current?.visible && !cameraGizmoDragRef.current && !lightGizmoDragRef.current) {
-        raycasterRef.current.setFromCamera(pointerRef.current, camera);
-        const camGizmoHover = raycasterRef.current.intersectObjects(
-          cameraGizmoHandlesRef.current,
-          false
-        );
-        if (camGizmoHover.length > 0) {
-          renderer.domElement.style.cursor = 'grab';
-        }
-      }
       if (dragRef.current) {
         raycasterRef.current.setFromCamera(pointerRef.current, camera);
         const intersection = new THREE.Vector3();
@@ -3314,6 +4159,7 @@ export default function Viewer3D({
     // Colocación de estrellas: clic (sin arrastre) sobre el texto añade
     // una estrella; clic cerca de una colocada la quita.
     const handleStarPlacementClick = (clientX: number, clientY: number) => {
+      console.log('[STAR] click', clientX, clientY);
       const rect = renderer.domElement.getBoundingClientRect();
       pointerRef.current.x = ((clientX - rect.left) / rect.width) * 2 - 1;
       pointerRef.current.y = -((clientY - rect.top) / rect.height) * 2 + 1;
@@ -3336,6 +4182,7 @@ export default function Viewer3D({
         (c): c is THREE.Mesh => c instanceof THREE.Mesh
       );
       const hits = raycasterRef.current.intersectObjects(meshes, false);
+      console.log('[STAR] hits', hits.length, 'meshes', meshes.length);
       if (hits.length > 0 && placed) {
         addPlacedStar(
           placed,
@@ -3450,13 +4297,128 @@ export default function Viewer3D({
        if (starPlacementRef.current) {
          // Registrar el punto inicial: solo coloca si NO hubo arrastre
          // (así girar la cámara con arrastre no coloca estrellas).
+         console.log('[STAR] pointerdown', e.clientX, e.clientY);
          placeDownRef.current = { x: e.clientX, y: e.clientY };
          return;
        }
 
+      // Modo grabación: armar el posible arrastre de cámara AL PRINCIPIO.
+      // Los drags de gizmo, asas, textura, caras o vértices quedan excluidos
+      // por sus refs en el pointermove (no marcan «moved») y los modos de
+      // selección no llegan a armar. Un arrastre sobre el cuerpo de la
+      // cámara-objeto también cuenta: es el gesto de moverla.
+      if (
+        grabacionActivaRef.current &&
+        e.button === 0 &&
+        !recDownRef.current &&
+        !selectionModeRef.current &&
+        !faceSelectModeRef.current
+      ) {
+        recDownRef.current = { x: e.clientX, y: e.clientY, moved: false };
+      }
+
         // --- Face selection: start drag ---
          if (faceSelectModeRef.current && !gizmoDragRef.current) {
           const rect = renderer.domElement.getBoundingClientRect();
+
+          // ¿El pointer está sobre un elemento ya seleccionado? Entonces
+          // el gesto es MOVER la selección (y no dibujar una figura):
+          // arrastre en el plano frontal a la cámara, emitiendo los
+          // vértices desplazados por onVerticesChange.
+          const mNow = meshRef.current;
+          const meshGroupForMove = meshGroupRef.current;
+          const meshObjForMove = findMainMesh(meshGroupForMove);
+          if (mNow && meshObjForMove) {
+            meshObjForMove.updateWorldMatrix(true, false);
+            const worldMatrixMove = meshObjForMove.matrixWorld;
+            pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+            pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+            raycasterRef.current.setFromCamera(pointerRef.current, camera);
+
+            // Puntos de anclaje por objetivo: centroides de caras,
+            // posiciones de vértices o puntos medios de segmentos.
+            const targetMove = faceSelectionTargetRef.current;
+            const anchors: Array<{ world: THREE.Vector3; idx: number }> = [];
+            const vertIdxSet = new Set<number>();
+            if (targetMove === 'cara') {
+              const sel = selectedFaceIdsRef.current;
+              if (sel.length > 0) {
+                const centroids = computeFaceCentroids(mNow, worldMatrixMove);
+                for (const f of sel) {
+                  const c = centroids[f];
+                  if (c) anchors.push({ world: c, idx: f });
+                }
+                for (const f of sel) {
+                  const face = mNow.faces[f];
+                  if (face) for (const vi of face) vertIdxSet.add(vi);
+                }
+              }
+            } else if (targetMove === 'vertice') {
+              for (const vi of selectedVertexIdsRef.current) {
+                const v = mNow.vertices[vi];
+                if (!v) continue;
+                anchors.push({
+                  world: new THREE.Vector3(v.x, v.y, v.z).applyMatrix4(worldMatrixMove),
+                  idx: vi,
+                });
+                vertIdxSet.add(vi);
+              }
+            } else {
+              for (const edge of deriveMeshEdges(mNow)) {
+                if (!selectedEdgeIdsRef.current.includes(edge.key)) continue;
+                const va = mNow.vertices[edge.a];
+                const vb = mNow.vertices[edge.b];
+                if (!va || !vb) continue;
+                anchors.push({
+                  world: new THREE.Vector3((va.x + vb.x) / 2, (va.y + vb.y) / 2, (va.z + vb.z) / 2)
+                    .applyMatrix4(worldMatrixMove),
+                  idx: edge.a,
+                });
+                vertIdxSet.add(edge.a);
+                vertIdxSet.add(edge.b);
+              }
+            }
+
+            // Ancla más cercano en pantalla; si está a <14 px, agarrar.
+            let grabbed: { world: THREE.Vector3 } | null = null;
+            let bestDist = Infinity;
+            for (const anchor of anchors) {
+              const screenPt = projectToScreen(anchor.world, camera, rect);
+              if (!screenPt) continue;
+              const d = Math.hypot(screenPt.x - e.clientX, screenPt.y - e.clientY);
+              if (d < bestDist) {
+                bestDist = d;
+                grabbed = anchor;
+              }
+            }
+            if (grabbed && bestDist < 14 && vertIdxSet.size > 0) {
+              const camDir = new THREE.Vector3();
+              camera.getWorldDirection(camDir);
+              const plane = new THREE.Plane();
+              plane.setFromNormalAndCoplanarPoint(
+                camDir.clone().negate(),
+                grabbed.world
+              );
+              const worldStart = new THREE.Vector3();
+              if (raycasterRef.current.ray.intersectPlane(plane, worldStart)) {
+                const invMatrix = new THREE.Matrix4()
+                  .copy(worldMatrixMove)
+                  .invert();
+                const localStart = worldStart.clone().applyMatrix4(invMatrix);
+                faceMoveDragRef.current = {
+                  plane,
+                  worldStart,
+                  localStart,
+                  originalVerts: mNow.vertices.map((v) => ({ ...v })),
+                  vertIdx: [...vertIdxSet],
+                };
+                controls.enabled = false;
+                renderer.domElement.style.cursor = 'grabbing';
+                return;
+              }
+            }
+          }
+
           faceSelectionStartRef.current = {
             x: e.clientX,
             y: e.clientY,
@@ -3464,7 +4426,6 @@ export default function Viewer3D({
           };
           controls.enabled = false;
           renderer.domElement.style.cursor = 'crosshair';
-          faceSelectionPointsRef.current = [];
 
           // Create / ensure HTML overlays for selection shapes
            const mountEl = mountRef.current;
@@ -3513,6 +4474,23 @@ export default function Viewer3D({
               svg.appendChild(poly);
               mountEl.appendChild(svg);
               faceSelectionPolyDivRef.current = poly;
+            }
+            if (!faceSelectionLineRef.current) {
+              const svgNS = 'http://www.w3.org/2000/svg';
+              const svg = document.createElementNS(svgNS, 'svg');
+              svg.style.position = 'absolute';
+              svg.style.top = '0';
+              svg.style.left = '0';
+              svg.style.width = '100%';
+              svg.style.height = '100%';
+              svg.style.pointerEvents = 'none';
+              svg.style.zIndex = '10';
+              const line = document.createElementNS(svgNS, 'line');
+              line.setAttribute('stroke', '#06b7a3');
+              line.setAttribute('stroke-width', '1.5');
+              svg.appendChild(line);
+              mountEl.appendChild(svg);
+              faceSelectionLineRef.current = line;
             }
           }
           return;
@@ -3709,123 +4687,6 @@ export default function Viewer3D({
         }
       }
 
-      // Camera gizmo (3-axis arrows + rotation rings): if click hits a handle, start drag.
-      // Only interactive when showCameraPathGizmo is active and NOT in cameraViewMode.
-      if (
-        cameraGizmoHandleGroupRef.current?.visible &&
-        !cameraGizmoDragRef.current &&
-        !lightGizmoDragRef.current &&
-        !lightDragRef.current &&
-        !gizmoDragRef.current &&
-        !dragRef.current
-      ) {
-        const rect = renderer.domElement.getBoundingClientRect();
-        pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-        pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-        raycasterRef.current.setFromCamera(pointerRef.current, camera);
-        const camGizmoHits = raycasterRef.current.intersectObjects(
-          cameraGizmoHandlesRef.current,
-          false
-        );
-        if (camGizmoHits.length > 0) {
-          const ud = camGizmoHits[0].object.userData as {
-            axis: GizmoAxis;
-            mode: 'move' | 'rotate';
-          };
-          const camGizmo = cameraGizmoRef.current;
-          if (camGizmo && camera3D) {
-            const camPos = camGizmo.position.clone();
-            const camQuat = camGizmo.quaternion.clone();
-            const startDir = getCameraPositionFromStateRef.current
-              ? getCameraPositionFromStateRef.current(camera3D).sub(
-                  new THREE.Vector3(camera3D.offsetX, camera3D.offsetY, 0)
-                ).normalize()
-              : new THREE.Vector3(0, 0, 1);
-
-            if (ud.mode === 'move') {
-              const axisWorld = GIZMO_AXIS_DIR[ud.axis].clone();
-              const t0 = closestPointOnAxis(
-                raycasterRef.current.ray,
-                camPos,
-                axisWorld
-              );
-              if (t0 !== null) {
-                cameraGizmoDragRef.current = {
-                  axis: ud.axis,
-                  axisWorld,
-                  startPos: camPos,
-                  startQuat: camQuat,
-                  startDir,
-                  startT: t0,
-                  mode: 'move',
-                  plane: new THREE.Plane(),
-                  basisU: new THREE.Vector3(),
-                  basisV: new THREE.Vector3(),
-                  startAngle: 0,
-                  startOffsetX: camera3D.offsetX,
-                  startOffsetY: camera3D.offsetY,
-                  startZoom: camera3D.zoom,
-                  startRotationX: camera3D.rotationX,
-                  startRotationY: camera3D.rotationY,
-                };
-                controls.enabled = false;
-                renderer.domElement.style.cursor = 'grabbing';
-                return;
-              }
-            } else if (ud.mode === 'rotate') {
-              const axisWorld = GIZMO_AXIS_DIR[ud.axis].clone();
-              const plane = new THREE.Plane();
-              plane.setFromNormalAndCoplanarPoint(axisWorld, camPos);
-              const hit = new THREE.Vector3();
-              if (raycasterRef.current.ray.intersectPlane(plane, hit)) {
-                const camDir = new THREE.Vector3();
-                camera.getWorldDirection(camDir);
-                let basisU = camDir
-                  .clone()
-                  .sub(axisWorld.clone().multiplyScalar(camDir.dot(axisWorld)));
-                if (basisU.lengthSq() < 1e-6) {
-                  basisU = new THREE.Vector3(1, 0, 0);
-                }
-                basisU.normalize();
-                const basisV = new THREE.Vector3().crossVectors(axisWorld, basisU).normalize();
-
-                const d = hit.clone().sub(camPos);
-                const startProj = d.clone().projectOnPlane(axisWorld);
-                if (startProj.lengthSq() < 1e-6) {
-                  startProj.crossVectors(axisWorld, basisU).cross(axisWorld).normalize();
-                }
-                const startAngle = Math.atan2(
-                  startProj.dot(basisV),
-                  startProj.dot(basisU)
-                );
-
-                cameraGizmoDragRef.current = {
-                  axis: ud.axis,
-                  axisWorld,
-                  startPos: camPos,
-                  startQuat: camQuat,
-                  startDir,
-                  startT: 0,
-                  mode: 'rotate',
-                  plane,
-                  basisU,
-                  basisV,
-                  startAngle,
-                  startOffsetX: camera3D.offsetX,
-                  startOffsetY: camera3D.offsetY,
-                  startZoom: camera3D.zoom,
-                  startRotationX: camera3D.rotationX,
-                  startRotationY: camera3D.rotationY,
-                };
-                controls.enabled = false;
-                renderer.domElement.style.cursor = 'grabbing';
-                return;
-              }
-            }
-          }
-        }
-      }
-
       // Manipulador: si el clic cae sobre un asa, empieza su arrastre y
       // no se toca nada más (ni vértices ni cámara)
       if (gizmoOnRef.current && gizmoGroupRef.current?.visible) {
@@ -3931,6 +4792,52 @@ export default function Viewer3D({
           return;
         }
       }
+      // Asas del recorrido de la cámara-objeto: arrastrar el fotograma
+      // (cian) o el foco del fotograma seleccionado (naranja) en el plano
+      // perpendicular a la vista.
+      if (
+        cameraObjectPathRef.current?.group.visible &&
+        !activeCameraRef.current
+      ) {
+        const rect = renderer.domElement.getBoundingClientRect();
+        pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        raycasterRef.current.setFromCamera(pointerRef.current, camera);
+        const asaHits = raycasterRef.current.intersectObjects(
+          cameraObjectPathRef.current.handles.children,
+          true
+        );
+        if (asaHits.length > 0) {
+          let asa: THREE.Object3D | null = asaHits[0].object;
+          while (
+            asa &&
+            asa.userData.cameraKeyframe === undefined &&
+            !asa.userData.cameraTarget
+          ) {
+            asa = asa.parent;
+          }
+          if (asa) {
+            const esTarget = !!asa.userData.cameraTarget;
+            const punto = asa.getWorldPosition(new THREE.Vector3());
+            const normal = camera
+              .getWorldDirection(new THREE.Vector3())
+              .negate();
+            cameraPathDragRef.current = {
+              kind: esTarget ? 'target' : 'keyframe',
+              index: (asa.userData.cameraKeyframe as number) ?? 0,
+              plane: new THREE.Plane().setFromNormalAndCoplanarPoint(
+                normal,
+                punto
+              ),
+              startPos: punto.clone(),
+              original: punto.clone(),
+            };
+            controls.enabled = false;
+            renderer.domElement.style.cursor = 'grabbing';
+            return;
+          }
+        }
+      }
       if (meshGroupRef.current) {
         const rect = renderer.domElement.getBoundingClientRect();
         pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -3996,6 +4903,85 @@ export default function Viewer3D({
     };
 
       const onPointerUp = (e: PointerEvent) => {
+        // --- Modo grabación: capturar al soltar ---
+        if (recDownRef.current) {
+          const movido = recDownRef.current.moved;
+          recDownRef.current = null;
+          if (
+            grabacionActivaRef.current &&
+            movido &&
+            onGrabacionCapturaRef.current
+          ) {
+            // La pose de la vista grabando: cámara + pivote de órbita (la
+            // cámara mira siempre a controls.target mientras OrbitControls
+            // orbita y panea) + FOV actual.
+            onGrabacionCapturaRef.current({
+              position: {
+                x: camera.position.x,
+                y: camera.position.y,
+                z: camera.position.z,
+              },
+              target: {
+                x: controls.target.x,
+                y: controls.target.y,
+                z: controls.target.z,
+              },
+              fov: camera.fov,
+            });
+          }
+        }
+        // --- Mover selección: soltar ---
+        if (faceMoveDragRef.current) {
+          // Emisión final: el último frame pudo quedar throttled.
+          const move = faceMoveDragRef.current;
+          if (move.latestVerts) {
+            onVerticesChangeRef.current?.(move.latestVerts);
+          } else if (e.ctrlKey || e.shiftKey) {
+            // Ctrl/Mayús+clic SIN arrastrar sobre la selección: quitar la
+            // cara pinchada. Sin esto el agarre de movimiento se come el
+            // clic y no se puede reducir una a una dentro de la selección.
+            const mClic = meshRef.current;
+            const meshObjClic = findMainMesh(meshGroupRef.current);
+            if (mClic && meshObjClic && mClic.faces.length > 0) {
+              meshGroupRef.current?.updateMatrixWorld();
+              meshObjClic.updateWorldMatrix(true, false);
+              const worldMatrix = meshObjClic.matrixWorld;
+              const rectClic = renderer.domElement.getBoundingClientRect();
+              const ray = new THREE.Raycaster();
+              ray.setFromCamera(
+                new THREE.Vector2(
+                  ((e.clientX - rectClic.left) / rectClic.width) * 2 - 1,
+                  -((e.clientY - rectClic.top) / rectClic.height) * 2 + 1
+                ),
+                camera
+              );
+              const hits = ray.intersectObject(meshObjClic, false);
+              if (hits.length > 0) {
+                const puntoHit = hits[0].point;
+                const centroids = computeFaceCentroids(mClic, worldMatrix);
+                let mejorIdx = -1;
+                let mejorDist = Infinity;
+                for (let i = 0; i < centroids.length; i++) {
+                  const d = centroids[i].distanceTo(puntoHit);
+                  if (d < mejorDist) { mejorDist = d; mejorIdx = i; }
+                }
+                if (mejorIdx >= 0) {
+                  const prev = selectedFaceIdsRef.current ?? [];
+                  if (prev.includes(mejorIdx)) {
+                    const nuevos = prev.filter((f) => f !== mejorIdx);
+                    onFaceSelectionChangeRef.current?.(nuevos);
+                    selectedFaceIdsRef.current = nuevos;
+                  }
+                }
+              }
+            }
+          }
+          faceMoveDragRef.current = null;
+          controls.enabled = true;
+          renderer.domElement.style.cursor = '';
+          return;
+        }
+
         // --- Face selection: finalize ---
         if (faceSelectionStartRef.current && faceSelectModeRef.current) {
           const start = faceSelectionStartRef.current;
@@ -4007,6 +4993,7 @@ export default function Viewer3D({
           if (faceSelectionRectDivRef.current) faceSelectionRectDivRef.current.style.display = 'none';
           if (faceSelectionCircleDivRef.current) faceSelectionCircleDivRef.current.style.display = 'none';
           if (faceSelectionPolyDivRef.current) faceSelectionPolyDivRef.current.style.display = 'none';
+          if (faceSelectionLineRef.current) faceSelectionLineRef.current.style.display = 'none';
 
           const m = meshRef.current;
           if (!m) return;
@@ -4015,51 +5002,260 @@ export default function Viewer3D({
           const meshGroup = meshGroupRef.current;
           if (!meshGroup) return;
           meshGroup.updateMatrixWorld();
-          const meshObj = meshGroup.getObjectByName('mesh') as THREE.Mesh | undefined;
+          const meshObj = findMainMesh(meshGroup);
           if (!meshObj) return;
           meshObj.updateWorldMatrix(true, false);
           const worldMatrix = meshObj.matrixWorld;
 
           const rect = renderer.domElement.getBoundingClientRect();
           const tool = faceSelectionToolRef.current;
-          const centroids = computeFaceCentroids(m, worldMatrix);
+          const target = faceSelectionTargetRef.current;
 
-          const selected: number[] = [];
-          const selectedFaceIds = selectedFaceIdsRef.current ?? [];
-
-          for (let i = 0; i < centroids.length; i++) {
-            const screenPt = projectToScreen(centroids[i], camera, rect);
-            if (!screenPt) continue;
-
-            let inside = false;
+          // La prueba de la herramienta sobre un punto de pantalla,
+          // unificada para los tres objetivos (el polígono dejó paso a la
+          // línea: puntos a <12 px del segmento dibujado).
+          const insideShape = (screenPt: { x: number; y: number }): boolean => {
             if (tool === 'rectangle') {
               const x1 = Math.min(start.x, e.clientX);
               const y1 = Math.min(start.y, e.clientY);
               const x2 = Math.max(start.x, e.clientX);
               const y2 = Math.max(start.y, e.clientY);
-              inside = isPointInRect(screenPt.x, screenPt.y, x1, y1, x2, y2);
-            } else if (tool === 'circle') {
+              return isPointInRect(screenPt.x, screenPt.y, x1, y1, x2, y2);
+            }
+            if (tool === 'circle') {
               const radius = Math.sqrt(
                 (e.clientX - start.x) ** 2 + (e.clientY - start.y) ** 2
               );
-              inside = isPointInCircle(screenPt.x, screenPt.y, start.x, start.y, radius);
-            } else if (tool === 'polygon') {
-              const pts = faceSelectionPointsRef.current;
-              // Close the polygon by adding the start point
-              const polygon = pts.length >= 3 ? [...pts, { x: pts[0].x, y: pts[0].y }] : pts;
-              inside = polygon.length >= 3 && isPointInPolygon(screenPt.x, screenPt.y, polygon);
+              return isPointInCircle(screenPt.x, screenPt.y, start.x, start.y, radius);
             }
+            // line
+            return distanceToSegment(
+              screenPt.x, screenPt.y,
+              start.x, start.y, e.clientX, e.clientY
+            ) <= FACE_LINE_TOLERANCE;
+          };
 
-            if (inside) {
-              selected.push(i);
+          // Clic casi sin arrastre: elegir el elemento más cercano al
+          // puntero (un rectángulo de tamaño cero no atraparía nada).
+          const clicSimple =
+            Math.hypot(e.clientX - start.x, e.clientY - start.y) < 4;
+          // Teclas acumuladoras: Ctrl o Mayús añaden/quitan sin perder la selección.
+          const modificada = e.ctrlKey || e.shiftKey;
+
+          // Visibilidad: solo caras FRONTALES (mirando a la cámara) y los
+          // vértices/segmentos que pertenecen a alguna de ellas. Sin esto
+          // un rectángulo atraviesa el objeto y captura lo que está detrás.
+          const soloVisible = faceSelectVisibleOnlyRef.current;
+          const camPos = camera.getWorldPosition(new THREE.Vector3());
+          let frenteCaras: Uint8Array | null = null;
+          if (soloVisible) {
+            frenteCaras = new Uint8Array(m.faces.length);
+            for (let i = 0; i < m.faces.length; i++) {
+              const face = m.faces[i];
+              if (face.length < 3) continue;
+              const a = m.vertices[face[0]];
+              const b = m.vertices[face[1]];
+              const c = m.vertices[face[2]];
+              if (!a || !b || !c) continue;
+              const wa = new THREE.Vector3(a.x, a.y, a.z).applyMatrix4(worldMatrix);
+              const wb = new THREE.Vector3(b.x, b.y, b.z).applyMatrix4(worldMatrix);
+              const wc = new THREE.Vector3(c.x, c.y, c.z).applyMatrix4(worldMatrix);
+              const n = new THREE.Vector3()
+                .subVectors(wb, wa)
+                .cross(new THREE.Vector3().subVectors(wc, wa));
+              if (n.dot(new THREE.Vector3().subVectors(camPos, wa)) > 0) {
+                frenteCaras[i] = 1;
+              }
             }
           }
 
-          faceSelectionPointsRef.current = [];
+          if (target === 'vertice') {
+            // Un vértice es visible si pertenece a alguna cara frontal.
+            let verticeVisible: Uint8Array | null = null;
+            if (frenteCaras) {
+              verticeVisible = new Uint8Array(m.vertices.length);
+              for (let i = 0; i < m.faces.length; i++) {
+                if (!frenteCaras[i]) continue;
+                for (const vi of m.faces[i]) {
+                  if (vi < verticeVisible.length) verticeVisible[vi] = 1;
+                }
+              }
+            }
+            // Vértices: un punto de pantalla por vértice.
+            const selected: number[] = [];
+            if (clicSimple) {
+              let mejorIdx = -1;
+              let mejorDist = 16;
+              for (let i = 0; i < m.vertices.length; i++) {
+                if (verticeVisible && !verticeVisible[i]) continue;
+                const v = m.vertices[i];
+                if (!v) continue;
+                const world = new THREE.Vector3(v.x, v.y, v.z).applyMatrix4(worldMatrix);
+                const screenPt = projectToScreen(world, camera, rect);
+                if (!screenPt) continue;
+                const dist = Math.hypot(screenPt.x - e.clientX, screenPt.y - e.clientY);
+                if (dist < mejorDist) { mejorDist = dist; mejorIdx = i; }
+              }
+              if (mejorIdx >= 0) selected.push(mejorIdx);
+            } else {
+              for (let i = 0; i < m.vertices.length; i++) {
+                if (verticeVisible && !verticeVisible[i]) continue;
+                const v = m.vertices[i];
+                if (!v) continue;
+                const world = new THREE.Vector3(v.x, v.y, v.z).applyMatrix4(worldMatrix);
+                const screenPt = projectToScreen(world, camera, rect);
+                if (!screenPt) continue;
+                if (insideShape(screenPt)) selected.push(i);
+              }
+            }
+            const prev = selectedVertexIdsRef.current ?? [];
+            let newIds: number[];
+            if (selected.length === 0 && !modificada) {
+              // Clic o rectángulo en el vacío: deselecciona todo.
+              newIds = [];
+            } else if (selected.length > 0 && selected.every((f) => prev.includes(f))) {
+              newIds = prev.filter((f) => !selected.includes(f));
+            } else {
+              newIds = [...new Set([...prev, ...selected])];
+            }
+            onVertexSelectionChangeRef.current?.(newIds);
+            selectedVertexIdsRef.current = newIds;
+            return;
+          }
 
-          // Toggle: if all selected faces are already in the selection, deselect; otherwise add
+          if (target === 'segmento') {
+            // Un segmento es visible si pertenece a alguna cara frontal.
+            let edgeVisible: Set<string> | null = null;
+            if (frenteCaras) {
+              edgeVisible = new Set<string>();
+              for (let i = 0; i < m.faces.length; i++) {
+                if (!frenteCaras[i]) continue;
+                const face = m.faces[i];
+                for (let j = 0; j < face.length; j++) {
+                  const va = face[j];
+                  const vb = face[(j + 1) % face.length];
+                  if (va === vb) continue;
+                  edgeVisible.add(`${Math.min(va, vb)}-${Math.max(va, vb)}`);
+                }
+              }
+            }
+            // Segmentos: un punto de pantalla por punto medio de arista.
+            const edges = deriveMeshEdges(m);
+            const selectedKeys: string[] = [];
+            if (clicSimple) {
+              let mejorKey: string | null = null;
+              let mejorDist = 16;
+              for (const edge of edges) {
+                if (edgeVisible && !edgeVisible.has(edge.key)) continue;
+                const va = m.vertices[edge.a];
+                const vb = m.vertices[edge.b];
+                if (!va || !vb) continue;
+                const mid = new THREE.Vector3(
+                  (va.x + vb.x) / 2,
+                  (va.y + vb.y) / 2,
+                  (va.z + vb.z) / 2
+                ).applyMatrix4(worldMatrix);
+                const screenPt = projectToScreen(mid, camera, rect);
+                if (!screenPt) continue;
+                const dist = Math.hypot(screenPt.x - e.clientX, screenPt.y - e.clientY);
+                if (dist < mejorDist) { mejorDist = dist; mejorKey = edge.key; }
+              }
+              if (mejorKey) selectedKeys.push(mejorKey);
+            } else {
+              for (const edge of edges) {
+                if (edgeVisible && !edgeVisible.has(edge.key)) continue;
+                const va = m.vertices[edge.a];
+                const vb = m.vertices[edge.b];
+                if (!va || !vb) continue;
+                const mid = new THREE.Vector3(
+                  (va.x + vb.x) / 2,
+                  (va.y + vb.y) / 2,
+                  (va.z + vb.z) / 2
+                ).applyMatrix4(worldMatrix);
+                const screenPt = projectToScreen(mid, camera, rect);
+                if (!screenPt) continue;
+                if (insideShape(screenPt)) selectedKeys.push(edge.key);
+              }
+            }
+            const prev = selectedEdgeIdsRef.current ?? [];
+            let newIds: string[];
+            if (selectedKeys.length === 0 && !modificada) {
+              // Clic o rectángulo en el vacío: deselecciona todo.
+              newIds = [];
+            } else if (
+              selectedKeys.length > 0 &&
+              selectedKeys.every((k) => prev.includes(k))
+            ) {
+              newIds = prev.filter((k) => !selectedKeys.includes(k));
+            } else {
+              newIds = [...new Set([...prev, ...selectedKeys])];
+            }
+            onEdgeSelectionChangeRef.current?.(newIds);
+            selectedEdgeIdsRef.current = newIds;
+            return;
+          }
+
+          // Caras (objetivo por defecto): centroides.
+          const centroids = computeFaceCentroids(m, worldMatrix);
+          const selected: number[] = [];
+          const selectedFaceIds = selectedFaceIdsRef.current ?? [];
+          let mejorIdx = -1;
+
+          if (clicSimple) {
+            // Raycast: el primer punto golpeado es SIEMPRE de la cara más
+            // cercana a la cámara; así el clic no atraviesa el objeto y
+            // selecciona una cara que está detrás. Entre las caras se
+            // elige la de centroide más cercano al punto golpeado.
+            let puntoHit: THREE.Vector3 | null = null;
+            const meshObjClic = findMainMesh(meshGroupRef.current);
+            if (meshObjClic) {
+              const ray = new THREE.Raycaster();
+              ray.setFromCamera(
+                new THREE.Vector2(
+                  ((e.clientX - rect.left) / rect.width) * 2 - 1,
+                  -((e.clientY - rect.top) / rect.height) * 2 + 1
+                ),
+                camera
+              );
+              const hits = ray.intersectObject(meshObjClic, false);
+              if (hits.length > 0) puntoHit = hits[0].point;
+            }
+            let mejorDist = puntoHit ? Infinity : 24;
+            for (let i = 0; i < centroids.length; i++) {
+              if (frenteCaras && !frenteCaras[i]) continue;
+              if (puntoHit) {
+                const dist = centroids[i].distanceTo(puntoHit);
+                if (dist < mejorDist) { mejorDist = dist; mejorIdx = i; }
+              } else {
+                const screenPt = projectToScreen(centroids[i], camera, rect);
+                if (!screenPt) continue;
+                const dist = Math.hypot(screenPt.x - e.clientX, screenPt.y - e.clientY);
+                if (dist < mejorDist) { mejorDist = dist; mejorIdx = i; }
+              }
+            }
+          } else {
+            for (let i = 0; i < centroids.length; i++) {
+              if (frenteCaras && !frenteCaras[i]) continue;
+              const screenPt = projectToScreen(centroids[i], camera, rect);
+              if (!screenPt) continue;
+              if (insideShape(screenPt)) {
+                selected.push(i);
+              }
+            }
+          }
+          if (clicSimple && mejorIdx >= 0) selected.push(mejorIdx);
+
+          // Clic simple sin teclas: la selección pasa a ser SOLO esa cara.
+          // Ctrl/Mayús+clic: añade (o quita, si ya estaba) esa cara una a
+          // una, sin perder el resto. El rectángulo/círculo/línea mantiene
+          // su conmutación por lotes de siempre.
           let newFaceIds: number[];
-          if (selected.length > 0 && selected.every((f) => selectedFaceIds.includes(f))) {
+          if (clicSimple && !modificada) {
+            newFaceIds = mejorIdx >= 0 ? [mejorIdx] : [];
+          } else if (!clicSimple && selected.length === 0) {
+            // Rectángulo/círculo/línea en el vacío: deselecciona todo.
+            newFaceIds = [];
+          } else if (selected.length > 0 && selected.every((f) => selectedFaceIds.includes(f))) {
             newFaceIds = selectedFaceIds.filter((f) => !selected.includes(f));
           } else {
             newFaceIds = [...new Set([...selectedFaceIds, ...selected])];
@@ -4093,24 +5289,64 @@ export default function Viewer3D({
             const meshGroup = meshGroupRef.current;
             if (meshGroup) {
               meshGroup.updateMatrixWorld();
-              const duplicates = meshGroup.children.filter(
-                (c) => c.userData.sceneObjectDuplicate
-              );
+              const rect = renderer.domElement.getBoundingClientRect();
+              // Proyectar las 8 esquinas de la caja a pantalla: con la
+              // cámara en perspectiva, la esquina mínima 3D no siempre
+              // cae a la izquierda/abajo de la máxima en pantalla (el
+              // intervalo quedaba invertido y el objeto se escapaba del
+              // rectángulo aunque lo cubriera). Devuelve null si la caja
+              // está vacía.
+              const enPantalla = (figura: THREE.Object3D) => {
+                const box = new THREE.Box3().setFromObject(figura);
+                if (box.isEmpty()) return null;
+                const { min, max } = box;
+                const corners = [
+                  [min.x, min.y, min.z], [max.x, min.y, min.z],
+                  [min.x, max.y, min.z], [max.x, max.y, min.z],
+                  [min.x, min.y, max.z], [max.x, min.y, max.z],
+                  [min.x, max.y, max.z], [max.x, max.y, max.z],
+                ].map(([cx, cy, cz]) =>
+                  new THREE.Vector3(cx, cy, cz).project(camera)
+                );
+                const sx = corners.map(
+                  (v) => ((v.x + 1) * 0.5) * rect.width + rect.left
+                );
+                const sy = corners.map(
+                  (v) => ((1 - v.y) * 0.5) * rect.height + rect.top
+                );
+                return {
+                  sx1: Math.min(...sx),
+                  sx2: Math.max(...sx),
+                  sy1: Math.min(...sy),
+                  sy2: Math.max(...sy),
+                };
+              };
+              const toca = (c: {
+                sx1: number;
+                sx2: number;
+                sy1: number;
+                sy2: number;
+              }) => !(c.sx2 < x1 || c.sx1 > x2 || c.sy2 < y1 || c.sy1 > y2);
               const selectedIds: string[] = [];
-              for (const dup of duplicates) {
-                const box = new THREE.Box3().setFromObject(dup);
-                if (box.isEmpty()) continue;
-                // Project bounding box corners to screen space
-                const min = box.min.project(camera);
-                const max = box.max.project(camera);
-                // Convert NDC to canvas pixel coordinates
-                const rect = renderer.domElement.getBoundingClientRect();
-                const sx1 = ((min.x + 1) * 0.5) * rect.width + rect.left;
-                const sy1 = ((1 - min.y) * 0.5) * rect.height + rect.top;
-                const sx2 = ((max.x + 1) * 0.5) * rect.width + rect.left;
-                const sy2 = ((1 - max.y) * 0.5) * rect.height + rect.top;
-                // Check if the projected bounding box intersects with the selection rect
-                if (sx2 < x1 || sx1 > x2 || sy2 < y1 || sy1 > y2) continue;
+              // Los objetos CONGELADOS se dibujan como duplicados: la
+              // figura activa NO es un duplicado (es la malla principal),
+              // así que sin ella el rectángulo nunca la tomaría a ella
+              // también — con 2 objetos solo seleccionaba 1.
+              const activoId = meshGroup.userData.sceneObjectId as
+                | string
+                | undefined;
+              const principal = meshGroup.children.find(
+                (c) => !c.userData.sceneObjectDuplicate
+              );
+              const cajaPrincipal =
+                activoId && principal ? enPantalla(principal) : null;
+              if (activoId && cajaPrincipal && toca(cajaPrincipal)) {
+                selectedIds.push(activoId);
+              }
+              for (const dup of meshGroup.children) {
+                if (!dup.userData.sceneObjectDuplicate) continue;
+                const caja = enPantalla(dup);
+                if (!caja || !toca(caja)) continue;
                 const objId = dup.userData.sceneObjectId;
                 if (objId) selectedIds.push(objId);
               }
@@ -4139,6 +5375,7 @@ export default function Viewer3D({
         const dx = e.clientX - placeDownRef.current.x;
         const dy = e.clientY - placeDownRef.current.y;
         placeDownRef.current = null;
+        console.log('[STAR] pointerup', dx, dy, 'up?', starPlacementRef.current);
         if (dx * dx + dy * dy < 36) {
           handleStarPlacementClick(e.clientX, e.clientY);
         }
@@ -4153,20 +5390,19 @@ export default function Viewer3D({
         return;
       }
 
-      // Release light gizmo drag (3-axis arrows)
-      if (lightGizmoDragRef.current) {
-        lightGizmoDragRef.current = null;
+      // Release camera-object path handle drag
+      if (cameraPathDragRef.current) {
+        cameraPathDragRef.current = null;
         controls.enabled = true;
         renderer.domElement.style.cursor = '';
         return;
       }
 
-      // Release camera gizmo drag (3-axis arrows + rotation rings)
-      if (cameraGizmoDragRef.current) {
-        cameraGizmoDragRef.current = null;
+      // Release light gizmo drag (3-axis arrows)
+      if (lightGizmoDragRef.current) {
+        lightGizmoDragRef.current = null;
         controls.enabled = true;
         renderer.domElement.style.cursor = '';
-        cameraGizmoHandleGroupRef.current!.visible = true;
         return;
       }
 
@@ -4182,6 +5418,44 @@ export default function Viewer3D({
           const t = transformRef.current;
           setTransform(t);
           onObjectTransformRef.current?.(t);
+          // Modo grabación: soltar el gizmo sobre la cámara grabada
+          // captura un fotograma con la pose del cuerpo (posición del
+          // transform; foco = el último fotograma, o el foco apuntado si
+          // el recorrido está vacío). Funciona desde cualquier ventana.
+          const idArrastrado = selectedObjectIdRef.current;
+          const camObj = (objectsRef.current ?? []).find(
+            (o) => o.id === idArrastrado && o.kind === 'camera' && o.camera
+          );
+          // Un clic en el gizmo sin arrastrar no captura: el transform
+          // de props aún es el previo al arrastre (no hay avisos en vivo).
+          const trPrevio = camObj?.transform;
+          const movioGizmo =
+            !trPrevio ||
+            Math.hypot(
+              t.px - trPrevio.px,
+              t.py - trPrevio.py,
+              t.pz - trPrevio.pz
+            ) > 1e-9;
+          if (
+            grabacionCamaraIdRef.current &&
+            idArrastrado === grabacionCamaraIdRef.current &&
+            movioGizmo &&
+            onGrabacionCapturaRef.current
+          ) {
+            const kfsCam = camObj?.camera?.keyframes ?? [];
+            const foco = kfsCam.length
+              ? kfsCam[kfsCam.length - 1].target
+              : (camObj?.camera?.target as Vec3 | undefined) ?? {
+                  x: t.px,
+                  y: t.py,
+                  z: t.pz - 1,
+                };
+            onGrabacionCapturaRef.current({
+              position: { x: t.px, y: t.py, z: t.pz },
+              target: foco,
+              fov: camera.fov,
+            });
+          }
           // Si hay objetos multiseleccionados, aplica el delta al resto
           const startTransforms = multiTransformStartRef.current;
           const selIds = selectedObjectIdsRef.current ?? [];
@@ -4252,6 +5526,12 @@ export default function Viewer3D({
     renderer.domElement.addEventListener('pointermove', onPointerMove);
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
     window.addEventListener('pointerup', onPointerUp);
+    // Rueda del ratón durante la grabación: OrbitControls acerca (dolly) y
+    // este gesto también captura fotograma al quedar la vista quieta.
+    const onRuedaGrabacion = () => gestoZoomGrabacion();
+    renderer.domElement.addEventListener('wheel', onRuedaGrabacion, {
+      passive: true,
+    });
 
     return () => {
       cancelAnimationFrame(animId);
@@ -4271,6 +5551,8 @@ export default function Viewer3D({
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('pointerup', onPointerUp);
+      renderer.domElement.removeEventListener('wheel', onRuedaGrabacion);
+      if (recZoomTimerRef.current) clearTimeout(recZoomTimerRef.current);
       controls.dispose();
       for (const h of gizmoHandlesRef.current) {
         h.geometry.dispose();
@@ -4352,7 +5634,8 @@ export default function Viewer3D({
         child === latheAxisRef.current ||
         child === textureHelperGroupRef.current ||
         child === textureHelperGizmoGroupRef.current ||
-        child.userData.sceneObjectDuplicate
+        child.userData.sceneObjectDuplicate ||
+        child.userData.cameraBodyActive
       ) continue;
       meshGroup.remove(child);
       if (child instanceof THREE.Mesh) {
@@ -4365,14 +5648,20 @@ export default function Viewer3D({
     let cancelled = false;
 
     // --- SI HAY TEXTURA, CONSTRUIR MALLA CON TEXTURA ---
-    if (mesh.texture && !smoothShading && !wireframe) {
+    // También entra aquí una malla sin textura general pero con texturas
+    // por cara (faceTextures): el material base queda sin mapa. Las texturas
+    // por cara tienen prioridad sobre el sombreado suave (ese camino no
+    // sabe pintarlas; sin esto no se verían).
+    const tieneTexturasPorCara = (mesh.faceTextures ?? []).some((tx) => !!tx);
+    if (((mesh.texture && !smoothShading) || tieneTexturasPorCara) && !wireframe) {
       // Limpiar grupo
       for (const child of [...meshGroup.children]) {
         if (
           child === latheAxisRef.current ||
           child === textureHelperGroupRef.current ||
           child === textureHelperGizmoGroupRef.current ||
-          child.userData.sceneObjectDuplicate
+          child.userData.sceneObjectDuplicate ||
+          child.userData.cameraBodyActive
         ) continue;
         meshGroup.remove(child);
         if (child instanceof THREE.Mesh) {
@@ -4434,7 +5723,12 @@ export default function Viewer3D({
       };
 
       // Construir geometría con UVs
-      for (const face of mesh.faces) {
+      // Por cara apilada: cuántos triángulos aporta y qué textura lleva,
+      // para montar los grupos de material de las texturas por cara.
+      const faceEntries: Array<{ triCount: number; tex: string | null }> = [];
+      const faceTexturesList = mesh.faceTextures ?? null;
+      for (let faceIdx = 0; faceIdx < mesh.faces.length; faceIdx++) {
+        const face = mesh.faces[faceIdx];
         if (face.length < 3) continue;
         const v0 = mesh.vertices[face[0]];
         const v1 = mesh.vertices[face[1]];
@@ -4470,6 +5764,10 @@ export default function Viewer3D({
         for (let i = 1; i < face.length - 1; i++) {
           indices.push(baseIdx, baseIdx + i, baseIdx + i + 1);
         }
+        faceEntries.push({
+          triCount: face.length - 2,
+          tex: faceTexturesList?.[faceIdx] ?? null,
+        });
       }
 
       if (positions.length === 0) return;
@@ -4502,7 +5800,71 @@ export default function Viewer3D({
         envMapIntensity: finish === 'mirror' ? 1.5 : 0,
       });
 
-      const meshObj = new THREE.Mesh(geometry, material);
+      // Texturas por cara: un material extra por textura distinta y un
+      // grupo de índices por tramo contiguo de caras con la misma textura.
+      // Las caras sin textura quedan en el material 0 (el general).
+      let meshMaterials: THREE.Material | THREE.Material[] = material;
+      if (faceEntries.some((e) => e.tex)) {
+        const texMatIndex = new Map<string, number>();
+        const extraMaterials: THREE.MeshPhysicalMaterial[] = [];
+        const faceLoader = new THREE.TextureLoader();
+        const loadFaceTexture = (mat: THREE.MeshPhysicalMaterial, url: string) => {
+          faceLoader.load(
+            url,
+            (texture) => {
+              if (cancelled) return;
+              texture.colorSpace = THREE.SRGBColorSpace;
+              texture.anisotropy = 4;
+              texture.needsUpdate = true;
+              texture.wrapS = THREE.RepeatWrapping;
+              texture.wrapT = THREE.RepeatWrapping;
+              mat.map = texture;
+              mat.color.set(0xffffff);
+              mat.needsUpdate = true;
+            },
+            undefined,
+            (err) => console.error('Error loading face texture:', err)
+          );
+        };
+        for (const entry of faceEntries) {
+          if (!entry.tex || texMatIndex.has(entry.tex)) continue;
+          const faceMat = new THREE.MeshPhysicalMaterial({
+            color: 0xcccccc,
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity,
+            map: null,
+            metalness: material.metalness,
+            roughness: material.roughness,
+          });
+          loadFaceTexture(faceMat, entry.tex);
+          texMatIndex.set(entry.tex, 1 + extraMaterials.length);
+          extraMaterials.push(faceMat);
+        }
+        // Grupos sobre el búfer de índices: tramos contiguos con el mismo
+        // material. Sin grupo que cubra un tramo, ese tramo no se dibuja.
+        let runStart = 0;
+        let runMat = -1;
+        let idxCursor = 0;
+        for (const entry of faceEntries) {
+          let matIndex = 0;
+          if (entry.tex) matIndex = texMatIndex.get(entry.tex) ?? 0;
+          if (matIndex !== runMat) {
+            if (runMat >= 0 && idxCursor > runStart) {
+              geometry.addGroup(runStart, idxCursor - runStart, runMat);
+            }
+            runStart = idxCursor;
+            runMat = matIndex;
+          }
+          idxCursor += entry.triCount * 3;
+        }
+        if (runMat >= 0 && idxCursor > runStart) {
+          geometry.addGroup(runStart, idxCursor - runStart, runMat);
+        }
+        meshMaterials = [material, ...extraMaterials];
+      }
+
+      const meshObj = new THREE.Mesh(geometry, meshMaterials);
       meshObj.castShadow = true;
       meshObj.receiveShadow = true;
       meshGroup.add(meshObj);
@@ -4950,9 +6312,85 @@ export default function Viewer3D({
     return clone;
   };
 
+  /**
+   * Cuerpo de la cámara-objeto ACTIVA dentro de meshGroup: es un hijo más
+   * del grupo (la malla principal está vacía para las cámaras), de modo
+   * que el gizmo XYZ y applyObjectTransform la mueven igual que una
+   * figura. Se orienta SIEMPRE hacia su foco (lookAt): el fotograma
+   * seleccionado mientras haya uno, y camera.target en su defecto.
+   */
+  useEffect(() => {
+    const meshGroup = meshGroupRef.current;
+    if (!meshGroup) return;
+    const activa = (objects ?? []).find(
+      (o) => o.id === selectedObjectId && o.kind === 'camera'
+    );
+    const anteriores = meshGroup.children.filter((c) => c.userData.cameraBodyActive);
+    for (const viejo of anteriores) {
+      if (!activa || viejo.userData.sceneObjectId !== activa.id) {
+        meshGroup.remove(viejo);
+        viejo.traverse((item) => {
+          const m = item as THREE.Mesh;
+          m.geometry?.dispose();
+          if (m.material) disposeMaterial(m.material);
+        });
+      }
+    }
+    if (!activa) return;
+    let root = anteriores.find((c) => c.userData.sceneObjectId === activa.id);
+    if (!root) {
+      root = buildCameraObjectVisual(activa.camera);
+      root.name = 'cameraBodyRoot';
+      root.userData.cameraBodyActive = true;
+      root.userData.sceneObjectId = activa.id;
+      meshGroup.add(root);
+    }
+    const foco =
+      cameraEditor?.objectId === activa.id
+        ? cameraEditor.focus
+        : activa.camera?.target ?? null;
+    orientCameraBodyVisual(root, foco);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [objects, selectedObjectId, cameraEditor]);
+
+  // Recorrido 3D de la cámara-objeto seleccionada: curva + asas. Solo
+  // cuando el objeto activo ES una cámara (y fuera de la vista de cámara).
+  useEffect(() => {
+    const activa = (objects ?? []).find(
+      (o) => o.id === selectedObjectId && o.kind === 'camera'
+    );
+    rebuildCameraObjectPathRef.current({
+      keyframes: activa?.camera?.keyframes ?? [],
+      selected: cameraEditor?.keyframeIndex ?? null,
+      focus: cameraEditor?.focus ?? null,
+      visible: !!activa,
+    });
+  }, [objects, selectedObjectId, cameraEditor]);
+
    useEffect(() => {
    const meshGroup = meshGroupRef.current;
-   if (!meshGroup || !objects?.length) return;
+   if (!meshGroup) return;
+
+    // Limpieza de huérfanos: al reemplazar la escena ("En escena nueva")
+    // o al borrar un objeto, los duplicados de los objetos que salieron
+    // de la lista deben desaparecer del visor. Antes este efecto solo
+    // creaba y actualizaba duplicados: los de los objetos antiguos
+    // quedaban huérfanos como hijos del grupo y seguían dibujándose
+    // junto a los nuevos. Se hace antes de cualquier early-return para
+    // que ocurra aunque la escena quede vacía o sin selección.
+    const validIds = new Set((objects ?? []).map((object) => object.id));
+    for (const child of [...meshGroup.children]) {
+      if (!child.userData.sceneObjectDuplicate) continue;
+      if (validIds.has(child.userData.sceneObjectId)) continue;
+      meshGroup.remove(child);
+      child.traverse((item) => {
+        const childMesh = item as THREE.Mesh;
+        childMesh.geometry?.dispose();
+        if (childMesh.material) disposeMaterial(childMesh.material);
+      });
+    }
+
+    if (!objects?.length) return;
 
     const selected = objects.find((object) => object.id === selectedObjectId);
     if (!selected) return;
@@ -5008,63 +6446,47 @@ export default function Viewer3D({
         duplicate = new THREE.Group();
         duplicate.userData.sceneObjectId = object.id;
         duplicate.userData.sceneObjectDuplicate = true;
-        // El dueño de la configuración muestra la figura de la pestaña
-        // actual (la malla que el editor construye ahora) pero con SU
-        // textura —la guardada en su instantánea— y no la que haya en
-        // pantalla mientras se ajusta una copia pegada. Sin instantánea
-        // (proyectos cargados antiguos) se usa la malla de la
-        // configuración tal cual. Las demás copias traen su propia
-        // instantánea, y la clonación de la figura activa queda como
-        // último recurso.
-        if (object.id === configObjectId) {
-          const ownerBase = configMesh ?? mesh;
-          if (ownerBase && ownerBase.vertices.length > 0 && object.mesh && object.mesh.vertices.length > 0) {
-            duplicate.add(
-              buildSnapshotObjectVisual(
-                {
-                  ...ownerBase,
-                  texture: object.mesh.texture,
-                  textureColor: object.mesh.texture
-                    ? object.mesh.textureColor ?? '#ffffff'
-                    : undefined,
-                  textureRelief: object.mesh.textureRelief,
-                  textureFinish: object.mesh.textureFinish,
-                },
-                 configSmooth ?? smoothShading,
-                 object.textureProjection ?? configProjection ?? textureProjection,
-                 undefined,
-                 object.mesh.textureRepeat ?? textureRepeat
-               )
-            );
-          } else {
-            duplicate.add(
-              buildSnapshotObjectVisual(
-                configMesh ?? mesh,
-             configSmooth ?? smoothShading,
-             configProjection ?? textureProjection,
-             undefined,
-             (configMesh ?? mesh).textureRepeat ?? textureRepeat
-           )
-            );
-          }
-        } else if (object.mesh && object.mesh.vertices.length > 0) {
+        // Cada objeto muestra SU propia instantánea congelada, sea o no
+        // el dueño de la configuración: la figura de un objeto no puede
+        // mutar porque cambie la pestaña activa del editor (el dueño se
+        // congela al salir de su pestaña, así que su instantánea ya está
+        // fresca). Solo un dueño recién creado que aún no se ha congelado
+        // usa la figura viva de su pestaña como último recurso. Sin
+        // instantánea ni figura viva el duplicado queda vacío: ya no se
+        // clona la figura principal como "fantasma".
+        if (object.mesh && object.mesh.vertices.length > 0) {
           duplicate.add(
-             buildSnapshotObjectVisual(
-               object.mesh,
-               object.smooth ?? false,
-               object.textureProjection ?? 'planar',
-               undefined,
-               object.mesh.textureRepeat ?? textureRepeat
-             )
+            buildSnapshotObjectVisual(
+              object.mesh,
+              object.smooth ?? false,
+              object.textureProjection ?? 'planar',
+              undefined,
+              object.mesh.textureRepeat ?? 1
+            )
           );
-        } else {
-          for (const child of [...meshGroup.children]) {
-            if (child === latheAxisRef.current || child.userData.sceneObjectDuplicate) continue;
-            duplicate.add(cloneObjectVisual(child));
-          }
-         }
-         meshGroup.add(duplicate);
-       }
+        } else if (
+          object.id === configObjectId &&
+          (configMesh ?? mesh) &&
+          (configMesh ?? mesh).vertices.length > 0
+        ) {
+          duplicate.add(
+            buildSnapshotObjectVisual(
+              configMesh ?? mesh,
+              configSmooth ?? smoothShading,
+              configProjection ?? textureProjection,
+              (configMesh ?? mesh).textureFinish ?? 'semi-matte'
+            )
+          );
+        } else if (object.kind === 'camera') {
+          // Cámara-objeto: cuerpo + cono de visión, sin malla.
+          duplicate.add(buildCameraObjectVisual(object.camera));
+          duplicate.name = `cameraBodyRoot:${object.id}`;
+          // Mira a su foco (posición del fotograma o camera.target).
+          const focoDuplicada = object.camera?.keyframes[0]?.target ?? object.camera?.target;
+          orientCameraBodyVisual(duplicate, focoDuplicada ?? null);
+        }
+        meshGroup.add(duplicate);
+      }
         // En modo boolean preview: el objeto cortador (duplicate) se muestra transparente
         if (booleanToolObjectId === object.id) {
           duplicate.traverse(function (child) {
@@ -5149,6 +6571,8 @@ export default function Viewer3D({
     forceObjectsUpdate,
     configSmooth,
     configProjection,
+    configFinish,
+    configRelief,
     smoothShading,
     textureProjection,
     ]);
@@ -5515,17 +6939,6 @@ export default function Viewer3D({
     }
   };
 
-    // Update camera path and gizmo when tracks change (not during playback)
-    useEffect(() => {
-      if (!showCameraPath) {
-        if (cameraPathRef.current) cameraPathRef.current.visible = false;
-        return;
-      }
-      const cameraTrack = animationTracks?.find((t) => t.objectId === null);
-      if (!cameraTrack || cameraTrack.keyframes.length === 0) return;
-      drawCameraPathRef.current?.(cameraTrack);
-    }, [animationTracks, showCameraPath]);
-
     useEffect(() => {
       if (exportMp4Trigger && exportMp4Trigger > exportTriggerRef.current) {
         exportTriggerRef.current = exportMp4Trigger;
@@ -5641,12 +7054,21 @@ export default function Viewer3D({
   }, [objectTransform]);
 
   // Manipulador: visible solo si está activado y hay objeto; su tamaño
-  // se ajusta al del objeto (esferas de radio de la malla).
+  // se ajusta al del objeto (esferas de radio de la malla). Con una
+  // cámara-objeto activa no hay malla (su cuerpo es un grupo): se ve
+  // igual, con un tamaño fijo razonable.
   useEffect(() => {
     const g = gizmoGroupRef.current;
     if (!g) return;
-    g.visible = showGizmo && mesh.vertices.length > 0;
-    if (mesh.vertices.length === 0) return;
+    const esCamara =
+      (objectsRef.current ?? []).find(
+        (o) => o.id === selectedObjectIdRef.current
+      )?.kind === 'camera';
+    g.visible = showGizmo && (mesh.vertices.length > 0 || esCamara);
+    if (mesh.vertices.length === 0) {
+      if (esCamara) g.scale.setScalar(1);
+      return;
+    }
     const box = new THREE.Box3();
     for (const v of mesh.vertices) {
       box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
@@ -5933,20 +7355,32 @@ export default function Viewer3D({
                 <ToggleButton
                   active={faceSelectMode}
                   onClick={() => onFaceSelectionModeChangeRef.current?.(!faceSelectMode)}
-                  title="Seleccionar caras de la figura activa"
+                  title="Seleccionar caras, vértices o segmentos de la figura activa"
                 >
                   <MousePointerClick className="w-3.5 h-3.5" />
                 </ToggleButton>
                 {faceSelectMode && (
-                  <select
-                    value={faceSelectionTool}
-                    onChange={(e) => onFaceSelectionToolChangeRef.current?.(e.target.value as any)}
-                    className="px-1.5 py-0.5 text-xs bg-white/10 rounded border border-white/20 text-white"
-                  >
-                    <option value="rectangle">Rectángulo</option>
-                    <option value="circle">Círculo</option>
-                    <option value="polygon">Polígono</option>
-                  </select>
+                  <>
+                    <select
+                      value={faceSelectionTarget ?? 'cara'}
+                      onChange={(e) => onFaceSelectionTargetChangeRef.current?.(e.target.value as any)}
+                      title="Qué seleccionar: caras, vértices o segmentos"
+                      className="px-1.5 py-0.5 text-xs bg-white/10 rounded border border-white/20 text-white"
+                    >
+                      <option value="cara">Cara</option>
+                      <option value="vertice">Vértice</option>
+                      <option value="segmento">Segmento</option>
+                    </select>
+                    <select
+                      value={faceSelectionTool}
+                      onChange={(e) => onFaceSelectionToolChangeRef.current?.(e.target.value as any)}
+                      className="px-1.5 py-0.5 text-xs bg-white/10 rounded border border-white/20 text-white"
+                    >
+                      <option value="rectangle">Rectángulo</option>
+                      <option value="circle">Círculo</option>
+                      <option value="line">Línea</option>
+                    </select>
+                  </>
                 )}
               </>
             )}
@@ -6085,12 +7519,26 @@ export default function Viewer3D({
       )}
       <div
         ref={mountRef}
+        data-testid="viewer-container"
         className="relative flex-1 min-h-0"
         style={{
           background:
             'radial-gradient(ellipse at 50% 40%, hsl(224 45% 16%) 0%, hsl(224 50% 7%) 80%)',
         }}
-      />
+      >
+        {grabacionActiva && (
+          <div
+            className="absolute top-2 left-2 z-10 flex items-center gap-1.5 rounded bg-black/60 px-2 py-1 text-[10px] font-semibold text-red-300 pointer-events-none"
+            data-testid="rec-indicator"
+          >
+            <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+            REC
+            {activeCamera?.keyframes.length
+              ? activeCamera.keyframes.length
+              : null}
+          </div>
+        )}
+      </div>
       {selectedVertex !== null && (
         <div className="px-3 py-1.5 border-t border-white/5 text-[10px] font-mono text-muted-foreground">
           V{selectedVertex}: x={mesh.vertices[selectedVertex]?.x.toFixed(2)} y=
@@ -6276,7 +7724,9 @@ function addPlacedStar(
     const material = new THREE.SpriteMaterial({
       map: getStarTexture(),
       transparent: true,
-      opacity: 0,
+      // Opacidad visible: las colocadas no tienen fade propio (solo latido
+      // de escala en el bucle); con 0 quedaban invisibles.
+      opacity: 0.95,
     depthTest: false, // siempre por delante del texto
     blending: THREE.AdditiveBlending,
     rotation: Math.random() * Math.PI,
@@ -6785,21 +8235,3 @@ function updateStars(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-  

@@ -3,7 +3,8 @@
 import type { FC } from 'react';
 import Viewer3D, { type ObjectTransform } from '@/components/viewer-3d';
 import { PanelButtons } from '@/components/editor/Editor3D';
-import type { AnimationTrack, Keyframe } from '@/lib/animation';
+import { useI18n } from '@/lib/i18n';
+import type { AnimationTrack, CameraKeyframe, Vec3 } from '@/lib/animation';
 
 interface ViewerPanelProps {
   viewName: 'front' | 'top' | 'side' | '3d';
@@ -26,11 +27,19 @@ interface ViewerPanelProps {
     selectionMode?: boolean;
     onSelectionModeChange?: (active: boolean) => void;
     faceSelectMode?: boolean;
-    faceSelectionTool?: 'rectangle' | 'circle' | 'polygon';
+    faceSelectionTool?: 'rectangle' | 'circle' | 'line';
+    faceSelectionTarget?: 'cara' | 'vertice' | 'segmento';
+    faceSelectVisibleOnly?: boolean;
+    wireframeOffSignal?: number;
     selectedFaceIds?: number[];
     onFaceSelectionChange?: (faceIds: number[]) => void;
+    selectedVertexIds?: number[];
+    onVertexSelectionChange?: (vertexIds: number[]) => void;
+    selectedEdgeIds?: string[];
+    onEdgeSelectionChange?: (edgeIds: string[]) => void;
     onFaceSelectionModeChange?: (active: boolean) => void;
-    onFaceSelectionToolChange?: (tool: 'rectangle' | 'circle' | 'polygon') => void;
+    onFaceSelectionToolChange?: (tool: 'rectangle' | 'circle' | 'line') => void;
+    onFaceSelectionTargetChange?: (target: 'cara' | 'vertice' | 'segmento') => void;
     onMultiObjectTransform?: (transforms: { id: string; transform: ObjectTransform }[]) => void;
     objectName?: string;
     onObjectNameChange?: (name: string) => void;
@@ -41,7 +50,9 @@ interface ViewerPanelProps {
    viewerProjection: any;
    textureHelper: any;
    textureHelperTransform: any;
-   textureRepeat?: number;
+    textureRepeat?: number;
+    textureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
+    textureRelief?: number;
    setTextureHelperTransform: (transform: any) => void;
    lightConfig: any;
    showLightHelpers: boolean;
@@ -68,12 +79,38 @@ interface ViewerPanelProps {
   pan3D: (view: any, dx: number, dy: number) => void;
   zoom3D: (view: any, f: number) => void;
   orbit3D: (view: any, dir: any, angle: number) => void;
-  onCameraMove?: (cam: any) => void;
-   showCameraPathGizmo?: boolean;
-   showCameraPath?: boolean;
-    cameraViewMode?: boolean;
-    onCameraGizmoMove?: (keyframes: Keyframe[]) => void;
-    selectedKeyframeIndex?: number;
+    /** Cámara-objeto que maneja la vista de cámara / exportación MP4 */
+    activeCamera?: { id: string; keyframes: CameraKeyframe[]; fov: number } | null;
+    /** Cámara de exportación MP4 (primera con ≥2 fotogramas) */
+    exportCamera?: { id: string; keyframes: CameraKeyframe[]; fov: number } | null;
+    /** Cámaras-objeto de la escena para el selector de la ventana */
+    camarasObjeto?: { id: string; n: number; etiqueta: string; nombre?: string }[];
+    /** Cámara-objeto activa en ESTA ventana (id; null = vista libre) */
+    camaraObjetoId?: string | null;
+    /** Cambia la cámara activa de esta ventana */
+    onCamaraObjetoChange?: (id: string | null) => void;
+    /** Modo grabación activo en ESTA ventana */
+    grabacionActiva?: boolean;
+    /** Enciende/apaga el modo grabación de esta ventana */
+    onGrabacionToggle?: () => void;
+    /** Captura de fotograma al soltar un arrastre de la vista grabando */
+    onGrabacionCaptura?: (pose: { position: { x: number; y: number; z: number }; target: { x: number; y: number; z: number }; fov: number }) => void;
+    /** Cámara-objeto en grabación (global): soltar el gizmo sobre ella captura un kf */
+    grabacionCamaraId?: string | null;
+    /** Cámara-objeto en edición (foco del fotograma activo) */
+    cameraEditor?: {
+      objectId: string;
+      keyframeIndex: number | null;
+      focus: Vec3 | null;
+      keyframes: CameraKeyframe[];
+      fov: number;
+    };
+    /** Mueve la posición de un fotograma del recorrido (asa cian) */
+    onCameraKeyframeMove?: (index: number, pos: Vec3) => void;
+    /** Mueve el foco del fotograma seleccionado (asa naranja) */
+    onCameraTargetMove?: (pos: Vec3) => void;
+    /** Orbita el foco alrededor del cuerpo al ROTAR la cámara con el gizmo */
+    onCameraTargetOrbit?: (target: Vec3) => void;
     exportMp4Trigger?: number;
    onExportProgress?: (percent: number) => void;
    onExportComplete?: (result: { success: boolean; outputPath?: string; error?: string }) => void;
@@ -100,10 +137,18 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
     onSelectionModeChange,
     faceSelectMode,
     faceSelectionTool,
+    faceSelectionTarget,
+    faceSelectVisibleOnly,
+    wireframeOffSignal,
     selectedFaceIds,
     onFaceSelectionChange,
+    selectedVertexIds,
+    onVertexSelectionChange,
+    selectedEdgeIds,
+    onEdgeSelectionChange,
     onFaceSelectionModeChange,
     onFaceSelectionToolChange,
+    onFaceSelectionTargetChange,
     onMultiObjectTransform,
     objectName,
     onObjectNameChange,
@@ -114,7 +159,9 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
    viewerProjection,
    textureHelper,
    textureHelperTransform,
-   textureRepeat,
+    textureRepeat,
+    textureFinish,
+    textureRelief,
   setTextureHelperTransform,
   lightConfig,
   showLightHelpers,
@@ -140,16 +187,25 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
   pan3D,
   zoom3D,
    orbit3D,
-   onCameraMove,
-   showCameraPathGizmo,
-    showCameraPath,
-    cameraViewMode,
-    onCameraGizmoMove,
-    selectedKeyframeIndex,
+    activeCamera,
+    exportCamera,
+    camarasObjeto,
+    camaraObjetoId,
+    onCamaraObjetoChange,
+    grabacionActiva,
+    onGrabacionToggle,
+    onGrabacionCaptura,
+    grabacionCamaraId,
+    cameraEditor,
+    onCameraKeyframeMove,
+    onCameraTargetMove,
+    onCameraTargetOrbit,
     exportMp4Trigger,
     onExportProgress,
     onExportComplete,
-}) => (
+}) => {
+  const { t } = useI18n();
+  return (
   <div
     onClick={onActiveView}
     className={`relative flex flex-col rounded-lg border-2 overflow-hidden transition-colors ${
@@ -158,10 +214,47 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
         : 'border-white/10'
     }`}
   >
-    <div className="flex items-center justify-between px-2 py-1 bg-black/60 backdrop-blur-sm shrink-0">
-      <span className="text-[10px] font-semibold uppercase tracking-wider text-green-300">
-        {label}
-      </span>
+    <div className="flex items-center justify-between gap-1.5 px-2 py-1 bg-black/60 backdrop-blur-sm shrink-0">
+      <div className="flex items-center gap-1.5 min-w-0">
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-green-300 shrink-0">
+          {label}
+        </span>
+        {camarasObjeto && camarasObjeto.length > 0 && (
+          <select
+            value={camaraObjetoId ?? ''}
+            onChange={(e) => onCamaraObjetoChange?.(e.target.value || null)}
+            title={t('editor3D.panelCameraSelect')}
+            data-testid={`camera-select-${viewName}`}
+            className="px-1 py-0.5 rounded bg-black/40 border border-white/10 text-[10px] text-foreground max-w-[120px] cursor-pointer"
+          >
+            <option value="">{t('editor3D.noCamera')}</option>
+            {camarasObjeto.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.etiqueta}{c.nombre && c.nombre !== c.etiqueta ? ` · ${c.nombre}` : ''}
+              </option>
+            ))}
+          </select>
+        )}
+        {camaraObjetoId && (
+          <button
+            onClick={() => onGrabacionToggle?.()}
+            title={grabacionActiva ? t('editor3D.recStop') : t('editor3D.rec')}
+            data-testid={`rec-btn-${viewName}`}
+            className={`px-1.5 py-0.5 rounded text-[10px] font-semibold flex items-center gap-1 cursor-pointer border ${
+              grabacionActiva
+                ? 'bg-red-500/25 border-red-500/60 text-red-200'
+                : 'bg-black/40 border-white/10 text-foreground/80 hover:text-red-300'
+            }`}
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                grabacionActiva ? 'bg-red-500 animate-pulse' : 'bg-foreground/40'
+              }`}
+            />
+            REC
+          </button>
+        )}
+      </div>
       <PanelButtons
         onPan={(dx: number, dy: number) => pan3D(viewName, dx * 0.02, dy * 0.02)}
         onZoom={(f: number) => zoom3D(viewName, f)}
@@ -190,10 +283,18 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
            onSelectionModeChange={onSelectionModeChange}
            faceSelectMode={faceSelectMode}
            faceSelectionTool={faceSelectionTool}
+           faceSelectionTarget={faceSelectionTarget}
+           faceSelectVisibleOnly={faceSelectVisibleOnly}
+           wireframeOffSignal={wireframeOffSignal}
            selectedFaceIds={selectedFaceIds}
            onFaceSelectionChange={onFaceSelectionChange}
+           selectedVertexIds={selectedVertexIds}
+           onVertexSelectionChange={onVertexSelectionChange}
+           selectedEdgeIds={selectedEdgeIds}
+           onEdgeSelectionChange={onEdgeSelectionChange}
            onFaceSelectionModeChange={onFaceSelectionModeChange}
            onFaceSelectionToolChange={onFaceSelectionToolChange}
+           onFaceSelectionTargetChange={onFaceSelectionTargetChange}
           onMultiObjectTransform={onMultiObjectTransform}
            objectName={objectName}
            onObjectNameChange={onObjectNameChange}
@@ -212,6 +313,8 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
           textureHelperTransform={textureHelperTransform}
           onTextureHelperTransform={setTextureHelperTransform}
           textureRepeat={textureRepeat}
+          configFinish={textureFinish}
+          configRelief={textureRelief}
          lightConfig={lightConfig}
          showLightHelpers={showLightHelpers}
          showGround={showGround}
@@ -227,12 +330,15 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
          onLightConfigChange={setLightConfig}
          camera3D={panelCameras[viewName]}
          onCameraChange={(cam) => handleCameraChange(viewName, cam)}
-          onCameraMove={onCameraMove}
-         showCameraPathGizmo={showCameraPathGizmo}
-         showCameraPath={showCameraPath}
-         cameraViewMode={cameraViewMode}
-         onCameraGizmoMove={onCameraGizmoMove}
-         selectedKeyframeIndex={selectedKeyframeIndex}
+         activeCamera={activeCamera}
+         exportCamera={exportCamera}
+         cameraEditor={cameraEditor}
+         onCameraKeyframeMove={onCameraKeyframeMove}
+         onCameraTargetMove={onCameraTargetMove}
+         onCameraTargetOrbit={onCameraTargetOrbit}
+         grabacionActiva={grabacionActiva}
+         onGrabacionCaptura={onGrabacionCaptura}
+         grabacionCamaraId={grabacionCamaraId}
          animationTracks={animationTracks}
          animationTime={animationTime}
          onAnimationComplete={onAnimationComplete}
@@ -255,4 +361,5 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
        )}
      </div>
    </div>
-);
+  );
+};

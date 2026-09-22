@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
+import { Fragment, useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import type { ComponentType, Key } from 'react';
 import * as THREE from 'three';
 import DrawingCanvas from '@/components/drawing-canvas';
@@ -10,7 +10,14 @@ import { ViewerPanel } from '@/components/editor/viewer-panel';
 import { KeyframeEditor } from '@/components/editor/keyframe-editor';
 import type { LightConfig } from '@/components/viewer-3d';
 import type { FxConfig } from '@/components/viewer-3d';
-import type { AnimationTrack, Keyframe } from '@/lib/animation';
+import type {
+  AnimationTrack,
+  Keyframe,
+  CameraData,
+  CameraKeyframe,
+  Vec3,
+} from '@/lib/animation';
+import { createDefaultCameraData, evaluateCameraKeyframes, EASING_OPTIONS } from '@/lib/animation';
 import LightingModal from '@/components/LightingModal';
 import TextureBrowserModal from '@/components/texture-browser-modal';
 import BooleanCSGModal from './BooleanCSGModal';
@@ -36,6 +43,7 @@ import {
   Polygon,
   reconstructVoxels,
   voxelsToBoxMesh,
+  meshToVoxels,
   meshToTriangles,
   DEFAULT_VIEWS,
   HIGH_FIDELITY_RES,
@@ -47,9 +55,35 @@ import {
   type TextureFinish,
   type Mesh,
 } from '@/lib/geometry';
+import { extractObj3dMesh, decimateMesh } from '@/lib/obj3d-thumbnails';
 import { buildViewsMesh, buildExtrudeMesh, buildExtrudeMeshes, polylineToPolygon } from '@/lib/views-mesh';
 import { sanitizePolylinesByCanvas, newPolylineId } from '@/lib/polylines';
 import type { PolylinesByCanvas, Polyline } from '@/lib/polylines';
+
+/**
+ * Prepara la URL de textura de suelo/cielo leída de un .zeus para que
+ * Three.js pueda cargarla en el renderer.
+ *
+ * - "media://..." se deja TAL CUAL: es el protocolo de la app de
+ *   escritorio y TextureLoader lo carga sin problema. Convertirla a
+ *   ruta cruta ("F:\...") rompía la carga — el renderer no puede abrir
+ *   rutas de archivo directamente — y así se perdían las texturas de
+ *   suelo y cielo al reabrir el archivo.
+ * - Rutas crudas (guardadas así por versiones viejas): se reenvuelven
+ *   como "media://file?path=...", el mismo formato que entrega el
+ *   explorador de texturas al elegirlas.
+ * - data:/http(s): URLs de la versión web: van sin tocar.
+ */
+function restoreTextureUrl(url: string): string {
+  if (url.startsWith('media://')) return url;
+  if (
+    isElectron() &&
+    (/^[A-Za-z]:[\\/]/.test(url) || url.startsWith('\\\\'))
+  ) {
+    return 'media://file?path=' + encodeURIComponent(url);
+  }
+  return url;
+}
 import {
   buildTextMesh,
   buildTextPlaneMesh,
@@ -84,6 +118,7 @@ import { useI18n, LANGUAGES } from '@/lib/i18n';
 import {
   Boxes,
   BoxSelect,
+  FilePlus,
   RefreshCw,
   AlertCircle,
   Info,
@@ -117,14 +152,22 @@ import {
   Scissors,
   Expand,
    Sun,
-   Camera,
+   Video,
+   Eye,
+   EyeOff,
 } from 'lucide-react';
 
 const EditorCanvasComponent = EditorCanvas as unknown as ComponentType<any>;
 
-type Mode = 'views' | 'mesh' | 'text' | 'lathe' | 'extrude';
+// 'scene' es la pestaña neutra: el espacio de trabajo donde vive el
+// editor (seleccionar, mover, agrupar, animar). Las demás son
+// pestañas-herramienta: solo construyen/editan la figura de un objeto
+// cuando el usuario entra en ellas manualmente.
+type Mode = 'scene' | 'views' | 'mesh' | 'text' | 'lathe' | 'extrude';
 type EditorClipboard = {
-  mode: Mode;
+  // Pestaña donde nació lo copiado. Puede faltar cuando se copia un
+  // objeto antiguo sin pestaña asignada desde la vista Escena.
+  mode?: Mode;
   views: Views;
   resolution: number;
   meshStyle: 'fusionada' | 'suave' | 'voxeles';
@@ -150,6 +193,8 @@ type EditorClipboard = {
    textureFinish: TextureFinish;
    textureRelief: number;
    textureRepeat: number;
+   textureHelper: boolean;
+   textureHelperTransform: ObjectTransform;
    editedVertices: Vertex3D[] | null;
   meshSilhouette: Polygon;
   meshSections: Array<{ id: number; polygon: Polygon; y: number }>;
@@ -194,6 +239,16 @@ type SceneObject = {
   name: string;
   transform: ObjectTransform;
   /**
+   * Clase de objeto: figura normal (valor por defecto, ausente) o
+   * cámara de animación con su recorrido editable.
+   */
+  kind?: 'figure' | 'camera';
+  /**
+   * Datos de la cámara-objeto: ángulo de visión y fotogramas del
+   * recorrido. Solo presente cuando kind === 'camera'.
+   */
+  camera?: CameraData;
+  /**
    * Pestaña donde se debe mostrar este objeto. Si no se especifica,
    * se muestra en todas las pestañas (comportamiento anterior).
    */
@@ -220,45 +275,13 @@ type SceneObject = {
    frozen?: boolean;
  };
 
-/**
+ /**
  * Figura representativa de un objeto guardado (.zeus): la del dueño de
  * la configuración guardada (o la del primer objeto con malla que traiga
- * el archivo). null si el archivo no trae ninguna figura. La usan tanto
- * el modal "Objeto 3D" (crear y vista previa) como su miniatura.
+ * el archivo). Ahora vive en lib/obj3d-thumbnails (la usa también la ruta
+ * /api/objetos-3d, que ya lee cada archivo y devuelve su miniatura
+ * diezmada — así el modal no se baja los .zeus enteros para las tarjetas).
  */
-function extractObj3dMesh(data: unknown): {
-  name?: string;
-  mesh: Mesh;
-  smooth?: boolean;
-  textureProjection?: LatheTextureProjection;
-} | null {
-  if (!data || typeof data !== 'object') return null;
-  const project = data as {
-     sceneObjects?: Array<{
-      id?: string;
-      name?: string;
-      mesh?: Mesh;
-      smooth?: boolean;
-      textureProjection?: LatheTextureProjection;
-    }>;
-    configObjectId?: unknown;
-  };
-  const objs = Array.isArray(project.sceneObjects) ? project.sceneObjects : [];
-  const owner =
-    typeof project.configObjectId === 'string'
-      ? objs.find((o) => o?.id === project.configObjectId)
-      : undefined;
-  const source =
-    owner?.mesh ??
-    objs.find((o) => o?.mesh && o.mesh.vertices.length > 0)?.mesh;
-  if (!source || source.vertices.length === 0) return null;
-  return {
-    name: owner?.name,
-    mesh: source,
-    smooth: owner?.smooth,
-    textureProjection: owner?.textureProjection,
-  };
-}
 
 // Foto completa del editor para deshacer/rehacer: la configuración de la
 // pestaña Y la escena (objetos con sus instantáneas de malla, selección
@@ -307,103 +330,77 @@ type HistoryState = {
   sceneObjects: SceneObject[];
   selectedObjectId: string | null;
   configObjectId: string | null;
+  /** Pestaña activa: deshacer/rehacer también devuelve al usuario a la
+   * pestaña en la que estaba cuando hizo el cambio (la foto del
+   * historial es todo el editor, no solo la escena). */
+  mode: Mode;
   /** Grupos de objetos definidos por el usuario */
   groups: ObjectGroup[];
   /** Polilíneas libres de los lienzos 2D, por lienzo (solo 2D) */
   polylines: PolylinesByCanvas;
 };
 
-const DEFAULT_LATHE_PROFILE: Polygon = [
-  { x: 0.3, y: -0.6 },
-  { x: 0.8, y: -0.6 },
-  { x: 0.8, y: 0.6 },
-  { x: 0.3, y: 0.6 },
-];
+// Plantillas por defecto: vacías. Los lienzos 2D arrancan en blanco
+// — el usuario dibuja desde cero o inserta una forma de un clic. El
+// torno necesita ≥3 puntos de perfil; la malla, silueta ≥3 vértices
+// y secciones; sin dibujo no hay figura (área de trabajo vacío).
+const DEFAULT_LATHE_PROFILE: Polygon = [];
 
-// La silueta por defecto llega hasta arriba del lienzo (y=0) y hasta
-// abajo (y=1): el dibujo ocupa toda la altura del lienzo.
-const DEFAULT_MESH_SILHOUETTE: Polygon = [
-  { x: 0.35, y: 0 },
-  { x: 0.65, y: 0 },
-  { x: 0.75, y: 0.5 },
-  { x: 0.6, y: 1 },
-  { x: 0.4, y: 1 },
-  { x: 0.25, y: 0.5 },
-];
+const DEFAULT_MESH_SILHOUETTE: Polygon = [];
 
-// El costado (Z·Y) por defecto también ocupa toda la altura del lienzo
-const DEFAULT_MESH_SIDE_VIEW: Polygon = [
-  { x: 0.3, y: 0 },
-  { x: 0.7, y: 0 },
-  { x: 0.75, y: 0.5 },
-  { x: 0.6, y: 1 },
-  { x: 0.4, y: 1 },
-  { x: 0.25, y: 0.5 },
-];
+const DEFAULT_MESH_SIDE_VIEW: Polygon = [];
 
-// Las líneas rojas (plantillas) por defecto coinciden con los extremos
-// del dibujo: una arriba del todo (y=0), otra en media (y=0.5) y otra
-// abajo del todo (y=1). Además, cada una se estira al ancho de la
-// silueta (X) y del costado (Z) que les toca a su altura.
 const DEFAULT_MESH_SECTIONS: Array<{
   id: number;
   polygon: Polygon;
   y: number;
-}> = [
-  {
-    id: 1,
-    y: 0,
-    polygon: [
-      { x: 0.3, y: 0.3 },
-      { x: 0.7, y: 0.3 },
-      { x: 0.7, y: 0.7 },
-      { x: 0.3, y: 0.7 },
-    ],
-  },
-  {
-    id: 2,
-    y: 0.5,
-    polygon: [
-      { x: 0.2, y: 0.5 },
-      { x: 0.5, y: 0.2 },
-      { x: 0.8, y: 0.5 },
-      { x: 0.5, y: 0.8 },
-    ],
-  },
-  {
-    id: 3,
-    y: 1,
-    polygon: [
-      { x: 0.35, y: 0.35 },
-      { x: 0.65, y: 0.35 },
-      { x: 0.65, y: 0.65 },
-      { x: 0.35, y: 0.65 },
-    ],
-  },
-].map((s) => ({
-  ...s,
-  polygon: fitSectionToViews(
-    s.polygon,
-    s.y,
-    DEFAULT_MESH_SILHOUETTE,
-    DEFAULT_MESH_SIDE_VIEW
-  ),
-}));
+}> = [];
 
 // Formas de un clic (círculo, cuadrado, …) tal cual salen de sus botones:
 // sirven para detectar cuándo se inserta una en una plantilla y ajustarla
 // al ancho de la silueta y del costado que le toca a su altura.
 const PRESET_SHAPES: Polygon[] = SHAPES.map((s) => s.build());
 
-// Configuración del panel con la que nace un objeto nuevo: la que
-// «Nuevo objeto» aplica al crearlo, para dibujarlo desde la plantilla
-// por defecto. Usarla SIEMPRE vía structuredClone: los DEFAULT_* son
+// Malla vacía: la que ve el visor cuando la configuración de la pestaña
+// no pertenece a ningún objeto (arranque de la app, escena sin dueño).
+// Sin dueño, cada pestaña mostraría su plantilla por defecto como un
+// objeto fantasma en un área de trabajo que debe ir vacío.
+const EMPTY_MESH: Mesh = { vertices: [], faces: [] };
+
+// Color del resalte automático de caras seleccionadas: se aplica como
+// textura (cian; cualquier color no blanco vale) para que lo seleccionado
+// se pinte de verdad sobre la malla.
+const COLOR_AUTO_CARA = '#22d3ee';
+const dataUrlColorAuto = (() => {
+  let cache: string | null = null;
+  return () => {
+    if (cache) return cache;
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 2;
+      canvas.height = 2;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = COLOR_AUTO_CARA;
+        ctx.fillRect(0, 0, 2, 2);
+      }
+      cache = canvas.toDataURL('image/png');
+    } catch {
+      cache = COLOR_AUTO_CARA;
+    }
+    return cache;
+  };
+})();
+
+// Configuración del panel con la que nace una pieza en blanco: lienzos
+// vacíos, sin dibujo previo. La usa sanitizeObjectConfig como fallback
+// campo a campo. Usarla SIEMPRE vía structuredClone: los DEFAULT_* son
 // objetos compartidos a nivel de módulo.
 const DEFAULT_OBJECT_CONFIG: ObjectConfig = {
   views: structuredClone(DEFAULT_VIEWS),
   resolution: 32,
   meshStyle: 'suave',
-  text: 'HOLA',
+  text: '',
   fontCss: "'Textura', sans-serif",
   textDepth: 48,
   hollowText: false,
@@ -423,6 +420,8 @@ const DEFAULT_OBJECT_CONFIG: ObjectConfig = {
    textureFinish: 'semi-matte',
    textureRelief: 0.25,
    textureRepeat: 1,
+   textureHelper: false,
+   textureHelperTransform: structuredClone(IDENTITY_TRANSFORM),
    editedVertices: null,
   meshSilhouette: structuredClone(DEFAULT_MESH_SILHOUETTE),
   meshSections: structuredClone(DEFAULT_MESH_SECTIONS),
@@ -506,9 +505,15 @@ function sanitizeObjectConfig(raw: unknown): ObjectConfig | null {
     ),
      textureRelief:
        typeof c.textureRelief === 'number' ? c.textureRelief : d.textureRelief,
-     textureRepeat:
-       typeof c.textureRepeat === 'number' ? c.textureRepeat : d.textureRepeat,
-     editedVertices:
+      textureRepeat:
+        typeof c.textureRepeat === 'number' ? c.textureRepeat : d.textureRepeat,
+      textureHelper:
+        typeof c.textureHelper === 'boolean' ? c.textureHelper : d.textureHelper,
+      textureHelperTransform:
+        c.textureHelperTransform && typeof c.textureHelperTransform === 'object'
+          ? (structuredClone(c.textureHelperTransform) as ObjectTransform)
+          : (structuredClone(d.textureHelperTransform) as ObjectTransform),
+      editedVertices:
       Array.isArray(c.editedVertices) && c.editedVertices.length > 0
         ? (structuredClone(c.editedVertices) as Vertex3D[])
         : null,
@@ -753,7 +758,15 @@ function SectionTools({
   );
 }
 
-export default function Home() {
+export default function Home({
+  onNewProject,
+}: {
+  /** Al pulsar «Nuevo proyecto» la página reinicia el editor de raíz
+      (remonta el componente con otra key): TODO el estado vuelve a su
+      valor de arranque — escena, lienzos, plantillas, texturas, luces,
+      animación, portapapeles, nombre y ruta del proyecto. */
+  onNewProject?: () => void;
+}) {
   const { t, locale, setLocale } = useI18n();
   const [views, setViews] = useState<Views>(DEFAULT_VIEWS);
   const [editedVertices, setEditedVertices] = useState<Vertex3D[] | null>(null);
@@ -769,17 +782,9 @@ export default function Home() {
     'suave'
   );
 
-  const [editingView, setEditingView] = useState<
-    'front' | 'top' | 'side' | '3d' | null
-  >(null);
-  const [editingLathe, setEditingLathe] = useState(false);
-  const [editingTextPanel, setEditingTextPanel] = useState<
-    'front' | 'top' | 'side' | '3d' | null
-  >(null);
-  const [editingLathePanel, setEditingLathePanel] = useState<
-    'front' | 'top' | 'side' | '3d' | null
-  >(null);
-  const [editingMeshPanel, setEditingMeshPanel] = useState<
+  // Ventila de viewport maximizada ('front'|'top'|'side'|'3d'), común a
+  // todas las herramientas: las 4 ventanas son siempre las mismas.
+  const [editingPanel, setEditingPanel] = useState<
     'front' | 'top' | 'side' | '3d' | null
   >(null);
   const [editorGridResolution, setEditorGridResolution] = useState(32);
@@ -790,7 +795,10 @@ export default function Home() {
   >(null);
   const [editingMesh, setEditingMesh] = useState(false);
 
-  const [mode, setMode] = useState<Mode>('views');
+  // El editor arranca en la pestaña neutra "Escena": el espacio de
+  // trabajo. Las pestañas-herramienta se abren manualmente cuando se
+  // necesita crear o modificar la figura de un objeto.
+  const [mode, setMode] = useState<Mode>('scene');
   const [editorClipboard, setEditorClipboard] =
     useState<EditorClipboard | null>(null);
   // Portapapeles de formas 2D: Copiar con un lienzo abierto a pantalla
@@ -801,7 +809,7 @@ export default function Home() {
    );
    const [multiObjectClipboard, setMultiObjectClipboard] =
      useState<MultiObjectClipboard | null>(null);
-  const [text, setText] = useState('HOLA');
+  const [text, setText] = useState('');
   const [fontCss, setFontCss] = useState("'Textura', sans-serif");
   const [textDepth, setTextDepth] = useState(48);
   const [hollowText, setHollowText] = useState(false);
@@ -873,14 +881,10 @@ export default function Home() {
   const [textureBrowserOpen, setTextureBrowserOpen] = useState(false);
 
   const [showTextureModal, setShowTextureModal] = useState(false);
-  const [cameraViewMode, setCameraViewMode] = useState(false);
-  const [showCameraPath, setShowCameraPath] = useState(true);
   const [exportMp4Trigger, setExportMp4Trigger] = useState(0);
   const [exportProgress, setExportProgress] = useState<number | null>(null);
   const [exportResult, setExportResult] = useState<{ success: boolean; outputPath?: string; error?: string } | null>(null);
-  const [isRecordingCameraPath, setIsRecordingCameraPath] = useState(false);
-  const [cameraPathKeyframes, setCameraPathKeyframes] = useState<Array<{time: number; camera: Camera3D}>>([]);
-  const [textureSelectTarget, setTextureSelectTarget] = useState<'ground' | 'skybox' | 'object' | null>(null);
+  const [textureSelectTarget, setTextureSelectTarget] = useState<'ground' | 'skybox' | 'object' | 'face' | null>(null);
   const [groundTexture, setGroundTexture] = useState<string | null>(null);
   const [groundTextureFileName, setGroundTextureFileName] = useState('');
   const [groundTextureFinish, setGroundTextureFinish] = useState<TextureFinish>('semi-matte');
@@ -903,6 +907,10 @@ export default function Home() {
 
   const [figureColor, setFigureColor] = useState('#121ca7');
   const [latheFigureColor, setLatheFigureColor] = useState('#121ca7');
+  // Transparencia del objeto de escena seleccionado: panel centralizado
+  // en la pestaña Escena; se escribe en mesh.opacity de las figuras
+  // marcadas (el visor y el guardado la respetan tal cual).
+  const [figureOpacity, setFigureOpacity] = useState(1);
 
   const [latheProfile, setLatheProfile] = useState<Polygon>(
     DEFAULT_LATHE_PROFILE
@@ -1121,15 +1129,6 @@ export default function Home() {
     replaceMeshSectionPolygon,
   ]);
 
-  useEffect(() => {
-    if (!meshSilhouette || meshSilhouette.length === 0) {
-      setMeshSilhouette(structuredClone(DEFAULT_MESH_SILHOUETTE));
-    }
-    if (!meshSections || meshSections.length === 0) {
-      setMeshSections(structuredClone(DEFAULT_MESH_SECTIONS));
-    }
-  }, []);
-
   const [customFonts, setCustomFonts] = useState<FontOption[]>([]);
   const [customFontName, setCustomFontName] = useState('');
   const [importing, setImporting] = useState(false);
@@ -1148,30 +1147,39 @@ export default function Home() {
 
   const [saveModalOpen, setSaveModalOpen] = useState(false);
   const [objectName, setObjectName] = useState('');
+  const [currentProjectPath, setCurrentProjectPath] = useState<string | null>(
+    null
+  );
   const [savingObject, setSavingObject] = useState(false);
   const [saveMsg, setSaveMsg] = useState<{ ok: boolean; text: string } | null>(
     null
   );
-  // Modal "Objeto 3D": objetos guardados (.zeus) de dos sitios —
-  // public/Obj-3D (al pinchar se CREA en la escena) y la carpeta local
+  /** 'object' = guarda en la carpeta de Objetos 3D; 'project' = en Proyectos 3D */
+  const [saveTarget, setSaveTarget] = useState<'object' | 'project'>('object');
+  // Modal "Objeto 3D": objetos guardados (.zeus) de tres sitios —
+  // public/Obj-3D (al pinchar se CREA en la escena), la carpeta local
   // de Objetos 3D donde guarda el botón Guardar (al pinchar se CARGA
-  // en el editor, como hacía el antiguo botón Cargar).
+  // en el editor, como hacía el antiguo botón Cargar) y la carpeta
+  // local de Proyectos 3D (lo mismo: se carga en el editor al pinchar).
   const [obj3dModalOpen, setObj3dModalOpen] = useState(false);
   const [obj3dFiles, setObj3dFiles] = useState<
     Array<{
       name: string;
       /** De dónde viene el archivo */
-      source: 'public' | 'local';
+       source: 'public' | 'local' | 'project';
       /** Ruta absoluta (solo archivos de la carpeta local) */
       path?: string;
       size?: number;
-      outline?: number[][] | null;
-      /** Figura leída para la miniatura: undefined = leyendo, null = sin figura */
+      /** Miniatura diezmada de la figura (la trae ya la respuesta del
+       * listado; para los archivos locales se lee aparte). undefined =
+       * leyendo, null = sin figura */
       mesh?: Mesh | null;
     }>
   >([]);
   const [obj3dLoading, setObj3dLoading] = useState(false);
   const [obj3dCreating, setObj3dCreating] = useState(false);
+  /** Archivo local que se está abriendo en el editor (spinner en su tarjeta) */
+  const [obj3dOpeningName, setObj3dOpeningName] = useState<string | null>(null);
   const [obj3dMsg, setObj3dMsg] = useState<{
     ok: boolean;
     text: string;
@@ -1185,9 +1193,17 @@ export default function Home() {
   // Figuras ya leídas del modal Objeto 3D (clave "origen/nombre"), para
   // no releer el archivo al volver a pasar el ratón por él
   const obj3dMeshCacheRef = useRef<Map<string, Mesh>>(new Map());
+  // Datos COMPLETOS de los archivos (promesas, clave "origen/nombre"): se
+  // precargan al pasar el ratón por una tarjeta para que pinchar sea
+  // instantáneo — la miniatura del listado está diezmada, pero para crear
+  // el objeto o abrir el editor se necesita el archivo entero.
+  const obj3dDataCacheRef = useRef<Map<string, Promise<unknown>>>(new Map());
 
   // Input oculto para seleccionar un archivo .zeus desde el navegador
   const obj3dFileInputRef = useRef<HTMLInputElement | null>(null);
+  // Modo de apertura/imports: 'merge' = "Abrir en escena" (añadir a la
+  // escena actual), 'new' = "En escena nueva" (reemplazar la escena actual)
+  const [importMode, setImportMode] = useState<'merge' | 'new'>('new');
 
   // Input oculto para importar modelos 3D (.obj, .glb, etc.)
   const modelFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1199,6 +1215,10 @@ export default function Home() {
   // declaran aquí arriba porque el historial de deshacer/rehacer los
   // fotografía en cada paso.
   const [sceneObjects, setSceneObjects] = useState<SceneObject[]>([]);
+  // Cuadradito de textura que salta la primera aplicación tras un
+  // cambio de pestaña, de selección o de restauración del panel (lo
+  // arman syncTextureStateToSelection y applyObjectConfig).
+  const textureApplySkipRef = useRef(false);
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
     const [selectedObjectIds, setSelectedObjectIds] = useState<string[]>([]);
     const [groups, setGroups] = useState<ObjectGroup[]>([]);
@@ -1206,9 +1226,26 @@ export default function Home() {
   const [renameDraft, setRenameDraft] = useState('');
    const [selectionMode, setSelectionMode] = useState(false);
    const [faceSelectMode, setFaceSelectMode] = useState(false);
-   const [faceSelectionTool, setFaceSelectionTool] = useState<'rectangle' | 'circle' | 'polygon'>('rectangle');
+   const [faceSelectionTool, setFaceSelectionTool] = useState<'rectangle' | 'circle' | 'line'>('rectangle');
+   const [faceSelectionTarget, setFaceSelectionTarget] = useState<'cara' | 'vertice' | 'segmento'>('cara');
+   // Solo capturar lo visible (caras de frente, no lo que está detrás).
+   const [faceSelectVisibleOnly, setFaceSelectVisibleOnly] = useState(true);
+   // Señal para que el visor apague la vista de alambre (tras asignar textura).
+   const [wireframeOffSignal, setWireframeOffSignal] = useState(0);
    const [selectedFaceIds, setSelectedFaceIds] = useState<number[]>([]);
+   const [selectedVertexIds, setSelectedVertexIds] = useState<number[]>([]);
+   const [selectedEdgeIds, setSelectedEdgeIds] = useState<string[]>([]);
+   // Cómo se MUESTRA la figura del objeto seleccionado en la pestaña
+   // Escena: fusionada (tal cual), suave (sombreado suave) o voxeles
+   // (voxelización de la superficie en vivo; no cambia la figura real).
+   const [sceneMeshStyle, setSceneMeshStyle] = useState<'fusionada' | 'suave' | 'voxeles'>('fusionada');
+   // Input oculto para elegir la imagen de la textura por caras.
+   const faceTextureInputRef = useRef<HTMLInputElement | null>(null);
    const [viewRefreshTick, setViewRefreshTick] = useState(0);
+  // Índice del fotograma del recorrido de la cámara-objeto seleccionado
+  // (o null si no hay ninguno). Determina a qué fotograma se escribe la
+  // posición al mover la cámara con el manipulador XYZ.
+  const [cameraKeyframeIndex, setCameraKeyframeIndex] = useState<number | null>(null);
   // Objeto dueño de la configuración actual: su figura es la malla que
   // el editor construye ahora. Los demás son copias congeladas (pegadas
   // o dejadas atrás al crear/seleccionar) con su propia instantánea.
@@ -1258,6 +1295,22 @@ export default function Home() {
     },
     });
 
+  // Cámara-objeto activa por VENTANA (null = vista libre del panel): cada
+  // visor se maneja con la pose de SU cámara elegida; se guarda en el .zeus.
+  const [panelCamerasObjeto, setPanelCamerasObjeto] = useState<
+    Record<'front' | 'top' | 'side' | '3d', string | null>
+  >({ front: null, top: null, side: null, '3d': null });
+
+  // Modo grabación: ventana + cámara-objeto que está grabando fotogramas.
+  // Estado EFÍMERO (no va al .zeus): los fotogramas capturados viajan con
+  // la cámara dentro de sceneObjects por la vía de guardado ya existente.
+  const [grabacion, setGrabacion] = useState<{
+    vista: 'front' | 'top' | 'side' | '3d';
+    camaraId: string;
+  } | null>(null);
+  const grabacionRef = useRef(grabacion);
+  grabacionRef.current = grabacion;
+
    const [animationTracks, setAnimationTracks] = useState<AnimationTrack[]>([]);
    const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
    const [playing, setPlaying] = useState(false);
@@ -1265,22 +1318,33 @@ export default function Home() {
     const [showKeyframeEditor, setShowKeyframeEditor] = useState(false);
     const [showGroupsPanel, setShowGroupsPanel] = useState(true);
 
-    useEffect(() => {
-      if (cameraViewMode && animationTracks.length > 0) {
-        setShowKeyframeEditor(true);
-      }
-    }, [cameraViewMode, animationTracks.length]);
     const animationStartTimeRef = useRef<number | null>(null);
    const animIdRef = useRef<number | null>(null);
-  const recordingStartTimeRef = useRef<number>(0);
-   const noopRef = useRef(() => {});
+    // Espejo de sceneObjects para la duración de reproducción: leerlo por
+    // ref evita reiniciar la reproducción en cada re-render de la escena.
+    const sceneObjectsPlaybackRef = useRef(sceneObjects);
+    sceneObjectsPlaybackRef.current = sceneObjects;
 
     useEffect(() => {
-      if (!playing || animationTracks.length === 0) {
+      // Duración de reproducción: la mayor pista de objeto o, si no hay
+      // pistas, el recorrido de la primera cámara-objeto (escenas solo
+      // de cámara también se reproducen).
+      const cam = sceneObjectsPlaybackRef.current.find(
+        (o) => o.kind === 'camera' && (o.camera?.keyframes.length ?? 0) >= 2
+      );
+      const camSpan = cam?.camera
+        ? Math.max(...cam.camera.keyframes.map((k) => k.time)) / 1000
+        : 0;
+      const maxDuration = Math.max(
+        animationTracks.length > 0
+          ? Math.max(...animationTracks.map((t) => t.duration)) / 1000
+          : 0,
+        camSpan
+      );
+      if (!playing || maxDuration <= 0) {
         animationStartTimeRef.current = null;
         return;
       }
-      const maxDuration = Math.max(...animationTracks.map((t) => t.duration)) / 1000;
       animationStartTimeRef.current = performance.now();
 
       const animate = () => {
@@ -1288,7 +1352,8 @@ export default function Home() {
         const elapsed = (performance.now() - animationStartTimeRef.current) / 1000;
         let t = elapsed;
         if (t >= maxDuration) {
-          if (animationTracks.every((track) => !track.looping)) {
+          const loop = animationTracks.some((track) => track.looping);
+          if (!loop) {
             setPlaying(false);
             animationStartTimeRef.current = null;
             return;
@@ -1329,40 +1394,6 @@ export default function Home() {
   }, [mode]);
   useEffect(() => {
     setViews(DEFAULT_VIEWS);
-  }, []);
-
-  // Cargar la plantilla de Botella-Cafe.zeus como perfil de torno por defecto
-  useEffect(() => {
-    const loadDefaultLatheProfile = async () => {
-      try {
-        let data: any = null;
-        if (typeof window !== 'undefined' && (window as any).electronAPI) {
-          data = await readProject('public/Obj-3D/Botella-Cafe.zeus');
-        } else {
-          const res = await fetch('/Obj-3D/Botella-Cafe.zeus');
-          if (res.ok) data = await res.json();
-        }
-        if (
-          data?.type === 'editor3d' &&
-          Array.isArray(data.latheProfile) &&
-          data.latheProfile.length >= 3
-        ) {
-          setLatheProfile(data.latheProfile);
-        }
-      } catch {
-        // Silencioso: si no se puede cargar, se usa el perfil por defecto
-      }
-    };
-    loadDefaultLatheProfile();
-  }, []);
-
-  useEffect(() => {
-    if (typeof document === 'undefined') return;
-    if (document.fonts) {
-      document.fonts.ready.then(() => setFontVersion((v) => v + 1));
-    } else {
-      setFontVersion((v) => v + 1);
-    }
   }, []);
 
   useEffect(() => {
@@ -1438,6 +1469,7 @@ export default function Home() {
       sceneObjects,
       selectedObjectId,
       configObjectId,
+      mode,
       groups,
       polylines,
     });
@@ -1460,7 +1492,8 @@ export default function Home() {
         const sceneSame =
           lastState.sceneObjects === currentState.sceneObjects &&
           lastState.selectedObjectId === currentState.selectedObjectId &&
-          lastState.configObjectId === currentState.configObjectId;
+          lastState.configObjectId === currentState.configObjectId &&
+          lastState.mode === currentState.mode;
         const isSame =
           sceneSame &&
           same(lastState.views, currentState.views) &&
@@ -1552,6 +1585,7 @@ export default function Home() {
     sceneObjects,
     selectedObjectId,
     configObjectId,
+    mode,
     polylines,
     history,
     historyIndex,
@@ -1600,6 +1634,10 @@ export default function Home() {
     setSceneObjects(state.sceneObjects);
     setSelectedObjectId(state.selectedObjectId);
     setConfigObjectId(state.configObjectId);
+    // La pestaña activa también se restaura: deshacer tras un cambio
+    // de pestaña devuelve al usuario a donde estaba. Fotos antiguas sin
+    // mode caen en la pestaña neutra.
+    setMode(state.mode ?? 'scene');
     setGroups(state.groups ?? []);
     // Fotos antiguas sin polilíneas: se restauran como lienzo vacío
     setPolylines(state.polylines ?? {});
@@ -1727,130 +1765,6 @@ export default function Home() {
     },
     []
   );
-
-  const handleCameraMoveForRecording = useCallback(
-    (cam: Camera3D) => {
-      if (!isRecordingCameraPath) return;
-      const now = Date.now();
-      const elapsed = (now - recordingStartTimeRef.current) / 1000;
-      setCameraPathKeyframes((prev) => {
-        if (prev.length > 0) {
-          const last = prev[prev.length - 1];
-          if (elapsed - last.time < 0.016) return prev;
-        }
-        return [...prev, { time: elapsed, camera: cam }];
-      });
-    },
-    [isRecordingCameraPath]
-  );
-
-  const startCameraPathRecording = useCallback(() => {
-    setCameraPathKeyframes([]);
-    recordingStartTimeRef.current = Date.now();
-    setIsRecordingCameraPath(true);
-  }, []);
-
-  const moveCameraByArrowKey = useCallback(
-    (direction: 'left' | 'right' | 'forward' | 'backward') => {
-      const cam = panelCameras['3d'];
-      if (!cam) return;
-      const step = 0.1;
-      const rotationY = cam.rotationY;
-      const forward = new THREE.Vector3(
-        Math.sin(rotationY),
-        0,
-        Math.cos(rotationY)
-      ).normalize();
-      const right = new THREE.Vector3(
-        Math.sin(rotationY + Math.PI / 2),
-        0,
-        Math.cos(rotationY + Math.PI / 2)
-      ).normalize();
-      let delta = new THREE.Vector3();
-      if (direction === 'left') delta = right.clone().multiplyScalar(-step);
-      else if (direction === 'right') delta = right.clone().multiplyScalar(step);
-      else if (direction === 'forward') delta = forward.clone().multiplyScalar(-step);
-      else if (direction === 'backward') delta = forward.clone().multiplyScalar(step);
-      const newCam = {
-        ...cam,
-        offsetX: cam.offsetX + delta.x,
-        offsetY: cam.offsetY + delta.y,
-      };
-      setPanelCameras((prev) => ({
-        ...prev,
-        '3d': newCam,
-      }));
-      if (isRecordingCameraPath) {
-        handleCameraMoveForRecording(newCam);
-      }
-    },
-    [panelCameras, isRecordingCameraPath, handleCameraMoveForRecording]
-  );
-
-  useEffect(() => {
-    if (!isRecordingCameraPath) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement) return;
-      if (e.target instanceof HTMLTextAreaElement) return;
-      e.preventDefault();
-      if (e.key === 'ArrowLeft') moveCameraByArrowKey('left');
-      else if (e.key === 'ArrowRight') moveCameraByArrowKey('right');
-      else if (e.key === 'ArrowUp') moveCameraByArrowKey('forward');
-      else if (e.key === 'ArrowDown') moveCameraByArrowKey('backward');
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isRecordingCameraPath, moveCameraByArrowKey]);
-
-  const stopCameraPathRecording = useCallback(() => {
-    setIsRecordingCameraPath(false);
-    const duration = cameraPathKeyframes.length > 0
-      ? cameraPathKeyframes[cameraPathKeyframes.length - 1].time
-      : 3;
-    if (cameraPathKeyframes.length < 2) return;
-    const keyframes = cameraPathKeyframes.map((kf) => ({
-      time: kf.time,
-      properties: {
-        zoom: kf.camera.zoom,
-        offsetX: kf.camera.offsetX,
-        offsetY: kf.camera.offsetY,
-        rotationX: kf.camera.rotationX,
-        rotationY: kf.camera.rotationY,
-      },
-    }));
-       const newTrack: AnimationTrack = {
-       id: `camerapath_${Date.now()}`,
-        name: t('editor3D.cameraPathTrack'),
-       objectId: null,
-        duration: duration * 1000,
-       looping: false,
-       keyframes: cameraPathKeyframes.map((kf) => ({
-          time: kf.time * 1000,
-         values: {
-           zoom: kf.camera.zoom,
-           offsetX: kf.camera.offsetX,
-           offsetY: kf.camera.offsetY,
-           rotationX: kf.camera.rotationX,
-           rotationY: kf.camera.rotationY,
-         },
-         easing: 'ease-in-out' as any,
-       })),
-     };
-     setAnimationTracks((prev) => [...prev, newTrack]);
-     setSelectedTrackId(newTrack.id);
-   }, [cameraPathKeyframes]);
-
-   const handleCameraGizmoMove = useCallback(
-     (keyframes: Keyframe[]) => {
-       setAnimationTracks((prev) =>
-         prev.map((track) => {
-           if (track.objectId !== null) return track;
-           return { ...track, keyframes };
-         })
-       );
-     },
-     []
-   );
 
    const ensureStylesheet = useCallback((url: string, key: string) => {
     return new Promise<void>((resolve) => {
@@ -2053,7 +1967,38 @@ export default function Home() {
       setTextureFileName('');
     }
     setEditedVertices(null);
-  }, [mode]);
+    // Quitar de verdad la textura de los objetos seleccionados. Vaciar el
+    // panel no bastaba: para los textos applyTextureToSelectedObjects
+    // conservaba la imagen ya aplicada y «Quitar textura» no hacía nada —
+    // la textura quedaba atrancada en el objeto y también en su copia.
+    const ids = selectedObjectIds.length > 0
+      ? selectedObjectIds
+      : (selectedObjectId ? [selectedObjectId] : []);
+    if (ids.length === 0) return;
+    setSceneObjects((current) =>
+      current.map((object) => {
+        if (!ids.includes(object.id)) return object;
+        const mesh = object.mesh;
+        if (!mesh || mesh.vertices.length === 0) return object;
+        const newMesh = structuredClone(mesh);
+        if (mesh.texturePanela) {
+          // La imagen la puso el panel: se restaura la horneada de la
+          // figura (en un texto, el trazo de su fuente).
+          newMesh.texture = mesh.textureOriginal ?? undefined;
+          delete newMesh.texturePanela;
+          delete newMesh.textureOriginal;
+        } else {
+          // Textura puesta antes de que existiera la marca (u horneada en
+          // la figura): se quita. Si el texto se reconstruye, el
+          // constructor vuelve a hornear su raster.
+          newMesh.texture = undefined;
+          delete newMesh.texturePanela;
+          delete newMesh.textureOriginal;
+        }
+        return { ...object, mesh: newMesh };
+      })
+    );
+  }, [mode, selectedObjectId, selectedObjectIds]);
 
   /**
    * Importa una imagen PNG y la convierte en un polígono de contorno.
@@ -2374,6 +2319,13 @@ export default function Home() {
   );
 
   const baseMesh = useMemo<Mesh>(() => {
+    // En la pestaña neutra no se construye ninguna figura: la escena
+    // muestra la instantánea de cada objeto. Sin este early return las
+    // plantillas heredadas del panel construirían una figura "fantasma"
+    // viva en Escena con la forma de la última pestaña-herramienta.
+    if (mode === 'scene') {
+      return { vertices: [], faces: [] as number[][] };
+    }
     if (mode === 'text') {
       if (textMode === 'plane') {
         const result = buildTextPlaneMesh({
@@ -2389,6 +2341,9 @@ export default function Home() {
           result.textureColor = '#ffffff';
           result.textureRelief = textureRelief;
           result.textureFinish = textureFinish;
+          result.textureRepeat = textureRepeat;
+          result.textureHelper = textureHelper;
+          result.textureHelperTransform = structuredClone(textureHelperTransform);
           result.faceColors = undefined;
         } else {
           result.textureFinish = textureFinish;
@@ -2421,6 +2376,9 @@ export default function Home() {
         m.textureColor = '#ffffff';
         m.textureRelief = textureRelief;
         m.textureFinish = textureFinish;
+        m.textureRepeat = textureRepeat;
+        m.textureHelper = textureHelper;
+        m.textureHelperTransform = structuredClone(textureHelperTransform);
         m.faceColors = undefined;
       } else {
         m.textureFinish = textureFinish;
@@ -2433,16 +2391,6 @@ export default function Home() {
           }
         }
       }
-      console.log('🔍 MESH TEXTO:', {
-        textMode,
-        tieneTextura: !!m.texture,
-        opacity: m.opacity,
-        textOpacity,
-        faceColors: m.faceColors?.length,
-        faceOpacities: m.faceOpacities?.length,
-        primeraFaceOpacity: m.faceOpacities?.[0],
-        ultimaFaceOpacity: m.faceOpacities?.[m.faceOpacities.length - 1],
-      });
 
       return m;
     }
@@ -2464,6 +2412,9 @@ export default function Home() {
         mesh.textureColor = '#ffffff';
         mesh.textureRelief = textureRelief;
         mesh.textureFinish = textureFinish;
+        mesh.textureRepeat = textureRepeat;
+        mesh.textureHelper = textureHelper;
+        mesh.textureHelperTransform = structuredClone(textureHelperTransform);
       } else {
         if (mesh.faces) {
           mesh.faceColors = mesh.faces.map(() => latheFigureColor);
@@ -2625,11 +2576,13 @@ export default function Home() {
     extrudeDepth,
     extrudeHoles,
     figureColor,
-    texture,
-     textureProjection,
-     textureRelief,
-     textureRepeat,
-     textureFinish,
+     texture,
+      textureProjection,
+      textureRelief,
+      textureRepeat,
+      textureFinish,
+      textureHelper,
+      textureHelperTransform,
     latheProfile,
     latheSegments,
     latheClamp,
@@ -2692,15 +2645,66 @@ export default function Home() {
       ? selectedSceneObject
       : null;
   const frozenSelectedId = frozenSelected?.id ?? null;
-  const viewerMesh = frozenSelected ? frozenSelected.mesh! : triMesh;
+  // ¿Hay un lienzo 2D abierto? Se usa tanto para decidir el layout de
+  // los visores como para saber si la figura de la pestaña se está
+  // dibujando en vivo.
+  const isEditingCanvas =
+    editingPanel !== null ||
+    editingLatheProfile ||
+    editingViewProfile !== null ||
+    editingMeshProfile !== null ||
+    editingMesh ||
+    editingMeshSide;
+  // El área de trabajo arranca vacío: la figura de la pestaña solo se
+  // materializa en el visor si pertenece a un objeto (el dueño de la
+  // configuración) o si hay un lienzo 2D abrierto dibujándola. Sin
+  // esto, cambiar de pestaña haría aparecer su plantilla por defecto
+  // como un objeto fantasma en una escena sin objetos.
+  const viewerMeshRaw = frozenSelected
+    ? frozenSelected.mesh!
+    : configObjectId || isEditingCanvas
+      ? triMesh
+      : EMPTY_MESH;
+  // Estilo de visualización de la pestaña Escena: la figura REAL nunca
+  // cambia — voxeles solo revoxeliza la superficie para el visor y suave
+  // solo activa el sombreado suave.
+  const viewerMesh = useMemo(() => {
+    if (
+      mode !== 'scene' ||
+      !frozenSelected ||
+      sceneMeshStyle === 'fusionada' ||
+      viewerMeshRaw.vertices.length === 0
+    ) {
+      return viewerMeshRaw;
+    }
+    if (sceneMeshStyle === 'voxeles') {
+      const solid = meshToVoxels(viewerMeshRaw, 24);
+      if (!solid.resolution) return viewerMeshRaw;
+      return voxelsToBoxMesh(solid.voxels, solid.resolution, false, [-1, 1]);
+    }
+    return viewerMeshRaw;
+  }, [mode, frozenSelected, sceneMeshStyle, viewerMeshRaw]);
   const viewerSmooth = frozenSelected
-    ? (frozenSelected.smooth ?? false)
+    ? (mode === 'scene' && sceneMeshStyle === 'suave'
+        ? true
+        : (frozenSelected.smooth ?? false))
     : smoothShadingValue;
   const viewerProjection = frozenSelected
     ? (frozenSelected.textureProjection ?? 'planar')
     : textureProjection;
 
   const visibleSceneObjects = useMemo(() => sceneObjects, [sceneObjects]);
+
+  // ¿Alguno de los objetos seleccionados lleva textura en su malla? El
+  // botón «Quitar textura» también debe verse (y funcionar) cuando la
+  // textura vive en el objeto y el panel quedó vacío — p. ej. tras
+  // recargar el editor —, que es como se queda atrancada una textura vieja.
+  const texturaEnSeleccion = (selectedObjectIds.length > 0
+    ? selectedObjectIds
+    : selectedObjectId
+      ? [selectedObjectId]
+      : []
+  ).some((id) => !!sceneObjects.find((o) => o.id === id)?.mesh?.texture);
 
   const updateView = useCallback(
     (key: keyof Views) => (poly: Polygon) => {
@@ -2715,12 +2719,15 @@ export default function Home() {
   }, []);
 
   const openSaveModal = useCallback(() => {
-    setObjectName(
-      mode === 'text' ? text.trim().slice(0, 30) || 'texto-3d' : 'figura-3d'
-    );
-    setSaveMsg(null);
-    setSaveModalOpen(true);
-  }, [mode, text]);
+    if (!objectName) {
+      setObjectName(
+        mode === 'text' ? text.trim().slice(0, 30) || 'texto-3d' : 'figura-3d'
+      );
+    }
+     setSaveTarget('object');
+     setSaveMsg(null);
+     setSaveModalOpen(true);
+  }, [mode, text, objectName]);
 
   // Captura la configuración COMPLETA del panel (todas las plantillas,
   // colores, textos, texturas y polilíneas): es lo que se congela con
@@ -2750,6 +2757,8 @@ export default function Home() {
       textureFinish,
       textureRelief,
       textureRepeat,
+      textureHelper,
+      textureHelperTransform: structuredClone(textureHelperTransform),
       editedVertices: editedVertices ? structuredClone(editedVertices) : null,
       meshSilhouette: structuredClone(meshSilhouette),
       meshSections: structuredClone(meshSections),
@@ -2786,6 +2795,9 @@ export default function Home() {
       textureProjection,
       textureFinish,
       textureRelief,
+      textureRepeat,
+      textureHelper,
+      textureHelperTransform,
       editedVertices,
       meshSilhouette,
       meshSections,
@@ -2807,6 +2819,11 @@ export default function Home() {
   // crear un objeto nuevo (defaults) y al cargar un archivo v3.
   // Los nombres de archivo de las texturas son cosméticos: se derivan.
   const applyObjectConfig = useCallback((config: ObjectConfig) => {
+    // Restaurar el panel no es «el usuario cambió un ajuste»: arma el
+    // salto para que el efecto de textura no pise con estos valores las
+    // instantáneas que cada objeto ya trae consigo (al reabrir un
+    // archivo, su config congelada puede ser anterior a su textura).
+    textureApplySkipRef.current = true;
     setViews(structuredClone(config.views));
     setResolution(config.resolution);
     setMeshStyle(config.meshStyle);
@@ -2829,8 +2846,10 @@ export default function Home() {
      setTextureProjection(config.textureProjection);
      setTextureFinish(config.textureFinish);
      setTextureRelief(config.textureRelief);
-     setTextureRepeat(config.textureRepeat ?? 1);
-    setEditedVertices(
+      setTextureRepeat(config.textureRepeat ?? 1);
+      setTextureHelper(config.textureHelper ?? false);
+      setTextureHelperTransform(config.textureHelperTransform ?? IDENTITY_TRANSFORM);
+     setEditedVertices(
       config.editedVertices ? structuredClone(config.editedVertices) : null
     );
     setMeshSilhouette(structuredClone(config.meshSilhouette));
@@ -2942,7 +2961,12 @@ export default function Home() {
           ...object,
           mesh: {
             ...structuredClone(triMesh),
-            texture: ownerTexture ?? undefined,
+            // La textura del panel (vacía para un texto pintado con su
+            // propia fuente de color) no puede BORRAR la que la figura
+            // viva ya trae tejida en sus uvs: si el panel no muestra
+            // ninguna, se guarda la de la figura construida ahora, que
+            // es la que se está viendo.
+            texture: ownerTexture ?? triMesh.texture ?? undefined,
             textureColor: ownerTexture ? '#ffffff' : undefined,
             textureRelief: ownerRelief,
             textureFinish: ownerFinish,
@@ -2976,11 +3000,16 @@ export default function Home() {
         objectTextureFinish,
         skyboxImage,
         animationTracks,
-        cameraViewMode,
-       // Polilíneas libres de los lienzos 2D (solo 2D): viajan con el
-       // proyecto para volver al reabrirlo
-       polylines,
-    };
+        panelCamerasObjeto,
+        // Fuentes importadas (Google Fonts y locales): viajan con el
+        // proyecto para volver al reabrirlo
+        customFonts,
+        customFontName,
+        // Polilíneas libres de los lienzos 2D (solo 2D): viajan con el
+        // proyecto para volver al reabrirlo
+        polylines,
+     };
+
     setSavingObject(true);
     try {
       if (!isElectron()) {
@@ -2996,16 +3025,33 @@ export default function Home() {
         URL.revokeObjectURL(url);
         setSaveMsg({ ok: true, text: t('editor3D.downloadedAs', { name }) });
       } else {
-        const paths = await getLocalPaths();
-        const folder = paths?.objetos_3d;
-        if (!folder) {
-          setSaveMsg({ ok: false, text: t('editor3D.noFolder3dMsg') });
-          return;
+        // 'object' con ruta cargada → sobreescribe el archivo abierto;
+        // 'project' o sin ruta cargada → crea uno nuevo en la carpeta
+        // correspondiente (objetos_3d o proyectos_3d según el destino).
+        const hadExistingPath = !!currentProjectPath && saveTarget === 'object';
+        let savePath: string;
+        if (currentProjectPath && saveTarget === 'object') {
+          savePath = currentProjectPath;
+        } else {
+          const paths = await getLocalPaths();
+          const folderKey = saveTarget === 'project' ? 'proyectos_3d' : 'objetos_3d';
+          const folder = paths?.[folderKey];
+          if (!folder) {
+            setSaveMsg({ ok: false, text: t('editor3D.noFolderMsg') });
+            return;
+          }
+          savePath = `${folder}/${name}.zeus`;
+          if (saveTarget === 'project') setCurrentProjectPath(savePath);
         }
-        const ok = await saveProject(`${folder}/${name}.zeus`, projectData);
+        const ok = await saveProject(savePath, projectData);
         if (!ok) throw new Error(t('editor3D.cannotWriteFile'));
-        setSaveMsg({ ok: true, text: t('editor3D.savedAs', { name }) });
-      }
+        setSaveMsg({
+          ok: true,
+          text: hadExistingPath
+            ? t('editor3D.updated')
+            : t('editor3D.savedAs', { name }),
+        });
+       }
     } catch (e: unknown) {
       setSaveMsg({
         ok: false,
@@ -3017,6 +3063,8 @@ export default function Home() {
   }, [
     savingObject,
     objectName,
+    currentProjectPath,
+    saveTarget,
     mode,
     views,
     resolution,
@@ -3064,11 +3112,355 @@ export default function Home() {
      groundTextureFinish,
      skyboxImage,
      animationTracks,
-     cameraViewMode,
-   ]);
+      panelCamerasObjeto,
+      customFonts,
+      customFontName,
+    ]);
 
-  // Carga en el editor el objeto de la carpeta local pinchado en el
+  // Al cambiar de objeto activo, los controles de textura pasan a
+  // mostrar los ajustes del recién seleccionado: los que tiene
+  // guardados en su instantánea (su textura, acabado, relieve y
+  // proyección), no los que quedaran en pantalla del anterior. Sin
+  // instantánea (dueño recién creado o objetos de proyectos cargados)
+  // no se toca nada: lo que hay en pantalla ya es lo suyo.
+  // (Vive antes de createObjectsFromZeusData: abrir en escena
+  // sincroniza el panel con el objeto activo nada más montarlo.)
+   const syncTextureStateToSelection = useCallback(
+     (id: string | null, lista?: typeof sceneObjects) => {
+       if (!id) return;
+       textureApplySkipRef.current = true;
+       const object = (lista ?? sceneObjects).find((o) => o.id === id);
+       const mesh = object?.mesh;
+       if (!mesh || mesh.vertices.length === 0) return;
+       const objectTexture = mesh.texture ?? null;
+       if (mode === 'lathe') {
+         setLatheTexture(objectTexture);
+         setLatheTextureFileName(objectTexture ? 'textura-objeto' : '');
+       } else {
+         setTexture(objectTexture);
+         setTextureFileName(objectTexture ? 'textura-objeto' : '');
+       }
+       setTextureProjection(object?.textureProjection ?? 'planar');
+       setTextureFinish(mesh.textureFinish ?? 'semi-matte');
+       setTextureRelief(mesh.textureRelief ?? 0.25);
+       setTextureRepeat(mesh.textureRepeat ?? 1);
+       // La transparencia del panel centralizado sigue la del objeto
+       // recién seleccionado (mesh.opacity; 1 si nunca se ajustó).
+       setFigureOpacity(mesh.opacity ?? 1);
+       setTextureHelper(mesh.textureHelper ?? false);
+       setTextureHelperTransform(mesh.textureHelperTransform ?? IDENTITY_TRANSFORM);
+     },
+     [mode, sceneObjects]
+   );
+
+    const applyTextureToSelectedObjects = useCallback(() => {
+       // Construir la lista de objetos a actualizar: multiselección o
+       // el objeto activo cuando no hay multiselección
+       const ids = selectedObjectIds.length > 0
+         ? selectedObjectIds
+         : (selectedObjectId ? [selectedObjectId] : []);
+       if (ids.length === 0) return;
+       const textureUrl = mode === 'lathe' ? latheTexture : texture;
+       setSceneObjects((current) =>
+         current.map((object) => {
+           if (!ids.includes(object.id)) return object;
+           const mesh = object.mesh;
+           if (!mesh || mesh.vertices.length === 0) return object;
+           const newMesh = structuredClone(mesh);
+           if (textureUrl) {
+             // La textura del panel sustituye a la de la malla, pero se
+             // recuerda la horneada (el trazo de la fuente de un texto)
+             // para poder restaurarla al quitar la del panel.
+             if (!mesh.texturePanela) {
+               newMesh.textureOriginal = mesh.texture ?? undefined;
+             }
+             newMesh.texturePanela = true;
+             newMesh.texture = textureUrl;
+           } else if (mesh.texturePanela) {
+             // El panel ya no tiene textura y la que llevaba la puso el
+             // panel: se quita y vuelve la horneada de la figura (en un
+             // texto, el trazo de su fuente). Antes se conservaba siempre
+             // la imagen del panel en los textos y la textura aplicada
+             // ya no se podía quitar — ni en la copia pegada.
+             newMesh.texture = mesh.textureOriginal ?? undefined;
+             delete newMesh.texturePanela;
+             delete newMesh.textureOriginal;
+           } else {
+             // Con el panel sin textura no se borra la que la malla trae
+             // tejida en sus uvs: el trazo de una fuente de color es parte
+             // de la figura (reconstruir la figura viva tampoco lo quita —
+             // el constructor siempre devuelve su raster).
+             newMesh.texture =
+               object.mode === 'text' ? mesh.texture : undefined;
+           }
+           newMesh.textureColor = '#ffffff';
+            newMesh.textureRepeat = textureRepeat;
+            newMesh.textureFinish = textureFinish;
+            newMesh.textureRelief = textureRelief;
+            newMesh.textureHelper = textureHelper;
+            newMesh.textureHelperTransform = structuredClone(textureHelperTransform);
+           return {
+             ...object,
+             textureProjection,
+             mesh: newMesh,
+           };
+         })
+       );
+      }, [selectedObjectId, selectedObjectIds, mode, latheTexture, texture, textureRepeat, textureFinish, textureRelief, textureProjection, textureHelper, textureHelperTransform]);
+
+    // --- Textura por caras (selección de caras de la figura activa) ---
+    // El objeto cuya malla se está viendo/editando: el seleccionado; si
+    // no hay, el dueño de la configuración de la pestaña.
+    const faceTextureTargetId = selectedObjectId ?? configObjectId ?? null;
+
+    // Mapa triángulo → cara original: la selección de caras vive sobre la
+    // malla del visor, que en modo vivo es triMesh (polígonos partidos en
+    // triángulos con el mismo abanico que este mapa reproduce).
+    const triangleToFaceMap = useCallback((srcMesh: { faces: number[][] }): number[] => {
+      const map: number[] = [];
+      srcMesh.faces.forEach((face, faceIdx) => {
+        for (let i = 1; i < face.length - 1; i++) map.push(faceIdx);
+      });
+      return map;
+    }, []);
+
+    const applyFaceTextureToSelection = useCallback((textureUrl: string | null) => {
+      const id = selectedObjectId ?? configObjectId;
+      if (!id || selectedFaceIds.length === 0) return;
+      // Fin del ciclo: tras asignar una textura el alambre se apaga solo
+      // (el visor reacciona a esta señal), para que la textura se vea sin
+      // tener que pulsar «Vista de alambre» a mano.
+      if (textureUrl) setWireframeOffSignal((s) => s + 1);
+      setSceneObjects((current) => {
+        const object = current.find((o) => o.id === id);
+        if (!object?.mesh || object.mesh.vertices.length === 0) return current;
+        // Índices de cara ORIGINAL: la selección vive sobre la malla del
+        // visor, que en modo vivo es triMesh (triángulos del abanico).
+        const viewedMesh = id === configObjectId ? triMesh : object.mesh;
+        let faceIds = selectedFaceIds;
+        if (viewedMesh.faces.length !== object.mesh.faces.length) {
+          const map = triangleToFaceMap(object.mesh);
+          faceIds = [
+            ...new Set(
+              selectedFaceIds
+                .map((tx) => map[tx])
+                .filter((f) => f !== undefined)
+            ),
+          ];
+        }
+        if (faceIds.length === 0) return current;
+        // Lo asignado ya no lleva el color automático de resalte.
+        for (const f of faceIds) autoPintadasRef.current.delete(f);
+        const newMesh = structuredClone(object.mesh);
+        const textures = [...(newMesh.faceTextures ?? [])];
+        while (textures.length < newMesh.faces.length) textures.push(null);
+        for (const f of faceIds) {
+          if (f >= 0 && f < textures.length) textures[f] = textureUrl;
+        }
+        if (textures.every((tx) => tx === null)) {
+          delete newMesh.faceTextures;
+        } else {
+          newMesh.faceTextures = textures;
+        }
+        return current.map((o) => (o.id === id ? { ...o, mesh: newMesh } : o));
+      });
+    }, [selectedObjectId, configObjectId, selectedFaceIds, triMesh, triangleToFaceMap]);
+
+    // ---- Resalte por textura automática -------------------------------
+    // El usuario lo pidió así: las caras seleccionadas se pintan con una
+    // textura de color (cian, cualquier color no blanco vale). Al dejar
+    // de estar seleccionadas recuperan su estado anterior. Solo se tocan
+    // las caras sin textura propia: el trabajo manual nunca se sobreescribe.
+    const autoPintadasRef = useRef<Set<number>>(new Set());
+    const pintarSeleccionAuto = useCallback((ids: number[]) => {
+      const id = selectedObjectId ?? configObjectId;
+      if (!id) return;
+      const colorAuto = dataUrlColorAuto();
+      setSceneObjects((current) => {
+        const object = current.find((o) => o.id === id);
+        if (!object?.mesh || object.mesh.vertices.length === 0) return current;
+        const viewedMesh = id === configObjectId ? triMesh : object.mesh;
+        let selIds = ids;
+        if (viewedMesh.faces.length !== object.mesh.faces.length) {
+          const map = triangleToFaceMap(object.mesh);
+          selIds = [...new Set(ids.map((tx) => map[tx]).filter((f) => f !== undefined))];
+        }
+        const selSet = new Set(selIds);
+        const actuales = object.mesh.faceTextures ?? [];
+        const cambios = new Map<number, string | null>();
+        // Caras que dejaron de estar seleccionadas: quitar SOLO el color
+        // automático que puso este sistema (las demás no se tocan).
+        for (const f of autoPintadasRef.current) {
+          if (selSet.has(f)) continue;
+          if (actuales[f] === colorAuto) cambios.set(f, null);
+        }
+        // Caras seleccionadas sin textura propia: pintar de cian.
+        const pintadas = new Set<number>();
+        for (const f of selIds) {
+          if (f < 0 || f >= object.mesh.faces.length) continue;
+          const actual = actuales[f];
+          if (actual == null) {
+            cambios.set(f, colorAuto);
+            pintadas.add(f);
+          } else if (actual === colorAuto) {
+            pintadas.add(f); // ya estaba pintada por el resalte
+          }
+        }
+        if (cambios.size === 0) {
+          autoPintadasRef.current = pintadas;
+          return current;
+        }
+        const newMesh = structuredClone(object.mesh);
+        const textures = [...(newMesh.faceTextures ?? [])];
+        while (textures.length < newMesh.faces.length) textures.push(null);
+        for (const [f, color] of cambios) {
+          if (f >= 0 && f < textures.length) textures[f] = color;
+        }
+        if (textures.every((tx) => tx === null)) {
+          delete newMesh.faceTextures;
+        } else {
+          newMesh.faceTextures = textures;
+        }
+        autoPintadasRef.current = pintadas;
+        return current.map((o) => (o.id === id ? { ...o, mesh: newMesh } : o));
+      });
+    }, [selectedObjectId, configObjectId, triMesh, triangleToFaceMap]);
+
+    // Efecto: cada cambio de selección de caras repinta el resalte; al
+    // salir del modo (o cambiar de objetivo) se limpian los colores
+    // automáticos que quedaran puestos.
+    useEffect(() => {
+      if (faceSelectMode && faceSelectionTarget === 'cara') {
+        pintarSeleccionAuto(selectedFaceIds);
+      } else if (autoPintadasRef.current.size > 0) {
+        pintarSeleccionAuto([]);
+      }
+    }, [selectedFaceIds, faceSelectMode, faceSelectionTarget, pintarSeleccionAuto]);
+
+    // Tecla para deseleccionar todo de un golpe: Escape (o Ctrl+D) mientras
+    // el modo caras/vértices/segmentos está activo. No actúa si hay un
+    // modal abierto (Escape ya lo cierra y no debe borrar la selección).
+    useEffect(() => {
+      if (!faceSelectMode) return;
+      const deseleccionar = (e: KeyboardEvent) => {
+        if (e.key !== 'Escape' && !(e.key.toLowerCase() === 'd' && (e.ctrlKey || e.metaKey))) return;
+        if (document.querySelector('[role="dialog"]')) return;
+        e.preventDefault();
+        setSelectedFaceIds([]);
+        setSelectedVertexIds([]);
+        setSelectedEdgeIds([]);
+      };
+      window.addEventListener('keydown', deseleccionar);
+      return () => window.removeEventListener('keydown', deseleccionar);
+    }, [faceSelectMode]);
+
+    const handleFaceTextureFile = useCallback((file: File | null) => {
+      if (!file || !file.type.startsWith('image/')) return;
+      const reader = new FileReader();
+      reader.onload = () => applyFaceTextureToSelection(reader.result as string);
+      reader.readAsDataURL(file);
+      // Reset del input para poder volver a elegir la misma imagen.
+      if (faceTextureInputRef.current) faceTextureInputRef.current.value = '';
+    }, [applyFaceTextureToSelection]);
+
+    // Apply texture (URL + repeat + finish + relief + projection) state
+    // changes to all selected objects in real-time
+    // Estados de textura vistos por la aplicación anterior: la identidad
+    // de applyTextureToSelectedObjects cambia al cambiar de pestaña (sus
+    // deps incluyen mode) y, sin este recuerdo, el efecto se dispararía
+    // en CADA cambio de pestaña reescribiendo la textura de la
+    // instantánea seleccionada con la del panel — vacía para un texto
+    // pintado con su propia fuente de color — y borrando la textura que
+    // su malla trae tejida (sus uvs). Vive TRAS syncTextureStateToSelection:
+    // así la sincronización de «abrir en escena» arma el salto antes.
+    const textureApplyPrevRef = useRef({
+      texture,
+      latheTexture,
+      textureRepeat,
+      textureFinish,
+      textureRelief,
+      textureProjection,
+      textureHelper,
+      textureHelperTransform,
+    });
+    useEffect(() => {
+      const prev = textureApplyPrevRef.current;
+      const changed =
+        prev.texture !== texture ||
+        prev.latheTexture !== latheTexture ||
+        prev.textureRepeat !== textureRepeat ||
+        prev.textureFinish !== textureFinish ||
+        prev.textureRelief !== textureRelief ||
+        prev.textureProjection !== textureProjection ||
+        prev.textureHelper !== textureHelper ||
+        prev.textureHelperTransform !== textureHelperTransform;
+      textureApplyPrevRef.current = {
+        texture,
+        latheTexture,
+        textureRepeat,
+        textureFinish,
+        textureRelief,
+        textureProjection,
+        textureHelper,
+        textureHelperTransform,
+      };
+      if (textureApplySkipRef.current) {
+        textureApplySkipRef.current = false;
+        return;
+      }
+      // Solo un cambio REAL de algún estado de textura aplica algo: el
+      // mero cambio de identidad del callback (p. ej. al cambiar de
+      // pestaña) no debe tocar las instantáneas.
+      if (!changed) return;
+      applyTextureToSelectedObjects();
+      setViewRefreshTick((t) => t + 1);
+    }, [texture, latheTexture, textureRepeat, textureFinish, textureRelief, textureProjection, textureHelper, textureHelperTransform, applyTextureToSelectedObjects]);
+
+  // Crea en la escena actual los objetos guardados en un archivo .zeus
+  // (modo "Abrir en escena"): añade las figuras del archivo como objetos
+  // nuevos de la escena actual, sin tocar la configuración del editor.
+  const createObjectsFromZeusData = useCallback(
+    async (fileName: string, data: any) => {
+      const objs = Array.isArray(data.sceneObjects) ? data.sceneObjects : [];
+      const valid = objs.filter(
+        (o: Partial<SceneObject>) =>
+          (o.mesh && o.mesh.vertices.length > 0) || o.kind === 'camera'
+      );
+      if (valid.length === 0) {
+        throw new Error(t('editor3D.noSavedShape', { name: fileName }));
+      }
+      const baseId = `object-${Date.now()}`;
+      const newObjects: SceneObject[] = valid.map((obj: Partial<SceneObject>, i: number) => ({
+        id: i === 0 ? baseId : `${baseId}-${i}`,
+        name: obj.name ?? t('editor3D.copyOf', { name: fileName.replace(/\.zeus$/i, '') }),
+        transform: { ...(obj.transform ?? IDENTITY_TRANSFORM) },
+        mesh: structuredClone(obj.mesh),
+        smooth: obj.smooth,
+        textureProjection: obj.textureProjection,
+        mode: obj.mode,
+        kind: obj.kind,
+        camera: obj.camera ? structuredClone(obj.camera) : undefined,
+        hidden: obj.hidden,
+        frozen: obj.frozen,
+      }));
+      setSceneObjects((objects) => [...objects, ...newObjects]);
+      setSelectedObjectId(baseId);
+      // El panel salta a los ajustes del objeto activo de una vez (la
+      // lista del archivo aún no vive en el estado del editor): sin
+      // esto, un disparo del efecto de textura con el panel recién
+      // montado en defaults le escribiría AL activo esos valores
+      // falsos, pisando los que trae consigo del archivo.
+      syncTextureStateToSelection(baseId, newObjects);
+      setObj3dMsg({ ok: true, text: t('editor3D.addedToSceneMsg', { count: newObjects.length }) });
+      setObj3dModalOpen(false);
+    },
+    [t, syncTextureStateToSelection]
+  );
+
+   // Carga en el editor el objeto de la carpeta local pinchado en el
   // modal "Objeto 3D" (antes abría su propio modal con el botón Cargar).
+  // En "En escena nueva" reemplaza la escena y la configuración; en
+  // "Abrir en escena" añade los objetos del archivo a la escena actual.
   const loadObject = useCallback(
     async (file: { name: string; path?: string; data?: any }) => {
       if (!file.path && file.data === undefined) {
@@ -3078,9 +3470,18 @@ export default function Home() {
         });
         return;
       }
+      // Spinner en la tarjeta mientras se lee y se abre: antes el clic no
+      // daba ninguna señal hasta que el editor ya estaba cargado.
+      setObj3dOpeningName(file.name);
       try {
+        // file.data puede ser la promesa precargada al pasar el ratón por
+        // la tarjeta (hover): el archivo ya no se relee del disco.
         const data =
-          file.data ?? (file.path ? await readProject(file.path) : null);
+          file.data !== undefined
+            ? await file.data
+            : file.path
+              ? await readProject(file.path)
+              : null;
         if (!data || data.type !== 'editor3d') {
           setObj3dMsg({
             ok: false,
@@ -3088,10 +3489,55 @@ export default function Home() {
           });
           return;
         }
+        if (importMode === 'merge') {
+          // "Abrir en escena" con el área de trabajo VACÍO (el editor arranca
+          // así) es en realidad ABRIR el proyecto: se adopta el archivo como
+          // proyecto actual, igual que "En escena nueva", para que el modal
+          // de Guardar muestre su nombre en el campo de texto y el botón lo
+          // actualice en vez de crear un archivo aparte. Si la escena ya
+          // tenía objetos es un añadido real y no se adopta: Guardar
+          // seguiría creando un archivo nuevo, sin pisar el abierto.
+          if (sceneObjects.length === 0) {
+            setObjectName(file.name.replace(/\.zeus$/i, ''));
+            setCurrentProjectPath(file.path ?? null);
+          }
+          await createObjectsFromZeusData(file.name, data);
+          return;
+        }
+        setObjectName(file.name.replace(/\.zeus$/i, ''));
+        setCurrentProjectPath(file.path ?? null);
+        // Archivos v3 (con objetos de escena): el mode guardado es del
+        // objeto dueño, no del editor — se abre en el espacio de trabajo
+        // neutro "Escena" y las figuras se ven desde sus instantáneas.
+        // Pero si la figura solo existe viva en el panel (sin
+        // instantánea guardada, como los proyectos antiguos), abrir en
+        // Escena la ocultaría: se aterriza en su pestaña-herramienta.
+        const v3Objects: Partial<SceneObject>[] = Array.isArray(
+          data.sceneObjects
+        )
+          ? data.sceneObjects
+          : [];
+        const v3SelObj = v3Objects.find(
+          (o) =>
+            o?.id ===
+            (typeof data.selectedObjectId === 'string'
+              ? data.selectedObjectId
+              : v3Objects[0]?.id)
+        );
+        const v3OwnerObj =
+          typeof data.configObjectId === 'string'
+            ? v3Objects.find((o) => o?.id === data.configObjectId)
+            : undefined;
+        const openInScene =
+          v3Objects.length > 0 &&
+          ((!!v3SelObj?.mesh && v3SelObj.mesh.vertices.length > 0) ||
+            (!!v3OwnerObj?.mesh && v3OwnerObj.mesh.vertices.length > 0));
         setMode(
-          ['views', 'extrude', 'text', 'lathe'].includes(data.mode)
-            ? data.mode
-            : 'views'
+          openInScene
+            ? 'scene'
+            : ['views', 'extrude', 'text', 'lathe'].includes(data.mode)
+              ? data.mode
+              : 'views'
         );
         setViews(
           data.views && typeof data.views === 'object'
@@ -3106,7 +3552,7 @@ export default function Home() {
             ? data.meshStyle
             : 'suave'
         );
-        setText(typeof data.text === 'string' ? data.text : 'HOLA');
+        setText(typeof data.text === 'string' ? data.text : '');
         if (typeof data.fontCss === 'string') setFontCss(data.fontCss);
         if (typeof data.textDepth === 'number') setTextDepth(data.textDepth);
         setHollowText(!!data.hollowText);
@@ -3184,15 +3630,18 @@ export default function Home() {
               ? data.selectedObjectId
               : (data.sceneObjects[0]?.id ?? null);
           setSelectedObjectId(loadedSelected);
-          // El dueño de la configuración del proyecto cargado es el que
-          // lo era al guardar (archivos antiguos sin dueño guardado: el
-          // objeto activo, como siempre). Los demás se reconstruyen con
-          // su propia figura guardada.
+          // Al abrir en Escena nada se edita en vivo: el dueño queda
+          // vacío y las figuras se ven desde sus instantáneas. Solo los
+          // archivos sin instantáneas (figura viva únicamente en el
+          // panel) conservan un dueño al cargar, para que su figura se
+          // siga viendo en su pestaña-herramienta.
           setConfigObjectId(
-              typeof data.configObjectId === 'string' &&
-                data.sceneObjects.some(
-                  (o: { id?: string }) => o.id === data.configObjectId
-                )
+            openInScene
+              ? null
+              : typeof data.configObjectId === 'string' &&
+                  data.sceneObjects.some(
+                    (o: { id?: string }) => o.id === data.configObjectId
+                  )
                 ? data.configObjectId
                 : loadedSelected
           );
@@ -3270,9 +3719,20 @@ export default function Home() {
             }
           }
         } else {
-          setSceneObjects([]);
-          setSelectedObjectId(null);
-          setConfigObjectId(null);
+          // Archivo antiguo sin objetos en escena: la configuración
+          // cargada se convierte en un objeto nuevo de la escena (su
+          // dueño). Si quedara suelta, su figura sería invisible en un
+          // área de trabajo que solo muestra figuras con dueño.
+          const id = `object-${Date.now()}`;
+          setSceneObjects([
+            {
+              id,
+              name: file.name.replace(/\.zeus$/i, ''),
+              transform: { ...IDENTITY_TRANSFORM },
+            },
+          ]);
+          setSelectedObjectId(id);
+          setConfigObjectId(id);
           setGroups([]);
         }
         if (typeof data.editorGridResolution === 'number')
@@ -3299,7 +3759,7 @@ export default function Home() {
            setFxConfig(data.fxConfig);
           }
           if (typeof data.groundTexture === 'string') {
-            setGroundTexture(data.groundTexture);
+            setGroundTexture(restoreTextureUrl(data.groundTexture));
           }
            if (typeof data.groundTextureFinish === 'string') {
              setGroundTextureFinish(data.groundTextureFinish as TextureFinish);
@@ -3311,27 +3771,67 @@ export default function Home() {
             setObjectTextureFinish(data.objectTextureFinish as TextureFinish);
           }
           if (typeof data.skyboxImage === 'string') {
-            setSkyboxImage(data.skyboxImage);
+            setSkyboxImage(restoreTextureUrl(data.skyboxImage));
           }
           if (Array.isArray(data.animationTracks)) {
-            setAnimationTracks(data.animationTracks);
+            // Migración: las pistas con objectId null eran la cámara VIEJA
+            // (grabación de la vista). Su sistema se retiró; la cámara
+            // actual es un objeto con su propio recorrido (camera.keyframes).
+            setAnimationTracks(
+              data.animationTracks.filter((t: { objectId: string | null }) => t.objectId !== null)
+            );
           }
-          if (typeof data.cameraViewMode === 'boolean') {
-            setCameraViewMode(data.cameraViewMode);
+          // Cámara-objeto activa por ventana: solo ids que existen.
+          if (data.panelCamerasObjeto && typeof data.panelCamerasObjeto === 'object') {
+            const idsValidos = new Set(
+              (Array.isArray(data.sceneObjects) ? data.sceneObjects : []).map(
+                (o: { id?: string }) => o.id
+              )
+            );
+            setPanelCamerasObjeto((prev) => {
+              const next = { ...prev };
+              const entradas = data.panelCamerasObjeto as Record<string, string | null>;
+              for (const v of ['front', 'top', 'side', '3d'] as const) {
+                const id = entradas[v];
+                next[v] = typeof id === 'string' && idsValidos.has(id) ? id : null;
+              }
+              return next;
+            });
+          }
+          // Fuentes importadas: restaurar la lista y re-enlazar Google Fonts
+          if (Array.isArray(data.customFonts)) {
+             setCustomFonts(data.customFonts);
+            // Re-crear los <link> de Google Fonts para cada fuente importada
+            for (const f of data.customFonts) {
+              if (f.google && f.css) {
+                const family = f.css.replace(/^'|'$/g, '').replace(/,.*/, '').trim();
+                if (family) {
+                  await ensureStylesheet(
+                    `https://fonts.googleapis.com/css2?family=${encodeURIComponent(family).replace(/%20/g, '+')}:wght@400;700&display=swap`,
+                    `${encodeURIComponent(family).replace(/%20/g, '+')}-w`
+                  );
+                }
+              }
+            }
+          }
+          if (typeof data.customFontName === 'string') {
+            setCustomFontName(data.customFontName);
           }
          // Polilíneas libres de los lienzos 2D: los archivos antiguos no
          // las traen y quedan como lienzos vacíos
         setPolylines(sanitizePolylinesByCanvas(data.polylines));
-        setEditingView(null);
+        setEditingPanel(null);
         setObj3dModalOpen(false);
       } catch (e: unknown) {
         setObj3dMsg({
           ok: false,
           text: e instanceof Error ? e.message : t('editor3D.errorLoading'),
         });
+      } finally {
+        setObj3dOpeningName(null);
       }
     },
-    [applyObjectConfig]
+      [applyObjectConfig, ensureStylesheet, createObjectsFromZeusData, importMode, sceneObjects]
   );
 
   // Navegador: carga en el editor un archivo .zeus seleccionado desde el
@@ -3394,19 +3894,24 @@ export default function Home() {
         // Normalizamos y centramos todas las piezas juntas
         normalizeAndCenterMeshes(meshes);
         const baseId = `object-${Date.now()}`;
-        // Creamos un objeto escena por pieza, con identificadores únicos
-        setSceneObjects((objects) => [
-          ...objects,
-          ...meshes.map((mesh, i) => ({
-            id: i === 0 ? baseId : `${baseId}-${i}`,
-            name: t('editor3D.pieceN', { n: i + 1 }),
-            transform: { px: 0, py: 0, pz: 0, sx: 1, sy: 1, sz: 1, rx: 0, ry: 0, rz: 0 },
-            mesh: structuredClone(mesh),
-            smooth: true,
-          })),
-        ]);
-        // Seleccionamos la primera pieza
-        setSelectedObjectId(baseId);
+        const newObjects = meshes.map((mesh, i) => ({
+          id: i === 0 ? baseId : `${baseId}-${i}`,
+          name: t('editor3D.pieceN', { n: i + 1 }),
+          transform: { px: 0, py: 0, pz: 0, sx: 1, sy: 1, sz: 1, rx: 0, ry: 0, rz: 0 },
+          mesh: structuredClone(mesh),
+          smooth: true,
+        }));
+        if (importMode === 'new') {
+          // En escena nueva: reemplazar la escena actual
+          setSceneObjects(newObjects);
+          setSelectedObjectId(baseId);
+          setGroups([]);
+          setConfigObjectId(null);
+        } else {
+          // Abrir en escena: añadir a la escena actual
+          setSceneObjects((objects) => [...objects, ...newObjects]);
+          setSelectedObjectId(baseId);
+        }
         setModelImportMsg({ ok: true, text: t('editor3D.importedMsg', { pieces: meshes.length, vertices: totalVertices }) });
       } catch (e: unknown) {
         setModelImportMsg({
@@ -3415,12 +3920,15 @@ export default function Home() {
         });
       }
     },
-    []
+    [importMode]
   );
 
   // Abre el modal "Objeto 3D": lista los .zeus de public/Obj-3D y los de la
   // carpeta local donde guarda el botón Guardar (la carpeta local solo
-  // existe en la app de escritorio).
+  // existe en la app de escritorio). El listado del servidor ya trae la
+  // miniatura diezmada de cada figura pública, así que las tarjetas se ven
+  // en una sola petición — antes cada tarjeta se bajaba su .zeus entero
+  // (megas) una a una, y el spinner tapaba la lista hasta terminar.
   const openObj3dModal = useCallback(async () => {
     setObj3dMsg(null);
     setObj3dFiles([]);
@@ -3428,91 +3936,149 @@ export default function Home() {
     setObj3dModalOpen(true);
     setObj3dLoading(true);
     try {
-      // public/Obj-3D (se crea en la escena al pinchar)
+      const files: Array<{
+        name: string;
+        source: 'public' | 'local' | 'project';
+        path?: string;
+        mesh?: Mesh | null;
+      }> = [];
+      // public/Obj-3D (se crea en la escena al pinchar): miniaturas incluidas
       try {
         const res = await fetch('/api/objetos-3d', { cache: 'no-store' });
         const data = await res.json();
-        const files: Array<{
-          name: string;
-          source: 'public' | 'local';
-          path?: string;
-        }> = (Array.isArray(data.files) ? data.files : []).map(
-          (f: { name: string }) => ({ name: f.name, source: 'public' as const })
-        );
-
-        // Carpeta local de Objetos 3D (se carga en el editor al pinchar)
-        if (isElectron()) {
-          try {
-            const paths = await getLocalPaths();
-            const folder = paths?.objetos_3d;
-            if (folder) {
-              const localFiles = await listDirectory(folder);
-              for (const f of localFiles || []) {
-                if (
-                  f &&
-                  !f.isDirectory &&
-                  /\.zeus$/i.test(f.name || '') &&
-                  !files.some((x) => x.source === 'local' && x.name === f.name)
-                ) {
-                  files.push({
-                    name: f.name,
-                    source: 'local',
-                    path: f.path,
-                  });
-                }
-              }
-            }
-          } catch {
-            // Sin carpeta local la sección se queda vacía
+        for (const f of Array.isArray(data.files) ? data.files : []) {
+          if (f && typeof f.name === 'string') {
+            files.push({ name: f.name, source: 'public', mesh: f.mesh ?? null });
           }
-        }
-        setObj3dFiles(files);
-
-        // Miniaturas: se lee la figura de cada archivo (una sola vez,
-        // cacheada) y su tarjeta la dibuja congelada, como las miniaturas
-        // de texturas del explorador. Cada tarjeta se rellena en cuanto
-        // le toca, así la lista se ve desde el primer momento.
-        for (const f of files) {
-          const cacheKey = `${f.source}/${f.name}`;
-          let mesh = obj3dMeshCacheRef.current.get(cacheKey) ?? null;
-          if (!mesh) {
-            try {
-              const fileData =
-                f.source === 'local' && f.path
-                  ? await readProject(f.path)
-                  : await (
-                      await fetch(`/Obj-3D/${encodeURIComponent(f.name)}`, {
-                        cache: 'no-store',
-                      })
-                    ).json();
-              if (fileData) {
-                const source = extractObj3dMesh(fileData);
-                if (source) {
-                  mesh = source.mesh;
-                  obj3dMeshCacheRef.current.set(cacheKey, mesh);
-                }
-              }
-            } catch {
-              // Sin miniatura si el archivo no se puede leer: la tarjeta
-              // sigue funcionando igual para crear el objeto
-            }
-          }
-          setObj3dFiles((prev) =>
-            prev.map((x) =>
-              x.source === f.source && x.name === f.name
-                ? { ...x, mesh: mesh ?? null }
-                : x
-            )
-          );
         }
       } catch {
-        // Si no se puede leer public/Obj-3D, mostrar la lista vacía
-        // sin interrumpir la experiencia del usuario
+        // Si no se puede leer public/Obj-3D: se sigue con la carpeta local
       }
+
+       // Carpeta local de Objetos 3D (se carga en el editor al pinchar):
+       // primero solo los nombres, las miniaturas se leen en paralelo.
+       if (isElectron()) {
+         try {
+           const paths = await getLocalPaths();
+           const folder = paths?.objetos_3d;
+           if (folder) {
+             const localFiles = await listDirectory(folder);
+             for (const f of localFiles || []) {
+               if (
+                 f &&
+                 !f.isDirectory &&
+                 /\.zeus$/i.test(f.name || '') &&
+                 !files.some((x) => x.source === 'local' && x.name === f.name)
+               ) {
+                 files.push({
+                   name: f.name,
+                   source: 'local',
+                   path: f.path,
+                 });
+               }
+             }
+           }
+         } catch {
+           // Sin carpeta local la sección se queda vacía
+         }
+
+         // Carpeta local de Proyectos 3D (se carga en el editor al pinchar):
+         // igual que los objetos, con su propia sección en el modal.
+         try {
+           const paths = await getLocalPaths();
+           const folder = paths?.proyectos_3d;
+           if (folder) {
+             const projectFiles = await listDirectory(folder);
+             for (const f of projectFiles || []) {
+               if (
+                 f &&
+                 !f.isDirectory &&
+                 /\.zeus$/i.test(f.name || '') &&
+                 !files.some((x) => x.source === 'project' && x.name === f.name)
+               ) {
+                 files.push({
+                   name: f.name,
+                   source: 'project',
+                   path: f.path,
+                 });
+               }
+             }
+           }
+         } catch {
+           // Sin carpeta local la sección se queda vacía
+         }
+       }
+
+      // La lista se ve ya: el spinner solo cubre el listado. Las miniaturas
+      // que faltan (carpeta local) se rellenan en cuanto llegan.
+      setObj3dFiles(files);
+      setObj3dLoading(false);
+
+      // Miniaturas de la carpeta local (objetos y proyectos): en paralelo
+      // (antes una detrás de otra) y cacheadas entre aperturas del modal.
+      await Promise.all(
+        files
+          .filter((f) => (f.source === 'local' || f.source === 'project') && f.path)
+          .map(async (f) => {
+            const cacheKey = `${f.source}/${f.name}`;
+            let mesh = obj3dMeshCacheRef.current.get(cacheKey) ?? null;
+            if (!mesh) {
+              try {
+                const fileData = await readProject(f.path!);
+                const source = extractObj3dMesh(fileData);
+                if (source) {
+                  mesh = decimateMesh(source.mesh);
+                  obj3dMeshCacheRef.current.set(cacheKey, mesh);
+                }
+              } catch {
+                // Sin miniatura si el archivo no se puede leer: la tarjeta
+                // sigue funcionando igual para abrir el objeto
+              }
+            }
+            if (mesh) {
+              setObj3dFiles((prev) =>
+                prev.map((x) =>
+                  x.source === f.source && x.name === f.name
+                    ? { ...x, mesh }
+                    : x
+                )
+              );
+            }
+          })
+      );
     } finally {
       setObj3dLoading(false);
     }
   }, []);
+
+  // Datos completos de un archivo del modal (clave "origen/nombre"):
+  // si el ratón ya pasó por su tarjeta estará precargado (hover) y pinchar
+  // es instantáneo; si no, se lee ahora. La miniatura del listado está
+  // diezmada — para crear el objeto hace falta la malla completa.
+  const getObj3dFileData = useCallback(
+    async (file: {
+      name: string;
+      source: 'public' | 'local' | 'project';
+      path?: string;
+    }) => {
+      const cacheKey = `${file.source}/${file.name}`;
+      const cached = obj3dDataCacheRef.current.get(cacheKey);
+      if (cached) {
+        const data = await cached.catch(() => null);
+        if (data) return data;
+        obj3dDataCacheRef.current.delete(cacheKey);
+      }
+      const promise: Promise<unknown> =
+        (file.source === 'local' || file.source === 'project') && file.path
+          ? readProject(file.path)
+          : fetch(`/Obj-3D/${encodeURIComponent(file.name)}`, {
+              cache: 'no-store',
+            }).then((res) => (res.ok ? res.json() : Promise.reject(res)));
+      obj3dDataCacheRef.current.set(cacheKey, promise);
+      return promise;
+    },
+    []
+  );
 
   // Crea en la escena actual el objeto guardado pinchado en el modal: la
   // figura guardada entra como objeto nuevo de ESTA pestaña (igual que
@@ -3522,11 +4088,13 @@ export default function Home() {
       if (obj3dCreating) return;
       setObj3dCreating(true);
       try {
-        const res = await fetch(`/Obj-3D/${encodeURIComponent(file.name)}`, {
-          cache: 'no-store',
-        });
-        if (!res.ok) throw new Error(t('editor3D.cannotReadFile'));
-        const data = await res.json();
+        // El archivo completo: precargado al pasar el ratón (y si no, ahora)
+        let data: any;
+        try {
+          data = await getObj3dFileData({ ...file, source: 'public' });
+        } catch {
+          throw new Error(t('editor3D.cannotReadFile'));
+        }
         if (!data || data.type !== 'editor3d') {
           throw new Error(
             t('editor3D.notA3dObject', { name: file.name })
@@ -3542,22 +4110,49 @@ export default function Home() {
           (object) => object.id === selectedObjectId
         );
         const newId = `object-${Date.now()}`;
-        setSceneObjects((objects) => [
-          ...objects,
-          {
-            id: newId,
-            name: t('editor3D.copyOf', { name: source.name ?? t('editor3D.defaultObjectName') }),
-            mode, // Solo visible en esta pestaña
-            transform: {
-              ...(current?.transform ?? IDENTITY_TRANSFORM),
-              px: (current?.transform.px ?? 0) + 1.5,
+        if (importMode === 'new') {
+          setSceneObjects([
+            {
+              id: newId,
+              name: t('editor3D.copyOf', { name: source.name ?? t('editor3D.defaultObjectName') }),
+              mode, // Solo visible en esta pestaña
+              transform: {
+                ...(current?.transform ?? IDENTITY_TRANSFORM),
+                px: (current?.transform.px ?? 0) + 1.5,
+              },
+              mesh: structuredClone(source.mesh),
+              smooth: source.smooth,
+              textureProjection: source.textureProjection,
             },
-            mesh: structuredClone(source.mesh),
-            smooth: source.smooth,
-            textureProjection: source.textureProjection,
-          },
-        ]);
-        setObj3dModalOpen(false);
+          ]);
+          setSelectedObjectId(newId);
+          setConfigObjectId(null);
+          setGroups([]);
+          setObj3dModalOpen(false);
+        } else {
+          // Abrir en escena: añadir a la escena actual sin tocar la
+          // configuración
+          setSceneObjects((objects) => [
+            ...objects,
+            {
+              id: newId,
+              name: t('editor3D.copyOf', { name: source.name ?? t('editor3D.defaultObjectName') }),
+              mode, // Solo visible en esta pestaña
+              transform: {
+                ...(current?.transform ?? IDENTITY_TRANSFORM),
+                px: (current?.transform.px ?? 0) + 1.5,
+              },
+              mesh: structuredClone(source.mesh),
+              smooth: source.smooth,
+              textureProjection: source.textureProjection,
+            },
+          ]);
+          // Seleccionar el objeto nuevo: el visor solo dibuja las copias de
+          // escena cuando hay un objeto activo, así que sin selección el
+          // objeto recién creado quedaba invisible.
+          setSelectedObjectId(newId);
+          setObj3dModalOpen(false);
+        }
       } catch (e: unknown) {
         setObj3dMsg({
           ok: false,
@@ -3567,44 +4162,35 @@ export default function Home() {
         setObj3dCreating(false);
       }
     },
-    [obj3dCreating, mode, sceneObjects, selectedObjectId]
+    [obj3dCreating, getObj3dFileData, mode, sceneObjects, selectedObjectId, importMode, t]
   );
 
-  // Pasa el ratón por una tarjeta del modal: su figura se lee (una vez,
-  // cacheada) y se ve girando en la vista previa 3D de arriba. Vale para
-  // los archivos de public/Obj-3D y para los de la carpeta local.
+  // Pasa el ratón por una tarjeta del modal: su figura se ve girando en la
+  // vista previa 3D de arriba — la miniatura ya la trae la propia tarjeta
+  // (diezmada, sin bajar el archivo entero) y, de paso, el archivo completo
+  // se precarga en segundo plano para que pinchar sea instantáneo.
   const loadObj3dPreview = useCallback(
-    async (file: {
+    (file: {
       name: string;
-      source: 'public' | 'local';
+      source: 'public' | 'local' | 'project';
       path?: string;
+      mesh?: Mesh | null;
     }) => {
       const cacheKey = `${file.source}/${file.name}`;
-      const cached = obj3dMeshCacheRef.current.get(cacheKey);
-      if (cached) {
-        setObj3dPreview({ name: file.name, mesh: cached });
-        return;
-      }
-      try {
-        const data =
-          file.source === 'local' && file.path
-            ? await readProject(file.path)
-            : await (
-                await fetch(`/Obj-3D/${encodeURIComponent(file.name)}`, {
-                  cache: 'no-store',
-                })
-              ).json();
-        if (!data) return;
-        const source = extractObj3dMesh(data);
-        if (!source) return;
-        obj3dMeshCacheRef.current.set(cacheKey, source.mesh);
-        setObj3dPreview({ name: file.name, mesh: source.mesh });
-      } catch {
-        // Sin vista previa si el archivo no se puede leer: la tarjeta
-        // sigue funcionando igual para crear el objeto
+      const mesh =
+        file.mesh && file.mesh.vertices.length > 0
+          ? file.mesh
+          : obj3dMeshCacheRef.current.get(cacheKey);
+      if (mesh) setObj3dPreview({ name: file.name, mesh });
+      // Precarga del archivo que se apunta (una sola vez, promesa cacheada)
+      if (!obj3dDataCacheRef.current.has(cacheKey)) {
+        obj3dDataCacheRef.current.set(
+          cacheKey,
+          getObj3dFileData(file).catch(() => null)
+        );
       }
     },
-    []
+    [getObj3dFileData]
   );
 
   const resetModel = useCallback(() => {
@@ -3612,10 +4198,10 @@ export default function Home() {
     setPolylines({});
     if (mode === 'text') {
       setEditedVertices(null);
-      setEditingTextPanel(null);
+      setEditingPanel(null);
     } else if (mode === 'lathe') {
       setEditedVertices(null);
-      setEditingLathePanel(null);
+      setEditingPanel(null);
     } else if (mode === 'mesh') {
       setMeshSilhouette(structuredClone(DEFAULT_MESH_SILHOUETTE));
       setMeshSections(structuredClone(DEFAULT_MESH_SECTIONS));
@@ -3630,26 +4216,40 @@ export default function Home() {
       setExtrudeDepth(0.5);
       setExtrudeHoles([]);
       setEditedVertices(null);
-      setEditingView(null);
+      setEditingPanel(null);
     }
   }, [mode]);
 
   // Exporta el objeto actual a un formato de archivo común. Se exporta
-  // la misma malla triangulada que ve el visor 3D.
+  // la misma malla triangulada que ve el visor 3D. En la pestaña neutra
+  // no hay figura viva (triMesh vacío), así que se exporta la
+  // instantánea del objeto seleccionado.
   const exportModel = useCallback(
     (format: 'stl' | 'obj' | 'ply' | 'glb') => {
-      if (triMesh.vertices.length === 0) return;
+      // En Escena (o sin dueño) el triMesh está vacío: usar la
+      // instantánea del seleccionado, que es justo lo que ve el usuario.
+      const meshToExport =
+        triMesh.vertices.length > 0
+          ? triMesh
+          : frozenSelected?.mesh && frozenSelected.mesh.vertices.length > 0
+            ? frozenSelected.mesh
+            : null;
+      if (!meshToExport) return;
       const name = 'modelo-3d';
-      if (format === 'stl') exportSTL(triMesh, name);
-      else if (format === 'obj') exportOBJ(triMesh, name);
-      else if (format === 'ply') exportPLY(triMesh, name);
-      else exportGLB(triMesh, name);
+      if (format === 'stl') exportSTL(meshToExport, name);
+      else if (format === 'obj') exportOBJ(meshToExport, name);
+      else if (format === 'ply') exportPLY(meshToExport, name);
+      else exportGLB(meshToExport, name);
     },
-    [triMesh]
+    [triMesh, frozenSelected]
   );
 
+  // En la pestaña neutra no se construye ninguna figura: no hay nada
+  // que "poder construir", la barra de aviso tampoco tiene sentido ahí.
   const canBuild =
-    mode === 'text'
+    mode === 'scene'
+      ? false
+      : mode === 'text'
       ? text.trim().length > 0
       : mode === 'lathe'
         ? latheProfile.length >= 3
@@ -3705,15 +4305,23 @@ export default function Home() {
     if (selectionChanged) return;
     // La textura que manda en la pestaña actual
     const appliedTexture = mode === 'lathe' ? latheTexture : texture;
+    // IDs de objetos a actualizar: la copia congelada primaria y, si hay
+    // multiselección, todos los IDs seleccionados.
+    const idsToUpdate = new Set([...selectedObjectIds, frozenSelectedId]);
     setSceneObjects((current) =>
       current.map((object) => {
-        if (object.id !== frozenSelectedId || !object.mesh) return object;
+        if (!idsToUpdate.has(object.id) || !object.mesh) return object;
         return {
           ...object,
           textureProjection,
           mesh: {
             ...object.mesh,
-            texture: appliedTexture ?? undefined,
+            // Igual que en la figura viva: el panel sin textura no
+            // borra el trazo propio de una fuente de color en un
+            // texto (textura tejida en sus uvs).
+            texture:
+              appliedTexture ??
+              (object.mode === 'text' ? object.mesh.texture : undefined),
             textureColor: '#ffffff',
             textureRelief,
             textureRepeat,
@@ -3722,17 +4330,21 @@ export default function Home() {
         };
       })
     );
-  }, [
-    mode,
-    texture,
+    // También forzar el refresco del visor 3D para que refleje el cambio
+    // en tiempo real, incluso cuando no se multi-selecciona.
+    setViewRefreshTick((t) => t + 1);
+   }, [
+     mode,
+     texture,
      latheTexture,
      textureRelief,
      textureRepeat,
      textureFinish,
-    textureProjection,
-    frozenSelectedId,
-    isUndoRedo,
-  ]);
+     textureProjection,
+     frozenSelectedId,
+     selectedObjectIds,
+     isUndoRedo,
+   ]);
 
   const copyCurrentObject = useCallback(() => {
     // Con un lienzo 2D abierto a pantalla completa, Copiar trabaja con
@@ -3753,6 +4365,21 @@ export default function Home() {
         return;
       }
     }
+    // Copiar sin dueño (p. ej. desde la pestaña Escena, o con un objeto
+    // congelado seleccionado en cualquier pestaña): la malla viva está
+    // vacía, así que el portapapeles se construye desde la instantánea
+    // del propio objeto — su figura, su configuración y su pestaña
+    // viajan con él y Pegar crea una copia congelada idéntica.
+    if (!configObjectId && frozenSelected?.mesh) {
+      setEditorClipboard({
+        mode: frozenSelected.mode,
+        ...(frozenSelected.config ?? capturePanelConfig()),
+        mesh: structuredClone(frozenSelected.mesh),
+        smooth: frozenSelected.smooth ?? false,
+      });
+      setMultiObjectClipboard(null);
+      return;
+    }
     setEditorClipboard({
       mode,
       ...capturePanelConfig(),
@@ -3762,14 +4389,16 @@ export default function Home() {
       smooth: smoothShadingValue,
     });
     setMultiObjectClipboard(null);
-  }, [mode, capturePanelConfig, triMesh, smoothShadingValue, fullScreenCanvas, selectedObjectIds, sceneObjects]);
+  }, [mode, configObjectId, frozenSelected, capturePanelConfig, triMesh, smoothShadingValue, fullScreenCanvas, selectedObjectIds, sceneObjects]);
 
   // Solo el dueño de la configuración se congela con la malla actual,
   // porque su figura ES la que el editor está construyendo. Las copias
   // pegadas no se tocan: su figura es su propia instantánea y no se
   // sobrescribe con la configuración de otro. Junto a la malla se
   // congela también su configuración completa: al volver a
-  // seleccionarlo, el panel recuperará sus plantillas y ajustes.
+  // seleccionarlo, el panel recuperará sus plantillas y ajustes. La
+  // pestaña donde nació (mode) viaja con él: es la única forma de
+  // saber en qué herramienta se edita su figura.
    const freezeObjectSnapshot = useCallback(
      (objectId: string) => {
        setSceneObjects((current) =>
@@ -3777,6 +4406,10 @@ export default function Home() {
            object.id === objectId
              ? {
                  ...object,
+                 // Congelar desde Escena no cambia su pestaña: un
+                 // objeto nacido en el espacio neutro la gana la
+                 // primera vez que se congela en su herramienta.
+                 mode: mode === 'scene' ? object.mode : mode,
                  mesh: structuredClone(triMesh),
                  smooth: smoothShadingValue,
                  textureProjection,
@@ -3786,74 +4419,109 @@ export default function Home() {
          )
        );
      },
-     [triMesh, smoothShadingValue, textureProjection, capturePanelConfig]
+     [mode, triMesh, smoothShadingValue, textureProjection, capturePanelConfig]
    );
 
-   // Apply the current texture to ALL selected objects in the scene
-   const applyTextureToSelectedObjects = useCallback(() => {
-     if (selectedObjectIds.length === 0) return;
-     const textureUrl = mode === 'lathe' ? latheTexture : texture;
-     setSceneObjects((current) =>
-       current.map((object) => {
-         if (!selectedObjectIds.includes(object.id)) return object;
-         const mesh = object.mesh;
-         if (!mesh || mesh.vertices.length === 0) return object;
-         const newMesh = structuredClone(mesh);
-          newMesh.texture = textureUrl ?? undefined;
-          newMesh.textureColor = '#ffffff';
-          newMesh.textureRepeat = textureRepeat;
-         // Note: textureRelief, textureFinish, and textureProjection are
-         // panel-level settings and are saved to the object's mesh only
-         // when the object is frozen (freezeObjectSnapshot).
-         return {
-           ...object,
-           mesh: newMesh,
-         };
-       })
-     );
-    }, [selectedObjectIds, mode, latheTexture, texture, textureRepeat]);
-
-    // Apply texture (URL + repeat) state changes to all selected objects in real-time
-    const textureApplySkipRef = useRef(false);
-    useEffect(() => {
-      if (textureApplySkipRef.current) {
-        textureApplySkipRef.current = false;
-        return;
+  // Cambio de pestaña: el único camino para moverse entre pestañas. El
+  // usuario entra a cada pestaña manualmente — ningún clic ni acción
+  // cambia la pestaña por sí solo. Al salir de una pestaña-herramienta
+  // el dueño se congela con la figura que estaba construyendo: su
+  // objeto deja de depender de la pestaña activa y no puede mutar al
+  // recorrer el editor. En la pestaña neutra "Escena" nunca se
+  // re-adueña a nadie: la escena muestra las instantáneas.
+  const switchTab = useCallback(
+    (next: Mode) => {
+      if (next === mode) return;
+      // El ex-dueño sigue SELECCIONADO: su figura pasa a verse desde su
+      // instantánea. (No se des-selecciona: el visor ancla los
+      // duplicados al objeto seleccionado y sin selección los objetos
+      // congelados dejarían de dibujarse.)
+      if (configObjectId) {
+        freezeObjectSnapshot(configObjectId);
+        setConfigObjectId(null);
       }
-      applyTextureToSelectedObjects();
-      setViewRefreshTick((t) => t + 1);
-    }, [texture, latheTexture, textureRepeat, applyTextureToSelectedObjects]);
-
-  // Al cambiar de objeto activo, los controles de textura pasan a
-  // mostrar los ajustes del recién seleccionado: los que tiene
-  // guardados en su instantánea (su textura, acabado, relieve y
-  // proyección), no los que quedaran en pantalla del anterior. Sin
-  // instantánea (dueño recién creado o objetos de proyectos cargados)
-  // no se toca nada: lo que hay en pantalla ya es lo suyo.
-   const syncTextureStateToSelection = useCallback(
-     (id: string | null) => {
-       if (!id) return;
-       textureApplySkipRef.current = true;
-       const object = sceneObjects.find((o) => o.id === id);
-      const mesh = object?.mesh;
-      if (!mesh || mesh.vertices.length === 0) return;
-      const objectTexture = mesh.texture ?? null;
-      if (mode === 'lathe') {
-        setLatheTexture(objectTexture);
-        setLatheTextureFileName(objectTexture ? 'textura-objeto' : '');
-      } else {
-        setTexture(objectTexture);
-        setTextureFileName(objectTexture ? 'textura-objeto' : '');
+      setMode(next);
+      setEditedVertices(null);
+      // Cerrar todos los lienzos de la pestaña que se deja: no queda
+      // abierto un editor 2D de una herramienta que ya no está activa.
+      setEditingPanel(null);
+      setEditingMesh(false);
+      setEditingViewProfile(null);
+      setEditingMeshProfile(null);
+      setEditingMeshSide(false);
+      setEditingLatheProfile(false);
+      // Re-adueñación: si el objeto seleccionado pertenece a la
+      // pestaña a la que el usuario ENTRA MANUALMENTE, se abre para
+      // edición en vivo con SUS plantillas y ajustes. En cualquier otro
+      // caso (otra herramienta, Escena) el seleccionado se queda como
+      // instantánea y la escena no cambia en nada.
+      if (next !== 'scene') {
+        const sel = sceneObjects.find((o) => o.id === selectedObjectId);
+        if (sel?.config && (sel.mode ?? next) === next) {
+          applyObjectConfig(structuredClone(sel.config));
+          setConfigObjectId(sel.id);
+        }
       }
-      setTextureProjection(object?.textureProjection ?? 'planar');
-      setTextureFinish(mesh.textureFinish ?? 'semi-matte');
-      setTextureRelief(mesh.textureRelief ?? 0.25);
-      setTextureRepeat(mesh.textureRepeat ?? 1);
     },
-    [mode, sceneObjects]
+    [
+      mode,
+      configObjectId,
+      sceneObjects,
+      selectedObjectId,
+      freezeObjectSnapshot,
+      applyObjectConfig,
+    ]
   );
 
-   const toggleObjectHidden = useCallback(
+    // Transparencia centralizada (pestaña Escena): escribe la opacidad
+    // directamente en la malla de todos los objetos seleccionados — la
+    // instantánea la respeta el visor en vivo y la conserva el guardado.
+    const applyFigureOpacity = useCallback((op: number) => {
+      setFigureOpacity(op);
+      const ids = selectedObjectIds.length > 0
+        ? selectedObjectIds
+        : (selectedObjectId ? [selectedObjectId] : []);
+      if (ids.length === 0) return;
+      setSceneObjects((current) =>
+        current.map((object) => {
+          if (!ids.includes(object.id)) return object;
+          const mesh = object.mesh;
+          if (!mesh || mesh.vertices.length === 0) return object;
+          return { ...object, mesh: { ...mesh, opacity: op } };
+        })
+      );
+      setViewRefreshTick((t) => t + 1);
+    }, [selectedObjectId, selectedObjectIds]);
+
+    // Color de la figura (pestaña Escena): pinta TODAS las caras de los
+    // objetos seleccionados — en las pestañas-herramienta el color vive
+    // en la figura viva (se hornea al reconstruir), pero aquí el panel
+    // manda sobre las instantáneas ya guardadas. (Repintar de un color
+    // plano los textos con fuente de color es lo que el usuario pide
+    // al mover el control: la acción es explícita.)
+    const applyFigureColorToSelected = useCallback((color: string) => {
+      const ids = selectedObjectIds.length > 0
+        ? selectedObjectIds
+        : (selectedObjectId ? [selectedObjectId] : []);
+      if (ids.length === 0) return;
+      setSceneObjects((current) =>
+        current.map((object) => {
+          if (!ids.includes(object.id)) return object;
+          const mesh = object.mesh;
+          if (!mesh || mesh.vertices.length === 0) return object;
+          return {
+            ...object,
+            mesh: {
+              ...mesh,
+              faceColors: mesh.faces.map(() => color),
+            },
+          };
+        })
+      );
+      setViewRefreshTick((t) => t + 1);
+    }, [selectedObjectId, selectedObjectIds]);
+
+    const toggleObjectHidden = useCallback(
      (id: string) => {
        setSceneObjects((current) =>
          current.map((object) =>
@@ -3885,24 +4553,20 @@ export default function Home() {
       // copia ajustada hace un momento.)
       if (id === selectedObjectId) return;
 
-      // Verificar que el objeto sea visible en la pestaña actual
-      if (id) {
-        const obj = sceneObjects.find((o) => o.id === id);
-        if (obj && obj.mode && obj.mode !== mode) {
-          // El objeto no es visible en esta pestaña, no seleccionarlo
-          return;
+      // Cámara-objeto: solo selección. Nunca congela al dueño (no tiene
+      // figura ni configuración de panel), nunca adopta plantillas y no
+      // sincroniza el panel de textura.
+      if (id && sceneObjects.find((o) => o.id === id)?.kind === 'camera') {
+        if (configObjectId && id !== configObjectId) {
+          freezeObjectSnapshot(configObjectId);
         }
-        // Los objetos pegados entre pestañas (tienen mode pero no config)
-        // son copias congeladas: no deben convertirse en el objeto activo
-        // principal, solo deben moverse como duplicados en la escena.
-        if (
-          obj &&
-          obj.mode &&
-          !obj.config &&
-          obj.id !== configObjectId
-        ) {
-          return;
+        setConfigObjectId(null);
+        setSelectedObjectId(id);
+        setCameraKeyframeIndex(null);
+        if (id && !selectedObjectIds.includes(id)) {
+          setSelectedObjectIds([]);
         }
+        return;
       }
 
       // Al salir del dueño de la configuración, se congela su figura y
@@ -3910,15 +4574,22 @@ export default function Home() {
       if (configObjectId && id !== configObjectId) {
         freezeObjectSnapshot(configObjectId);
       }
-      // Si el objeto trae su configuración completa (congelada al dejar
-      // de ser dueño, pegada o cargada de un archivo v3), pasa a ser el
-      // nuevo dueño y el panel muestra SUS plantillas, colores y
-      // texturas: abrir el lienzo 2D es abrir el suyo. Sin configuración
-      // (objetos del modal «Objeto 3D», archivos antiguos) se queda
-      // como antes: se ve su figura congelada en el visor y el panel
-      // conserva la configuración del dueño.
+      // Si el objeto trae su configuración completa (congelada al
+      // dejar de ser dueño, pegada o cargada de un archivo v3) Y el
+      // usuario está en su pestaña-herramienta, pasa a ser el nuevo
+      // dueño y el panel muestra SUS plantillas: abrir el lienzo 2D es
+      // abrir el suyo. En cualquier otra pestaña —y siempre en Escena,
+      // el espacio de trabajo— solo se selecciona, para moverlo o
+      // texturizarlo: su figura es SU instantánea y no se toca. Los
+      // objetos sin configuración (modal «Objeto 3D», copias solo
+      // -figura, archivos antiguos) también quedan como selección
+      // simple.
       const nextObject = id ? sceneObjects.find((o) => o.id === id) : undefined;
-      if (nextObject?.config) {
+      if (
+        nextObject?.config &&
+        mode !== 'scene' &&
+        (nextObject.mode ?? mode) === mode
+      ) {
         applyObjectConfig(structuredClone(nextObject.config));
         setConfigObjectId(id);
         setSelectedObjectId(id);
@@ -4072,7 +4743,8 @@ export default function Home() {
             py: baseTransform.py + (obj.transform.py - centerY) + offsetY,
             pz: baseTransform.pz + (obj.transform.pz - centerZ) + offsetZ,
           },
-            mode: undefined,
+            // El spread de arriba ya trae su mode: la copia conserva la
+            // pestaña donde nació cada objeto.
             mesh: obj.mesh,
             smooth: obj.smooth,
             textureProjection: obj.textureProjection,
@@ -4091,6 +4763,7 @@ export default function Home() {
     // como era, montado sobre su instantánea de malla. La configuración
     // de ESTA pestaña no se toca y el objeto activo sigue siendo el
     // mismo; la copia queda al lado, como las de "pegar" normal.
+    // (Pegar en Escena siempre cae aquí: cb.mode nunca es 'scene'.)
     if (cb.mode !== mode) {
       if (!cb.mesh || cb.mesh.vertices.length === 0)
         return;
@@ -4102,7 +4775,10 @@ export default function Home() {
         {
           id: `object-${Date.now()}`,
           name: t('editor3D.objectN', { n: sceneObjects.length + 1 }),
-          mode: mode, // Solo visible en esta pestaña
+          // La copia conserva la pestaña de ORIGEN del objeto copiado:
+          // su figura se edita en su herramienta, no en la que suelte
+          // el usuario al pegarla.
+          mode: cb.mode,
           transform: {
             ...(current?.transform ?? IDENTITY_TRANSFORM),
             px: (current?.transform.px ?? 0) + 1.5,
@@ -4137,6 +4813,8 @@ export default function Home() {
       {
         id: duplicateId,
         name: t('editor3D.copyOf', { name: selected?.name ?? t('editor3D.defaultObjectName') }),
+        // La copia vive en la misma pestaña que su original.
+        mode: cb.mode,
         transform: { ...baseTransform, px: baseTransform.px + 1.5 },
          mesh: structuredClone(cb.mesh),
          smooth: cb.smooth,
@@ -4164,76 +4842,491 @@ export default function Home() {
     freezeObjectSnapshot,
   ]);
 
-  const createNewObject = useCallback(() => {
+  // Cámara de animación: se crea como un objeto MÁS de la escena, con su
+  // propio recorrido editable. Nace mirando al centro desde delante y
+  // sin fotogramas (el recorrido lo va añadiendo el usuario).
+  const addCameraObject = useCallback(() => {
+    const id = `object-${Date.now()}`;
+    setSceneObjects((objects) => [
+      ...objects,
+      {
+        id,
+        name: t('editor3D.cameraObjectName'),
+        kind: 'camera',
+        mode: 'scene',
+        transform: { ...IDENTITY_TRANSFORM, px: 0, py: 2, pz: 6 },
+        camera: createDefaultCameraData(),
+      },
+    ]);
+    setSelectedObjectId(id);
+    setConfigObjectId(null);
+    setCameraKeyframeIndex(null);
+    setViewRefreshTick((v) => v + 1);
+  }, [t]);
+
+  // Creación automática: el objeto se crea al vuelo ADOPTANDO el panel
+  // tal cual. Cuando el usuario empieza a dibujar o a escribir en una
+  // pestaña-herramienta sin ningún objeto en edición, el objeto se crea
+  // con lo que ya hay en pantalla — no obliga a pasar antes por un botón
+  // que fabrique el objeto. No aplica la plantilla por defecto (el
+  // dibujo/texto del usuario ya está en el panel), no reinicia el nombre
+  // ni la ruta del proyecto (no es un abandono explícito: "Guardar" debe
+  // seguir actualizando el archivo abierto) y no cierra lienzos (se
+  // dispara desde dentro de ellos, mientras se dibuja).
+  const adoptPanelAsNewObject = useCallback(() => {
     const current = sceneObjects.find(
       (object) => object.id === selectedObjectId
     );
     const id = `object-${Date.now()}`;
-    // El dueño de la configuración se congela con su figura y su
-    // configuración actuales; el objeto nuevo nace con la plantilla por
-    // defecto (NO como copia del objeto que estaba activo).
-    if (configObjectId) freezeObjectSnapshot(configObjectId);
     setSceneObjects((objects) => [
       ...objects,
       {
         id,
         name: `Objeto ${sceneObjects.length + 1}`,
-        transform: {
-          ...(current?.transform ?? IDENTITY_TRANSFORM),
-          px: (current?.transform.px ?? 0) + 1.5,
-        },
+        mode: mode === 'scene' ? undefined : mode,
+        transform: current?.transform ?? IDENTITY_TRANSFORM,
       },
     ]);
     setSelectedObjectId(id);
     setConfigObjectId(id);
+  }, [sceneObjects, selectedObjectId, mode]);
 
-    // La pieza nueva arranca con la plantilla por defecto en el mismo
-    // instante: el visor la muestra ya con esa forma — sumada al objeto
-    // anterior — y se va actualizando mientras se dibuja.
-    applyObjectConfig(structuredClone(DEFAULT_OBJECT_CONFIG));
-
-    // Cerrar cualquier lienzo/panel abierto y llevar al usuario a los
-    // lienzos 2D de esta pestaña para crear el objeto nuevo.
-    setEditingView(null);
-    setEditingTextPanel(null);
-    setEditingLathePanel(null);
-    setEditingMeshPanel(null);
-    setEditingMesh(false);
-    setEditingMeshProfile(null);
-    setEditingMeshSide(false);
-    setEditingLathe(false);
-    setEditingLatheProfile(false);
-    setEditingViewProfile(null);
-    if (mode === 'views' || mode === 'extrude') {
-      setEditingViewProfile('front');
-    } else if (mode === 'mesh') {
-      setEditingMesh(true);
-    } else if (mode === 'lathe') {
-      setEditingLatheProfile(true);
+  // Detector de "está creando": vigila las señales de dibujo de la
+  // pestaña-herramienta activa y, cuando el usuario cruza el umbral de
+  // figura construible (el mismo que decide si triMesh está vacío) sin
+  // ningún objeto en edición, crea el objeto adoptando el panel.
+  // Dispara UNA sola vez por borrador: la línea base se re-arma al
+  // cambiar de pestaña o de dueño, y solo cuenta la transición del
+  // umbral (false→true) o la primera mutación de los datos de dibujo
+  // con el umbral ya superado — teclear más texto edita el objeto ya
+  // creado (es el dueño), no crea otro.
+  const draftBaselineRef = useRef<{
+    key: string;
+    met: boolean;
+    data: string;
+  } | null>(null);
+  useEffect(() => {
+    if (mode === 'scene') return; // en Escena no se construyen figuras
+    if (isUndoRedo) return; // no crear nada durante un deshacer/rehacer
+    if (obj3dOpeningName) return; // ni a mitad de una carga de archivo
+    // Umbral de figura materializable, por pestaña (espeja los early
+    // returns de baseMesh).
+    const met =
+      mode === 'text'
+        ? text.trim().length > 0
+        : mode === 'lathe'
+          ? latheProfile.length >= 3
+          : mode === 'mesh'
+            ? meshSilhouette.length >= 3 && meshSections.length > 0
+            : views.front.length >= 3; // views y extrude
+    // Huella de los datos de dibujo: cambia cuando el usuario añade,
+    // mueve o borra puntos del dibujo (no con los ajustes secundarios
+    // como opacidad o profundidad).
+    const data = JSON.stringify({
+      mode,
+      text,
+      views,
+      latheProfile,
+      meshSilhouette,
+      meshSections,
+      meshSideView,
+    });
+    const key = `${mode}|${configObjectId ?? 'none'}`;
+    const baseline = draftBaselineRef.current;
+    if (!baseline || baseline.key !== key) {
+      // Pestaña o dueño nuevos: nueva línea base. No dispara aunque el
+      // umbral ya esté superado (contenido heredado del panel), solo
+      // las mutaciones que vengan después.
+      draftBaselineRef.current = { key, met, data };
+      return;
     }
-    // En la pestaña Texto no hay lienzo 2D: queda el texto por defecto.
+    if (!configObjectId && met && (met !== baseline.met || data !== baseline.data)) {
+      adoptPanelAsNewObject();
+      // El nuevo dueño cambia el key: la próxima pasada re-arma la
+      // línea base sin volver a disparar.
+    }
+    draftBaselineRef.current = { key, met, data };
   }, [
-    sceneObjects,
-    selectedObjectId,
-    configObjectId,
-    freezeObjectSnapshot,
-    applyObjectConfig,
     mode,
+    text,
+    views,
+    latheProfile,
+    meshSilhouette,
+    meshSections,
+    meshSideView,
+    configObjectId,
+    isUndoRedo,
+    obj3dOpeningName,
+    adoptPanelAsNewObject,
   ]);
 
    const handleObjectTransform = useCallback(
      (transform: ObjectTransform) => {
        if (!selectedObjectId) return;
        setSceneObjects((current) =>
-         current.map((object) =>
-           object.id === selectedObjectId ? { ...object, transform } : object
-         )
+         current.map((object) => {
+           if (object.id !== selectedObjectId) return object;
+           // Cámara-objeto con fotograma seleccionado: mover el cuerpo
+           // con el gizmo actualiza TAMBIÉN la posición de ese fotograma,
+           // para que el recorrido y el objeto no se desincronicen. En
+           // grabación NO: el arrastre del gizmo es una toma nueva (el kf
+           // se encadena al soltar, con el foco del recorrido intacto).
+           if (
+             object.kind === 'camera' &&
+             object.camera &&
+             cameraKeyframeIndex !== null &&
+             object.camera.keyframes[cameraKeyframeIndex] &&
+             !(
+               grabacionRef.current &&
+               grabacionRef.current.camaraId === object.id
+             )
+           ) {
+             const keyframes = object.camera.keyframes.map((kf, i) =>
+               i === cameraKeyframeIndex
+                 ? {
+                     ...kf,
+                     position: { x: transform.px, y: transform.py, z: transform.pz },
+                   }
+                 : kf
+             );
+             return {
+               ...object,
+               transform,
+               camera: { ...object.camera, keyframes },
+             };
+           }
+           return { ...object, transform };
+         })
        );
      },
-     [selectedObjectId]
+     [selectedObjectId, cameraKeyframeIndex]
    );
 
-   const handleObjectNameChange = useCallback(
+   // Arrastre del asa cian del recorrido: mueve la posición del fotograma.
+  // Si es el fotograma seleccionado, el cuerpo del objeto lo sigue (la
+  // sincronía transform ⇄ fotograma también funciona al revés).
+  const handleCameraKeyframeMove = useCallback(
+    (index: number, pos: Vec3) => {
+      setSceneObjects((current) =>
+        current.map((object) => {
+          if (
+            object.id !== selectedObjectId ||
+            object.kind !== 'camera' ||
+            !object.camera
+          )
+            return object;
+          const keyframes = object.camera.keyframes.map((kf, i) =>
+            i === index ? { ...kf, position: pos } : kf
+          );
+          if (index === cameraKeyframeIndex) {
+            return {
+              ...object,
+              transform: {
+                ...object.transform,
+                px: pos.x,
+                py: pos.y,
+                pz: pos.z,
+              },
+              camera: { ...object.camera, keyframes },
+            };
+          }
+          return { ...object, camera: { ...object.camera, keyframes } };
+        })
+      );
+    },
+    [selectedObjectId, cameraKeyframeIndex]
+  );
+
+  // ----- Cámara-objeto: edición desde la columna Escena -----
+
+  // Cambia datos globales de la cámara (FOV, foco por defecto, etc.).
+  const updateCameraData = useCallback(
+    (objectId: string, patch: Partial<CameraData>) => {
+      setSceneObjects((current) =>
+        current.map((o) =>
+          o.id === objectId && o.camera
+            ? { ...o, camera: { ...o.camera, ...patch } }
+            : o
+        )
+      );
+    },
+    []
+  );
+
+  // Cambia un campo de un fotograma (tiempo, foco, easing...).
+  const updateCameraKeyframe = useCallback(
+    (objectId: string, index: number, patch: Partial<CameraKeyframe>) => {
+      setSceneObjects((current) =>
+        current.map((o) => {
+          if (o.id !== objectId || !o.camera) return o;
+          const keyframes = o.camera.keyframes.map((kf, i) =>
+            i === index ? { ...kf, ...patch } : kf
+          );
+          return { ...o, camera: { ...o.camera, keyframes } };
+        })
+      );
+    },
+    []
+  );
+
+  // Nuevo fotograma: toma la pose ACTUAL del cuerpo (posición) y el foco
+  // del último fotograma (o camera.target si es la primera); su tiempo es
+  // el del reloj de animación y queda seleccionado.
+  const addCameraKeyframe = useCallback(() => {
+    const obj = sceneObjects.find(
+      (o) => o.id === selectedObjectId && o.kind === 'camera' && o.camera
+    );
+    if (!obj?.camera) return;
+    const foco =
+      obj.camera.keyframes.length > 0
+        ? { ...obj.camera.keyframes[obj.camera.keyframes.length - 1].target }
+        : { ...obj.camera.target };
+    const nuevo: CameraKeyframe = {
+      time: Math.round(currentTime * 1000),
+      position: {
+        x: obj.transform.px,
+        y: obj.transform.py,
+        z: obj.transform.pz,
+      },
+      target: foco,
+      easing: 'linear',
+    };
+    const keyframes = [...obj.camera.keyframes, nuevo];
+    setSceneObjects((current) =>
+      current.map((o) =>
+        o.id === obj.id
+          ? {
+              ...o,
+              camera: { ...o.camera!, keyframes },
+            }
+          : o
+      )
+    );
+    setCameraKeyframeIndex(keyframes.length - 1);
+  }, [sceneObjects, selectedObjectId, currentTime]);
+
+  // ----- Modo grabación de la cámara-objeto -----
+
+  // Enciende la grabación en una ventana con su cámara asignada: pausa la
+  // reproducción (el reloj pelearía con el manejo manual) y ancla el reloj
+  // al final del recorrido, para que al parar se muestre el último kf.
+  const iniciarGrabacion = useCallback(
+    (vista: 'front' | 'top' | 'side' | '3d', camaraId: string) => {
+      setPlaying(false);
+      const cam = sceneObjectsPlaybackRef.current.find(
+        (o) => o.id === camaraId && o.kind === 'camera' && o.camera
+      );
+      const kfs = cam?.camera?.keyframes ?? [];
+      if (kfs.length > 0) {
+        setCurrentTime(Math.max(...kfs.map((k) => k.time)) / 1000);
+      }
+      setGrabacion({ vista, camaraId });
+    },
+    []
+  );
+
+  // Apaga la grabación. Los fotogramas capturados quedan en la cámara.
+  const pararGrabacion = useCallback(() => setGrabacion(null), []);
+
+  // Captura un fotograma al soltar un arrastre: pose actual de la cámara
+  // (posición + foco + FOV) como kf nuevo encadenado al final (último kf
+  // + 1 s; t=0 si el recorrido estaba vacío). También sincroniza el
+  // transform del cuerpo para que al parar la grabación reaparezca en el
+  // último punto grabado, sin saltos. La pose llega de la ventana
+  // grabadora (arrastre de la vista) o de la ventana donde se soltó el
+  // gizmo sobre la cámara grabada: ambos lados ya validan la cámara.
+  const capturarFotogramaGrabacion = useCallback(
+    (
+      _vista: 'front' | 'top' | 'side' | '3d',
+      pose: { position: Vec3; target: Vec3; fov: number }
+    ) => {
+      const activa = grabacionRef.current;
+      if (!activa) return;
+      const cam = sceneObjectsPlaybackRef.current.find(
+        (o) => o.id === activa.camaraId && o.kind === 'camera' && o.camera
+      );
+      if (!cam?.camera) return;
+      const kfs = cam.camera.keyframes;
+      const total = kfs.length;
+      const time = total ? Math.max(...kfs.map((k) => k.time)) + 1000 : 0;
+      setSceneObjects((current) =>
+        current.map((o) => {
+          if (o.id !== activa.camaraId || !o.camera) return o;
+          const nuevo: CameraKeyframe = {
+            time,
+            position: { ...pose.position },
+            target: { ...pose.target },
+            easing: 'linear',
+          };
+          return {
+            ...o,
+            camera: {
+              ...o.camera,
+              keyframes: [...o.camera.keyframes, nuevo],
+            },
+            transform: {
+              ...o.transform,
+              px: pose.position.x,
+              py: pose.position.y,
+              pz: pose.position.z,
+            },
+          };
+        })
+      );
+      setCameraKeyframeIndex(total);
+      setCurrentTime(time / 1000);
+    },
+    []
+  );
+
+  // Borra un fotograma; si era el seleccionado, se limpia la selección.
+  const deleteCameraKeyframe = useCallback(
+    (objectId: string, index: number) => {
+      setSceneObjects((current) =>
+        current.map((o) => {
+          if (o.id !== objectId || !o.camera) return o;
+          const keyframes = o.camera.keyframes.filter((_, i) => i !== index);
+          return { ...o, camera: { ...o.camera, keyframes } };
+        })
+      );
+      setCameraKeyframeIndex((prev) => {
+        if (prev === null) return null;
+        if (prev === index) return null;
+        return prev > index ? prev - 1 : prev;
+      });
+    },
+    []
+  );
+
+  // Selecciona un fotograma y carga su pose en el cuerpo del objeto: la
+  // sincronía fotograma ⇄ transform también funciona al revés.
+  const selectCameraKeyframe = useCallback(
+    (index: number | null) => {
+      setCameraKeyframeIndex(index);
+      if (index === null || !selectedObjectId) return;
+      const kf = sceneObjects.find(
+        (o) => o.id === selectedObjectId && o.kind === 'camera' && o.camera
+      )?.camera?.keyframes[index];
+      if (!kf) return;
+      setSceneObjects((current) =>
+        current.map((o) =>
+          o.id === selectedObjectId
+            ? {
+                ...o,
+                transform: {
+                  ...o.transform,
+                  px: kf.position.x,
+                  py: kf.position.y,
+                  pz: kf.position.z,
+                },
+              }
+            : o
+        )
+      );
+    },
+    [sceneObjects, selectedObjectId]
+  );
+
+  // Órbita del foco al ROTAR la cámara-objeto con el gizmo: escribe el
+  // target del fotograma seleccionado; sin fotograma, camera.target.
+  const handleCameraTargetOrbit = useCallback(
+    (target: Vec3) => {
+      setSceneObjects((current) =>
+        current.map((object) => {
+          if (
+            object.id !== selectedObjectId ||
+            object.kind !== 'camera' ||
+            !object.camera
+          )
+            return object;
+          if (
+            cameraKeyframeIndex !== null &&
+            object.camera.keyframes[cameraKeyframeIndex]
+          ) {
+            const keyframes = object.camera.keyframes.map((kf, i) =>
+              i === cameraKeyframeIndex ? { ...kf, target } : kf
+            );
+            return { ...object, camera: { ...object.camera, keyframes } };
+          }
+          return { ...object, camera: { ...object.camera, target } };
+        })
+      );
+    },
+    [selectedObjectId, cameraKeyframeIndex]
+  );
+
+  // Datos de la cámara-objeto en edición para el visor: id, fotograma
+  // activo y el foco que orienta el cuerpo (target del fotograma
+  // seleccionado, o camera.target si no hay ninguno).
+  const cameraEditorValue = useMemo(() => {
+    const cam = sceneObjects.find(
+      (o) => o.id === selectedObjectId && o.kind === 'camera' && o.camera
+    );
+    if (!cam?.camera) return undefined;
+    const kf =
+      cameraKeyframeIndex !== null
+        ? cam.camera.keyframes[cameraKeyframeIndex]
+        : undefined;
+    return {
+      objectId: cam.id,
+      keyframeIndex: cameraKeyframeIndex,
+      focus: kf ? kf.target : cam.camera.target,
+      keyframes: cam.camera.keyframes,
+      fov: cam.camera.fov,
+    };
+  }, [sceneObjects, selectedObjectId, cameraKeyframeIndex]);
+
+  // Primera cámara-objeto con ≥2 fotogramas: la que maneja la vista de
+  // cámara y la exportación MP4 (reproducción con la cámara REAL).
+  const activeCameraValue = useMemo(() => {
+    const cam = sceneObjects.find(
+      (o) => o.kind === 'camera' && o.camera && o.camera.keyframes.length >= 2
+    );
+    if (!cam?.camera) return null;
+    return { id: cam.id, keyframes: cam.camera.keyframes, fov: cam.camera.fov };
+  }, [sceneObjects]);
+
+  // Duración del recorrido de la cámara activa (s): amplía el scrubbing
+  // del editor de animación cuando no hay pistas de objeto.
+  const cameraSpanValue = activeCameraValue
+    ? Math.max(...activeCameraValue.keyframes.map((k) => k.time)) / 1000
+    : 0;
+
+  // Cámara-objeto activa de UNA ventana: SU pose maneja ese visor.
+  const camaraObjetoDeVista = useCallback(
+    (viewName: 'front' | 'top' | 'side' | '3d') => {
+      const id = panelCamerasObjeto[viewName];
+      if (!id) return null;
+      const o = sceneObjects.find(
+        (x) => x.id === id && x.kind === 'camera' && x.camera
+      );
+      if (!o?.camera) return null;
+      return { id: o.id, keyframes: o.camera.keyframes, fov: o.camera.fov };
+    },
+    [panelCamerasObjeto, sceneObjects]
+  );
+
+  // Lista de cámaras-objeto para los selectores de las ventanas (por número).
+  const camarasObjetoValue = useMemo(
+    () =>
+      sceneObjects
+        .filter((o) => o.kind === 'camera')
+        .map((o, i) => {
+          const etiqueta = t('editor3D.cameraN', { n: i + 1 });
+          const nombre = o.name?.trim();
+          return {
+            id: o.id,
+            n: i + 1,
+            etiqueta:
+              nombre && nombre !== t('editor3D.cameraObjectName')
+                ? `${etiqueta} · ${nombre}`
+                : etiqueta,
+          };
+        }),
+    [sceneObjects, t]
+  );
+
+  const handleObjectNameChange = useCallback(
      (id: string, name: string) => {
        setSceneObjects((current) =>
          current.map((object) =>
@@ -4277,6 +5370,21 @@ export default function Home() {
     }
     setSelectedObjectId(nextId);
     setSceneObjects(remaining);
+    // La cámara borrada deja de manejar las ventanas que la tuvieran activa.
+    setPanelCamerasObjeto((prev) => {
+      const borrada = sceneObjects.find((o) => o.id === objectToDelete);
+      if (borrada?.kind !== 'camera') return prev;
+      const next = { ...prev };
+      for (const v of ['front', 'top', 'side', '3d'] as const) {
+        if (next[v] === objectToDelete) next[v] = null;
+      }
+      return next;
+    });
+    // Si la cámara borrada estaba grabando, se corta la grabación.
+    const borrada = sceneObjects.find((o) => o.id === objectToDelete);
+    if (borrada?.kind === 'camera' && grabacionRef.current?.camaraId === objectToDelete) {
+      setGrabacion(null);
+    }
     if (!configApplied) syncTextureStateToSelection(nextId);
     setObjectToDelete(null);
   }, [
@@ -4388,17 +5496,133 @@ export default function Home() {
     [sceneObjects, configObjectId, triMesh]
   );
 
-  const isEditingCanvas =
-    (editingView !== null && (mode === 'views' || mode === 'extrude')) ||
-    (editingLathe && mode === 'lathe') ||
-    (editingTextPanel !== null && mode === 'text') ||
-    (editingLathePanel !== null && mode === 'lathe') ||
-    (editingLatheProfile && mode === 'lathe') ||
-    (editingViewProfile !== null && (mode === 'views' || mode === 'extrude')) ||
-    (editingMeshPanel !== null && mode === 'mesh') ||
-    (editingMesh && mode === 'mesh') ||
-    (editingMeshProfile !== null && mode === 'mesh') ||
-    (editingMeshSide && mode === 'mesh');
+  // Las 4 ventanas (Frente, Superior, Costado y 3D) son las mismas para
+  // todas las herramientas: siempre muestran la escena completa (objeto
+  // seleccionado en vivo + resto congelado). Solo el panel lateral cambia
+  // según la herramienta activa. Es una función que devuelve JSX, no un
+  // componente: definirla como componente remontaría los visores WebGL
+  // (una instancia de THREE.WebGLRenderer por ventana) en cada render.
+  const renderViewerPanel = (viewName: 'front' | 'top' | 'side' | '3d') => (
+    <ViewerPanel
+      viewName={viewName}
+      label={
+        viewName === '3d'
+          ? t('editor3D.panelLabels.threeDFree')
+          : t(`editor3D.panelLabels.${viewName}Axis`)
+      }
+      editingState={editingPanel === viewName}
+      onSetEditing={(v: boolean) => setEditingPanel(v ? viewName : null)}
+      onActiveView={() => setActiveView(viewName)}
+      activeView={activeView}
+      viewerMesh={viewerMesh}
+      visibleSceneObjects={visibleSceneObjects}
+      configObjectId={configObjectId}
+      triMesh={triMesh}
+      smoothShadingValue={smoothShadingValue}
+      textureProjection={textureProjection}
+      selectedObjectId={selectedObjectId}
+      sceneObjects={sceneObjects}
+      handleObjectSelect={handleObjectSelect}
+      onMultiObjectTransform={handleMultiObjectTransform}
+      objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
+      onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
+      selectedObjectIds={selectedObjectIds}
+      onSelectionChange={setSelectedObjectIds}
+      selectionMode={selectionMode}
+      onSelectionModeChange={setSelectionMode}
+      faceSelectMode={faceSelectMode}
+      faceSelectionTool={faceSelectionTool}
+      faceSelectionTarget={faceSelectionTarget}
+      faceSelectVisibleOnly={faceSelectVisibleOnly}
+      wireframeOffSignal={wireframeOffSignal}
+      selectedFaceIds={selectedFaceIds}
+      onFaceSelectionChange={setSelectedFaceIds}
+      selectedVertexIds={selectedVertexIds}
+      onVertexSelectionChange={setSelectedVertexIds}
+      selectedEdgeIds={selectedEdgeIds}
+      onEdgeSelectionChange={setSelectedEdgeIds}
+      onFaceSelectionModeChange={(v) => {
+        setFaceSelectMode(v);
+        if (!v) {
+          setSelectedFaceIds([]);
+          setSelectedVertexIds([]);
+          setSelectedEdgeIds([]);
+        }
+      }}
+      onFaceSelectionToolChange={setFaceSelectionTool}
+      onFaceSelectionTargetChange={(tg) => {
+        setFaceSelectionTarget(tg);
+        // Cada objetivo lleva su propia selección: al cambiar se limpia.
+        setSelectedFaceIds([]);
+        setSelectedVertexIds([]);
+        setSelectedEdgeIds([]);
+      }}
+      showGizmo={showGizmo}
+      handleObjectTransform={handleObjectTransform}
+      activeCamera={camaraObjetoDeVista(viewName)}
+      exportCamera={activeCameraValue}
+      camarasObjeto={camarasObjetoValue}
+      camaraObjetoId={panelCamerasObjeto[viewName]}
+      onCamaraObjetoChange={(id) => {
+        // Cambiar la cámara de una ventana en grabación corta la grabación.
+        if (grabacionRef.current?.vista === viewName && id !== grabacionRef.current.camaraId) {
+          setGrabacion(null);
+        }
+        setPanelCamerasObjeto((prev) => ({ ...prev, [viewName]: id }));
+      }}
+      grabacionActiva={grabacion?.vista === viewName}
+      onGrabacionToggle={() => {
+        if (grabacionRef.current?.vista === viewName) {
+          pararGrabacion();
+        } else if (panelCamerasObjeto[viewName]) {
+          iniciarGrabacion(viewName, panelCamerasObjeto[viewName]!);
+        }
+      }}
+      onGrabacionCaptura={(pose) => capturarFotogramaGrabacion(viewName, pose)}
+      grabacionCamaraId={grabacion?.camaraId ?? null}
+      cameraEditor={cameraEditorValue}
+      onCameraKeyframeMove={handleCameraKeyframeMove}
+      onCameraTargetMove={handleCameraTargetOrbit}
+      onCameraTargetOrbit={handleCameraTargetOrbit}
+      handleVerticesChange={handleVerticesChange}
+      showLatheAxis={mode === 'lathe' as never}
+
+      viewerProjection={viewerProjection}
+      textureRepeat={textureRepeat}
+      textureFinish={textureFinish}
+      textureRelief={textureRelief}
+      textureHelper={textureHelper}
+      textureHelperTransform={textureHelperTransform}
+      setTextureHelperTransform={setTextureHelperTransform}
+      lightConfig={lightConfig}
+      showLightHelpers={showLightHelpers}
+      showGround={showGround}
+      groundTexture={groundTexture}
+      groundTextureFinish={groundTextureFinish}
+      groundTextureRepeat={groundTextureRepeat}
+      objectTextureFinish={objectTextureFinish}
+      skyboxImage={skyboxImage}
+      booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
+      forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
+      showGrid={showGrid}
+      setShowGrid={setShowGrid}
+      fxConfig={fxConfig}
+      setFxConfig={setFxConfig}
+      setLightConfig={setLightConfig}
+      panelCameras={panelCameras}
+      handleCameraChange={handleCameraChange}
+      exportMp4Trigger={exportMp4Trigger}
+      onExportProgress={setExportProgress}
+      onExportComplete={setExportResult}
+      animationTracks={animationTracks}
+      animationTime={currentTime}
+      onAnimationComplete={() => {}}
+      viewerSmooth={viewerSmooth}
+      pan3D={pan3D}
+      zoom3D={zoom3D}
+      orbit3D={orbit3D}
+    />
+  );
 
 
   return (
@@ -4419,11 +5643,12 @@ export default function Home() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          {/* Dropdown: Nuevo objeto, Eliminar objeto, Sustraer forma, Objeto 3D, Guardar, Luces */}
+          {/* Dropdown: Nuevo proyecto, Eliminar objeto, Sustraer forma, Objeto 3D, Guardar, Luces */}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
                 title={t('editor3D.moreActions')}
+                data-testid="actions-menu-trigger"
                 className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 transition-colors"
               >
                 <Plus className="w-3.5 h-3.5" />
@@ -4438,13 +5663,21 @@ export default function Home() {
               <DropdownMenuItem
                 onSelect={(e) => {
                   e.preventDefault();
-                  createNewObject();
+                  // Solo se pregunta si hay algo que perder: en un editor
+                  // ya limpio no debe molestar con un diálogo.
+                  if (
+                    sceneObjects.length > 0 &&
+                    !window.confirm(t('editor3D.newProjectConfirm'))
+                  )
+                    return;
+                  onNewProject?.();
                 }}
+                data-testid="new-project-btn"
                 className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5"
               >
                 <span className="text-sm font-bold flex items-center gap-1.5">
-                  <Plus className="w-3.5 h-3.5" />
-                  Nuevo objeto
+                  <FilePlus className="w-3.5 h-3.5" />
+                  {t('editor3D.newProject')}
                 </span>
               </DropdownMenuItem>
               <DropdownMenuItem
@@ -4466,6 +5699,7 @@ export default function Home() {
                   setBooleanModalOpen(true);
                 }}
                 disabled={visibleSceneObjects.length < 2}
+                data-testid="open-boolean-modal"
                 className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5 disabled:opacity-40"
                 title={
                   visibleSceneObjects.length < 2
@@ -4479,10 +5713,13 @@ export default function Home() {
                 </span>
               </DropdownMenuItem>
               <DropdownMenuItem
-                onSelect={(e) => {
-                  e.preventDefault();
+                onSelect={() => {
+                  // Sin preventDefault: el menú se cierra solo al abrir el
+                  // modal. Si se quedara abierto (menú modal de Radix),
+                  // bloquearía todos los clics del modal recién abierto.
                   openObj3dModal();
                 }}
+                data-testid="open-obj3d-modal"
                 className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5"
               >
                 <span className="text-sm font-bold flex items-center gap-1.5">
@@ -4491,10 +5728,13 @@ export default function Home() {
                 </span>
               </DropdownMenuItem>
               <DropdownMenuItem
-                onSelect={(e) => {
-                  e.preventDefault();
+                onSelect={() => {
+                  // Sin preventDefault: el menú se cierra solo al abrir el
+                  // modal. Si se quedara abierto (menú modal de Radix),
+                  // bloquearía todos los clics del modal recién abierto.
                   openSaveModal();
                 }}
+                data-testid="open-save-modal"
                 className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5"
               >
                 <span className="text-sm font-bold flex items-center gap-1.5">
@@ -4624,20 +5864,9 @@ export default function Home() {
                 )}
              </DropdownMenuContent>
            </DropdownMenu>
-           <button
-             onClick={() => setCameraViewMode(!cameraViewMode)}
-             className={`flex items-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium border transition-colors ${
-               cameraViewMode
-                 ? 'bg-blue-500/20 text-blue-300 border-blue-500/30 hover:bg-blue-500/30'
-                 : 'bg-white/5 text-muted-foreground hover:text-foreground border-white/10 hover:bg-white/10'
-             }`}
-              title={cameraViewMode ? t('editor3D.exitCameraView') : t('editor3D.enterCameraView')}
-           >
-             <Camera className="w-3.5 h-3.5" />
-              <span>{t('editor3D.cameraView')}</span>
-           </button>
             <button
              onClick={copyCurrentObject}
+             data-testid="copy-object-btn"
              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground border border-white/10 transition-colors"
               title={
                 fullScreenCanvas
@@ -4652,6 +5881,7 @@ export default function Home() {
           </button>
           <button
             onClick={pasteCurrentObject}
+            data-testid="paste-object-btn"
               disabled={
                 fullScreenCanvas
                   ? !polygonClipboard
@@ -4673,206 +5903,6 @@ export default function Home() {
              <ClipboardPaste className="w-3.5 h-3.5" />
              {t('editor3D.paste')}
           </button>
-           {sceneObjects.length > 1 && (
-              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <span>{t('editor3D.activeObject')}</span>
-                 <select
-                   value={selectedObjectIds.includes(selectedObjectId ?? '') ? (selectedObjectId ?? '') : ''}
-                   onChange={(e) => handleObjectSelect(e.target.value || null)}
-                  className="bg-gray-900 border border-white/10 rounded-md px-2 py-1.5 text-xs text-foreground focus:outline-none focus:border-green-500"
-                >
-                   {sceneObjects.map((object, index) => (
-                     <option key={object.id} value={object.id}>
-                        {object.name || t('editor3D.objectN', { n: index + 1 })}
-                     </option>
-                   ))}
-                </select>
-              </label>
-            )}
-            {sceneObjects.length > 1 && (
-             <DropdownMenu>
-               <DropdownMenuTrigger asChild>
-                 <button
-                   title={t('editor3D.selectMultipleObjects')}
-                  className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium border transition-colors ${
-                    selectedObjectIds.length > 0
-                      ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30 hover:bg-cyan-500/25'
-                      : 'bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 border border-white/10'
-                  }`}
-                >
-                   <BoxSelect className="w-3.5 h-3.5" />
-                   {t('editor3D.multi', { count: selectedObjectIds.length })}
-                </button>
-              </DropdownMenuTrigger>
-                <DropdownMenuContent className="bg-gray-900 border-gray-800 text-white min-w-[200px] max-h-[400px] overflow-y-auto [&::-webkit-scrollbar]:w-[3px] [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:bg-gray-600/50 hover:[&::-webkit-scrollbar-thumb]:bg-gray-500/50">
-                 {sceneObjects.map((object, index) => {
-                   const checked = selectedObjectIds.includes(object.id);
-                   const color = object.hidden
-                     ? 'text-red-400'
-                     : object.frozen
-                       ? 'text-gray-400'
-                       : 'text-foreground';
-                   const objectGroups = groups.filter((g) =>
-                     g.objectIds.includes(object.id)
-                   );
-                   return (
-                       <DropdownMenuCheckboxItem
-                        key={object.id}
-                        checked={checked}
-                        onCheckedChange={(v) => {
-                           if (v) {
-                             setSelectedObjectIds((prev) => [...prev, object.id]);
-                             // Set this object as the active one for the name input
-                             setSelectedObjectId(object.id);
-                           } else {
-                             setSelectedObjectIds((prev) => {
-                               const next = prev.filter((id) => id !== object.id);
-                               // If we're removing the active object, pick another from the remaining
-                               if (selectedObjectId === object.id && next.length > 0) {
-                                 setSelectedObjectId(next[0]);
-                               } else if (next.length === 0) {
-                                 setSelectedObjectId(null);
-                               }
-                               return next;
-                             });
-                           }
-                         }}
-                        className={`hover:bg-gray-800 cursor-pointer text-xs ${object.hidden ? 'opacity-60' : ''}`}
-                      >
-                        <span className="flex flex-col gap-0.5">
-                          <span className="flex items-center gap-1.5">
-                            <span className={`w-2 h-2 rounded-full ${object.hidden ? 'bg-red-400' : object.frozen ? 'bg-gray-400' : 'bg-green-400'}`} />
-                            <span className={color}>
-                              {object.name || t('editor3D.objectN', { n: index + 1 })}
-                            </span>
-                          </span>
-                          {objectGroups.length > 0 && (
-                            <span className="flex items-center gap-1 pl-3 text-[9px] text-cyan-400/70">
-                              <FolderOpen className="w-2.5 h-2.5" />
-                              {objectGroups.map((g) => g.name).join(', ')}
-                            </span>
-                          )}
-                        </span>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleObjectHidden(object.id);
-                          }}
-                          title={object.hidden ? t('editor3D.showObject') : t('editor3D.hideObject')}
-                          className="ml-auto px-1 py-0.5 rounded text-[10px] hover:bg-gray-700"
-                        >
-                          {object.hidden ? '🟢' : '🔴'}
-                        </button>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleObjectFrozen(object.id);
-                          }}
-                          title={object.frozen ? t('editor3D.unfreezeObject') : t('editor3D.freezeObject')}
-                          className="ml-auto px-1 py-0.5 rounded text-[10px] hover:bg-gray-700"
-                        >
-                          {object.frozen ? '🔓' : '🔒'}
-                        </button>
-                      </DropdownMenuCheckboxItem>
-                    );
-                  })}
-                  {groups.length > 0 && (
-                    <>
-                      <DropdownMenuSeparator className="border-white/10" />
-                      {groups
-                        .filter((g) => g.objectIds.length > 0)
-                        .map((grp) => {
-                          const validCount = grp.objectIds.filter((oid) =>
-                            sceneObjects.some((o) => o.id === oid)
-                          ).length;
-                          if (validCount === 0) return null;
-                          const groupObjs = sceneObjects.filter((o) =>
-                            grp.objectIds.includes(o.id)
-                          );
-                          const allHidden =
-                            groupObjs.length > 0 &&
-                            groupObjs.every((o) => o.hidden);
-                          const allFrozen =
-                            groupObjs.length > 0 &&
-                            groupObjs.every((o) => o.frozen);
-                          return (
-                            <div
-                              key={grp.id}
-                              className="flex items-center gap-1 px-1 rounded-md hover:bg-gray-800 text-xs"
-                                title={t('editor3D.selectGroup', { name: grp.name })}
-                            >
-                              <div
-                                className="flex items-center gap-1.5 flex-1 cursor-pointer py-1 pl-2"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  selectGroup(grp.id);
-                                }}
-                              >
-                                <FolderOpen className="w-3 h-3 text-green-400" />
-                                <span className="truncate">{grp.name}</span>
-                                <span className="text-[9px] text-muted-foreground/60">
-                                  {validCount} / {grp.objectIds.length}
-                                </span>
-                              </div>
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  toggleGroupHidden(grp.id);
-                                }}
-                                title={allHidden ? t('editor3D.showGroup') : t('editor3D.hideGroup')}
-                                className="px-1 py-0.5 rounded text-[10px] hover:bg-gray-700 text-muted-foreground"
-                              >
-                                {allHidden ? '🟢' : '🔴'}
-                              </button>
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  toggleGroupFrozen(grp.id);
-                                }}
-                                title={allFrozen ? t('editor3D.unfreezeGroup') : t('editor3D.freezeGroup')}
-                                className="px-1 py-0.5 rounded text-[10px] hover:bg-gray-700 text-muted-foreground"
-                              >
-                                {allFrozen ? '🔓' : '🔒'}
-                              </button>
-                            </div>
-                          );
-                        })}
-                    </>
-                  )}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
-         {lightConfig && lightConfig.spotlights.length > 0 && (
-            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <Sun className="w-3.5 h-3.5" />
-               <span>{t('editor3D.activeSpotlight')}</span>
-              <select
-                value={0}
-                onChange={() => {}}
-                className="bg-gray-900 border border-white/10 rounded-md px-2 py-1.5 text-xs text-foreground focus:outline-none focus:border-green-500"
-              >
-                {lightConfig.spotlights.filter((s) => s.enabled).map((_, index) => (
-                  <option key={index} value={index}>
-                    {t('editor3D.spotlightN', { n: index + 1 })}
-                  </option>
-                ))}
-              </select>
-            </label>
-          )}
-          {lightConfig && lightConfig.spotlights.length > 0 && (
-            <button
-              onClick={() => setShowLightHelpers(!showLightHelpers)}
-              className={`flex items-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium border transition-colors ${
-                showLightHelpers
-                  ? 'bg-white/10 text-foreground border-white/20 hover:bg-white/15'
-                  : 'bg-white/5 text-muted-foreground hover:text-foreground border-white/10 hover:bg-white/10'
-              }`}
-               title={showLightHelpers ? t('editor3D.hideLightHelpers') : t('editor3D.showLightHelpers')}
-            >
-              <Sun className="w-3.5 h-3.5" />
-               <span>{t('editor3D.spotlightRing')}</span>
-             </button>
-           )}
             {(mode === 'views' || mode === 'mesh' || mode === 'extrude') && (
             <>
               <div className="flex items-center gap-1 text-xs text-muted-foreground mr-2">
@@ -4891,53 +5921,77 @@ export default function Home() {
                   {resolution}
                 </span>
               </div>
-              <div
-                className="flex items-center rounded-md border border-white/10 overflow-hidden mr-2"
-                 title={t('editor3D.meshStyleReconstruct')}
-              >
-                {(
-                  [
-                    {
-                      key: 'suave',
-                      label: t('editor3D.smooth'),
-                      icon: Spline,
-                      title:
-                        t('editor3D.smoothDesc'),
-                    },
-                    {
-                      key: 'fusionada',
-                      label: t('editor3D.merged'),
-                      icon: Grid3x3,
-                      title:
-                        t('editor3D.mergedDesc'),
-                    },
-                    {
-                      key: 'voxeles',
-                      label: t('editor3D.voxels'),
-                      icon: Box,
-                      title:
-                        t('editor3D.voxelsDesc'),
-                    },
-                  ] as const
-                ).map(({ key, label, icon: Icon, title }) => (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
                   <button
-                    key={key}
-                    onClick={() => {
-                      setMeshStyle(key);
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-black/40 border border-white/10 hover:bg-white/5 text-foreground transition-colors"
+                    title={t('editor3D.meshStyleReconstruct')}
+                  >
+                    {meshStyle === 'suave' ? (
+                      <Spline className="w-3.5 h-3.5" />
+                    ) : meshStyle === 'fusionada' ? (
+                      <Grid3x3 className="w-3.5 h-3 h-3" />
+                    ) : (
+                      <Box className="w-3.5 h-3.5" />
+                    )}
+                    <span>
+                      {meshStyle === 'suave'
+                        ? t('editor3D.smooth')
+                        : meshStyle === 'fusionada'
+                          ? t('editor3D.merged')
+                          : t('editor3D.voxels')}
+                    </span>
+                    <ChevronDown className="w-3 h-3 opacity-60" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  align="start"
+                  className="bg-gray-900 border-gray-800 text-white min-w-[140px]"
+                >
+                  <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      setMeshStyle('suave');
                       setEditedVertices(null);
                     }}
-                    className={`flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium transition-colors ${
-                      meshStyle === key
-                        ? 'bg-green-500/25 text-green-300'
-                        : 'bg-white/5 text-muted-foreground hover:bg-white/10'
+                    className={`hover:bg-gray-800 cursor-pointer p-2 flex items-center gap-2 text-xs ${
+                      meshStyle === 'suave' ? 'bg-green-500/20 text-green-300' : ''
                     }`}
-                    title={title}
+                    title={t('editor3D.smoothDesc')}
                   >
-                    <Icon className="w-3.5 h-3.5" />
-                    {label}
-                  </button>
-                ))}
-              </div>
+                    <Spline className="w-3.5 h-3.5" />
+                    {t('editor3D.smooth')}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      setMeshStyle('fusionada');
+                      setEditedVertices(null);
+                    }}
+                    className={`hover:bg-gray-800 cursor-pointer p-2 flex items-center gap-2 text-xs ${
+                      meshStyle === 'fusionada' ? 'bg-green-500/20 text-green-300' : ''
+                    }`}
+                    title={t('editor3D.mergedDesc')}
+                  >
+                    <Grid3x3 className="w-3.5 h-3.5" />
+                    {t('editor3D.merged')}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      setMeshStyle('voxeles');
+                      setEditedVertices(null);
+                    }}
+                    className={`hover:bg-gray-800 cursor-pointer p-2 flex items-center gap-2 text-xs ${
+                      meshStyle === 'voxeles' ? 'bg-green-500/20 text-green-300' : ''
+                    }`}
+                    title={t('editor3D.voxelsDesc')}
+                  >
+                    <Box className="w-3.5 h-3.5" />
+                    {t('editor3D.voxels')}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </>
            )}
 
@@ -4995,11 +6049,40 @@ export default function Home() {
                    <span className="text-xs text-gray-400">{desc}</span>
                  </DropdownMenuItem>
                ))}
-               <DropdownMenuSeparator className="bg-gray-700" />
-               <DropdownMenuItem
-                 className="cursor-default p-2 flex flex-col items-start gap-0.5"
-               >
-                  <span className="text-xs font-semibold text-gray-400">{t('editor3D.importLabel')}</span>
+                <DropdownMenuSeparator className="bg-gray-700" />
+                <DropdownMenuItem
+                  className="cursor-default p-2 flex flex-col items-start gap-1"
+                >
+                  <span className="text-xs font-medium text-gray-400">
+                    {t('editor3D.importModeLabel')}
+                  </span>
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => setImportMode('merge')}
+                      className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                        importMode === 'merge'
+                          ? 'bg-green-600 text-white'
+                          : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                      }`}
+                    >
+                      {t('editor3D.openInScene')}
+                    </button>
+                    <button
+                      onClick={() => setImportMode('new')}
+                      className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                        importMode === 'new'
+                          ? 'bg-green-600 text-white'
+                          : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                      }`}
+                    >
+                      {t('editor3D.inSceneNew')}
+                    </button>
+                  </div>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="cursor-default p-2 flex flex-col items-start gap-0.5"
+                >
+                   <span className="text-xs font-semibold text-gray-400">{t('editor3D.importLabel')}</span>
                </DropdownMenuItem>
                 {IMPORT_FORMATS.map(({ ext, label, descKey, format }) => (
                   <DropdownMenuItem
@@ -5046,6 +6129,7 @@ export default function Home() {
           </button>
           <button
             onClick={undo}
+            data-testid="undo-btn"
             disabled={historyIndex <= 0}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 disabled:opacity-40 transition-colors"
             title={t('editor3D.undoTitle')}
@@ -5056,6 +6140,7 @@ export default function Home() {
 
           <button
             onClick={redo}
+            data-testid="redo-btn"
             disabled={historyIndex >= history.length - 1}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 disabled:opacity-40 transition-colors"
             title={t('editor3D.redoTitle')}
@@ -5110,150 +6195,69 @@ export default function Home() {
           <div className="px-3 pt-3">
             <div className="flex p-1 rounded-lg bg-black/40 border border-white/5">
               <button
-                onClick={() => {
-                  setMode('views');
-                  setEditedVertices(null);
-                  setEditingView(null);
-                  setEditingTextPanel(null);
-                  setEditingLathePanel(null);
-                  setEditingMeshPanel(null);
-                  setEditingMesh(false);
-                  // Al entrar en la pestaña, la pieza principal es la
-                  // figura de esa pestaña (el dueño de la
-                  // configuración); la copia pegada que pudiera estar
-                  // seleccionada se queda como copia al lado.
-                  if (configObjectId) {
-                    setSelectedObjectId(configObjectId);
-                    syncTextureStateToSelection(configObjectId);
-                  } else if (selectedObjectId) {
-                    setSelectedObjectId(null);
-                  }
-                }}
+                data-testid="tab-scene"
+                onClick={() => switchTab('scene')}
+                className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                  mode === 'scene'
+                    ? 'bg-green-500/20 text-green-300'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {t('editor3D.tabs.scene')}
+              </button>
+              <button
+                data-testid="tab-views"
+                onClick={() => switchTab('views')}
                 className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
                   mode === 'views'
                     ? 'bg-green-500/20 text-green-300'
                     : 'text-muted-foreground hover:text-foreground'
                 }`}
               >
-                
                 {t('editor3D.tabs.views')}
               </button>
               <button
-                onClick={() => {
-                  setMode('mesh');
-                  setEditedVertices(null);
-                  setEditingView(null);
-                  setEditingTextPanel(null);
-                  setEditingLathePanel(null);
-                  setEditingMeshPanel(null);
-                  setEditingMesh(false);
-                  // Al entrar en la pestaña, la pieza principal es la
-                  // figura de esa pestaña (el dueño de la
-                  // configuración); la copia pegada que pudiera estar
-                  // seleccionada se queda como copia al lado.
-                  if (configObjectId) {
-                    setSelectedObjectId(configObjectId);
-                    syncTextureStateToSelection(configObjectId);
-                  } else if (selectedObjectId) {
-                    setSelectedObjectId(null);
-                  }
-                }}
+                data-testid="tab-mesh"
+                onClick={() => switchTab('mesh')}
                 className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
                   mode === 'mesh'
                     ? 'bg-green-500/20 text-green-300'
                     : 'text-muted-foreground hover:text-foreground'
                 }`}
               >
-                
                 {t('editor3D.tabs.mesh')}
               </button>
               <button
-                onClick={() => {
-                  setMode('text');
-                  setEditedVertices(null);
-                  setEditingView(null);
-                  setEditingTextPanel(null);
-                  setEditingLathePanel(null);
-                  setEditingMeshPanel(null);
-                  setEditingMesh(false);
-                  // Al entrar en la pestaña, la pieza principal es la
-                  // figura de esa pestaña (el dueño de la
-                  // configuración); la copia pegada que pudiera estar
-                  // seleccionada se queda como copia al lado.
-                  if (configObjectId) {
-                    setSelectedObjectId(configObjectId);
-                    syncTextureStateToSelection(configObjectId);
-                  } else if (selectedObjectId) {
-                    setSelectedObjectId(null);
-                  }
-                }}
+                data-testid="tab-text"
+                onClick={() => switchTab('text')}
                 className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
                   mode === 'text'
                     ? 'bg-green-500/20 text-green-300'
                     : 'text-muted-foreground hover:text-foreground'
                 }`}
               >
-                
                 {t('editor3D.tabs.text')}
                </button>
                <button
-                 onClick={() => {
-                   setMode('lathe');
-                  setEditedVertices(null);
-                  setEditingView(null);
-                  setEditingLathe(false);
-                  setEditingTextPanel(null);
-                  setEditingLathePanel(null);
-                  setEditingMeshPanel(null);
-                  setEditingMesh(false);
-                  // Al entrar en la pestaña, la pieza principal es la
-                  // figura de esa pestaña (el dueño de la
-                  // configuración); la copia pegada que pudiera estar
-                  // seleccionada se queda como copia al lado.
-                  if (configObjectId) {
-                    setSelectedObjectId(configObjectId);
-                    syncTextureStateToSelection(configObjectId);
-                  } else if (selectedObjectId) {
-                    setSelectedObjectId(null);
-                  }
-                }}
-                className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
-                  mode === 'lathe'
-                    ? 'bg-green-500/20 text-green-300'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                
+                 data-testid="tab-lathe"
+                 onClick={() => switchTab('lathe')}
+                 className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                   mode === 'lathe'
+                     ? 'bg-green-500/20 text-green-300'
+                     : 'text-muted-foreground hover:text-foreground'
+                 }`}
+               >
                 {t('editor3D.tabs.lathe')}
               </button>
               <button
-                onClick={() => {
-                  setMode('extrude');
-                  setEditedVertices(null);
-                  setEditingView(null);
-                  setEditingViewProfile(null);
-                  setEditingTextPanel(null);
-                  setEditingLathePanel(null);
-                  setEditingMeshPanel(null);
-                  setEditingMesh(false);
-                  // Al entrar en la pestaña, la pieza principal es la
-                  // figura de esa pestaña (el dueño de la
-                  // configuración); la copia pegada que pudiera estar
-                  // seleccionada se queda como copia al lado.
-                  if (configObjectId) {
-                    setSelectedObjectId(configObjectId);
-                    syncTextureStateToSelection(configObjectId);
-                  } else if (selectedObjectId) {
-                    setSelectedObjectId(null);
-                  }
-                }}
+                data-testid="tab-extrude"
+                onClick={() => switchTab('extrude')}
                 className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
                   mode === 'extrude'
                     ? 'bg-green-500/20 text-green-300'
                     : 'text-muted-foreground hover:text-foreground'
                 }`}
               >
-                
                 {t('editor3D.tabs.extrude')}
               </button>
             </div>
@@ -5275,17 +6279,21 @@ export default function Home() {
                   selectedTrackId={selectedTrackId}
                   setSelectedTrackId={setSelectedTrackId}
                   playing={playing}
-                  setPlaying={setPlaying}
+                  setPlaying={(v) => {
+                    // Reproducir durante la grabación la corta: el reloj
+                    // pelearía con el manejo manual de la cámara.
+                    if (v && grabacionRef.current) setGrabacion(null);
+                    setPlaying(v);
+                  }}
                   currentTime={currentTime}
                   setCurrentTime={setCurrentTime}
                   sceneObjects={visibleSceneObjects}
-                  panelCameras={panelCameras}
-                   isRecordingCameraPath={isRecordingCameraPath}
-                   onStartCameraRecording={startCameraPathRecording}
-                   onStopCameraRecording={stopCameraPathRecording}
-                    showCameraPath={showCameraPath}
-                   onShowCameraPathChange={setShowCameraPath}
+                  canExportMp4={!!activeCameraValue}
+                  cameraSpan={cameraSpanValue}
                    onExportMp4={() => {
+                     // La exportación maneja el visor con su propia rama:
+                     // corta la grabación para no pelear con ella.
+                     setGrabacion(null);
                      setExportProgress(null);
                      setExportResult(null);
                      setExportMp4Trigger((t) => t + 1);
@@ -5422,7 +6430,12 @@ export default function Home() {
            )}
 
            {mode === 'views' || mode === 'extrude' ? (
-            <>
+            // key por modo: sin él, React reconcilia este panel con el de la
+            // otra pestaña posición a posición y morfa un <input type="file">
+            // (sin value) en el input controlado del nombre de textura — el
+            // warning "uncontrolled input to be controlled". Con key el panel
+            // se desmonta y se monta limpio en cada cambio de pestaña.
+            <Fragment key={mode}>
               <div className="px-3 py-2 border-b border-white/5">
 <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
                   <span className="w-1 h-3 rounded-full bg-green-500" />
@@ -5571,180 +6584,10 @@ export default function Home() {
                 </div>
               )}
 
-              <div className="border-t border-white/5 px-3 py-3 space-y-3 bg-[hsl(224_50%_6%)]">
-                <h3 className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center gap-2">
-                  <Palette className="w-3.5 h-3.5 text-green-400" />
-                  {t('editor3D.shapeAppearance')}
-                </h3>
-
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
-                    <span>{t('editor3D.shapeColor')}</span>
-                    <span className="font-mono text-[10px] text-green-400">
-                      {figureColor}
-                    </span>
-                  </label>
-                  <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-black/40 border border-white/10">
-                    <input
-                      type="color"
-                      value={figureColor}
-                      onChange={(e) => {
-                        setFigureColor(e.target.value);
-                        setEditedVertices(null);
-                      }}
-                       title={t('editor3D.shapeColor3d')}
-                      className="w-8 h-8 rounded cursor-pointer bg-transparent border border-white/10 p-0.5"
-                    />
-                    <button
-                      onClick={() => {
-                        setFigureColor('#121ca7');
-                        setEditedVertices(null);
-                      }}
-                      className="text-[10px] text-muted-foreground/60 hover:text-foreground transition-colors"
-                       title={t('editor3D.restore')}
-                    >
-                      Restablecer
-                    </button>
-                    <input
-                      type="text"
-                      value={textureFileName}
-                      readOnly
-                      placeholder={t('editor3D.noTextureSelected')}
-                      className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 text-foreground placeholder:text-muted-foreground/40 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap"
-                      onClick={openTexturePicker}
-                    />
-                    <button
-                      onClick={() => setTextureBrowserOpen(true)}
-                      title={t('editor3D.browse')}
-                      className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 transition-colors"
-                    >
-                      <ImageIcon className="w-3.5 h-3.5" />
-                      {t('editor3D.browse')}
-                    </button>
-                    {texture && (
-                      <button
-                        onClick={clearTexture}
-                         title={t('editor3D.removeTextureLabel')}
-                        className="shrink-0 flex items-center gap-1.5 px-2 py-2 rounded-md text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/30 transition-colors"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                  </div>
-                  <input
-                    ref={textureInputRef}
-                    type="file"
-                    accept="image/*"
-                    className="hidden"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) {
-                        handleTextureFile(file);
-                      }
-                      e.target.value = '';
-                    }}
-                  />
-                   <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
-                     <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
-                    {t('editor3D.textureHint')}
-                   </p>
-                   {texture && (
-                     <div className="mt-1 rounded-md border border-white/10 overflow-hidden w-16 h-16 bg-black/40">
-                       <img
-                         src={texture}
-                         alt="Textura cargada"
-                         className="w-full h-full object-cover"
-                       />
-                     </div>
-                   )}
-                    {texture && (
-                      <div className="flex items-center gap-2 mt-1">
-                        <label className="text-[10px] text-muted-foreground/80">
-                           {t('editor3D.textureRepeat')}
-                        </label>
-                        <input
-                          type="number"
-                          min={0.1}
-                          max={10}
-                          step={0.1}
-                          value={textureRepeat}
-                          onChange={(e) => setTextureRepeat(Math.max(0.1, Math.min(10, parseFloat(e.target.value) || 1)))}
-                          className="w-16 px-1 py-0.5 text-xs bg-black/40 border border-white/10 rounded text-foreground focus:outline-none focus:border-green-500"
-                        />
-                      </div>
-                    )}
-                    <label className="text-[10px] text-muted-foreground/80 mt-1">
-                      {t('editor3D.textureProjection')}
-                    </label>
-                   <select
-                     value={textureProjection}
-                     onChange={(event) =>
-                       setTextureProjection(
-                         event.target.value as LatheTextureProjection
-                       )
-                     }
-                     className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
-                   >
-                     <option value="cylindrical">{t('editor3D.projection.cylindrical')}</option>
-                     <option value="planar">{t('editor3D.projection.planar')}</option>
-                     <option value="spherical">{t('editor3D.projection.spherical')}</option>
-                   </select>
-                  <label className="flex items-center gap-1.5 mt-1 cursor-pointer text-[10px] text-muted-foreground/80">
-                    <input
-                      type="checkbox"
-                      checked={textureHelper}
-                      onChange={(e) => setTextureHelper(e.target.checked)}
-                      className="accent-yellow-400"
-                    />
-                    {t('editor3D.textureHelper')}
-                    {(textureHelper || textureHelperDirty) && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setTextureHelperTransform(IDENTITY_TRANSFORM)
-                        }
-                        className="ml-auto px-1.5 py-0.5 rounded border border-white/10 bg-black/40 hover:bg-white/10"
-                        title="Restablecer la pieza"
-                      >
-                        ↺
-                      </button>
-                    )}
-                  </label>
-                  <label className="text-[10px] text-muted-foreground/80 mt-1">
-                    Acabado de la textura
-                  </label>
-                  <select
-                    value={textureFinish}
-                    onChange={(event) =>
-                      setTextureFinish(event.target.value as TextureFinish)
-                    }
-                    className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
-                  >
-                     <option value="metallic">{t('editor3D.finish.metallic')}</option>
-                     <option value="semi-matte">{t('editor3D.finish.semiMatte')}</option>
-                     <option value="matte">{t('editor3D.finish.matte')}</option>
-                     <option value="glossy">{t('editor3D.finish.glossy')}</option>
-                     <option value="mirror">{t('editor3D.finish.mirror')}</option>
-                  </select>
-                  <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
-                    <span>{t('editor3D.textureRelief')}</span>
-                    <span className="font-mono text-green-400">
-                      {Math.round(textureRelief * 100)}%
-                    </span>
-                  </label>
-                  <Slider
-                    min={0}
-                    max={1}
-                    step={0.01}
-                    value={[textureRelief]}
-                    onValueChange={([v]) => setTextureRelief(v)}
-                    className="w-full mb-3"
-                  />
-                </div>
 
                 {/* Transparencia del objeto 3D: mando aparte de los
                     lienzos de dibujo, afecta a la figura completa */}
-                <div className="flex flex-col gap-1.5">
+                <div className="flex flex-col gap-1.5 border-t border-white/10 px-3 py-3">
                   <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
                     <span>{t('editor3D.object3dOpacity')}</span>
                     <span className="font-mono text-[10px] text-green-400">
@@ -5762,10 +6605,9 @@ export default function Home() {
                     <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />{t('editor3D.opacityHint')}
                   </p>
                 </div>
-              </div>
-            </>
+            </Fragment>
           ) : mode === 'text' ? (
-            <div className="flex-1 flex flex-col min-h-0">
+            <div key="text" className="flex-1 flex flex-col min-h-0">
               <div className="px-3 py-2 border-b border-white/5">
                 <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
                   <span className="w-1 h-3 rounded-full bg-green-500" />
@@ -5785,6 +6627,7 @@ export default function Home() {
                   <input
                     type="text"
                     value={text}
+                    data-testid="text-input"
                     onChange={(e) => {
                       setText(e.target.value);
                       setEditedVertices(null);
@@ -6049,56 +6892,81 @@ export default function Home() {
                   </div>
                 )}
 
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
-                    {t('editor3D.outputMode')}
-                  </label>
-                  <div className="flex p-1 rounded-lg bg-black/40 border border-white/5">
-                    <button
-                      onClick={() => {
-                        setTextMode('voxel');
-                        setEditedVertices(null);
-                      }}
-                      className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
-                        textMode === 'voxel'
-                          ? 'bg-green-500/20 text-green-300'
-                          : 'text-muted-foreground hover:text-foreground'
-                       }`}
-                       title={t('editor3D.greedyMeshTooltip')}
+                 <div className="flex flex-col gap-1.5">
+                   <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
+                     {t('editor3D.outputMode')}
+                   </label>
+                   <DropdownMenu>
+                     <DropdownMenuTrigger asChild>
+                       <button
+                         className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-black/40 border border-white/10 hover:bg-white/5 text-foreground transition-colors"
+                         title={
+                           textMode === 'voxel'
+                             ? t('editor3D.greedyMeshTooltip')
+                             : textMode === 'smooth'
+                               ? t('editor3D.smoothTextDesc')
+                               : t('editor3D.mergedTextDesc')
+                         }
+                       >
+                         {textMode === 'voxel' ? (
+                           <Boxes className="w-3.5 h-3.5" />
+                         ) : textMode === 'smooth' ? (
+                           <Spline className="w-3.5 h-3.5" />
+                         ) : (
+                           <Layers className="w-3.5 h-3.5" />
+                         )}
+                         <span>
+                           {textMode === 'voxel'
+                             ? t('editor3D.voxelTextLabel')
+                             : textMode === 'smooth'
+                               ? t('editor3D.smoothTextLabel')
+                               : t('editor3D.mergedTextLabel')}
+                         </span>
+                         <ChevronDown className="w-3 h-3 opacity-60" />
+                       </button>
+                     </DropdownMenuTrigger>
+                     <DropdownMenuContent
+                       align="start"
+                       className="bg-gray-900 border-gray-800 text-white min-w-[140px]"
                      >
-                       <Boxes className="w-3.5 h-3.5" />
-                       {t('editor3D.voxels3d')}
-                     </button>
-                    <button
-                      onClick={() => {
-                        setTextMode('smooth');
-                        setEditedVertices(null);
-                      }}
-                      className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
-                        textMode === 'smooth'
-                          ? 'bg-green-500/20 text-green-300'
-                          : 'text-muted-foreground hover:text-foreground'
-                      }`}
-                       title={t('editor3D.smoothTextDesc')}
-                    >
-                      <Spline className="w-3.5 h-3.5" />
-                      {t('editor3D.smoothTextLabel')}
-                    </button>
-                    <button
-                      onClick={() => {
-                        setTextMode('plane');
-                        setEditedVertices(null);
-                      }}
-                      className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-colors ${
-                        textMode === 'plane'
-                          ? 'bg-green-500/20 text-green-300'
-                          : 'text-muted-foreground hover:text-foreground'
-                      }`}
-                    >
-                      <Layers className="w-3.5 h-3.5" />
-                      {t('editor3D.flatView')}
-                    </button>
-                  </div>
+                       <DropdownMenuItem
+                         onSelect={(e) => {
+                           e.preventDefault();
+                           setTextMode('voxel');
+                           setEditedVertices(null);
+                         }}
+                         className="hover:bg-gray-800 cursor-pointer p-2 flex items-center gap-2 text-xs"
+                         title={t('editor3D.greedyMeshTooltip')}
+                       >
+                         <Boxes className="w-3.5 h-3.5" />
+                         {t('editor3D.voxelTextLabel')}
+                       </DropdownMenuItem>
+                       <DropdownMenuItem
+                         onSelect={(e) => {
+                           e.preventDefault();
+                           setTextMode('smooth');
+                           setEditedVertices(null);
+                         }}
+                         className="hover:bg-gray-800 cursor-pointer p-2 flex items-center gap-2 text-xs"
+                         title={t('editor3D.smoothTextDesc')}
+                       >
+                         <Spline className="w-3.5 h-3.5" />
+                         {t('editor3D.smoothTextLabel')}
+                       </DropdownMenuItem>
+                       <DropdownMenuItem
+                         onSelect={(e) => {
+                           e.preventDefault();
+                           setTextMode('plane');
+                           setEditedVertices(null);
+                         }}
+                         className="hover:bg-gray-800 cursor-pointer p-2 flex items-center gap-2 text-xs"
+                         title={t('editor3D.mergedTextDesc')}
+                       >
+                         <Layers className="w-3.5 h-3.5" />
+                         {t('editor3D.mergedTextLabel')}
+                       </DropdownMenuItem>
+                     </DropdownMenuContent>
+                   </DropdownMenu>
                   <p className="text-[10px] text-muted-foreground/60">
                     {textMode === 'plane'
                       ? t('editor3D.planeDesc')
@@ -6152,132 +7020,6 @@ export default function Home() {
                   </p>
                 </div>
 
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center gap-2">
-                    <ImageIcon className="w-3.5 h-3.5 text-green-400" />
-                    {t('editor3D.textureImage')}
-                  </label>
-                  <div className="flex gap-1.5">
-                    <input
-                      type="text"
-                      value={textureFileName}
-                      readOnly
-                      placeholder={t('editor3D.noTextureSelected')}
-                      className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 text-foreground placeholder:text-muted-foreground/40 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap"
-                      onClick={() => setTextureBrowserOpen(true)}
-                    />
-                    <button
-                      onClick={() => setTextureBrowserOpen(true)}
-                      title={t('editor3D.selectImageAsTexture')}
-                      className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 transition-colors"
-                    >
-                      <ImageIcon className="w-3.5 h-3.5" />
-                      {t('editor3D.browse')}
-                    </button>
-                    {texture && (
-                      <button
-                        onClick={clearTexture}
-                         title={t('editor3D.removeTextureLabel')}
-                        className="shrink-0 flex items-center gap-1.5 px-2 py-2 rounded-md text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/30 transition-colors"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                  </div>
-                  <input
-                    ref={textureInputRef}
-                    type="file"
-                    accept="image/*"
-                    className="hidden"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) {
-                        handleTextureFile(file);
-                      }
-                      e.target.value = '';
-                    }}
-                  />
-                  <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
-                    <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
-                    {t('editor3D.textureOnText')}
-                  </p>
-                  {texture && (
-                    <div className="mt-1 rounded-md border border-white/10 overflow-hidden w-16 h-16 bg-black/40">
-                      <img
-                        src={texture}
-                        alt="Textura cargada"
-                        className="w-full h-full object-cover"
-                      />
-                    </div>
-                  )}
-                  <label className="text-[10px] text-muted-foreground/80 mt-1">
-                    {t('editor3D.textureProjection')}
-                  </label>
-                  <select
-                    value={textureProjection}
-                    onChange={(event) =>
-                      setTextureProjection(
-                        event.target.value as LatheTextureProjection
-                      )
-                    }
-                    className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
-                  >
-<option value="cylindrical">{t('editor3D.projection.cylindrical')}</option>
-                     <option value="planar">{t('editor3D.projection.planar')}</option>
-                     <option value="spherical">{t('editor3D.projection.spherical')}</option>
-                  </select>
-                  <label className="flex items-center gap-1.5 mt-1 cursor-pointer text-[10px] text-muted-foreground/80">
-                    <input
-                      type="checkbox"
-                      checked={textureHelper}
-                      onChange={(e) => setTextureHelper(e.target.checked)}
-                      className="accent-yellow-400"
-                    />
-                    {t('editor3D.textureHelper')}
-                    {(textureHelper || textureHelperDirty) && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setTextureHelperTransform(IDENTITY_TRANSFORM)
-                        }
-                        className="ml-auto px-1.5 py-0.5 rounded border border-white/10 bg-black/40 hover:bg-white/10"
-                        title="Restablecer la pieza"
-                      >
-                        ↺
-                      </button>
-                    )}
-                  </label>
-                  <label className="text-[10px] text-muted-foreground/80 mt-1">
-                    Acabado de la textura
-                  </label>
-                  <select
-                    value={textureFinish}
-                    onChange={(event) =>
-                      setTextureFinish(event.target.value as TextureFinish)
-                    }
-                    className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
-                  >
-                     <option value="metallic">{t('editor3D.finish.metallic')}</option>
-                     <option value="semi-matte">{t('editor3D.finish.semiMatte')}</option>
-                     <option value="matte">{t('editor3D.finish.matte')}</option>
-                     <option value="glossy">{t('editor3D.finish.glossy')}</option>
-                     <option value="mirror">{t('editor3D.finish.mirror')}</option>
-                  </select>
-                  <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
-                    <span>{t('editor3D.textureRelief')}</span>
-                    <span className="font-mono text-green-400">
-                      {Math.round(textureRelief * 100)}%
-                    </span>
-                  </label>
-                  <Slider
-                    min={0}
-                    max={1}
-                    step={0.01}
-                    value={[textureRelief]}
-                    onValueChange={([v]) => setTextureRelief(v)}
-                    className="w-full"
-                  />
-                </div>
 
                 <div className="mt-1 flex flex-col gap-1.5">
                   <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold">
@@ -6306,7 +7048,7 @@ export default function Home() {
               </div>
             </div>
           ) : mode === 'mesh' ? (
-            <div className="flex-1 flex flex-col min-h-0 overflow-y-auto custom-scrollbar">
+            <div key="mesh" className="flex-1 flex flex-col min-h-0 overflow-y-auto custom-scrollbar">
               <div className="px-3 py-2 border-b border-white/5 shrink-0">
                 <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
                 <span className="w-1 h-3 rounded-full bg-green-500" />
@@ -6477,35 +7219,6 @@ export default function Home() {
                       {t('editor3D.shapeAppearance')}
                     </h3>
 
-                    {/* Color de la figura */}
-                    <div className="flex flex-col gap-1.5">
-                      <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
-                     <span>{t('editor3D.shapeColor')}</span>
-                        <span className="font-mono text-[10px] text-green-400">
-                          {figureColor}
-                        </span>
-                      </label>
-                      <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-black/40 border border-white/10">
-                        <input
-                          type="color"
-                          value={figureColor}
-                          onChange={(e) => {
-                            setFigureColor(e.target.value);
-                            setEditedVertices(null);
-                          }}
-                          className="w-8 h-8 rounded cursor-pointer bg-transparent border border-white/10 p-0.5"
-                        />
-                        <button
-                          onClick={() => {
-                            setFigureColor('#121ca7');
-                            setEditedVertices(null);
-                          }}
-                          className="text-[10px] text-muted-foreground/60 hover:text-foreground transition-colors"
-                        >
-                       {t('editor3D.restore')}
-                        </button>
-                      </div>
-                    </div>
 
                     {/* Transparencia del objeto 3D: mando aparte de las
                         plantillas, afecta a la figura completa */}
@@ -6531,142 +7244,745 @@ export default function Home() {
                       </p>
                     </div>
 
-                    {/* Textura */}
-                    <div className="flex flex-col gap-1.5">
-                      <label className="text-[10px] text-muted-foreground/80">
-                        {t('editor3D.textureImage')}
-                      </label>
-                      <div className="flex gap-1.5">
-                        <input
-                          type="text"
-                          value={textureFileName}
-                          readOnly
-                       placeholder={t('editor3D.noTextureSelected')}
-                          className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 text-foreground placeholder:text-muted-foreground/40 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap"
-                          onClick={openTexturePicker}
-                        />
-                        <button
-                          onClick={() => setTextureBrowserOpen(true)}
-                      title={t('editor3D.browse')}
-                          className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 transition-colors"
-                        >
-                      <ImageIcon className="w-3.5 h-3.5" />
-                      {t('editor3D.browse')}
-                        </button>
-                        {texture && (
-                          <button
-                            onClick={clearTexture}
-                            title={t('editor3D.removeTextureLabel')}
-                            className="shrink-0 flex items-center gap-1.5 px-2 py-2 rounded-md text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/30 transition-colors"
-                          >
-                            <X className="w-3.5 h-3.5" />
-                          </button>
-                        )}
-                      </div>
-                      <input
-                        ref={textureInputRef}
-                        type="file"
-                        accept="image/*"
-                        className="hidden"
-                        onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          if (file) handleTextureFile(file);
-                          e.target.value = '';
-                        }}
-                      />
-                      <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
-                        <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
-                        {t('editor3D.textureHint')}
-                      </p>
-                      {texture && (
-                        <div className="mt-1 rounded-md border border-white/10 overflow-hidden w-16 h-16 bg-black/40">
-                          <img
-                            src={texture}
-                          alt={t('editor3D.textureAlt')}
-                            className="w-full h-full object-cover"
-                          />
-                        </div>
-                      )}
-
-                      <label className="text-[10px] text-muted-foreground/80 mt-1">
-                      {t('editor3D.textureProjection')}
-                      </label>
-                      <select
-                        value={textureProjection}
-                        onChange={(event) =>
-                          setTextureProjection(
-                            event.target.value as LatheTextureProjection
-                          )
-                        }
-                        className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
-                      >
-                        <option value="cylindrical">
-                          {t('editor3D.projection.cylindrical')}
-                        </option>
-                        <option value="planar">{t('editor3D.projection.planar')}</option>
-                        <option value="spherical">{t('editor3D.projection.spherical')}</option>
-                      </select>
-                      <label className="flex items-center gap-1.5 mt-1 cursor-pointer text-[10px] text-muted-foreground/80">
-                        <input
-                          type="checkbox"
-                          checked={textureHelper}
-                          onChange={(e) => setTextureHelper(e.target.checked)}
-                          className="accent-yellow-400"
-                        />
-                     {t('editor3D.textureHelper')}
-                        {(textureHelper || textureHelperDirty) && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setTextureHelperTransform(IDENTITY_TRANSFORM)
-                            }
-                            className="ml-auto px-1.5 py-0.5 rounded border border-white/10 bg-black/40 hover:bg-white/10"
-                         title={t('editor3D.restore')}
-                          >
-                            ↺
-                          </button>
-                        )}
-                      </label>
-
-                      <label className="text-[10px] text-muted-foreground/80 mt-1">
-                     {t('editor3D.textureFinish')}
-                      </label>
-                      <select
-                        value={textureFinish}
-                        onChange={(event) =>
-                          setTextureFinish(event.target.value as TextureFinish)
-                        }
-                        className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
-                      >
-                     <option value="metallic">{t('editor3D.finish.metallic')}</option>
-                     <option value="semi-matte">{t('editor3D.finish.semiMatte')}</option>
-                     <option value="matte">{t('editor3D.finish.matte')}</option>
-                     <option value="glossy">{t('editor3D.finish.glossy')}</option>
-                     <option value="mirror">{t('editor3D.finish.mirror')}</option>
-                   </select>
-
-                      <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
-                    <span>{t('editor3D.textureRelief')}</span>
-                        <span className="font-mono text-green-400">
-                          {Math.round(textureRelief * 100)}%
-                        </span>
-                      </label>
-                      <Slider
-                        min={0}
-                        max={1}
-                        step={0.01}
-                        value={[textureRelief]}
-                        onValueChange={([v]) => setTextureRelief(v)}
-                        className="w-full mb-3"
-                      />
-                    </div>
                   </div>
                   {/* ▲▲▲ FIN DEL BLOQUE DE APARIENCIA ▲▲▲ */}
                 </div>
               </div>
             </div>
+          ) : mode === 'scene' ? (
+            // Panel de la pestaña neutra: el espacio de trabajo. Lista
+            // permanente de los objetos de la escena, con la insignia de
+            // su pestaña de construcción — la guía de dónde se edita
+            // cada figura, sin ningún botón que salte de pestaña — y los
+            // mismos ocultar/congelar/eliminar del desplegable de
+            // multiselección. Transformar se hace con el gizmo del
+            // visor; grupos y animación viven en la columna de arriba.
+            <Fragment key="scene">
+              {/* Columna escaneable ENTERA: si el panel de apariencia
+                  crece más que la columna, rueda aquí (barra fina, sin
+                  fondo); la lista de objetos conserva el suyo con tope
+                  propio para cuando sean muchos. */}
+              <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar flex flex-col">
+              <div className="px-3 py-2 border-b border-white/5 shrink-0">
+                <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
+                  <span className="w-1 h-3 rounded-full bg-green-500" />
+                  {t('editor3D.scenePanelTitle')}
+                </h2>
+                <p className="text-[10px] text-muted-foreground/60 mt-0.5 flex items-center gap-1">
+                  <Info className="w-2.5 h-2.5" />
+                  {t('editor3D.scenePanelHint')}
+                </p>
+                {/* Cámara de animación: un objeto más de la escena, con
+                    recorrido editable. Vive junto al título para que se
+                    encuentre fácil. */}
+                <button
+                  onClick={addCameraObject}
+                  data-testid="add-camera-object-btn"
+                  className="mt-2 w-full flex items-center justify-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-medium text-purple-200 bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/30 transition-colors"
+                >
+                  <Video className="w-3 h-3" />
+                  {t('editor3D.addCamera')}
+                </button>
+              </div>
+              {/* ▼ Apariencia centralizada: un solo juego de color y
+                  textura, aquí en Escena, que se aplica a los objetos
+                  seleccionados (y queda como base de lo que se
+                  construya después en las pestañas herramienta). ▼ */}
+              <div className="border-t border-white/5 px-3 py-3 space-y-3 bg-[hsl(224_50%_6%)] shrink-0">
+                <h3 className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center gap-2">
+                  <Palette className="w-3.5 h-3.5 text-green-400" />
+                  {t('editor3D.shapeAppearance')}
+                </h3>
+
+                {/* Color de la figura: pinta lo que se construya de
+                    aquí en adelante (vistas, malla y torno comparten
+                    el mismo estado ahora). */}
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
+                    <span>{t('editor3D.shapeColor')}</span>
+                    <span className="font-mono text-[10px] text-green-400">
+                      {figureColor}
+                    </span>
+                  </label>
+                  <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-black/40 border border-white/10">
+                    <input
+                      type="color"
+                      value={figureColor}
+                      data-testid="scene-figure-color"
+                      onChange={(e) => {
+                        setFigureColor(e.target.value);
+                        setLatheFigureColor(e.target.value);
+                        setEditedVertices(null);
+                        applyFigureColorToSelected(e.target.value);
+                      }}
+                      title={t('editor3D.shapeColor3d')}
+                      className="w-8 h-8 rounded cursor-pointer bg-transparent border border-white/10 p-0.5"
+                    />
+                    <button
+                      onClick={() => {
+                        setFigureColor('#121ca7');
+                        setLatheFigureColor('#121ca7');
+                        setEditedVertices(null);
+                        applyFigureColorToSelected('#121ca7');
+                      }}
+                      className="text-[10px] text-muted-foreground/60 hover:text-foreground transition-colors"
+                      title={t('editor3D.restore')}
+                    >
+                      {t('editor3D.restore')}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Textura: campo, búsqueda directa y el modal de
+                    lectura; se aplica a todos los seleccionados. */}
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-[10px] text-muted-foreground/80">
+                    {t('editor3D.textureImage')}
+                  </label>
+                  <div className="flex gap-1.5">
+                    <input
+                      type="text"
+                      value={textureFileName}
+                      readOnly
+                      placeholder={t('editor3D.noTextureSelected')}
+                      className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 text-foreground placeholder:text-muted-foreground/40 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap"
+                      onClick={openTexturePicker}
+                      data-testid="scene-texture-field"
+                    />
+                    <button
+                      onClick={() => setTextureBrowserOpen(true)}
+                      data-testid="scene-texture-browse"
+                      title={t('editor3D.selectImageAsTexture')}
+                      className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 transition-colors"
+                    >
+                      <ImageIcon className="w-3.5 h-3.5" />
+                      {t('editor3D.browse')}
+                    </button>
+                    {(texture || texturaEnSeleccion) && (
+                      <button
+                        onClick={clearTexture}
+                        data-testid="scene-texture-remove"
+                        title={t('editor3D.removeTextureLabel')}
+                        className="shrink-0 flex items-center gap-1.5 px-2 py-2 rounded-md text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/30 transition-colors"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                  <input
+                    ref={textureInputRef}
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    data-testid="scene-texture-file-input"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) handleTextureFile(file);
+                      e.target.value = '';
+                    }}
+                  />
+                  <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
+                    <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
+                    {t('editor3D.textureHint')}
+                  </p>
+                  {texture && (
+                    <div className="mt-1 rounded-md border border-white/10 overflow-hidden w-16 h-16 bg-black/40">
+                      <img
+                        src={texture}
+                        alt={t('editor3D.textureAlt')}
+                        className="w-full h-full object-cover"
+                      />
+                    </div>
+                  )}
+                  {texture && (
+                    <div className="flex items-center gap-2 mt-1">
+                      <label className="text-[10px] text-muted-foreground/80">
+                        {t('editor3D.textureRepeat')}
+                      </label>
+                      <input
+                        type="number"
+                        min={0.1}
+                        max={10}
+                        step={0.1}
+                        value={textureRepeat}
+                        data-testid="scene-texture-repeat"
+                        onChange={(e) => setTextureRepeat(Math.max(0.1, Math.min(10, parseFloat(e.target.value) || 1)))}
+                        className="w-16 px-1 py-0.5 text-xs bg-black/40 border border-white/10 rounded text-foreground focus:outline-none focus:border-green-500"
+                      />
+                    </div>
+                  )}
+                  <label className="text-[10px] text-muted-foreground/80 mt-1">
+                    {t('editor3D.textureProjection')}
+                  </label>
+                  <select
+                    value={textureProjection}
+                    data-testid="scene-texture-projection"
+                    onChange={(event) =>
+                      setTextureProjection(
+                        event.target.value as LatheTextureProjection
+                      )
+                    }
+                    className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
+                  >
+                    <option value="cylindrical">
+                      {t('editor3D.projection.cylindrical')}
+                    </option>
+                    <option value="planar">{t('editor3D.projection.planar')}</option>
+                    <option value="spherical">{t('editor3D.projection.spherical')}</option>
+                  </select>
+                  <label className="flex items-center gap-1.5 mt-1 cursor-pointer text-[10px] text-muted-foreground/80">
+                    <input
+                      type="checkbox"
+                      checked={textureHelper}
+                      data-testid="scene-texture-helper"
+                      onChange={(e) => setTextureHelper(e.target.checked)}
+                      className="accent-yellow-400"
+                    />
+                    {t('editor3D.textureHelper')}
+                    {(textureHelper || textureHelperDirty) && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setTextureHelperTransform(IDENTITY_TRANSFORM)
+                        }
+                        className="ml-auto px-1.5 py-0.5 rounded border border-white/10 bg-black/40 hover:bg-white/10"
+                        title={t('editor3D.restore')}
+                      >
+                        ↺
+                      </button>
+                    )}
+                  </label>
+                  <label className="text-[10px] text-muted-foreground/80 mt-1">
+                    {t('editor3D.textureFinish')}
+                  </label>
+                  <select
+                    value={textureFinish}
+                    data-testid="scene-texture-finish"
+                    onChange={(event) =>
+                      setTextureFinish(event.target.value as TextureFinish)
+                    }
+                    className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
+                  >
+                    <option value="metallic">{t('editor3D.finish.metallic')}</option>
+                    <option value="semi-matte">{t('editor3D.finish.semiMatte')}</option>
+                    <option value="matte">{t('editor3D.finish.matte')}</option>
+                    <option value="glossy">{t('editor3D.finish.glossy')}</option>
+                    <option value="mirror">{t('editor3D.finish.mirror')}</option>
+                  </select>
+                  <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
+                    <span>{t('editor3D.textureRelief')}</span>
+                    <span className="font-mono text-green-400">
+                      {Math.round(textureRelief * 100)}%
+                    </span>
+                  </label>
+                  <Slider
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    value={[textureRelief]}
+                    onValueChange={([v]) => setTextureRelief(v)}
+                    className="w-full"
+                    data-testid="scene-texture-relief"
+                  />
+
+                  {/* Tipo de malla del objeto seleccionado (solo
+                      visualización: no cambia la figura real). */}
+                  <label className="text-[10px] text-muted-foreground/80 mt-1">
+                    {t('editor3D.sceneMeshStyle')}
+                  </label>
+                  <select
+                    value={sceneMeshStyle}
+                    data-testid="scene-mesh-style"
+                    onChange={(event) =>
+                      setSceneMeshStyle(
+                        event.target.value as 'fusionada' | 'suave' | 'voxeles'
+                      )
+                    }
+                    className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
+                  >
+                    <option value="fusionada">{t('editor3D.merged')}</option>
+                    <option value="suave">{t('editor3D.smooth')}</option>
+                    <option value="voxeles">{t('editor3D.voxels')}</option>
+                  </select>
+
+                  {/* Transparencia del objeto seleccionado: escribe
+                      mesh.opacity en las figuras marcadas; el visor la
+                      respeta en vivo y el guardado la conserva. */}
+                  <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
+                    <span>{t('editor3D.object3dOpacity')}</span>
+                    <span className="font-mono text-[10px] text-green-400">
+                      {Math.round(figureOpacity * 100)}%
+                    </span>
+                  </label>
+                  <Slider
+                    min={5}
+                    max={100}
+                    step={1}
+                    value={[Math.round(figureOpacity * 100)]}
+                    onValueChange={([v]) => applyFigureOpacity(Math.max(0.05, v / 100))}
+                    className="w-full"
+                    data-testid="scene-figure-opacity"
+                  />
+                </div>
+              </div>
+              <div
+                className="shrink-0 overflow-y-auto custom-scrollbar max-h-[320px] px-2 py-2 space-y-1"
+                data-testid="scene-object-list"
+              >
+                {sceneObjects.length === 0 && (
+                  <p className="text-[11px] text-muted-foreground/60 px-2 py-4 text-center leading-relaxed">
+                    {t('editor3D.scenePanelEmpty')}
+                  </p>
+                )}
+                {sceneObjects.map((object, index) => {
+                  const isSelected = selectedObjectId === object.id;
+                  const color = object.hidden
+                    ? 'text-red-400'
+                    : object.frozen
+                      ? 'text-gray-400'
+                      : 'text-foreground';
+                  const objectGroups = groups.filter((g) =>
+                    g.objectIds.includes(object.id)
+                  );
+                  return (
+                    <div
+                      key={object.id}
+                      data-testid={`scene-object-${index}`}
+                      onClick={() => handleObjectSelect(object.id)}
+                      className={`rounded-lg border px-2 py-1.5 cursor-pointer transition-colors ${
+                        isSelected
+                          ? 'bg-green-500/10 border-green-500/40'
+                          : selectedObjectIds.includes(object.id)
+                            ? 'bg-cyan-500/5 border-cyan-500/30'
+                            : 'bg-white/[0.02] border-white/5 hover:bg-white/5'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        {sceneObjects.length > 1 && (
+                          <input
+                            type="checkbox"
+                            checked={selectedObjectIds.includes(object.id)}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={() => {
+                              if (selectedObjectIds.includes(object.id)) {
+                                const next = selectedObjectIds.filter(
+                                  (id) => id !== object.id
+                                );
+                                setSelectedObjectIds(next);
+                                if (selectedObjectId === object.id) {
+                                  // El activo era el desmarcado: el
+                                  // siguiente de la lista toma el relevo
+                                  // y el panel pasa a mostrar SUS
+                                  // ajustes (textura, acabado, relieve,
+                                  // proyección, transparencia).
+                                  const siguiente =
+                                    next.length > 0 ? next[0] : null;
+                                  if (
+                                    configObjectId &&
+                                    siguiente !== configObjectId
+                                  ) {
+                                    freezeObjectSnapshot(configObjectId);
+                                  }
+                                  setSelectedObjectId(siguiente);
+                                  syncTextureStateToSelection(siguiente);
+                                }
+                              } else {
+                                setSelectedObjectIds([
+                                  ...selectedObjectIds,
+                                  object.id,
+                                ]);
+                                if (selectedObjectId !== object.id) {
+                                  if (
+                                    configObjectId &&
+                                    object.id !== configObjectId
+                                  ) {
+                                    freezeObjectSnapshot(configObjectId);
+                                  }
+                                  setSelectedObjectId(object.id);
+                                  // El panel salta a los ajustes del
+                                  // recién activado; así Guardar nunca le
+                                  // escribe la textura que quedara en
+                                  // pantalla del objeto anterior.
+                                  syncTextureStateToSelection(object.id);
+                                }
+                              }
+                            }}
+                            className="w-3 h-3 accent-green-500 cursor-pointer shrink-0"
+                            data-testid={`scene-object-check-${index}`}
+                            title={t('editor3D.selectMultipleObjects')}
+                          />
+                        )}
+                        <span className={`w-2 h-2 rounded-full shrink-0 ${object.hidden ? 'bg-red-400' : object.frozen ? 'bg-gray-400' : 'bg-green-400'}`} />
+                        <span className={`text-xs truncate flex-1 min-w-0 ${color}`}>
+                          {object.name || t('editor3D.objectN', { n: index + 1 })}
+                        </span>
+                        <span className="ml-auto shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-muted-foreground">
+                          {object.kind === 'camera'
+                            ? t('editor3D.cameraBadge')
+                            : t(`editor3D.tabs.${object.mode ?? 'views'}`)}
+                        </span>
+                        {objectGroups.length > 0 && (
+                          <span className="shrink-0 min-w-0 max-w-24 flex items-center gap-0.5 text-[9px] text-cyan-400/70">
+                            <FolderOpen className="w-2.5 h-2.5 shrink-0" />
+                            <span className="truncate">
+                              {objectGroups.map((g) => g.name).join(', ')}
+                            </span>
+                          </span>
+                        )}
+                        <div className="flex items-center gap-0.5 shrink-0">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleObjectHidden(object.id);
+                          }}
+                          title={object.hidden ? t('editor3D.showObject') : t('editor3D.hideObject')}
+                          className="px-1 py-0.5 rounded text-[10px] hover:bg-gray-700"
+                        >
+                          {object.hidden ? '🟢' : '🔴'}
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleObjectFrozen(object.id);
+                          }}
+                          title={object.frozen ? t('editor3D.unfreezeObject') : t('editor3D.freezeObject')}
+                          className="px-1 py-0.5 rounded text-[10px] hover:bg-gray-700"
+                        >
+                          {object.frozen ? '🔓' : '🔒'}
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setObjectToDelete(object.id);
+                          }}
+                          title={t('editor3D.deleteObject')}
+                          className="px-1 py-0.5 rounded text-muted-foreground hover:text-red-400 hover:bg-gray-700"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+                {/* Focos de la escena: como la lista se llena desde el
+                    modal de luces, cada foco vive aquí como un objeto más,
+                    con su conmutador de conexión. El visor ya ignora los
+                    desconectados (enabled: false). */}
+                {(lightConfig?.spotlights ?? []).map((spot, index) => (
+                  <div
+                    key={spot.id}
+                    data-testid={`scene-spotlight-${index}`}
+                    onClick={() => setIsLightingModalOpen(true)}
+                    className="rounded-lg border px-2 py-1.5 cursor-pointer transition-colors bg-white/[0.02] border-white/5 hover:bg-white/5"
+                  >
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span
+                        className={`w-2 h-2 rounded-full shrink-0 ${spot.enabled ? 'bg-green-400' : 'bg-red-400'}`}
+                      />
+                      <Sun className="w-3 h-3 shrink-0 text-amber-400" />
+                      <span
+                        className={`text-xs truncate flex-1 min-w-0 ${spot.enabled ? 'text-foreground' : 'text-red-400'}`}
+                      >
+                        {t('editor3D.spotlightN', { n: index + 1 })}
+                      </span>
+                      <span className="ml-auto shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-muted-foreground">
+                        {t('editor3D.spotlightBadge')}
+                      </span>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setLightConfig((prev) =>
+                            prev
+                              ? {
+                                  ...prev,
+                                  spotlights: prev.spotlights.map((s) =>
+                                    s.id === spot.id
+                                      ? { ...s, enabled: !s.enabled }
+                                      : s
+                                  ),
+                                }
+                              : prev
+                          );
+                        }}
+                        data-testid={`scene-spotlight-toggle-${index}`}
+                         title={spot.enabled ? t('editor3D.spotlightDisconnect') : t('editor3D.spotlightConnect')}
+                         className="px-1 py-0.5 rounded text-[10px] hover:bg-gray-700"
+                       >
+                         {spot.enabled ? '🟢' : '🔴'}
+                       </button>
+                       {spot.enabled && (
+                         <button
+                           onClick={(e) => {
+                             e.stopPropagation();
+                             setLightConfig((prev) =>
+                               prev
+                                 ? {
+                                     ...prev,
+                                     spotlights: prev.spotlights.map((s) =>
+                                       s.id === spot.id
+                                         ? {
+                                             ...s,
+                                             helperVisible: s.helperVisible === false,
+                                           }
+                                         : s
+                                     ),
+                                   }
+                                 : prev
+                             );
+                           }}
+                           data-testid={`scene-spotlight-helper-toggle-${index}`}
+                           title={
+                             spot.helperVisible === false
+                               ? t('editor3D.spotlightShowHelper')
+                               : t('editor3D.spotlightHideHelper')
+                           }
+                           className="px-1 py-0.5 rounded text-[10px] hover:bg-gray-700"
+                         >
+                           {spot.helperVisible === false ? (
+                             <EyeOff className="w-3 h-3 text-muted-foreground" />
+                           ) : (
+                             <Eye className="w-3 h-3 text-amber-400" />
+                           )}
+                         </button>
+                       )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {(() => {
+                // Ajustes de la cámara-objeto seleccionada: FOV, foco y
+                // fotogramas del recorrido, editables desde la columna.
+                const camObj = sceneObjects.find(
+                  (o) =>
+                    o.id === selectedObjectId &&
+                    o.kind === 'camera' &&
+                    o.camera
+                );
+                if (!camObj?.camera) return null;
+                const cam = camObj.camera;
+                const ordenados = cam.keyframes
+                  .map((kf, i) => ({ kf, i }))
+                  .sort((a, b) => a.kf.time - b.kf.time);
+                const foco =
+                  cameraKeyframeIndex !== null &&
+                  cam.keyframes[cameraKeyframeIndex]
+                    ? cam.keyframes[cameraKeyframeIndex].target
+                    : cam.target;
+                const apuntarFoco = (nuevo: Vec3) => {
+                  if (
+                    cameraKeyframeIndex !== null &&
+                    cam.keyframes[cameraKeyframeIndex]
+                  ) {
+                    updateCameraKeyframe(camObj.id, cameraKeyframeIndex, {
+                      target: nuevo,
+                    });
+                  } else {
+                    updateCameraData(camObj.id, { target: nuevo });
+                  }
+                };
+                return (
+                  <div
+                    className="shrink-0 px-3 py-2 border-t border-white/5 space-y-2"
+                    data-testid="camera-editor"
+                  >
+                    {grabacion?.camaraId === camObj.id && (
+                      <div
+                        className="flex items-center gap-1.5 text-[10px] font-semibold text-red-300"
+                        data-testid="camera-recording-badge"
+                      >
+                        <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                        {t('editor3D.recordingBadge')}
+                      </div>
+                    )}
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <label className="text-[10px] text-muted-foreground">
+                          {t('editor3D.cameraFov')}
+                        </label>
+                        <span className="text-[10px] text-muted-foreground/70">
+                          {Math.round(cam.fov)}°
+                        </span>
+                      </div>
+                      <Slider
+                        min={10}
+                        max={120}
+                        step={1}
+                        value={[cam.fov]}
+                        onValueChange={([v]) =>
+                          updateCameraData(camObj.id, { fov: v })
+                        }
+                        className="w-full"
+                        data-testid="camera-fov"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-muted-foreground">
+                        {t('editor3D.cameraFocus')}
+                      </label>
+                      <div className="flex items-center gap-1">
+                        {(['x', 'y', 'z'] as const).map((axis) => (
+                          <input
+                            key={axis}
+                            type="number"
+                            step={0.1}
+                            value={Number(foco[axis].toFixed(1))}
+                            onChange={(e) => {
+                              const v = parseFloat(e.target.value) || 0;
+                              apuntarFoco({ ...foco, [axis]: v });
+                            }}
+                            className="w-full min-w-0 bg-black/40 border border-white/10 rounded px-1 py-0.5 text-[10px]"
+                            data-testid={`camera-focus-${axis}`}
+                          />
+                        ))}
+                      </div>
+                      <select
+                        value=""
+                        onChange={(e) => {
+                          const destino = sceneObjects.find(
+                            (o) => o.id === e.target.value
+                          );
+                          if (!destino) return;
+                          apuntarFoco({
+                            x: destino.transform.px,
+                            y: destino.transform.py,
+                            z: destino.transform.pz,
+                          });
+                        }}
+                        className="mt-1 w-full bg-black/40 border border-white/10 rounded px-1 py-0.5 text-[10px]"
+                        data-testid="camera-aim-select"
+                      >
+                        <option value="">{t('editor3D.aimAtObject')}</option>
+                        {sceneObjects
+                          .filter((o) => o.id !== camObj.id)
+                          .map((o, i) => (
+                            <option key={o.id} value={o.id}>
+                              {o.name || t('editor3D.objectN', { n: i + 1 })}
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <label className="text-[10px] text-muted-foreground">
+                          {t('editor3D.cameraKeyframes')}
+                        </label>
+                        <button
+                          onClick={addCameraKeyframe}
+                          className="px-1.5 py-0.5 rounded text-[10px] bg-purple-500/10 border border-purple-500/30 text-purple-200 hover:bg-purple-500/20"
+                          data-testid="add-camera-keyframe-btn"
+                        >
+                          {t('editor3D.addKeyframe')}
+                        </button>
+                      </div>
+                      {cam.keyframes.length === 0 && (
+                        <p className="text-[10px] text-muted-foreground/60 py-1 leading-relaxed">
+                          {t('editor3D.cameraNoKeyframes')}
+                        </p>
+                      )}
+                      <div
+                        className="mt-1 space-y-1 max-h-[160px] overflow-y-auto custom-scrollbar"
+                        data-testid="camera-keyframe-list"
+                      >
+                        {ordenados.map(({ kf, i }) => (
+                          <div
+                            key={i}
+                            onClick={() => selectCameraKeyframe(i)}
+                            className={`rounded border px-1.5 py-1 cursor-pointer text-[10px] space-y-1 ${
+                              cameraKeyframeIndex === i
+                                ? 'bg-purple-500/10 border-purple-500/40'
+                                : 'bg-white/[0.02] border-white/5 hover:bg-white/5'
+                            }`}
+                            data-testid={`camera-keyframe-${i}`}
+                          >
+                            <div className="flex items-center gap-1">
+                              <span className="text-muted-foreground shrink-0">
+                                {t('editor3D.cameraTime')}
+                              </span>
+                              <input
+                                type="number"
+                                step={0.1}
+                                min={0}
+                                value={Number((kf.time / 1000).toFixed(1))}
+                                onClick={(e) => e.stopPropagation()}
+                                onChange={(e) => {
+                                  const v = Math.max(
+                                    0,
+                                    (parseFloat(e.target.value) || 0) * 1000
+                                  );
+                                  updateCameraKeyframe(camObj.id, i, {
+                                    time: Math.round(v),
+                                  });
+                                }}
+                                className="w-14 bg-black/40 border border-white/10 rounded px-1 py-0.5"
+                                data-testid={`camera-kf-time-${i}`}
+                              />
+                              <select
+                                value={kf.easing}
+                                onClick={(e) => e.stopPropagation()}
+                                onChange={(e) =>
+                                  updateCameraKeyframe(camObj.id, i, {
+                                    easing: e.target
+                                      .value as CameraKeyframe['easing'],
+                                  })
+                                }
+                                className="w-full min-w-0 bg-black/40 border border-white/10 rounded px-1 py-0.5"
+                                data-testid={`camera-kf-easing-${i}`}
+                              >
+                                {EASING_OPTIONS.map((opt) => (
+                                  <option key={opt.value} value={opt.value}>
+                                    {opt.label}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  deleteCameraKeyframe(camObj.id, i);
+                                }}
+                                title={t('editor3D.deleteObject')}
+                                className="px-1 py-0.5 rounded text-muted-foreground hover:text-red-400 hover:bg-gray-700 shrink-0"
+                                data-testid={`camera-kf-delete-${i}`}
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            </div>
+                            <div className="flex items-center gap-1">
+                              {(['x', 'y', 'z'] as const).map((axis) => (
+                                <input
+                                  key={axis}
+                                  type="number"
+                                  step={0.1}
+                                  value={Number(
+                                    kf.position[axis].toFixed(1)
+                                  )}
+                                  onClick={(e) => e.stopPropagation()}
+                                  onChange={(e) => {
+                                    const v =
+                                      parseFloat(e.target.value) || 0;
+                                    updateCameraKeyframe(camObj.id, i, {
+                                      position: {
+                                        ...kf.position,
+                                        [axis]: v,
+                                      },
+                                    });
+                                  }}
+                                  className="w-full min-w-0 bg-black/40 border border-white/10 rounded px-1 py-0.5"
+                                  data-testid={`camera-kf-pos-${i}-${axis}`}
+                                />
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+              </div>
+            </Fragment>
           ) : (
-            <>
+            <Fragment key="lathe">
               <div className="px-3 py-2 border-b border-white/5 shrink-0">
                 <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
                   <span className="w-1 h-3 rounded-full bg-green-500" />
@@ -6676,29 +7992,77 @@ export default function Home() {
                   <Info className="w-2.5 h-2.5" />
                   {t('editor3D.profileDrawHint')}
                 </p>
-                <div className="flex items-center rounded-md border border-white/10 overflow-hidden mt-2">
-                  {(
-                    [
-                      { key: 'suave', label: t('editor3D.smooth'), icon: Spline },
-                      { key: 'fusionada', label: t('editor3D.merged'), icon: Grid3x3 },
-                      { key: 'voxeles', label: t('editor3D.voxels'), icon: Box },
-                    ] as const
-                  ).map(({ key, label, icon: Icon }) => (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
                     <button
-                      key={key}
-                      onClick={() => setMeshStyle(key)}
-                      className={`flex-1 flex items-center justify-center gap-1 px-2 py-1.5 text-[10px] font-medium transition-colors ${
-                        meshStyle === key
-                          ? 'bg-green-500/25 text-green-300'
-                          : 'bg-white/5 text-muted-foreground hover:bg-white/10'
-                      }`}
-                      title={t('editor3D.useMeshInLathe', { style: label.toLowerCase() })}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-black/40 border border-white/10 hover:bg-white/5 text-foreground transition-colors"
+                      title={t('editor3D.meshStyleReconstruct')}
                     >
-                      <Icon className="w-3 h-3" />
-                      {label}
+                      {meshStyle === 'suave' ? (
+                        <Spline className="w-3.5 h-3.5" />
+                      ) : meshStyle === 'fusionada' ? (
+                        <Grid3x3 className="w-3.5 h-3.5" />
+                      ) : (
+                        <Box className="w-3.5 h-3.5" />
+                      )}
+                      <span>
+                        {meshStyle === 'suave'
+                          ? t('editor3D.smooth')
+                          : meshStyle === 'fusionada'
+                            ? t('editor3D.merged')
+                            : t('editor3D.voxels')}
+                      </span>
+                      <ChevronDown className="w-3 h-3 opacity-60" />
                     </button>
-                  ))}
-                </div>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent
+                    align="start"
+                    className="bg-gray-900 border-gray-800 text-white min-w-[140px]"
+                  >
+                    <DropdownMenuItem
+                      onSelect={(e) => {
+                        e.preventDefault();
+                        setMeshStyle('suave');
+                        setEditedVertices(null);
+                      }}
+                      className={`hover:bg-gray-800 cursor-pointer p-2 flex items-center gap-2 text-xs ${
+                        meshStyle === 'suave' ? 'bg-green-500/20 text-green-300' : ''
+                      }`}
+                      title={t('editor3D.useMeshInLathe', { style: t('editor3D.smooth').toLowerCase() })}
+                    >
+                      <Spline className="w-3.5 h-3.5" />
+                      {t('editor3D.smooth')}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={(e) => {
+                        e.preventDefault();
+                        setMeshStyle('fusionada');
+                        setEditedVertices(null);
+                      }}
+                      className={`hover:bg-gray-800 cursor-pointer p-2 flex items-center gap-2 text-xs ${
+                        meshStyle === 'fusionada' ? 'bg-green-500/20 text-green-300' : ''
+                      }`}
+                      title={t('editor3D.useMeshInLathe', { style: t('editor3D.merged').toLowerCase() })}
+                    >
+                      <Grid3x3 className="w-3.5 h-3.5" />
+                      {t('editor3D.merged')}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={(e) => {
+                        e.preventDefault();
+                        setMeshStyle('voxeles');
+                        setEditedVertices(null);
+                      }}
+                      className={`hover:bg-gray-800 cursor-pointer p-2 flex items-center gap-2 text-xs ${
+                        meshStyle === 'voxeles' ? 'bg-green-500/20 text-green-300' : ''
+                      }`}
+                      title={t('editor3D.useMeshInLathe', { style: t('editor3D.voxels').toLowerCase() })}
+                    >
+                      <Box className="w-3.5 h-3.5" />
+                      {t('editor3D.voxels')}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               </div>
 
               <div className="flex-none h-56 p-3 flex">
@@ -6712,7 +8076,6 @@ export default function Home() {
                   axisVertical={true}
                   polylines={getPolylines('lathe:profile')}
                   onEdit={() => {
-                    console.log('EDIT PERFIL pulsado');
                     setEditingLatheProfile(true);
                   }}
                 />
@@ -6744,144 +8107,6 @@ export default function Home() {
                     {t('editor3D.shapeAppearance')}
                   </h3>
 
-                   <div className="flex flex-col gap-1.5">
-                     <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
-                       <span>{t('editor3D.shapeColor')}</span>
-                       <span className="font-mono text-[10px] text-green-400">
-                         {latheFigureColor}
-                       </span>
-                     </label>
-                     <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-black/40 border border-white/10">
-                       <input
-                         type="color"
-                         value={latheFigureColor}
-                         onChange={(e) => {
-                           setLatheFigureColor(e.target.value);
-                           setEditedVertices(null);
-                         }}
-                         className="w-8 h-8 rounded cursor-pointer bg-transparent border border-white/10 p-0.5"
-                       />
-                       <button
-                         onClick={() => {
-                           setLatheFigureColor('#121ca7');
-                           setEditedVertices(null);
-                         }}
-                         className="text-[10px] text-muted-foreground/60 hover:text-foreground transition-colors"
-                       >
-                         Restablecer
-                       </button>
-                       <input
-                         type="text"
-                         value={latheTextureFileName}
-                         readOnly
-                         placeholder={t('editor3D.noTextureSelected')}
-                         className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 text-foreground placeholder:text-muted-foreground/40 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap"
-                         onClick={openTexturePicker}
-                       />
-                       <button
-                         onClick={() => setTextureBrowserOpen(true)}
-                         title={t('editor3D.browse')}
-                         className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 transition-colors"
-                       >
-                          <ImageIcon className="w-3.5 h-3.5" />
-                          {t('editor3D.browse')}
-                        </button>
-                       {latheTexture && (
-                         <button
-                           onClick={clearTexture}
-                            title={t('editor3D.removeTexture')}
-                           className="shrink-0 flex items-center gap-1.5 px-2 py-2 rounded-md text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/30 transition-colors"
-                         >
-                           <X className="w-3.5 h-3.5" />
-                         </button>
-                       )}
-                    </div>
-                    <input
-                      ref={textureInputRef}
-                      type="file"
-                      accept="image/*"
-                      className="hidden"
-                      onChange={(e) => {
-                        const file = e.target.files?.[0];
-                        if (file) handleTextureFile(file);
-                        e.target.value = '';
-                      }}
-                    />
-                    {latheTexture && (
-                      <div className="mt-1 rounded-md border border-white/10 overflow-hidden w-16 h-16 bg-black/40">
-                        <img
-                          src={latheTexture}
-                          alt="Textura cargada"
-                          className="w-full h-full object-cover"
-                        />
-                      </div>
-                    )}
-                    <label className="text-[10px] text-muted-foreground/80 mt-1">
-                      {t('editor3D.textureProjection')}
-                    </label>
-                    <select
-                      value={textureProjection}
-                      onChange={(event) =>
-                        setTextureProjection(
-                          event.target.value as LatheTextureProjection
-                        )
-                      }
-                      className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
-                    >
-                     <option value="cylindrical">{t('editor3D.projection.cylindrical')}</option>
-                     <option value="planar">{t('editor3D.projection.planar')}</option>
-                     <option value="spherical">{t('editor3D.projection.spherical')}</option>
-                    </select>
-                    <label className="flex items-center gap-1.5 mt-1 cursor-pointer text-[10px] text-muted-foreground/80">
-                      <input
-                        type="checkbox"
-                        checked={textureHelper}
-                        onChange={(e) => setTextureHelper(e.target.checked)}
-                        className="accent-yellow-400"
-                      />
-                      {t('editor3D.textureHelper')}
-                      {(textureHelper || textureHelperDirty) && (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setTextureHelperTransform(IDENTITY_TRANSFORM)
-                          }
-                          className="ml-auto px-1.5 py-0.5 rounded border border-white/10 bg-black/40 hover:bg-white/10"
-                          title={t('editor3D.restore')}
-                        >
-                          ↺
-                        </button>
-                      )}
-                    </label>
-                    <label className="text-[10px] text-muted-foreground/80 mt-1">
-                      {t('editor3D.textureFinish')}
-                    </label>
-                    <select
-                      value={textureFinish}
-                      onChange={(event) =>
-                        setTextureFinish(event.target.value as TextureFinish)
-                      }
-                      className="w-full px-3 py-2 rounded-md text-xs bg-black/40 border border-white/10 text-foreground"
-                    >
-                      <option value="glossy">{t('editor3D.finish.metallic')}</option>
-                      <option value="semi-matte">{t('editor3D.finish.semiMatte')}</option>
-                      <option value="matte">{t('editor3D.finish.matte')}</option>
-                      <option value="mirror">{t('editor3D.finish.glossy')}</option>
-                    </select>
-                    <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
-                      <span>{t('editor3D.textureRelief')}</span>
-                      <span className="font-mono text-green-400">
-                        {Math.round(textureRelief * 100)}%
-                      </span>
-                    </label>
-                    <Slider
-                      min={0}
-                      max={1}
-                      step={0.01}
-                      value={[textureRelief]}
-                      onValueChange={([v]) => setTextureRelief(v)}
-                      className="w-full"
-                    />
                     <label className="text-[10px] text-muted-foreground/80 mt-1 flex items-center justify-between">
                       <span>{t('editor3D.latheOpacity')}</span>
                       <span className="font-mono text-green-400">
@@ -6910,7 +8135,6 @@ export default function Home() {
                     Cerrar extremos (tapas)
                   </span>
                 </label>
-              </div>
 
               <div className="mt-auto px-3 py-2 border-t border-white/5">
                 <p className="text-[10px] text-muted-foreground/60 flex items-center gap-1">
@@ -6920,45 +8144,11 @@ export default function Home() {
                   {!latheClamp && ' Sin tapas, los extremos quedan abiertos.'}
                    </p>
                  </div>
-                 </>
+                 </Fragment>
              )}
          </div>
 
          <div className="flex-1 flex flex-col min-w-0 min-h-0">
-           {cameraViewMode && (
-             <div className="flex items-center gap-2 px-2 py-1.5 bg-black/60 backdrop-blur-sm border-b border-white/5 shrink-0">
-               <button
-                 onClick={() => setPlaying(!playing)}
-                 className={`p-1 rounded text-xs ${
-                   playing
-                     ? 'bg-green-500/20 text-green-300'
-                     : 'bg-blue-500/20 hover:bg-blue-500/30 text-blue-300'
-                 }`}
-                  title={playing ? t('editor3D.pause') : t('editor3D.play')}
-               >
-                 {playing ? '⏸' : '▶'}
-               </button>
-               <button
-                 onClick={() => { setPlaying(false); setCurrentTime(0.1); }}
-                 className="p-1 rounded text-xs bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground"
-                  title={t('editor3D.stop')}
-               >
-                 ⏹
-               </button>
-               <input
-                 type="range"
-                 min={0.01}
-                 max={Math.max(...(animationTracks.length > 0 ? animationTracks.map((t) => t.duration) : [3000])) / 1000}
-                 step={0.01}
-                 value={currentTime}
-                 onChange={(e) => setCurrentTime(Math.max(parseFloat(e.target.value) || 0.1, 0.01))}
-                 className="flex-1 h-1"
-               />
-               <span className="w-16 text-right text-foreground text-xs font-mono">
-                 {currentTime.toFixed(1)}s / {Math.max(...(animationTracks.length > 0 ? animationTracks.map((t) => t.duration) : [3000])) / 1000}s
-               </span>
-             </div>
-           )}
            <div
             className={`relative flex-1 ${isEditingCanvas ? 'grid grid-cols-1 grid-rows-1' : 'grid grid-cols-2 grid-rows-2'} gap-1.5 p-1.5 min-w-0 min-h-0`}
           >
@@ -7022,912 +8212,6 @@ export default function Home() {
                 templateOpacity={templateOpacity}
                 templateScale={templateScale}
               />
-            ) : mode === 'views' || mode === 'extrude' ? (
-              <>
-                {(!editingView || editingView === 'front') && (
-        <ViewerPanel
-          viewName="front"
-          label={t('editor3D.panelLabels.frontAxis')}
-          editingState={editingView === 'front'}
-          onSetEditing={(v: boolean) => setEditingView(v ? 'front' : null)}
-          onActiveView={() => setActiveView('front')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-
-                {(!editingView || editingView === 'top') && (
-        <ViewerPanel
-          viewName="top"
-          label={t('editor3D.panelLabels.topAxis')}
-          editingState={editingView === 'top'}
-          onSetEditing={(v: boolean) => setEditingView(v ? 'top' : null)}
-          onActiveView={() => setActiveView('top')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-
-                {(!editingView || editingView === 'side') && (
-        <ViewerPanel
-          viewName="side"
-          label={t('editor3D.panelLabels.sideAxis')}
-          editingState={editingView === 'side'}
-          onSetEditing={(v: boolean) => setEditingView(v ? 'side' : null)}
-          onActiveView={() => setActiveView('side')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-
-                {(!editingView || editingView === '3d') && (
-        <ViewerPanel
-          viewName="3d"
-          label={isRecordingCameraPath ? '3D ●' : '3D'}
-          editingState={editingView === '3d'}
-          onSetEditing={(v: boolean) => setEditingView(v ? '3d' : null)}
-          onActiveView={() => setActiveView('3d')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-              </>
-            ) : mode === 'text' ? (
-              <>
-                {(!editingTextPanel || editingTextPanel === 'front') && (
-        <ViewerPanel
-          viewName="front"
-          label={t('editor3D.panelLabels.front')}
-          editingState={editingTextPanel === 'front'}
-          onSetEditing={(v: boolean) => setEditingTextPanel(v ? 'front' : null)}
-          onActiveView={() => setActiveView('front')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-
-                {(!editingTextPanel || editingTextPanel === 'top') && (
-        <ViewerPanel
-          viewName="top"
-          label={t('editor3D.panelLabels.top')}
-          editingState={editingTextPanel === 'top'}
-          onSetEditing={(v: boolean) => setEditingTextPanel(v ? 'top' : null)}
-          onActiveView={() => setActiveView('top')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-
-                {(!editingTextPanel || editingTextPanel === 'side') && (
-        <ViewerPanel
-          viewName="side"
-          label={t('editor3D.panelLabels.side')}
-          editingState={editingTextPanel === 'side'}
-          onSetEditing={(v: boolean) => setEditingTextPanel(v ? 'side' : null)}
-          onActiveView={() => setActiveView('side')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-
-                {(!editingTextPanel || editingTextPanel === '3d') && (
-        <ViewerPanel
-          viewName="3d"
-          label={isRecordingCameraPath ? '3D Libre ●' : '3D Libre'}
-          editingState={editingTextPanel === '3d'}
-          onSetEditing={(v: boolean) => setEditingTextPanel(v ? '3d' : null)}
-          onActiveView={() => setActiveView('3d')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-              </>
-            ) : mode === 'lathe' ? (
-              <>
-                {(!editingLathePanel || editingLathePanel === 'front') && (
-        <ViewerPanel
-          viewName="front"
-          label={t('editor3D.panelLabels.front')}
-          editingState={editingLathePanel === 'front'}
-          onSetEditing={(v: boolean) => setEditingLathePanel(v ? 'front' : null)}
-          onActiveView={() => setActiveView('front')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-
-                {(!editingLathePanel || editingLathePanel === 'top') && (
-        <ViewerPanel
-          viewName="top"
-          label={t('editor3D.panelLabels.top')}
-          editingState={editingLathePanel === 'top'}
-          onSetEditing={(v: boolean) => setEditingLathePanel(v ? 'top' : null)}
-          onActiveView={() => setActiveView('top')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-
-                {(!editingLathePanel || editingLathePanel === 'side') && (
-        <ViewerPanel
-          viewName="side"
-          label={t('editor3D.panelLabels.side')}
-          editingState={editingLathePanel === 'side'}
-          onSetEditing={(v: boolean) => setEditingLathePanel(v ? 'side' : null)}
-          onActiveView={() => setActiveView('side')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-
-                {(!editingLathePanel || editingLathePanel === '3d') && (
-        <ViewerPanel
-          viewName="3d"
-          label={isRecordingCameraPath ? '3D Libre ●' : '3D Libre'}
-          editingState={editingLathePanel === '3d'}
-          onSetEditing={(v: boolean) => setEditingLathePanel(v ? '3d' : null)}
-          onActiveView={() => setActiveView('3d')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-              </>
             ) : mode === 'mesh' && editingMeshProfile ? (
               /* Un solo panel maximizado */
               editingMeshProfile === 'silhouette' ? (
@@ -8261,309 +8545,16 @@ export default function Home() {
                   )}
                 </div>
               </div>
-            ) : mode === 'mesh' ? (
+            ) : editingPanel !== null ? (
+              renderViewerPanel(editingPanel)
+            ) : (
               <>
-                {(!editingMeshPanel || editingMeshPanel === 'front') && (
-        <ViewerPanel
-          viewName="front"
-          label={t('editor3D.panelLabels.frontAxis')}
-          editingState={editingMeshPanel === 'front'}
-          onSetEditing={(v: boolean) => setEditingMeshPanel(v ? 'front' : null)}
-          onActiveView={() => setActiveView('front')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-
-                {(!editingMeshPanel || editingMeshPanel === 'top') && (
-        <ViewerPanel
-          viewName="top"
-          label={t('editor3D.panelLabels.topAxis')}
-          editingState={editingMeshPanel === 'top'}
-          onSetEditing={(v: boolean) => setEditingMeshPanel(v ? 'top' : null)}
-          onActiveView={() => setActiveView('top')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-
-                {(!editingMeshPanel || editingMeshPanel === 'side') && (
-        <ViewerPanel
-          viewName="side"
-          label={t('editor3D.panelLabels.sideAxis')}
-          editingState={editingMeshPanel === 'side'}
-          onSetEditing={(v: boolean) => setEditingMeshPanel(v ? 'side' : null)}
-          onActiveView={() => setActiveView('side')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
-
-                {(!editingMeshPanel || editingMeshPanel === '3d') && (
-        <ViewerPanel
-          viewName="3d"
-          label={isRecordingCameraPath ? '3D Libre ●' : '3D Libre'}
-          editingState={editingMeshPanel === '3d'}
-          onSetEditing={(v: boolean) => setEditingMeshPanel(v ? '3d' : null)}
-          onActiveView={() => setActiveView('3d')}
-          activeView={activeView}
-          viewerMesh={viewerMesh}
-          visibleSceneObjects={visibleSceneObjects}
-          configObjectId={configObjectId}
-          triMesh={triMesh}
-          smoothShadingValue={smoothShadingValue}
-          textureProjection={textureProjection}
-          selectedObjectId={selectedObjectId}
-          sceneObjects={sceneObjects}
-          handleObjectSelect={handleObjectSelect}
-             onMultiObjectTransform={handleMultiObjectTransform}
-              objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
-              onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
-          selectedObjectIds={selectedObjectIds}
-          onSelectionChange={setSelectedObjectIds}
-          selectionMode={selectionMode}
-          onSelectionModeChange={setSelectionMode}
-          faceSelectMode={faceSelectMode}
-          faceSelectionTool={faceSelectionTool}
-          selectedFaceIds={selectedFaceIds}
-          onFaceSelectionChange={setSelectedFaceIds}
-          onFaceSelectionModeChange={setFaceSelectMode}
-          onFaceSelectionToolChange={setFaceSelectionTool}
-          showGizmo={showGizmo}
-          handleObjectTransform={handleObjectTransform}
-          handleVerticesChange={handleVerticesChange}
-          showLatheAxis={mode === 'lathe' as never}
-
-          viewerProjection={viewerProjection}
-          textureRepeat={textureRepeat}
-          textureHelper={textureHelper}
-          textureHelperTransform={textureHelperTransform}
-          setTextureHelperTransform={setTextureHelperTransform}
-          lightConfig={lightConfig}
-          showLightHelpers={showLightHelpers}
-          showGround={showGround}
-           groundTexture={groundTexture}
-             groundTextureFinish={groundTextureFinish}
-             groundTextureRepeat={groundTextureRepeat}
-             objectTextureFinish={objectTextureFinish}
-          skyboxImage={skyboxImage}
-          booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
-          forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-          showGrid={showGrid}
-          setShowGrid={setShowGrid}
-          fxConfig={fxConfig}
-          setFxConfig={setFxConfig}
-          setLightConfig={setLightConfig}
-          panelCameras={panelCameras}
-           handleCameraChange={handleCameraChange}
-            onCameraMove={isRecordingCameraPath ? handleCameraMoveForRecording : undefined}
-             showCameraPathGizmo={showGround || isRecordingCameraPath}
-             onCameraGizmoMove={handleCameraGizmoMove}
-             showCameraPath={showCameraPath}
-             exportMp4Trigger={exportMp4Trigger}
-             onExportProgress={setExportProgress}
-             onExportComplete={setExportResult}
-            cameraViewMode={cameraViewMode}
-           animationTracks={animationTracks}
-            animationTime={playing ? currentTime : 0.1}
-           onAnimationComplete={() => {}}
-           viewerSmooth={viewerSmooth}
-          pan3D={pan3D}
-          zoom3D={zoom3D}
-          orbit3D={orbit3D}
-        />
-      )}
+                {renderViewerPanel('front')}
+                {renderViewerPanel('top')}
+                {renderViewerPanel('side')}
+                {renderViewerPanel('3d')}
               </>
-            ) : null}
+            )}
           </div>
 
           {/* Botones flotantes de preview boolean: aparecen sobre los viewports */}
@@ -8601,6 +8592,93 @@ export default function Home() {
               >
                 {t('editor3D.cancelPreview')}
               </button>
+            </div>
+          )}
+
+          {/* Barra flotante del selector de caras/vértices/segmentos: info
+              de la selección y textura por caras */}
+          {faceSelectMode && (
+            <div
+              data-testid="face-select-bar"
+              className="absolute bottom-4 left-14 z-50 flex items-center gap-2 bg-gray-900/90 rounded-lg border border-cyan-500/30 px-3 py-2 shadow-lg max-w-[calc(100%-4rem)] flex-wrap"
+            >
+              <span className="text-xs text-cyan-300 shrink-0">
+                {faceSelectionTarget === 'cara'
+                  ? t('editor3D.faceSelFaces', { n: selectedFaceIds.length })
+                  : faceSelectionTarget === 'vertice'
+                    ? t('editor3D.faceSelVertices', { n: selectedVertexIds.length })
+                    : t('editor3D.faceSelEdges', { n: selectedEdgeIds.length })}
+              </span>
+              <input
+                ref={faceTextureInputRef}
+                type="file"
+                accept="image/*"
+                onChange={(e) => {
+                  handleFaceTextureFile(e.target.files?.[0] ?? null);
+                }}
+                className="hidden"
+              />
+              <button
+                data-testid="face-texture-assign"
+                disabled={
+                  faceSelectionTarget !== 'cara' ||
+                  selectedFaceIds.length === 0 ||
+                  !faceTextureTargetId
+                }
+                onClick={() => faceTextureInputRef.current?.click()}
+                className="px-2.5 py-1 rounded-md text-xs font-medium bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-100 border border-cyan-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                title={t('editor3D.faceTextureAssign')}
+              >
+                {t('editor3D.faceTextureAssign')}
+              </button>
+              <button
+                data-testid="face-texture-gallery"
+                disabled={
+                  faceSelectionTarget !== 'cara' ||
+                  selectedFaceIds.length === 0 ||
+                  !faceTextureTargetId
+                }
+                onClick={() => {
+                  // Abrir la galería de texturas apuntando a las caras seleccionadas.
+                  setTextureSelectTarget('face');
+                  setShowTextureModal(true);
+                }}
+                className="px-2.5 py-1 rounded-md text-xs font-medium bg-purple-500/20 hover:bg-purple-500/30 text-purple-100 border border-purple-500/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                title={t('editor3D.faceTextureGallery')}
+              >
+                {t('editor3D.faceTextureGallery')}
+              </button>
+              <button
+                data-testid="face-texture-clear"
+                disabled={
+                  faceSelectionTarget !== 'cara' ||
+                  selectedFaceIds.length === 0 ||
+                  !faceTextureTargetId
+                }
+                onClick={() => applyFaceTextureToSelection(null)}
+                className="px-2.5 py-1 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-white/5 border border-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                title={t('editor3D.faceTextureClear')}
+              >
+                {t('editor3D.faceTextureClear')}
+              </button>
+              <label
+                className="flex items-center gap-1.5 text-[11px] text-muted-foreground cursor-pointer select-none shrink-0"
+                title={t('editor3D.faceSelVisibleOnly')}
+              >
+                <input
+                  type="checkbox"
+                  data-testid="face-visible-only"
+                  checked={faceSelectVisibleOnly}
+                  onChange={(e) => setFaceSelectVisibleOnly(e.target.checked)}
+                  className="accent-cyan-500 cursor-pointer"
+                />
+                {t('editor3D.faceSelVisibleOnly')}
+              </label>
+              <span className="text-[10px] text-muted-foreground/70 shrink-0">
+                {viewerMesh.vertices.length === 0
+                  ? t('editor3D.faceSelNoObject')
+                  : t('editor3D.faceSelHint')}
+              </span>
             </div>
           )}
 
@@ -8726,7 +8804,7 @@ export default function Home() {
         </div>
       </main>
 
-      {!canBuild && mode !== 'views' && mode !== 'extrude' && (
+      {!canBuild && mode !== 'scene' && mode !== 'views' && mode !== 'extrude' && (
         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-4 py-2 rounded-lg bg-red-950/80 border border-red-800/50 text-red-200 text-xs backdrop-blur-sm shadow-lg z-50">
           <AlertCircle className="w-3.5 h-3.5" />
           {mode === 'text'
@@ -8740,8 +8818,16 @@ export default function Home() {
       <Modal
         isOpen={saveModalOpen}
         onClose={() => setSaveModalOpen(false)}
-        title={t('editor3D.save3dObject')}
-        description={t('editor3D.saveToFolder')}
+        title={
+          saveTarget === 'project'
+            ? t('editor3D.save3dProject')
+            : t('editor3D.save3dObject')
+        }
+        description={
+          saveTarget === 'project'
+            ? t('editor3D.saveToProjectFolder')
+            : t('editor3D.saveToFolder')
+        }
         size="md"
       >
         <div className="space-y-4 py-4">
@@ -8753,6 +8839,7 @@ export default function Home() {
             <input
               type="text"
               value={objectName}
+              data-testid="save-name-input"
               onChange={(e) => setObjectName(e.target.value)}
               placeholder={
                 mode === 'text'
@@ -8776,6 +8863,32 @@ export default function Home() {
             </p>
           </div>
 
+          <div className="flex items-center gap-2 pb-1">
+            <span className="text-xs text-gray-400">{t('editor3D.saveDestination')}</span>
+            <div className="flex gap-1">
+              <button
+                onClick={() => setSaveTarget('object')}
+                className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                  saveTarget === 'object'
+                    ? 'bg-cyan-600 text-white'
+                    : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                }`}
+              >
+                {t('editor3D.saveAsObject')}
+              </button>
+              <button
+                onClick={() => setSaveTarget('project')}
+                className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                  saveTarget === 'project'
+                    ? 'bg-emerald-600 text-white'
+                    : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                }`}
+              >
+                {t('editor3D.saveAsProject')}
+              </button>
+            </div>
+          </div>
+
           {saveMsg && (
             <div
               className={`rounded-lg px-4 py-2 text-sm border ${
@@ -8797,6 +8910,7 @@ export default function Home() {
             </button>
             <button
               onClick={saveObject}
+              data-testid="save-confirm-btn"
               disabled={savingObject}
               className="px-6 py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 rounded-lg text-white text-sm font-bold transition-all flex items-center gap-2"
             >
@@ -8832,6 +8946,34 @@ export default function Home() {
             </div>
           )}
 
+          <div className="flex items-center gap-2 pb-1">
+            <span className="text-xs text-gray-400">{t('editor3D.importModeLabel')}</span>
+            <div className="flex gap-1">
+              <button
+                onClick={() => setImportMode('merge')}
+                data-testid="import-mode-merge"
+                className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                  importMode === 'merge'
+                    ? 'bg-green-600 text-white'
+                    : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                }`}
+              >
+                {t('editor3D.openInScene')}
+              </button>
+              <button
+                onClick={() => setImportMode('new')}
+                data-testid="import-mode-new"
+                className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                  importMode === 'new'
+                    ? 'bg-green-600 text-white'
+                    : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                }`}
+              >
+                {t('editor3D.inSceneNew')}
+              </button>
+            </div>
+          </div>
+
           {!isElectron() && (
             <div className="space-y-2">
               <button
@@ -8846,6 +8988,7 @@ export default function Home() {
                 ref={obj3dFileInputRef}
                 type="file"
                 accept=".zeus,application/json,text/plain"
+                data-testid="zeus-file-input"
                 className="hidden"
                 onChange={(e) => {
                   const file = e.target.files?.[0];
@@ -8904,14 +9047,23 @@ export default function Home() {
                         .map((f) => (
                           <button
                             key={`local-${f.name}`}
-                            onClick={() => loadObject(f)}
+                            data-testid={`obj3d-card-${f.source}`}
+                            onClick={() =>
+                              loadObject({
+                                ...f,
+                                // Precargado al pasar el ratón: promesa o nada
+                                data: obj3dDataCacheRef.current.get(
+                                  `local/${f.name}`
+                                ),
+                              })
+                            }
                             onMouseEnter={() => loadObj3dPreview(f)}
                             disabled={obj3dCreating}
                             className="group relative aspect-square rounded-md overflow-hidden border border-white/10 bg-black/20 hover:border-green-500/50 transition-all disabled:opacity-50"
                             title={t('editor3D.loadInEditor', { name: f.name.replace(/\.zeus$/i, '') })}
                           >
                             <Object3DThumbnail mesh={f.mesh} />
-                            {obj3dCreating && (
+                            {(obj3dCreating || obj3dOpeningName === f.name) && (
                               <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
                                 <Loader2 className="w-5 h-5 animate-spin text-green-400" />
                               </div>
@@ -8927,7 +9079,55 @@ export default function Home() {
                   </div>
                 )}
 
-                {obj3dFiles.some((f) => f.source === 'public') && (
+                 {obj3dFiles.some((f) => f.source === 'project') && (
+                   <div>
+                     <div className="flex items-center justify-between mb-1.5">
+                       <h4 className="text-xs font-bold text-foreground">
+                         {t('editor3D.your3dProjectsFolder')}
+                       </h4>
+                       <span className="text-[10px] text-muted-foreground/70">
+                         {t('editor3D.clickToLoadInEditor')}
+                       </span>
+                     </div>
+                     <div className="grid grid-cols-3 gap-2">
+                       {obj3dFiles
+                         .filter((f) => f.source === 'project')
+                         .map((f) => (
+                           <button
+                             key={`project-${f.name}`}
+                             data-testid={`obj3d-card-${f.source}`}
+                             onClick={() =>
+                               loadObject({
+                                 ...f,
+                                 // Precargado al pasar el ratón: promesa o nada
+                                 data: obj3dDataCacheRef.current.get(
+                                   `project/${f.name}`
+                                 ),
+                               })
+                             }
+                             onMouseEnter={() => loadObj3dPreview(f)}
+                             disabled={obj3dCreating}
+                             className="group relative aspect-square rounded-md overflow-hidden border border-white/10 bg-black/20 hover:border-emerald-500/50 transition-all disabled:opacity-50"
+                             title={t('editor3D.loadInEditor', { name: f.name.replace(/\.zeus$/i, '') })}
+                           >
+                             <Object3DThumbnail mesh={f.mesh} />
+                             {(obj3dCreating || obj3dOpeningName === f.name) && (
+                               <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
+                                 <Loader2 className="w-5 h-5 animate-spin text-green-400" />
+                               </div>
+                             )}
+                             <div className="absolute bottom-0 left-0 right-0 p-1 bg-gradient-to-t from-black/80 to-transparent">
+                               <span className="text-[9px] text-white truncate block">
+                                 {f.name.replace(/\.zeus$/i, '')}
+                               </span>
+                             </div>
+                           </button>
+                         ))}
+                     </div>
+                   </div>
+                 )}
+
+                 {obj3dFiles.some((f) => f.source === 'public') && (
                   <div>
                     <div className="flex items-center justify-between mb-1.5">
                       <h4 className="text-xs font-bold text-foreground">
@@ -8943,6 +9143,7 @@ export default function Home() {
                         .map((f) => (
                           <button
                             key={`public-${f.name}`}
+                            data-testid={`obj3d-card-${f.source}`}
                             onClick={() => createObj3dFromFile(f)}
                             onMouseEnter={() => loadObj3dPreview(f)}
                             disabled={obj3dCreating}
@@ -9031,6 +9232,7 @@ export default function Home() {
               </button>
               <button
                 onClick={confirmDeleteObject}
+                data-testid="confirm-delete-btn"
                 className="px-4 py-2 rounded-md text-sm font-bold bg-red-500 hover:bg-red-600 text-white transition-colors"
               >
                 {t('editor3D.delete')}
@@ -9070,6 +9272,9 @@ export default function Home() {
            } else if (textureSelectTarget === 'object') {
              setSelectedObjectTexture(dataUrl);
              setSelectedObjectTextureFileName(fileName);
+           } else if (textureSelectTarget === 'face') {
+             // Textura elegida de la galería para las caras seleccionadas.
+             applyFaceTextureToSelection(dataUrl);
            } else {
              setSkyboxImage(dataUrl);
              setSkyboxImageFileName(fileName);
@@ -9203,5 +9408,4 @@ export function PanelButtons({
     </div>
   );
 }
-
 

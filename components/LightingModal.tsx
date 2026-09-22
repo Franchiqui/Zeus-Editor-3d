@@ -13,6 +13,8 @@ import {
   ToggleRight,
   Move3D,
   Palette,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 
 interface LightingModalProps {
@@ -66,6 +68,7 @@ export default function LightingModal({
       castShadow: false,
       shadowIntensity: 0.5,
       shadowColor: 0x000000,
+      helperVisible: true,
     };
     setConfig((prev) => ({
       ...prev,
@@ -224,16 +227,38 @@ export default function LightingModal({
                         ) : (
                           <ToggleLeft className="w-4 h-4 text-muted-foreground" />
                         )}
-                      </button>
-                      Activo
-                    </label>
-                    <button
-                      onClick={() => removeSpotlight(spot.id)}
-                      className="p-1 rounded text-red-400 hover:bg-red-500/20"
-                      title="Eliminar foco"
-                    >
-                      <Trash2 className="w-3 h-3" />
                     </button>
+                       Activo
+                    </label>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() =>
+                          updateSpotlight(spot.id, {
+                            helperVisible: spot.helperVisible === false,
+                          })
+                        }
+                        className="p-0.5 hover:bg-gray-700 rounded"
+                        title={
+                          spot.helperVisible === false
+                            ? 'Mostrar ayuda visual'
+                            : 'Ocultar ayuda visual'
+                        }
+                        disabled={!spot.enabled}
+                      >
+                        {spot.helperVisible === false ? (
+                          <EyeOff className="w-3.5 h-3.5 text-muted-foreground" />
+                        ) : (
+                          <Eye className="w-3.5 h-3.5 text-amber-400" />
+                        )}
+                      </button>
+                      <button
+                        onClick={() => removeSpotlight(spot.id)}
+                        className="p-1 rounded text-red-400 hover:bg-red-500/20"
+                        title="Eliminar foco"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </div>
                   </div>
 
                   {/* Position controls */}

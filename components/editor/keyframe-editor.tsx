@@ -8,10 +8,6 @@ import {
   KeyframeProperty,
   EasingFunction,
   createDefaultTrack,
-  createDefaultKeyframe,
-  cloneTrack,
-  evaluateTrack,
-  CAMERA_PROPERTIES,
   OBJECT_PROPERTIES,
   KEYFRAME_PROPERTY_LABELS,
   EASING_OPTIONS,
@@ -27,12 +23,10 @@ interface KeyframeEditorProps {
   currentTime: number;
   setCurrentTime: (time: number) => void;
   sceneObjects: { id: string; id_label?: string; name?: string }[];
-  panelCameras: Record<string, { zoom: number; offsetX: number; offsetY: number; rotationX: number; rotationY: number }>;
-  isRecordingCameraPath?: boolean;
-  onStartCameraRecording?: () => void;
-  onStopCameraRecording?: () => void;
-  showCameraPath?: boolean;
-  onShowCameraPathChange?: (show: boolean) => void;
+  /** Hay cámara-objeto con ≥2 fotogramas: se puede exportar MP4 */
+  canExportMp4?: boolean;
+  /** Duración del recorrido de la cámara-objeto (s): amplía el scrubbing */
+  cameraSpan?: number;
   onExportMp4?: () => void;
   exportProgress?: number | null;
   exportResult?: { success: boolean; outputPath?: string; error?: string } | null;
@@ -48,23 +42,13 @@ export const KeyframeEditor: FC<KeyframeEditorProps> = ({
   currentTime,
   setCurrentTime,
   sceneObjects,
-  panelCameras,
-  isRecordingCameraPath = false,
-  onStartCameraRecording,
-  onStopCameraRecording,
-  showCameraPath = true,
-  onShowCameraPathChange,
+  canExportMp4 = false,
+  cameraSpan = 0,
   onExportMp4,
   exportProgress,
   exportResult,
 }) => {
   const selectedTrack = tracks.find((t) => t.id === selectedTrackId) ?? null;
-
-  const handleAddTrack = () => {
-    const newTrack = createDefaultTrack(null, 'Cámara', 3);
-    setTracks([...tracks, newTrack]);
-    setSelectedTrackId(newTrack.id);
-  };
 
   const handleAddObjectTrack = (objectId: string) => {
     const newTrack = createDefaultTrack(objectId, `Objeto: ${objectId}`, 3);
@@ -159,10 +143,7 @@ export const KeyframeEditor: FC<KeyframeEditorProps> = ({
 
   const getPropertyColumns = (): KeyframeProperty[] => {
     if (!selectedTrack) return [];
-    const hasObjects = sceneObjects.length > 0;
-    return selectedTrack.objectId === null
-      ? (hasObjects ? [...CAMERA_PROPERTIES] : CAMERA_PROPERTIES)
-      : OBJECT_PROPERTIES;
+    return OBJECT_PROPERTIES;
   };
 
   const properties = getPropertyColumns();
@@ -172,23 +153,13 @@ export const KeyframeEditor: FC<KeyframeEditorProps> = ({
       <div className="flex items-center justify-between">
         <span className="font-semibold text-green-300">Animación</span>
         <div className="flex gap-1">
-          {!selectedTrack && (
-            <>
-              <button
-                onClick={handleAddTrack}
-                className="px-2 py-1 rounded bg-blue-500/20 hover:bg-blue-500/30 text-blue-300"
-              >
-                + Cámara
-              </button>
-              {sceneObjects.length > 0 && (
-                <button
-                  onClick={() => handleAddObjectTrack(sceneObjects[0].id)}
-                  className="px-2 py-1 rounded bg-purple-500/20 hover:bg-purple-500/30 text-purple-300"
-                >
-                  + Objeto
-                </button>
-              )}
-            </>
+          {!selectedTrack && sceneObjects.length > 0 && (
+            <button
+              onClick={() => handleAddObjectTrack(sceneObjects[0].id)}
+              className="px-2 py-1 rounded bg-purple-500/20 hover:bg-purple-500/30 text-purple-300"
+            >
+              + Objeto
+            </button>
           )}
           {selectedTrack && (
             <>
@@ -256,7 +227,7 @@ export const KeyframeEditor: FC<KeyframeEditorProps> = ({
         <input
           type="range"
           min={0.01}
-          max={selectedTrack?.duration ?? 3}
+          max={Math.max(selectedTrack?.duration ?? 3, cameraSpan)}
           step={0.01}
           value={currentTime}
           onChange={(e) => setCurrentTime(Math.max(parseFloat(e.target.value) || 0.1, 0.01))}
@@ -268,6 +239,7 @@ export const KeyframeEditor: FC<KeyframeEditorProps> = ({
       <div className="flex gap-1">
         <button
           onClick={() => setPlaying(!playing)}
+          data-testid="play-animation-btn"
           className={`px-3 py-1 rounded text-xs font-medium ${
             playing
               ? 'bg-green-500/20 text-green-300'
@@ -285,39 +257,11 @@ export const KeyframeEditor: FC<KeyframeEditorProps> = ({
             + Fotograma
           </button>
         )}
-        {onStartCameraRecording && (
-          <button
-            onClick={isRecordingCameraPath ? onStopCameraRecording : onStartCameraRecording}
-            className={`px-3 py-1 rounded text-xs font-medium ${
-              isRecordingCameraPath
-                ? 'bg-red-500/20 hover:bg-red-500/30 text-red-300'
-                : 'bg-purple-500/20 hover:bg-purple-500/30 text-purple-300'
-            }`}
-            title={isRecordingCameraPath ? 'Detener grabación de recorrido' : 'Grabar recorrido de cámara'}
-          >
-            {isRecordingCameraPath ? '● Detener' : 'Grabar recorrido'}
-          </button>
-        )}
-        {onShowCameraPathChange && (
-          <button
-            onClick={() => onShowCameraPathChange(!showCameraPath)}
-            className={`px-2 py-1 rounded text-xs font-medium ${
-              showCameraPath
-                ? 'bg-green-500/20 hover:bg-green-500/30 text-green-300'
-                : 'bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground'
-            }`}
-            title={showCameraPath ? 'Ocultar línea de recorrido de cámara' : 'Mostrar línea de recorrido de cámara'}
-          >
-            <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: showCameraPath ? '#4ade80' : '#666' }} />
-              Recorrido {showCameraPath ? 'visible' : 'oculto'}
-            </span>
-          </button>
-          )}
-        </div>
+      </div>
 
-        {/* Botón de exportación MP4 y barra de progreso */}
-        {tracks.length > 0 && (
+        {/* Botón de exportación MP4 y barra de progreso: requiere una
+            cámara-objeto con ≥2 fotogramas (la cámara del recorrido). */}
+        {canExportMp4 && (
           <div className="flex flex-col gap-1.5">
             {exportProgress != null && exportProgress < 100 && (
               <div className="flex items-center gap-2 text-xs">
@@ -412,7 +356,7 @@ export const KeyframeEditor: FC<KeyframeEditorProps> = ({
                             }
                           }}
                           className="w-16 px-1 py-0.5 rounded bg-black/30 border border-white/10 text-foreground text-xs"
-                          placeholder={selectedTrack.objectId === null && prop === 'zoom' ? '1' : '0'}
+                          placeholder="0"
                         />
                       </td>
                     ))}

@@ -74,8 +74,8 @@
               }
        },
        "scripts": {
-              "dev": "concurrently \"next dev -p 3003\" \"npx next dev -p 3006\" \"node zeus-bridge.js\"",
-              "dev:main": "next dev -p 3003",
+              "dev": "concurrently \"next dev -p 3009\" \"npx next dev -p 3006\" \"node zeus-bridge.js\"",
+              "dev:main": "next dev -p 3009",
               "dev:pb": "concurrently \"npx next dev -p 3006\"",
               "pb:serve": "cd pocket-base && pocketbase.exe serve --http 127.0.0.1:8236",
               "bridge": "node zeus-bridge.js",

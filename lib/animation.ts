@@ -158,14 +158,6 @@ export const KEYFRAME_PROPERTY_LABELS: Record<KeyframeProperty, string> = {
   scale: 'Escala',
 };
 
-export const CAMERA_PROPERTIES: KeyframeProperty[] = [
-  'zoom',
-  'offsetX',
-  'offsetY',
-  'rotationX',
-  'rotationY',
-];
-
 export const OBJECT_PROPERTIES: KeyframeProperty[] = [
   'translateX',
   'translateY',
@@ -210,4 +202,82 @@ export function cloneTrack(track: AnimationTrack): AnimationTrack {
     ...track,
     keyframes: track.keyframes.map((k) => ({ ...k, values: { ...k.values } })),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Cámara como objeto de escena: pose por fotograma (posición + foco + FOV).
+// ---------------------------------------------------------------------------
+
+export type Vec3 = { x: number; y: number; z: number };
+
+export type CameraKeyframe = {
+  /** Milisegundos dentro del recorrido */
+  time: number;
+  /** Posición del cuerpo de la cámara */
+  position: Vec3;
+  /** Foco: el punto hacia el que mira (look-at) */
+  target: Vec3;
+  /** Ángulo de visión; si falta, usa el FOV del objeto */
+  fov?: number;
+  easing: EasingFunction;
+};
+
+export type CameraData = {
+  fov: number;
+  /** Foco actual de la cámara (sin fotograma seleccionado) */
+  target: Vec3;
+  keyframes: CameraKeyframe[];
+};
+
+export function createDefaultCameraData(): CameraData {
+  return { fov: 45, target: { x: 0, y: 1, z: 0 }, keyframes: [] };
+}
+
+/** Evalúa el recorrido de una cámara-objeto en un instante (ms). */
+export function evaluateCameraKeyframes(
+  keyframes: CameraKeyframe[],
+  time: number,
+  fovFallback: number = 45
+): { position: Vec3; target: Vec3; fov: number } | null {
+  if (keyframes.length === 0) return null;
+  const sorted = [...keyframes].sort((a, b) => a.time - b.time);
+  const poseOf = (k: CameraKeyframe): { position: Vec3; target: Vec3; fov: number } => ({
+    position: k.position,
+    target: k.target,
+    fov: k.fov ?? fovFallback,
+  });
+  if (keyframes.length === 1 || time <= sorted[0].time) {
+    return poseOf(sorted[0]);
+  }
+  if (time >= sorted[sorted.length - 1].time) {
+    return poseOf(sorted[sorted.length - 1]);
+  }
+  // Segmento que contiene `time` (misma lógica que findKeyframeSegment,
+  // pero sobre fotogramas de cámara).
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const start = sorted[i];
+    const end = sorted[i + 1];
+    if (time >= start.time && time <= end.time) {
+      const dur = end.time - start.time;
+      const progress = dur > 0 ? (time - start.time) / dur : 0;
+      const eased = getEasingFunction(end.easing)(progress);
+      const lerp = (a: number, b: number) => a + (b - a) * eased;
+      const fovA = start.fov ?? fovFallback;
+      const fovB = end.fov ?? fovFallback;
+      return {
+        position: {
+          x: lerp(start.position.x, end.position.x),
+          y: lerp(start.position.y, end.position.y),
+          z: lerp(start.position.z, end.position.z),
+        },
+        target: {
+          x: lerp(start.target.x, end.target.x),
+          y: lerp(start.target.y, end.target.y),
+          z: lerp(start.target.z, end.target.z),
+        },
+        fov: lerp(fovA, fovB),
+      };
+    }
+  }
+  return poseOf(sorted[sorted.length - 1]);
 }
