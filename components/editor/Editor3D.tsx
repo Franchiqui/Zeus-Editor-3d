@@ -16,8 +16,9 @@ import type {
   CameraData,
   CameraKeyframe,
   Vec3,
-  TransformTrack,
-  PluginParamTrack,
+   TransformTrack,
+   TransformProperty,
+   PluginParamTrack,
 } from '@/lib/animation';
 import {
   createDefaultCameraData,
@@ -25,7 +26,7 @@ import {
   evaluateTransformTrack,
   evaluatePluginParamTrack,
   motionMaxDuration,
-  diffTransform,
+  TRANSFORM_PROPERTIES,
   upsertKeyframeAt,
   createTransformTrack,
   createPluginParamTrack,
@@ -1339,7 +1340,7 @@ export default function Home({
    const [animationTracks, setAnimationTracks] = useState<AnimationTrack[]>([]);
    const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
    const [playing, setPlaying] = useState(false);
-    const [currentTime, setCurrentTime] = useState(0.1);
+     const [currentTime, setCurrentTime] = useState(0);
     const [showKeyframeEditor, setShowKeyframeEditor] = useState(false);
     const [showGroupsPanel, setShowGroupsPanel] = useState(true);
 
@@ -1470,7 +1471,7 @@ export default function Home({
             t = ((t % maxDuration) + maxDuration) % maxDuration;
           }
         }
-        setCurrentTime(Math.max(t, 0.1));
+         setCurrentTime(Math.max(t, 0));
         animIdRef.current = requestAnimationFrame(animate);
       };
       animIdRef.current = requestAnimationFrame(animate);
@@ -5238,27 +5239,28 @@ export default function Home({
          const animado = prevTrack
            ? evaluateTransformTrack(prevTrack, currentTimeRef.current)
            : null;
-         const base = {
-           px: animado?.px ?? estatico.px,
-           py: animado?.py ?? estatico.py,
-           pz: animado?.pz ?? estatico.pz,
-           rx: animado?.rx ?? estatico.rx,
-           ry: animado?.ry ?? estatico.ry,
-           rz: animado?.rz ?? estatico.rz,
-           sx: animado?.sx ?? estatico.sx,
-           sy: animado?.sy ?? estatico.sy,
-           sz: animado?.sz ?? estatico.sz,
-         };
-         const values = diffTransform(base, transform);
-         if (Object.keys(values).length === 0) return;
+          const base: Record<TransformProperty, number> = {
+            px: animado?.px ?? estatico.px ?? 0, py: animado?.py ?? estatico.py ?? 0, pz: animado?.pz ?? estatico.pz ?? 0,
+            rx: animado?.rx ?? estatico.rx ?? 0, ry: animado?.ry ?? estatico.ry ?? 0, rz: animado?.rz ?? estatico.rz ?? 0,
+            sx: animado?.sx ?? estatico.sx ?? 1, sy: animado?.sy ?? estatico.sy ?? 1, sz: animado?.sz ?? estatico.sz ?? 1,
+            o: animado?.o ?? estatico.o ?? (objetoAnterior?.mesh?.opacity ?? 1),
+          };
+          // Cada fotograma guarda el transform COMPLETO (posición, rotación,
+          // escala y opacidad) para que la interpolación sea siempre coherente.
+          const t = transform as Record<TransformProperty, number>;
+          const values: Partial<Record<TransformProperty, number>> = {};
+          for (const p of TRANSFORM_PROPERTIES) {
+            values[p] = t[p] ?? base[p];
+          }
+          if (Object.keys(values).length === 0) return;
          setTransformTracks((current) => {
            const prev = current.find((tr) => tr.objectId === selectedObjectId);
-           if (!prev) {
-             const track = createTransformTrack(
-               selectedObjectId,
-               estatico,
-               Math.max(5, currentTimeRef.current)
-             );
+            if (!prev) {
+              const track = createTransformTrack(
+                selectedObjectId,
+                base,
+                Math.max(5, currentTimeRef.current)
+              );
              track.keyframes = upsertKeyframeAt(track.keyframes, {
                time: currentTimeRef.current,
                values,
@@ -8597,7 +8599,13 @@ export default function Home({
                   <div className="w-16 h-0.5 rounded-full bg-white/25 pointer-events-none" />
                 </div>
                 <MotionEditor
-                  sceneObjects={sceneObjects}
+                   sceneObjects={sceneObjects.map((o) => ({
+                      id: o.id,
+                      name: o.name,
+                      hidden: o.hidden,
+                      transform: { ...o.transform, o: o.mesh?.opacity ?? 1 },
+                      opacity: o.mesh?.opacity,
+                    }))}
                   selectedObjectId={selectedObjectId}
                   onSelectObject={handleObjectSelect}
                   groups={groups}
@@ -8613,8 +8621,10 @@ export default function Home({
                   setCurrentTime={setCurrentTime}
                   autoKey={autoKey}
                   setAutoKey={setAutoKey}
-                  showMotionPath={showMotionPath}
+                   showMotionPath={showMotionPath}
                   setShowMotionPath={setShowMotionPath}
+                  onApplyTransform={handleObjectTransform}
+                  onApplyOpacity={applyFigureOpacity}
                   onRestoreObject={handleRestoreMotionObject}
                   resolverMallaBase={resolverMallaBase}
                   height={motionEditorHeight ?? undefined}

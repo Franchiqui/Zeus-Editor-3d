@@ -294,9 +294,11 @@ export function mergeMeshes(
   const faces: number[][] = [];
   const faceColors: (string | null)[] = [];
   const faceOpacities: number[] = [];
+  const uvs: [number, number][] = [];
 
   let hasAnyColors = false;
   let hasAnyOpacities = false;
+  let hasAnyUVs = false;
   let texture: string | undefined;
 
   const pos = new THREE.Vector3();
@@ -316,11 +318,15 @@ export function mergeMeshes(
 
     const startVertex = vertices.length;
 
-    // Transformar y añadir vértices
+     // Transformar y añadir vértices
+    const meshHasUVs = !!mesh.uvs && mesh.uvs.length > 0;
     for (const v of mesh.vertices) {
       pos.set(v.x, v.y, v.z);
       pos.applyMatrix4(matrix);
       vertices.push({ x: pos.x, y: pos.y, z: pos.z });
+      if (meshHasUVs) {
+        uvs.push(mesh.uvs![vertices.length - 1 - startVertex] ?? [0, 0]);
+      }
     }
 
     // Añadir caras con índices ajustados
@@ -337,12 +343,14 @@ export function mergeMeshes(
 
     if (meshHasColors) hasAnyColors = true;
     if (meshHasOpacities) hasAnyOpacities = true;
+    if (meshHasUVs) hasAnyUVs = true;
     if (!texture && mesh.texture) texture = mesh.texture;
   }
 
   const result: Mesh = { vertices, faces };
   if (hasAnyColors) result.faceColors = faceColors;
   if (hasAnyOpacities) result.faceOpacities = faceOpacities;
+  if (hasAnyUVs) result.uvs = uvs;
   if (texture) result.texture = texture;
 
   return result;

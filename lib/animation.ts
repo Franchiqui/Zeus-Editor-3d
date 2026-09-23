@@ -291,11 +291,17 @@ export function evaluateCameraKeyframes(
 export type TransformProperty =
   | 'px' | 'py' | 'pz'
   | 'rx' | 'ry' | 'rz'
-  | 'sx' | 'sy' | 'sz';
+  | 'sx' | 'sy' | 'sz'
+  | 'o';
 
 export interface TransformKeyframe {
   time: number;
-  /** Solo las propiedades que cambian en este fotograma. */
+  /**
+   * Valores absolutos de TODAS las propiedades del fotograma (posición,
+   * rotación, escala y opacidad). No solo las que cambian: así cada
+   * fotograma es independiente y no hay ambigüedad sobre la base de
+   * partida al interpolar.
+   */
   values: Partial<Record<TransformProperty, number>>;
   easing: EasingFunction;
 }
@@ -336,7 +342,7 @@ export interface PluginParamTrack {
 }
 
 export const TRANSFORM_PROPERTIES: TransformProperty[] = [
-  'px', 'py', 'pz', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz',
+  'px', 'py', 'pz', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz', 'o',
 ];
 
 export const TRANSFORM_PROPERTY_LABELS: Record<TransformProperty, string> = {
@@ -349,6 +355,7 @@ export const TRANSFORM_PROPERTY_LABELS: Record<TransformProperty, string> = {
   sx: 'Escala X',
   sy: 'Escala Y',
   sz: 'Escala Z',
+  o: 'Opacidad',
 };
 
 /**

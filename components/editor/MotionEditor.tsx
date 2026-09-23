@@ -27,14 +27,16 @@ import {
   PluginParamKeyframe,
   TransformProperty,
   TransformTrack,
+  TRANSFORM_PROPERTIES,
   TRANSFORM_PROPERTY_LABELS,
   createPluginParamTrack,
   createTransformTrack,
   createGroupTransformTrack,
-  diffTransform,
+  evaluateTransformTrack,
   evaluatePluginParamTrack,
   motionMaxDuration,
   upsertKeyframeAt,
+  type TransformKeyframe,
 } from '@/lib/animation';
 import { cloneMesh } from '@/lib/plugins/clone';
 import type { Mesh } from '@/lib/geometry';
@@ -52,6 +54,7 @@ export interface MotionEditorObject {
   name?: string;
   hidden?: boolean;
   transform: Record<TransformProperty, number>;
+  opacity?: number;
 }
 
 export interface MotionEditorProps {
@@ -76,9 +79,19 @@ export interface MotionEditorProps {
   setCurrentTime: (t: number) => void;
   autoKey: boolean;
   setAutoKey: (v: boolean) => void;
-  /** Recorrido editable del objeto seleccionado visible en el visor. */
+  /**
+   * Recorrido editable del objeto seleccionado visible en el visor.
+   */
   showMotionPath: boolean;
   setShowMotionPath: (v: boolean) => void;
+  /**
+   * Aplica una transformada absoluta al objeto seleccionado.
+   */
+  onApplyTransform: (transform: Record<TransformProperty, number>) => void;
+  /**
+   * Aplica una opacidad al objeto seleccionado (0..1).
+   */
+  onApplyOpacity: (opacity: number) => void;
   /**
    * Devuelve el objeto a su transform estático y borra TODAS sus pistas
    * (transformada y plugin) y su malla base congelada.
@@ -131,11 +144,13 @@ export const MotionEditor: FC<MotionEditorProps> = ({
   autoKey,
   setAutoKey,
   showMotionPath,
-  setShowMotionPath,
-  onRestoreObject,
-  resolverMallaBase,
-  height,
-  onClose,
+   setShowMotionPath,
+   onApplyTransform,
+   onApplyOpacity,
+   onRestoreObject,
+   resolverMallaBase,
+   height,
+   onClose,
 }) => {
   const { t } = useI18n();
   const plugins = useSyncExternalStore(
@@ -188,7 +203,86 @@ export const MotionEditor: FC<MotionEditorProps> = ({
   );
   const selectedParam = animatableParams.find((p) => p.id === paramId);
 
-  // ------------------------------------------------------------- transporte
+  // ------------------------------------------------------- transforma numérica
+
+  // Transformada estática del objeto seleccionado.
+  const selectedObject = selectedObjectId
+    ? sceneObjects.find((o) => o.id === selectedObjectId)
+    : null;
+
+  // Valores animados en el playhead (si el objeto tiene pista de transformada).
+  const animatedTransform = useMemo(() => {
+    if (!selectedObjectId) return null;
+    const tr = transformTracks.find((tk) => tk.objectId === selectedObjectId);
+    if (!tr) return null;
+    return evaluateTransformTrack(tr, currentTime);
+  }, [selectedObjectId, transformTracks, currentTime]);
+
+   // Valores efectivos: usamos la animación en playhead si existe,
+   // si no la transformada estática del objeto. La opacidad del mesh
+   // se expone como 'o' para que los campos numéricos y los fotogramas
+   // la lean/escriban de forma uniforme.
+   const effectiveTransform = useMemo(() => {
+     if (!selectedObject) return null;
+     const base = selectedObject.transform;
+     const withOpacity = { ...base, o: selectedObject.opacity ?? 1 };
+     if (!animatedTransform) return withOpacity;
+     return { ...withOpacity, ...animatedTransform };
+   }, [selectedObject, animatedTransform]);
+
+    // Aplica un cambio a una sola propiedad y, si autoKey está activado o
+   // hay un fotograma seleccionado en el playhead, crea/actualiza el
+   // fotograma en el tiempo actual con los valores absolutos nuevos.
+   const handleNumericChange = (prop: TransformProperty, value: number) => {
+     if (!selectedObject || !effectiveTransform) return;
+     const newTransform = { ...effectiveTransform, [prop]: value };
+     // La opacidad vive en mesh.opacity, no en la transformada del
+     // ObjectTransform: actualizar el mesh también (no solo el fotograma).
+     if (prop === 'o') {
+       onApplyOpacity(value);
+     } else {
+       onApplyTransform(newTransform);
+     }
+
+     const shouldUpdateKeyframe =
+       autoKey ||
+       (selectedKeyframeTime !== null && Math.abs(selectedKeyframeTime - currentTime) < 1e-4);
+     if (!shouldUpdateKeyframe) return;
+
+     const tr = transformTracks.find((tk) => tk.objectId === selectedObjectId);
+     if (!tr) return;
+     // Base = valores animados previos al playhead (o transformada estática).
+     const base = animatedTransform ?? selectedObject.transform;
+     const baseValues: Record<TransformProperty, number> = {
+       px: base.px ?? 0, py: base.py ?? 0, pz: base.pz ?? 0,
+       rx: base.rx ?? 0, ry: base.ry ?? 0, rz: base.rz ?? 0,
+       sx: base.sx ?? 1, sy: base.sy ?? 1, sz: base.sz ?? 1,
+       o: base.o ?? (selectedObject.opacity ?? 1),
+     };
+     // Cada fotograma guarda el transform COMPLETO (posición, rotación,
+     // escala y opacidad) para que la interpolación sea siempre coherente
+     // y no dependa de qué propiedades cambiaron en este fotograma.
+     const values: Partial<Record<TransformProperty, number>> = {};
+     for (const p of TRANSFORM_PROPERTIES) {
+       values[p] = newTransform[p] ?? baseValues[p];
+     }
+     if (Object.keys(values).length === 0) return;
+     setTransformTracks(
+       transformTracks.map((tk) =>
+         tk.objectId === selectedObjectId
+           ? {
+               ...tk,
+               duration: Math.max(tk.duration, currentTime),
+               keyframes: upsertKeyframeAt(tk.keyframes, {
+                 time: currentTime,
+                 values,
+                 easing: 'linear',
+               }),
+             }
+           : tk
+       )
+     );
+   };
 
   const togglePlay = useCallback(() => setPlaying(!playing), [playing, setPlaying]);
 
@@ -224,19 +318,18 @@ export const MotionEditor: FC<MotionEditorProps> = ({
       const objeto = sceneObjects.find((o) => o.id === tTrack.objectId);
       const actual = objeto?.transform;
       const primerKf = tTrack.keyframes[0];
-      // Values: props cuyo valor difiere del fotograma t=0 (o todas si
-      // aún no hay fotograma inicial).
+      // Values: el transform COMPLETO (posición, rotación, escala y
+      // opacidad) del objeto en este momento. Cada fotograma es
+      // independiente: no depende de la base del anterior.
       const base = primerKf?.values ?? {};
-      const values = actual
-        ? diffTransform(
-            {
-              px: base.px ?? actual.px, py: base.py ?? actual.py, pz: base.pz ?? actual.pz,
-              rx: base.rx ?? actual.rx, ry: base.ry ?? actual.ry, rz: base.rz ?? actual.rz,
-              sx: base.sx ?? actual.sx, sy: base.sy ?? actual.sy, sz: base.sz ?? actual.sz,
-            },
-            actual
-          )
-        : {};
+      const values: Partial<Record<TransformProperty, number>> = {};
+      for (const p of TRANSFORM_PROPERTIES) {
+        if (p === 'o') {
+          values[p] = objeto?.opacity ?? base.o ?? 1;
+        } else {
+          values[p] = actual ? (actual[p] ?? base[p] ?? 0) : (base[p] ?? 0);
+        }
+      }
       const nuevo = { time: currentTime, values, easing: 'linear' as EasingFunction };
       updateTransformTrack(tTrack.id, {
         keyframes: upsertKeyframeAt(tTrack.keyframes, nuevo),
@@ -438,7 +531,16 @@ export const MotionEditor: FC<MotionEditorProps> = ({
       const el = timelineRef.current;
       if (!el) return 0;
       const rect = el.getBoundingClientRect();
-      return clampTime((clientX - rect.left) / pxPerSecond);
+      // getBoundingClientRect() es relativo al viewport: al hacer scroll
+      // horizontal del contenedor padre, rect.left se desplaza. Hay que
+      // compensar sumando scrollLeft de todos los ancestros scrollables.
+      let scrollLeft = 0;
+      let parent = el.parentElement;
+      while (parent) {
+        scrollLeft += parent.scrollLeft || 0;
+        parent = parent.parentElement;
+      }
+      return clampTime((clientX - rect.left + scrollLeft) / pxPerSecond);
     },
     [pxPerSecond, globalDuration] // eslint-disable-line react-hooks/exhaustive-deps
   );
@@ -454,7 +556,22 @@ export const MotionEditor: FC<MotionEditorProps> = ({
     window.addEventListener('pointerup', up);
   };
 
-  /** Empieza a arrastrar un diamante: mueve un time flotante local. */
+  // Arrastre de fotograma: el drag no arranca en pointerdown sino al
+  // primer pointermove que supere el umbral (evita que un click de
+  // selección arranque el drag).
+  const keyframeDragRef = useRef<{
+    trackId: string;
+    kfTime: number;
+    kind: 'transform' | 'plugin';
+    startX: number;
+    startTime: number;
+    active: boolean;
+  } | null>(null);
+   const DRAG_THRESHOLD = 4; // px mínimos para iniciar el arrastre
+   // Indica que el último pointerup terminó un arrastre de fotograma:
+   // el onClick posterior no debe saltar currentTime al tiempo origen.
+   const dragJustEndedRef = useRef(false);
+
   const beginKeyframeDrag = (
     e: React.PointerEvent,
     trackId: string,
@@ -462,18 +579,41 @@ export const MotionEditor: FC<MotionEditorProps> = ({
     kind: 'transform' | 'plugin'
   ) => {
     e.stopPropagation();
-    dragRef.current = { trackId, originalTime: kfTime, kind };
+    e.preventDefault();
+    keyframeDragRef.current = {
+      trackId,
+      kfTime,
+      kind,
+      startX: e.clientX,
+      startTime: kfTime,
+      active: false,
+    };
     setDragTime(kfTime);
-    const move = (ev: PointerEvent) => setDragTime(timeFromEvent(ev.clientX));
-    const up = () => {
-      const drag = dragRef.current;
-      const nuevoTime = dragTimeRef.current;
+    const move = (ev: PointerEvent) => {
+      const ref = keyframeDragRef.current;
+      if (!ref) return;
+      const delta = Math.abs(ev.clientX - ref.startX);
+      if (!ref.active && delta < DRAG_THRESHOLD) return;
+      if (!ref.active) {
+        ref.active = true;
+        dragRef.current = {
+          trackId: ref.trackId,
+          originalTime: ref.startTime,
+          kind: ref.kind,
+        };
+      }
+      setDragTime(timeFromEvent(ev.clientX));
+    };
+     const up = () => {
+       const ref = keyframeDragRef.current;
+       dragJustEndedRef.current = !!ref?.active;
+       keyframeDragRef.current = null;
       dragRef.current = null;
       setDragTime(null);
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
-      if (!drag || nuevoTime === null) return;
-      commitKeyframeDrag(drag.trackId, drag.originalTime, nuevoTime, drag.kind);
+      if (!ref || !ref.active) return;
+      commitKeyframeDrag(ref.trackId, ref.startTime, dragTimeRef.current ?? ref.startTime, ref.kind);
     };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
@@ -645,13 +785,23 @@ export const MotionEditor: FC<MotionEditorProps> = ({
             const isKfSel = isSel && selectedKeyframeTime !== null && Math.abs(kf.time - selectedKeyframeTime) < 1e-4;
             return (
               <button
-                key={kf.time}
-                onPointerDown={(e) => beginKeyframeDrag(e, track.id, kf.time, kind)}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setSelectedTrackId(track.id);
-                  setSelectedKeyframeTime(kf.time);
-                }}
+key={kf.time}
+                 onPointerDown={(e) => {
+                   if (e.button !== 0) return;
+                   beginKeyframeDrag(e, track.id, kf.time, kind);
+                 }}
+                 onClick={(e) => {
+                    e.stopPropagation();
+                    setSelectedTrackId(track.id);
+                    setSelectedKeyframeTime(kf.time);
+                    // Solo saltar currentTime en un click puro, no tras
+                    // arrastrar el fotograma (el arrastre ya posicionó el
+                    // playhead en el tiempo destino).
+                    if (!dragJustEndedRef.current) {
+                      setCurrentTime(kf.time);
+                    }
+                    dragJustEndedRef.current = false;
+                  }}
                 className={`absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3 h-3 rotate-45 border ${
                   isKfSel
                     ? 'bg-amber-300 border-amber-100'
@@ -978,9 +1128,103 @@ export const MotionEditor: FC<MotionEditorProps> = ({
           >
             {showMotionPath ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
           </button>
-          <span className="px-1.5 py-0.5 rounded bg-black/30 font-mono text-[11px]" data-testid="motion-time-display">
-            {formatTime(currentTime)}
-          </span>
+           <span className="px-1.5 py-0.5 rounded bg-black/30 font-mono text-[11px]" data-testid="motion-time-display">
+             {formatTime(currentTime)}
+           </span>
+
+           {effectiveTransform && (
+             <div className="flex items-center gap-1 ml-2">
+               <fieldset className="border border-white/10 rounded px-1.5 py-0.5">
+                 <legend className="text-[9px] text-muted-foreground px-0.5">
+                   {t('editor3D.motion.position')}
+                 </legend>
+                 <div className="flex items-end gap-0.5">
+                   {(['px', 'py', 'pz'] as const).map((prop, i) => (
+                     <div key={prop} className="flex flex-col items-center">
+                       <span className="text-[8px] text-muted-foreground mb-0.5">
+                         {['X', 'Y', 'Z'][i]}
+                       </span>
+                       <input
+                         type="number"
+                         step="0.1"
+                         value={effectiveTransform[prop]}
+                         onChange={(e) => {
+                           const v = parseFloat(e.target.value);
+                           if (!isNaN(v)) handleNumericChange(prop, v);
+                         }}
+                         className="w-14 px-0.5 py-0 rounded bg-black/30 border border-white/10 text-foreground font-mono text-[10px]"
+                       />
+                     </div>
+                   ))}
+                 </div>
+               </fieldset>
+               <fieldset className="border border-white/10 rounded px-1.5 py-0.5">
+                 <legend className="text-[9px] text-muted-foreground px-0.5">
+                   {t('editor3D.motion.rotation')}
+                 </legend>
+                 <div className="flex items-end gap-0.5">
+                   {(['rx', 'ry', 'rz'] as const).map((prop, i) => (
+                     <div key={prop} className="flex flex-col items-center">
+                       <span className="text-[8px] text-muted-foreground mb-0.5">
+                         {['X', 'Y', 'Z'][i]}
+                       </span>
+                       <input
+                         type="number"
+                         step="1"
+                         value={(effectiveTransform[prop] * 180) / Math.PI}
+                         onChange={(e) => {
+                           const v = parseFloat(e.target.value);
+                           if (!isNaN(v)) handleNumericChange(prop, (v * Math.PI) / 180);
+                         }}
+                         className="w-14 px-0.5 py-0 rounded bg-black/30 border border-white/10 text-foreground font-mono text-[10px]"
+                       />
+                     </div>
+                   ))}
+                 </div>
+               </fieldset>
+               <fieldset className="border border-white/10 rounded px-1.5 py-0.5">
+                 <legend className="text-[9px] text-muted-foreground px-0.5">
+                   {t('editor3D.motion.scale')}
+                 </legend>
+                 <div className="flex items-end gap-0.5">
+                   {(['sx', 'sy', 'sz'] as const).map((prop, i) => (
+                     <div key={prop} className="flex flex-col items-center">
+                       <span className="text-[8px] text-muted-foreground mb-0.5">
+                         {['X', 'Y', 'Z'][i]}
+                       </span>
+                       <input
+                         type="number"
+                         step="0.01"
+                         value={effectiveTransform[prop]}
+                         onChange={(e) => {
+                           const v = parseFloat(e.target.value);
+                           if (!isNaN(v)) handleNumericChange(prop, v);
+                         }}
+                         className="w-14 px-0.5 py-0 rounded bg-black/30 border border-white/10 text-foreground font-mono text-[10px]"
+                       />
+                     </div>
+                   ))}
+                 </div>
+               </fieldset>
+                <fieldset className="border border-white/10 rounded px-1.5 py-0.5">
+                  <legend className="text-[9px] text-muted-foreground px-0.5">
+                    {t('editor3D.motion.opacity')}
+                  </legend>
+                  <input
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    value={effectiveTransform?.o ?? selectedObject?.opacity ?? 1}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (!isNaN(v)) handleNumericChange('o', Math.min(1, Math.max(0, v)));
+                    }}
+                    className="w-14 px-0.5 py-0 rounded bg-black/30 border border-white/10 text-foreground font-mono text-[10px]"
+                  />
+                </fieldset>
+             </div>
+           )}
 
           <button
             onClick={() => setAutoKey(!autoKey)}

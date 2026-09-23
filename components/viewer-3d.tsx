@@ -401,7 +401,7 @@ interface Viewer3DProps {
     onExportComplete?: (result: { success: boolean; outputPath?: string; error?: string }) => void;
     }
 
-/** Posición, rotación y escala del objeto en el visor (la usa el manipulador) */
+/** Posición, rotación, escala y opacidad del objeto en el visor */
 export type ObjectTransform = {
   px: number;
   py: number;
@@ -412,6 +412,8 @@ export type ObjectTransform = {
   sx: number;
   sy: number;
   sz: number;
+  /** Opacidad (0..1). Opcional: si falta, no se anima. */
+  o?: number;
 };
 
 export const IDENTITY_TRANSFORM: ObjectTransform = {
@@ -424,6 +426,7 @@ export const IDENTITY_TRANSFORM: ObjectTransform = {
   sx: 1,
   sy: 1,
   sz: 1,
+  o: 1,
 };
 
 /** ¿El transform es el de reposo (la pieza sin tocar)? */
@@ -3077,23 +3080,44 @@ export default function Viewer3D({
     const motionParamsCache = new Map<string, Record<string, number>>();
     // Geometría original del seleccionado (transplante de plugin) y la
     // geometría animada en curso (para disponerla al reemplazarla).
-    const motionOrigGeometry: { mesh: THREE.Mesh | null; geo: THREE.BufferGeometry | null } = {
+     const motionOrigGeometry: { mesh: THREE.Mesh | null; geo: THREE.BufferGeometry | null } = {
       mesh: null,
       geo: null,
     };
     const motionAnimatedGeo: { geo: THREE.BufferGeometry | null } = { geo: null };
+    // Opacidad original de los materiales del objeto seleccionado (para
+    // restaurar al parar la animación). Se guarda Material → opacity.
+    const motionOrigOpacity = new Map<THREE.Material, number>();
     // Hijos originales de los duplicados con visual plugin (por objectId).
     const motionOrigChildren = new Map<string, THREE.Object3D[]>();
     const motionWarnedMissingBase = new Set<string>();
     let motionPrev = false;
 
-    const restoreMotionVisuals = () => {
-      // Transformada estática de vuelta (el arrastre del gizmo manda: si
-      // hay gesto en curso no se toca, el soltar ya la aplica).
-      if (!gizmoDragRef.current) {
-        applyObjectTransformRef.current(transformRef.current);
-      }
-      // Geometría transplantada del seleccionado: devolver la original.
+     const restoreMotionVisuals = () => {
+       // Transformada estática de vuelta (el arrastre del gizmo manda: si
+       // hay gesto en curso no se toca, el soltar ya la aplica).
+       if (!gizmoDragRef.current) {
+         applyObjectTransformRef.current(transformRef.current);
+       }
+       // Opacidad animada de vuelta a la original.
+       const meshGroup = meshGroupRef.current;
+       if (meshGroup) {
+         meshGroup.traverse((item) => {
+           const m = item as THREE.Mesh;
+           if (!m.isMesh || !m.material) return;
+           const materials = Array.isArray(m.material) ? m.material : [m.material];
+           for (const mat of materials) {
+             const orig = motionOrigOpacity.get(mat);
+             if (orig !== undefined) {
+               mat.opacity = orig;
+               mat.transparent = orig < 1;
+               mat.needsUpdate = true;
+             }
+           }
+         });
+       }
+       motionOrigOpacity.clear();
+       // Geometría transplantada del seleccionado: devolver la original.
       if (motionOrigGeometry.mesh && motionOrigGeometry.geo) {
         if (motionAnimatedGeo.geo) motionAnimatedGeo.geo.dispose();
         motionAnimatedGeo.geo = null;
@@ -3101,9 +3125,8 @@ export default function Viewer3D({
       }
       motionOrigGeometry.mesh = null;
       motionOrigGeometry.geo = null;
-      // Duplicados con visuales plugin: reponer los hijos originales.
-      const meshGroup = meshGroupRef.current;
-      if (meshGroup) {
+       // Duplicados con visuales plugin: reponer los hijos originales.
+       if (meshGroup) {
         for (const [oid, originales] of motionOrigChildren) {
           const dup = meshGroup.children.find(
             (c) => c.userData.sceneObjectDuplicate && c.userData.sceneObjectId === oid
@@ -3143,9 +3166,29 @@ export default function Viewer3D({
       const selMerged: ObjectTransform = evaluadoSel
         ? ({ ...transformRef.current, ...evaluadoSel } as ObjectTransform)
         : { ...transformRef.current };
-      if (evaluadoSel) {
-        applyObjectTransformRef.current(selMerged);
-      }
+       if (evaluadoSel) {
+         applyObjectTransformRef.current(selMerged);
+       }
+
+       // 1b) Opacidad animada del objeto seleccionado: si el fotograma
+       // incluye 'o', aplica esa opacidad a los materiales del mesh group.
+       // Se guarda la original la primera vez para restaurar al parar.
+       if (evaluadoSel?.o !== undefined) {
+         const targetOpacity = Math.max(0, Math.min(1, evaluadoSel.o));
+         meshGroup.traverse((item) => {
+           const m = item as THREE.Mesh;
+           if (!m.isMesh || !m.material) return;
+           const materials = Array.isArray(m.material) ? m.material : [m.material];
+           for (const mat of materials) {
+             if (!motionOrigOpacity.has(mat)) {
+               motionOrigOpacity.set(mat, mat.opacity);
+             }
+             mat.opacity = targetOpacity;
+             mat.transparent = targetOpacity < 1;
+             mat.needsUpdate = true;
+           }
+         });
+       }
 
       // 2) Duplicados con pista de transformada: su matriz es relativa al
       // seleccionado (animado), igual que en el efecto de duplicados.

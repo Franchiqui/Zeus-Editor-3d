@@ -1,1 +1,50 @@
-[]
+[
+  {
+    "id": "1790161800427",
+    "title": "Nueva Conversación-1",
+    "date": "23/9/2026",
+    "time": "13:10",
+    "messages": [
+      {
+        "type": "user",
+        "text": "He encontrado el siguiente error en mi código:\n\nArchivo: f:\\Zeus Editor 3D\\components\\editor\\MotionEditor.tsx\nLínea: 325\nError: No se encuentra el nombre 'diffTransform'.\n\n¿Por qué está ocurriendo esto y cómo puedo solucionarlo?",
+        "time": "13:10",
+        "imageData": null,
+        "isCodeChange": false,
+        "codeChangeData": null,
+        "isError": false
+      },
+      {
+        "type": "bot",
+        "text": "Por favor, selecciona un modelo de IA en la configuración.",
+        "displayHtml": "<div class=\"bot-text-part\">Por favor, selecciona un modelo de IA en la configuración.</div>",
+        "time": "13:10",
+        "imageData": null,
+        "isCodeChange": false,
+        "codeChangeData": null,
+        "isError": false,
+        "autoApplyStatus": "na"
+      },
+      {
+        "type": "user",
+        "text": "He encontrado el siguiente error en mi código:\n\nArchivo: f:\\Zeus Editor 3D\\components\\editor\\MotionEditor.tsx\nLínea: 325\nError: No se encuentra el nombre 'diffTransform'.\n\n¿Por qué está ocurriendo esto y cómo puedo solucionarlo?",
+        "time": "13:10",
+        "imageData": null,
+        "isCodeChange": false,
+        "codeChangeData": null,
+        "isError": false
+      },
+      {
+        "type": "bot",
+        "text": "Por favor, selecciona un modelo de IA en la configuración.",
+        "displayHtml": "<div class=\"bot-text-part\">Por favor, selecciona un modelo de IA en la configuración.</div>",
+        "time": "13:10",
+        "imageData": null,
+        "isCodeChange": false,
+        "codeChangeData": null,
+        "isError": false,
+        "autoApplyStatus": "na"
+      }
+    ]
+  }
+]
