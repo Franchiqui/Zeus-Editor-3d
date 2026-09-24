@@ -1,0 +1,3 @@
+app.get('/health', (_req: Request, res: Response) => {
+  res.json({ status: 'ok', service: 'ZEIA', version: API_VERSION, ts: nowIso(), uptime_s: Math.round(process.uptime()), model: llmStatus() });
+});

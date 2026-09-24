@@ -1,0 +1,64 @@
+  const overlayPanRef = useRef<{
+    viewX: number;
+    viewY: number;
+    panX: number;
+    panY: number;
+  } | null>(null);
+  // --- Herramientas del overlay (paridad con el editor de plantilla 2D) ---
+  // Herramienta activa: 'edit' (mover/curvar), 'select' (marquesina) o 'erase'.
+  const [meshOverlayTool, setMeshOverlayTool] = useState<CanvasTool>('edit');
+  // Índices de los vértices seleccionados (para mover/borrar en grupo).
+  const [meshOverlaySelection, setMeshOverlaySelection] = useState<number[]>(
+    []
+  );
+  // Radio del arco (slider Curva) y nº de vértices del arco (slider Vértices).
+  const [meshOverlayCurveAmount, setMeshOverlayCurveAmount] = useState(
+    DEFAULT_HANDLE_LEN
+  );
+  const [meshOverlayCurveSegments, setMeshOverlayCurveSegments] = useState(8);
+  // Modo Predibujar: al pasar por una esquina recta se predibuja el arco.
+  const [meshOverlayPredraw, setMeshOverlayPredraw] = useState(false);
+  // Resolución de la cuadrícula (divisiones), como el slider del editor 2D.
+  const [meshOverlayGridDiv, setMeshOverlayGridDiv] = useState(20);
+  // Vértice bajo el puntero (para el predibujo del arco).
+  const [meshOverlayHoverVertex, setMeshOverlayHoverVertex] = useState<
+    number | null
+  >(null);
+  // Marquesina de selección en curso (coordenadas 0..100 de la malla).
+  const overlayMarqueeRef = useRef<{
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+  } | null>(null);
+  const [overlayMarquee, setOverlayMarquee] = useState<{
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+  } | null>(null);
+  // Arrastre en grupo (varios vértices a la vez) con la herramienta Selección.
+  const overlayGroupDragRef = useRef<{
+    id: number;
+    idxs: number[];
+    base: {
+      x: number;
+      y: number;
+      hIn?: { x: number; y: number };
+      hOut?: { x: number; y: number };
+    }[];
+    startX: number;
+    startY: number;
+  } | null>(null);
+  // Polígono actual de la plantilla en edición (para la marquesina).
+  const overlayEditPolyRef = useRef<Point2D[] | null>(null);
+  useEffect(() => {
+    const s = meshSections.find((x) => x.id === meshOverlayEditId);
+    overlayEditPolyRef.current = s ? s.polygon : null;
+  }, [meshSections, meshOverlayEditId]);
+  // Al cambiar de plantilla en edición: herramienta Editar y sin selección.
+  useEffect(() => {
+    setMeshOverlaySelection([]);
+    setMeshOverlayTool('edit');
+    setMeshOverlayHoverVertex(null);
+  }, [meshOverlayEditId]);

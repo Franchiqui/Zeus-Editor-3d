@@ -1,0 +1,444 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Fondo oscuro desde el primer frame al cargar */
+html,
+body {
+  background-color: #10204d; /* gray-950 */
+}
+
+/* Fuente Electrolize para todos los editores */
+@font-face {
+  font-family: 'Electrolize';
+  src: url('/Electrolize-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Fuente Textura: fuente por defecto del editor 3D */
+@font-face {
+  font-family: 'Textura';
+  src: url('/Textura__1789172724847.ttf') format('truetype');
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+.font-editor {
+  font-family: 'Electrolize', system-ui, -apple-system, sans-serif;
+}
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222.2 47.4% 11.2%;
+
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222.2 47.4% 11.2%;
+
+    --border: 214.3 31.8% 91.4%;
+    --input: 214.3 31.8% 91.4%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222.2 47.4% 11.2%;
+
+    --primary: 222.2 47.4% 11.2%;
+    --primary-foreground: 210 40% 98%;
+
+    --secondary: 210 40% 96.1%;
+    --secondary-foreground: 222.2 47.4% 11.2%;
+
+    --accent: 210 40% 96.1%;
+    --accent-foreground: 222.2 47.4% 11.2%;
+
+    --destructive: 0 100% 50%;
+    --destructive-foreground: 210 40% 98%;
+
+    --ring: 215 20.2% 65.1%;
+
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 224 71% 4%;
+    --foreground: 213 31% 91%;
+
+    --muted: 223 47% 11%;
+    --muted-foreground: 215.4 16.3% 56.9%;
+
+    --accent: 216 34% 17%;
+    --accent-foreground: 210 40% 98%;
+
+    --popover: 224 71% 4%;
+    --popover-foreground: 215 20.2% 65.1%;
+
+    --border: 216 34% 17%;
+    --input: 216 34% 17%;
+
+    --card: 224 71% 4%;
+    --card-foreground: 213 31% 91%;
+
+    --primary: 142 70% 45%; /* Green-500 equivalent */
+    --primary-foreground: 144 70% 5%; /* Very dark green for contrast */
+
+    --secondary: 222.2 47.4% 11.2%;
+    --secondary-foreground: 210 40% 98%;
+
+    --destructive: 0 63% 31%;
+    --destructive-foreground: 210 40% 98%;
+
+    --ring: 142 70% 45%;
+
+    --radius: 0.5rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Electrolize', system-ui, -apple-system, sans-serif;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .resizable {
+    resize: both;
+    overflow: auto;
+  }
+}
+
+/* Scrollbar Personalizada Zeus: estrecha, sin fondo, muy sutil */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  transition: background 0.3s;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+/* Compatibilidad con Firefox */
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
+}
+
+/* Scrollbar del modal "Objeto 3D": estrecha de verdad, sin fondo.
+   Sin `scrollbar-width` a propósito: en Chromium moderno esa propiedad
+   anula los ::-webkit-scrollbar y engorda la barra hasta los 10px. */
+.modal-scrollbar::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+.modal-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.modal-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+}
+.modal-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+/* Scrollbar fina para tablas horizontales del editor de animación */
+.thin-scrollbar::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+.thin-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.thin-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+}
+.thin-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+.thin-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
+}
+
+/* Thin scrollbar with NO background on track (for modal bodies) */
+.thin-scrollbar-nobg::-webkit-scrollbar {
+  width: 3px;
+}
+.thin-scrollbar-nobg::-webkit-scrollbar-track {
+  background: transparent;
+}
+.thin-scrollbar-nobg::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+}
+.thin-scrollbar-nobg::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+.thin-scrollbar-nobg {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
+}
+
+/* Ventana sin marco (Electron): arrastrar desde el header */
+.electron-drag-region {
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+.electron-drag-region button,
+.electron-drag-region input,
+.electron-drag-region select,
+.electron-drag-region a,
+.electron-drag-region [role="button"],
+.electron-drag-region [role="menuitem"] {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+/* Barra superior Electron: sin fondo, más estrecha, línea solo en el centro */
+.electron-title-bar {
+  background: transparent !important;
+  backdrop-filter: none !important;
+  box-shadow: none !important;
+  height: 3rem !important; /* 48px, más estrecha */
+  border: none !important;
+}
+.electron-title-bar .electron-title-bar-line {
+  position: absolute;
+  bottom: 0;
+  left: 2rem;
+  right: 2rem;
+  height: 1px;
+  background: rgba(55, 65, 81, 0.8);
+  pointer-events: none;
+}
+
+/* Animación Marquee para nombres de archivos largos */
+@keyframes marquee {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+.animate-marquee {
+  display: inline-block;
+  animation: marquee 15s linear infinite;
+  padding-left: 0;
+}
+
+@keyframes pulse-subtle {
+  0%, 100% { opacity: 1; transform: scale(1.01); }
+  50% { opacity: 0.85; transform: scale(1.02); }
+}
+
+.animate-pulse-subtle {
+  animation: pulse-subtle 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Sin scrollbar visible (ritmos) - sigue scrolleando pero sin barra */
+.scrollbar-none {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+/* Scrollbar sutil: sin fondo, más estrecho (Effects Rack, etc.) */
+.scrollbar-thin-transparent {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(156, 163, 175, 0.5) transparent;
+}
+.scrollbar-thin-transparent::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+.scrollbar-thin-transparent::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scrollbar-thin-transparent::-webkit-scrollbar-thumb {
+  background-color: rgba(156, 163, 175, 0.5);
+  border-radius: 3px;
+}
+.scrollbar-thin-transparent::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(156, 163, 175, 0.7);
+}
+
+/* Historial de conversaciones: barra muy fina, sin fondo */
+.scrollbar-history {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(75 85 99) transparent;
+}
+.scrollbar-history::-webkit-scrollbar {
+  width: 2px;
+}
+.scrollbar-history::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scrollbar-history::-webkit-scrollbar-thumb {
+  background-color: rgb(75 85 99);
+  border-radius: 9999px;
+}
+.scrollbar-history::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(107 114 128);
+}
+
+/* Scrollbar para modal de imágenes locales: ultra estrecha, sin fondo, gris medio */
+.scrollbar-modal-images {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(75 85 99) transparent;
+}
+.scrollbar-modal-images::-webkit-scrollbar {
+  width: 6px;
+}
+.scrollbar-modal-images::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scrollbar-modal-images::-webkit-scrollbar-thumb {
+  background-color: rgb(75 85 99);
+  border-radius: 3px;
+}
+.scrollbar-modal-images::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(107 114 128);
+}
+
+/* Thumb del slider de velocidad: rectángulo con rayas */
+.slider-thumb-rect-striped {
+  width: 12px !important;
+  height: 18px !important;
+  border-radius: 2px !important;
+  background: repeating-linear-gradient(
+    90deg,
+    rgb(209 213 219) 0px,
+    rgb(209 213 219) 2px,
+    transparent 2px,
+    transparent 4px
+  ) !important;
+  border: 2px solid rgb(156 163 175) !important;
+}
+
+/* Variante verde (Master Output): rectángulo verde con rayas grises */
+.slider-thumb-rect-striped-green {
+  width: 12px !important;
+  height: 18px !important;
+  border-radius: 2px !important;
+  background: repeating-linear-gradient(
+    90deg,
+    rgb(209 213 219) 0px,
+    rgb(209 213 219) 2px,
+    rgb(34 197 94) 2px,
+    rgb(34 197 94) 4px
+  ) !important;
+  border: 2px solid rgb(34 197 94) !important;
+}
+
+/* Variante azul: rectángulo azul con rayas grises */
+.slider-thumb-rect-striped-blue {
+  width: 12px !important;
+  height: 18px !important;
+  border-radius: 2px !important;
+  background: repeating-linear-gradient(
+    90deg,
+    rgb(209 213 219) 0px,
+    rgb(209 213 219) 2px,
+    rgb(59 130 246) 2px,
+    rgb(59 130 246) 4px
+  ) !important;
+  border: 2px solid rgb(59 130 246) !important;
+}
+
+/* Variante roja: rectángulo rojo con rayas grises */
+.slider-thumb-rect-striped-red {
+  width: 12px !important;
+  height: 18px !important;
+  border-radius: 2px !important;
+  background: repeating-linear-gradient(
+    90deg,
+    rgb(209 213 219) 0px,
+    rgb(209 213 219) 2px,
+    rgb(239 68 68) 2px,
+    rgb(239 68 68) 4px
+  ) !important;
+  border: 2px solid rgb(239 68 68) !important;
+}
+
+/* Variante azul del thumb por defecto (3 rayas): recolorea el borde y las 3 rayas
+   a azul, manteniendo la forma de rectángulo del Slider estándar. */
+.slider-thumb-blue {
+  border-color: rgb(59 130 246) !important;
+}
+.slider-thumb-blue > span {
+  background-color: rgb(59 130 246) !important;
+  opacity: 0.6;
+}
+
+/* Editor HTML: sliders con thumb rectangular más ancho que alto y rayitas
+   verticales, igual que el resto de los editores. Aplica a los
+   <input type="range"> nativos dentro del editor. */
+.html-editor input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 16px;
+  background: transparent;
+  cursor: pointer;
+}
+.html-editor input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: rgb(55 65 81);
+}
+.html-editor input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 12px;
+  margin-top: -4px;
+  border-radius: 3px;
+  border: 1px solid rgb(156 163 175);
+  background-color: rgb(17 24 39);
+  background-image: repeating-linear-gradient(
+    90deg,
+    rgb(148 163 184) 0px,
+    rgb(148 163 184) 1px,
+    transparent 1px,
+    transparent 4px
+  );
+}
+.html-editor input[type="range"]::-moz-range-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: rgb(55 65 81);
+}
+.html-editor input[type="range"]::-moz-range-thumb {
+  width: 20px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid rgb(156 163 175);
+  background-color: rgb(17 24 39);
+  background-image: repeating-linear-gradient(
+    90deg,
+    rgb(148 163 184) 0px,
+    rgb(148 163 184) 1px,
+    transparent 1px,
+    transparent 4px
+  );
+}

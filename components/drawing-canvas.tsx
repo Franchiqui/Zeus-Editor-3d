@@ -5,6 +5,7 @@ import { SHAPES } from '@/lib/shapes';
 import { polylineToPathD } from '@/lib/polylines';
 import type { Polyline } from '@/lib/polylines';
 import { usePolygonEditor } from '@/hooks/use-polygon-editor';
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   Undo2,
   Redo2,
@@ -16,6 +17,12 @@ import {
   Triangle as TriangleIcon,
   Hexagon as HexagonIcon,
   Star as StarIcon,
+  ZoomIn,
+  ZoomOut,
+  Hand,
+  Minus,
+  Plus,
+  Scaling,
 } from 'lucide-react';
 
 // En el canvas, dibujar el eje
@@ -60,6 +67,33 @@ const SHAPE_ICONS = {
   estrella: StarIcon,
 } as const;
 
+/**
+ * Escala el poligono (y sus asas de curvatura) alrededor de su centroide.
+ * Cambia el TAMANO REAL de la plantilla (no la vista): afecta al objeto
+ * barrido / recorrido, que se reconstruye a partir de estas coordenadas.
+ */
+function scalePolygon(poly: Polygon, factor: number): Polygon {
+  if (poly.length === 0 || factor === 1) return poly;
+  let cx = 0;
+  let cy = 0;
+  for (const p of poly) {
+    cx += p.x;
+    cy += p.y;
+  }
+  cx /= poly.length;
+  cy /= poly.length;
+  const f = (x: number, y: number) => ({
+    x: cx + (x - cx) * factor,
+    y: cy + (y - cy) * factor,
+  });
+  return poly.map((p) => {
+    const np: Polygon[number] = { ...f(p.x, p.y) };
+    if (p.hIn) np.hIn = f(p.hIn.x, p.hIn.y);
+    if (p.hOut) np.hOut = f(p.hOut.x, p.hOut.y);
+    return np;
+  });
+}
+
 interface DrawingCanvasProps {
   label: string;
   axisLabel: string;
@@ -71,7 +105,7 @@ interface DrawingCanvasProps {
   onEdit?: () => void;
   /** Maximizar y ocupar todo el espacio del editor */
   onMaximize?: () => void;
-  /** Zoom (1 = tamaño original) */
+  /** Zoom inicial (1 = tamaño original). Si se omite, es interactivo. */
   zoom?: number;
   /** Desplazamiento en unidades del viewBox (100x100) */
   offsetX?: number;
@@ -94,13 +128,105 @@ export default function DrawingCanvas({
   axisVertical = false,
   onEdit,
   onMaximize,
-  zoom = 1,
-  offsetX = 0,
-  offsetY = 0,
+  zoom,
+  offsetX,
+  offsetY,
   showHeader = true,
   guideLines,
   polylines,
 }: DrawingCanvasProps) {
+  /* ---- Zoom / paneo interactivo de la plantilla ---- */
+  // El zoom se aplica al viewBox (no con un transform) para que el editor de
+  // polígonos siga mapeando bien el puntero: le pasamos el área VISIBLE.
+  const [localZoom, setLocalZoom] = useState(zoom ?? 1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [hand, setHand] = useState(false);
+  const [panDragging, setPanDragging] = useState(false);
+  const panStartRef = useRef<{ px: number; py: number; x: number; y: number } | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  /* ---- Escala REAL de la plantilla (tamano, NO la vista) ----
+     La escala se guarda implicitamente: 100% = el poligono tal cual entro en el
+     lienzo. Al escalar se reescribe el poligono (centroide fijo), de modo que
+     el recorrido muestra el tamano que tiene realmente la plantilla. */
+  const scaleBaseRef = useRef<Polygon>(polygon);
+  const scaleEmittedRef = useRef<Polygon | null>(null);
+  const [scalePct, setScalePct] = useState(100);
+
+  const effZoom = zoom ?? localZoom;
+  const offX = offsetX ?? 0;
+  const offY = offsetY ?? 0;
+  const span = 1 / effZoom; // lado del área visible (unidades 0..1)
+  const cMinX = 0.5 - span / 2 + offX + pan.x;
+  const cMinY = 0.5 - span / 2 + offY + pan.y;
+  const canvasBounds = {
+    minX: cMinX,
+    maxX: cMinX + span,
+    minY: cMinY,
+    maxY: cMinY + span,
+  };
+  const viewMinX = cMinX * 100;
+  const viewMinY = cMinY * 100;
+  const viewSpan = span * 100;
+  // Tamaño constante en pantalla de vértices y halos de agarre.
+  const uiScale = 1 / effZoom;
+
+  // Se puede reducir la plantilla todo lo que se quiera (limite practico).
+  const ZOOM_MIN = 0.01;
+  const ZOOM_MAX = 8;
+  const clampZoom = (z: number) => Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, z));
+  const zoomStep = (factor: number) => {
+    if (zoom !== undefined) return; // controlado por el padre
+    setLocalZoom((z) => clampZoom(z * factor));
+  };
+  const resetView = () => {
+    if (zoom !== undefined) return;
+    setLocalZoom(zoom ?? 1);
+    setPan({ x: 0, y: 0 });
+  };
+
+  // Rueda del ratón: acerca/aleja alrededor del cursor. Va en el contenedor
+  // para que siga funcionando con la capa de la mano por encima.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (zoom !== undefined) return;
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      const fx = (e.clientX - rect.left) / rect.width;
+      const fy = (e.clientY - rect.top) / rect.height;
+      // Punto del lienzo bajo el cursor (unidades 0..1).
+      const cx = fx * span + cMinX;
+      const cy = fy * span + cMinY;
+      const nz = clampZoom(effZoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15));
+      const nspan = 1 / nz;
+      const nbase = 0.5 - nspan / 2;
+      setLocalZoom(nz);
+      setPan({ x: cx - fx * nspan - nbase - offX, y: cy - fy * nspan - nbase - offY });
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [zoom, effZoom, span, cMinX, cMinY, offX, offY]);
+
+  const onPanPointerDown = (e: ReactPointerEvent) => {
+    panStartRef.current = { px: e.clientX, py: e.clientY, x: pan.x, y: pan.y };
+    setPanDragging(true);
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+  };
+  const onPanPointerMove = (e: ReactPointerEvent) => {
+    const start = panStartRef.current;
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!start || !rect || zoom !== undefined) return;
+    const dx = ((e.clientX - start.px) / rect.width) * span;
+    const dy = ((e.clientY - start.py) / rect.height) * span;
+    setPan({ x: start.x - dx, y: start.y - dy });
+  };
+  const onPanPointerEnd = () => {
+    panStartRef.current = null;
+    setPanDragging(false);
+  };
+
   const {
     svgRef,
     dragIndex,
@@ -116,33 +242,77 @@ export default function DrawingCanvas({
     canUndo,
     canRedo,
     selectedVertex,
-  } = usePolygonEditor({ polygon, onChange, resolution });
+  } = usePolygonEditor({ polygon, onChange, resolution, coordinateBounds: canvasBounds });
+
+  // Si el poligono cambia por FUERA (dibujar/editar/deshacer/otra forma/otra
+  // pestana), reinicia la referencia: 100% = tamano actual.
+  useEffect(() => {
+    if (polygon === scaleEmittedRef.current) return;
+    scaleBaseRef.current = polygon;
+    scaleEmittedRef.current = null;
+    setScalePct(100);
+  }, [polygon]);
+
+  const MIN_SCALE = 1; // % (se puede reducir todo lo que se quiera)
+  const MAX_SCALE = 4000; // %
+  const scaleBy = (factor: number) => {
+    if (polygon.length < 3) return;
+    const next = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scalePct * factor));
+    const f = next / scalePct;
+    if (!isFinite(f) || Math.abs(f - 1) < 1e-6) return;
+    const scaled = scalePolygon(polygon, f);
+    scaleEmittedRef.current = scaled;
+    setScalePct(next);
+    applyShape(scaled); // entra en el historial (Deshacer/Rehacer)
+  };
+  const resetScale = () => {
+    const base = scaleBaseRef.current;
+    if (!base || base.length < 3 || polygon === base) return;
+    scaleEmittedRef.current = base;
+    setScalePct(100);
+    applyShape(base);
+  };
 
   const gridLines = [];
-  for (let i = 0; i <= resolution; i++) {
+  const gxStart = Math.floor(canvasBounds.minX * resolution);
+  const gxEnd = Math.ceil(canvasBounds.maxX * resolution);
+  const gyStart = Math.floor(canvasBounds.minY * resolution);
+  const gyEnd = Math.ceil(canvasBounds.maxY * resolution);
+  // Al reducir mucho la vista, dibujar menos lineas para no colapsar el DOM.
+  const maxGrid = 90;
+  const gStepX = Math.max(1, Math.ceil((gxEnd - gxStart) / maxGrid));
+  for (let i = gxStart; i <= gxEnd; i += gStepX) {
     const pos = (i / resolution) * 100;
+    const major = i % 4 === 0;
     gridLines.push(
       <line
         key={`v${i}`}
         x1={pos}
-        y1={0}
+        y1={canvasBounds.minY * 100}
         x2={pos}
-        y2={100}
+        y2={canvasBounds.maxY * 100}
         stroke="hsl(224 30% 26%)"
-        strokeWidth={0.15}
-        opacity={i % 4 === 0 ? 0.8 : 0.4}
+        strokeWidth={major ? 1.2 : 1}
+        vectorEffect="non-scaling-stroke"
+        opacity={major ? 0.8 : 0.4}
       />
     );
+  }
+  const gStepY = Math.max(1, Math.ceil((gyEnd - gyStart) / maxGrid));
+  for (let i = gyStart; i <= gyEnd; i += gStepY) {
+    const pos = (i / resolution) * 100;
+    const major = i % 4 === 0;
     gridLines.push(
       <line
         key={`h${i}`}
-        x1={0}
+        x1={canvasBounds.minX * 100}
         y1={pos}
-        x2={100}
+        x2={canvasBounds.maxX * 100}
         y2={pos}
         stroke="hsl(224 30% 26%)"
-        strokeWidth={0.15}
-        opacity={i % 4 === 0 ? 0.8 : 0.4}
+        strokeWidth={major ? 1.2 : 1}
+        vectorEffect="non-scaling-stroke"
+        opacity={major ? 0.8 : 0.4}
       />
     );
   }
@@ -219,6 +389,7 @@ export default function DrawingCanvas({
         </div>
       )}
       <div
+        ref={containerRef}
         className="relative flex-1 rounded-lg overflow-hidden border border-white/10"
         style={{
           background:
@@ -227,7 +398,7 @@ export default function DrawingCanvas({
       >
         <svg
           ref={svgRef}
-          viewBox="0 0 100 100"
+          viewBox={`${viewMinX} ${viewMinY} ${viewSpan} ${viewSpan}`}
           preserveAspectRatio="xMidYMid meet"
           className="absolute inset-0 w-full h-full touch-none"
           {...handlers}
@@ -240,7 +411,7 @@ export default function DrawingCanvas({
               <stop offset="100%" stopColor="hsl(145 80% 25%)" stopOpacity={0.2} />
             </linearGradient>
           </defs>
-          <g transform={`translate(${50 + offsetX} ${50 + offsetY}) scale(${zoom}) translate(-50 -50)`}>
+          <g>
             {gridLines}
             {showAxis && (
               <line
@@ -250,7 +421,7 @@ export default function DrawingCanvas({
                 y2={axisVertical ? 100 : 50}
                 stroke="rgba(255,255,255,0.2)"
                 strokeWidth={0.7}
-                strokeDasharray={`${2 / zoom} ${2 / zoom}`}
+                strokeDasharray={`${2 / effZoom} ${2 / effZoom}`}
                 vectorEffect="non-scaling-stroke"
               />
             )}
@@ -270,7 +441,7 @@ export default function DrawingCanvas({
                 y2={y * 100}
                 stroke="hsl(0 80% 60%)"
                 strokeWidth={0.8}
-                strokeDasharray={`${2 / zoom} ${1.5 / zoom}`}
+                strokeDasharray={`${2 / effZoom} ${1.5 / effZoom}`}
                 vectorEffect="non-scaling-stroke"
                 opacity={0.8}
               />
@@ -280,7 +451,7 @@ export default function DrawingCanvas({
                 d={pathData}
                 fill="none"
                 stroke="hsl(145 75% 55%)"
-                strokeWidth={0.3}
+                strokeWidth={0.3 * uiScale}
                 strokeLinejoin="round"
                 strokeLinecap="round"
               />
@@ -298,7 +469,7 @@ export default function DrawingCanvas({
                   d={d}
                   fill="none"
                   stroke="hsl(190 85% 60%)"
-                  strokeWidth={0.2}
+                  strokeWidth={0.2 * uiScale}
                   strokeLinejoin="round"
                   strokeLinecap="round"
                   pointerEvents="none"
@@ -321,7 +492,7 @@ export default function DrawingCanvas({
                       <circle
                         cx={h.x * 100}
                         cy={h.y * 100}
-                        r={2.2}
+                        r={2.2 * uiScale}
                         fill="transparent"
                         onPointerDown={hh.onPointerDown}
                       />
@@ -331,17 +502,17 @@ export default function DrawingCanvas({
                         x2={h.x * 100}
                         y2={h.y * 100}
                         stroke="hsl(200 80% 60%)"
-                        strokeWidth={0.15}
+                        strokeWidth={0.15 * uiScale}
                         strokeDasharray="1 1"
                         opacity={0.7}
                       />
                       <circle
                         cx={h.x * 100}
                         cy={h.y * 100}
-                        r={0.65}
+                        r={0.65 * uiScale}
                         fill="hsl(200 80% 60%)"
                         stroke="hsl(224 50% 8%)"
-                        strokeWidth={0.2}
+                        strokeWidth={0.2 * uiScale}
                         onPointerDown={hh.onPointerDown}
                       />
                     </g>
@@ -356,7 +527,7 @@ export default function DrawingCanvas({
                   <circle
                     cx={p.x * 100}
                     cy={p.y * 100}
-                    r={3}
+                    r={3 * uiScale}
                     fill="transparent"
                     onPointerDown={vh.onPointerDown}
                     onDoubleClick={vh.onDoubleClick}
@@ -365,17 +536,17 @@ export default function DrawingCanvas({
                     <circle
                       cx={p.x * 100}
                       cy={p.y * 100}
-                      r={1.8}
+                      r={1.8 * uiScale}
                       fill="none"
                       stroke="hsl(145 90% 70%)"
-                      strokeWidth={0.3}
+                      strokeWidth={0.3 * uiScale}
                       opacity={0.5}
                     />
                   )}
                   <circle
                     cx={p.x * 100}
                     cy={p.y * 100}
-                    r={dragIndex === i ? 0.65 : 0.5}
+                    r={(dragIndex === i ? 0.65 : 0.5) * uiScale}
                     fill={
                       curveIndex === i
                         ? 'hsl(45 95% 60%)'
@@ -388,7 +559,7 @@ export default function DrawingCanvas({
                               : 'hsl(145 70% 50%)'
                     }
                     stroke="hsl(224 50% 8%)"
-                    strokeWidth={0.2}
+                    strokeWidth={0.2 * uiScale}
                     className="transition-all"
                     onPointerDown={vh.onPointerDown}
                     onDoubleClick={vh.onDoubleClick}
@@ -398,6 +569,81 @@ export default function DrawingCanvas({
             })}
           </g>
         </svg>
+        {/* Capa de la mano: captura el arrastre para desplazar la vista */}
+        {hand && zoom === undefined && (
+          <div
+            className="absolute inset-0 z-10 touch-none select-none"
+            onPointerDown={onPanPointerDown}
+            onPointerMove={onPanPointerMove}
+            onPointerUp={onPanPointerEnd}
+            onPointerCancel={onPanPointerEnd}
+            onDoubleClick={() => resetView()}
+            onContextMenu={(e) => e.preventDefault()}
+            style={{ cursor: panDragging ? 'grabbing' : 'grab' }}
+          />
+        )}
+        {/* Controles de zoom (esquina inferior derecha) */}
+        {zoom === undefined && (
+          <div className="absolute bottom-1.5 right-1.5 z-20 flex items-center gap-0.5 rounded-md border border-white/10 bg-black/40 backdrop-blur-sm px-0.5 py-0.5">
+            <button
+              onClick={() => setHand((h) => !h)}
+              className={`p-1 rounded transition-colors ${hand ? 'text-green-300 bg-green-500/20' : 'text-muted-foreground hover:text-green-300 hover:bg-green-500/10'}`}
+              title="Mano: arrastra para desplazar la vista (zoom con la rueda)"
+            >
+              <Hand className="w-3 h-3" />
+            </button>
+            <button
+              onClick={() => zoomStep(1 / 1.25)}
+              className="p-1 rounded text-muted-foreground hover:text-green-300 hover:bg-green-500/10 transition-colors"
+              title="Alejar (también con la rueda del ratón)"
+            >
+              <ZoomOut className="w-3 h-3" />
+            </button>
+            <button
+              onClick={() => resetView()}
+              className="px-1 text-[9px] font-mono text-muted-foreground hover:text-green-300 transition-colors tabular-nums"
+              title="Restablecer zoom"
+            >
+              {Math.round(effZoom * 100)}%
+            </button>
+            <button
+              onClick={() => zoomStep(1.25)}
+              className="p-1 rounded text-muted-foreground hover:text-green-300 hover:bg-green-500/10 transition-colors"
+              title="Acercar (también con la rueda del ratón)"
+            >
+              <ZoomIn className="w-3 h-3" />
+            </button>
+          </div>
+        )}
+        {/* Control de ESCALA REAL de la plantilla (NO es zoom): cambia el
+            tamano de la pieza. El zoom de arriba solo acerca/aleja la vista. */}
+        <div className="absolute top-1.5 right-1.5 z-20 flex items-center gap-0.5 rounded-md border border-green-500/30 bg-black/40 backdrop-blur-sm px-1 py-0.5">
+          <Scaling className="w-3 h-3 text-green-400/80" />
+          <button
+            onClick={() => scaleBy(1 / 1.15)}
+            disabled={polygon.length < 3}
+            className="p-1 rounded text-muted-foreground hover:text-green-300 hover:bg-green-500/10 disabled:opacity-30 disabled:hover:bg-transparent transition-colors"
+            title="Encoger la plantilla (tamano real)"
+          >
+            <Minus className="w-3 h-3" />
+          </button>
+          <button
+            onClick={resetScale}
+            disabled={polygon.length < 3}
+            className="px-1 text-[9px] font-mono text-green-400/90 hover:text-green-300 transition-colors tabular-nums disabled:opacity-40"
+            title="Escala real de la plantilla (clic = 100%)"
+          >
+            {Math.round(scalePct)}%
+          </button>
+          <button
+            onClick={() => scaleBy(1.15)}
+            disabled={polygon.length < 3}
+            className="p-1 rounded text-muted-foreground hover:text-green-300 hover:bg-green-500/10 disabled:opacity-30 disabled:hover:bg-transparent transition-colors"
+            title="Agrandar la plantilla (tamano real)"
+          >
+            <Plus className="w-3 h-3" />
+          </button>
+        </div>
       </div>
       {polygon.length === 0 && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">

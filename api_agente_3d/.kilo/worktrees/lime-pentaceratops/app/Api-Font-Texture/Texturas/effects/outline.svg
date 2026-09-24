@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
+  <!-- Outline: borde solido recortado, sin difuminado -->
+  <rect width="200" height="200" fill="#0a0a12"/>
+  <rect x="40" y="40" width="120" height="120" fill="none" stroke="#ff2828" stroke-width="6"/>
+</svg>

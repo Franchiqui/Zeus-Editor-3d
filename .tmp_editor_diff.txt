@@ -1,0 +1,2603 @@
+diff --git a/components/editor/Editor3D.tsx b/components/editor/Editor3D.tsx
+index 3408af8..b9d6b64 100644
+--- a/components/editor/Editor3D.tsx
++++ b/components/editor/Editor3D.tsx
+@@ -59,12 +59,14 @@ import WindowLayoutModal, { type WindowLayout } from './WindowLayoutModal';
+ import { MotionEditor } from './MotionEditor';
+ import { ObjectTransformFields } from './object-transform-fields';
+ import { AxisHeader } from './axis-header';
++import PathCanvas from './path-canvas';
+ import { cloneMesh } from '@/lib/plugins/clone';
+ import { performCSGOperation, type BooleanOperationType } from '@/lib/csg-mesh';
+ import { obtenerPlugin, listarPlugins, DESTINO_NUEVO_OBJETO, type PluginParams } from '@/lib/plugins';
+ import { toast } from 'sonner';
+ import MeshEditor from './MeshEditor';
+ import { buildLoftMesh } from '@/lib/loft-mesh';
++import { buildSweepMesh, type SweepNode } from '@/lib/sweep-mesh';
+ import type { ObjectTransform, Camera3D, GizmoMode } from '@/components/viewer-3d';
+ import {
+   IDENTITY_TRANSFORM,
+@@ -77,6 +79,8 @@ import {
+   scalePolygonUniformUnbounded,
+   setPolygonVertexCount,
+   rotatePolygonInPlace,
++  addPolygonVertex,
++  removePolygonVertex,
+ } from '@/lib/polygon-tools';
+ import {
+   Views,
+@@ -91,14 +95,21 @@ import {
+   buildLatheMesh,
+    pointInPolygon,
+    polygonArea,
++   roundedPolygonPath,
+   type LatheTextureProjection,
+   type TextureFinish,
+   type Mesh,
++  type Point2D,
++  type Handle2D,
+ } from '@/lib/geometry';
+ import { extractObj3dMesh, decimateMesh } from '@/lib/obj3d-thumbnails';
+ import { buildViewsMesh, buildExtrudeMesh, buildExtrudeMeshes, polylineToPolygon } from '@/lib/views-mesh';
+ import { sanitizePolylinesByCanvas, newPolylineId } from '@/lib/polylines';
+-import type { PolylinesByCanvas, Polyline } from '@/lib/polylines';
++import type { PolylinesByCanvas, Polyline, CanvasTool } from '@/lib/polylines';
++import {
++  computeRoundCornerPoints,
++  polygonRoundRadius,
++} from '@/hooks/use-polygon-editor';
+ 
+ /**
+  * Prepara la URL de textura de suelo/cielo leída de un .zeus para que
+@@ -201,10 +212,84 @@ import {
+    Move3D,
+    Rotate3D,
+    Scale3D,
++  Magnet,
++  MousePointer2,
++  Maximize2,
++  Minimize2,
++  Pencil,
++  ZoomIn,
++  ZoomOut,
++  Eraser,
+ } from 'lucide-react';
+ 
+ const EditorCanvasComponent = EditorCanvas as unknown as ComponentType<any>;
+ 
++/**
++ * Arco de redondeo de la esquina `i` calculado sobre la forma ACTUAL del
++ * polígono. Si una arista vecina ya está curvada (el vecino tiene asas Bézier),
++ * el arco sale TANGENTE a esa curva en vez de a la recta entre vértices, de
++ * modo que el redondeo empalma con las curvas existentes y no aparece un codo
++ * ni una "hinchazón" en la unión. Con vecinos de esquina recta el resultado es
++ * idéntico al redondeo clásico.
++ */
++function cornerArcPoints(
++  poly: Polygon,
++  i: number,
++  curveAmount: number,
++  segments: number
++): Point2D[] | null {
++  const n = poly.length;
++  if (n < 3) return null;
++  const prev = poly[(i - 1 + n) % n];
++  const vert = poly[i];
++  const next = poly[(i + 1) % n];
++  const radius = polygonRoundRadius(poly, curveAmount);
++  // Sin curvas alrededor: redondeo recto de siempre.
++  if (!prev.hOut && !next.hIn) {
++    return computeRoundCornerPoints(prev, vert, next, radius, segments);
++  }
++  // Punto de control REAL de cada arista en el extremo del vértice: si el
++  // vecino tiene asa, marca la tangente de su curva; si no, la recta.
++  const prevRef = prev.hOut ?? prev;
++  const nextRef = next.hIn ?? next;
++  let u1x = prevRef.x - vert.x;
++  let u1y = prevRef.y - vert.y;
++  let u2x = nextRef.x - vert.x;
++  let u2y = nextRef.y - vert.y;
++  const l1 = Math.hypot(u1x, u1y);
++  const l2 = Math.hypot(u2x, u2y);
++  if (l1 < 1e-6 || l2 < 1e-6) return null;
++  u1x /= l1;
++  u1y /= l1;
++  u2x /= l2;
++  u2y /= l2;
++  const cross = u1x * u2y - u1y * u2x;
++  if (Math.abs(cross) < 1e-3) return null;
++  const straight1 = Math.hypot(vert.x - prev.x, vert.y - prev.y);
++  const straight2 = Math.hypot(next.x - vert.x, next.y - vert.y);
++  const r = Math.min(radius, straight1 * 0.5, straight2 * 0.5);
++  if (r < 0.005) return null;
++  const t1 = { x: vert.x + u1x * r, y: vert.y + u1y * r };
++  const t2 = { x: vert.x + u2x * r, y: vert.y + u2y * r };
++  const dx = t2.x - t1.x;
++  const dy = t2.y - t1.y;
++  const s = (dx * u2y - dy * u2x) / cross;
++  const cx = t1.x + u1x * s;
++  const cy = t1.y + u1y * s;
++  const segCount = Math.max(1, Math.round(segments));
++  const arc: Point2D[] = [t1];
++  for (let k = 1; k <= segCount; k++) {
++    const t = k / (segCount + 1);
++    const it = 1 - t;
++    arc.push({
++      x: it * it * t1.x + 2 * it * t * cx + t * t * t2.x,
++      y: it * it * t1.y + 2 * it * t * cy + t * t * t2.y,
++    });
++  }
++  arc.push(t2);
++  return arc;
++}
++
+ // 'scene' es la pestaña neutra: el espacio de trabajo donde vive el
+ // editor (seleccionar, mover, agrupar, animar). Las demás son
+ // pestañas-herramienta: solo construyen/editan la figura de un objeto
+@@ -393,6 +478,14 @@ type HistoryState = {
+    effectTracks: EffectTrack[];
+    /** Mallas base congeladas para las pistas de plugin, por objectId. */
+    pluginBaseMeshes: Record<string, Mesh>;
++   /** Recorrido (Extruir): vértices con su posición, plantilla e inclinación. */
++   sweepNodes: SweepNode[];
++   /** Recorrido (Extruir): ¿tramo cerrado? */
++   sweepClosed: boolean;
++   /** Recorrido (Extruir): número de subdivisiones del barrido. */
++   sweepSubdivisions: number;
++   /** Recorrido (Extruir): vértice activo (selección). */
++   sweepActiveId: number | null;
+  };
+ 
+ // Comparación de dos fotos del editor (para saber si un cambio es real o
+@@ -448,7 +541,11 @@ const isSameHistoryState = (a: HistoryState, b: HistoryState): boolean =>
+   a.latheFigureColor === b.latheFigureColor &&
+   sameHistoryValue(a.gizmoOffset, b.gizmoOffset) &&
+   sameHistoryValue(a.groups, b.groups) &&
+-  sameHistoryValue(a.polylines, b.polylines);
++  sameHistoryValue(a.polylines, b.polylines) &&
++  sameHistoryValue(a.sweepNodes ?? [], b.sweepNodes ?? []) &&
++  (a.sweepClosed ?? false) === (b.sweepClosed ?? false) &&
++  (a.sweepSubdivisions ?? 5) === (b.sweepSubdivisions ?? 5) &&
++  (a.sweepActiveId ?? null) === (b.sweepActiveId ?? null);
+ 
+ // Plantillas por defecto: vacías. Los lienzos 2D arrancan en blanco
+ // — el usuario dibuja desde cero o inserta una forma de un clic. El
+@@ -466,6 +563,41 @@ const DEFAULT_MESH_SECTIONS: Array<{
+   y: number;
+ }> = [];
+ 
++// Colores de la vista superpuesta de plantillas (Mallas): a cada plantilla
++// le toca un color para poder reconocerla cuando todas se solapan encima.
++const SECTION_OVERLAY_COLORS = [
++  '#22c55e',
++  '#38bdf8',
++  '#f59e0b',
++  '#e879f9',
++  '#ef4444',
++  '#a3e635',
++  '#f97316',
++  '#8b5cf6',
++  '#14b8a6',
++  '#ec4899',
++];
++// Marfil: color de los SEGMENTOS (aristas de la malla) en la vista
++// superpuesta. Es un tono hueso cálido para que la malla se lea como un
++// dibujo técnico sobre la rejilla; el relleno de cada plantilla conserva
++// su color para no perder de vista cuál es cuál.
++const OVERLAY_SEGMENT_IVORY = '#F5EEDB';
++
++/**
++ * Estilo de los botones de la barra de edición de la vista superpuesta de
++ * plantillas (Mallas). Reutiliza el verde de selección del editor para los
++ * estados activos; los botones sin selección quedan atenuados.
++ */
++function overlayToolChip(active: boolean, disabled = false): string {
++  const base =
++    'flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border transition-colors';
++  if (disabled)
++    return `${base} bg-white/5 text-muted-foreground/40 border-white/10 cursor-not-allowed`;
++  if (active)
++    return `${base} bg-green-500/25 text-green-300 border-green-500/40`;
++  return `${base} bg-white/5 text-muted-foreground border-white/10 hover:bg-white/10 hover:text-foreground`;
++}
++
+ // Formas de un clic (círculo, cuadrado, …) tal cual salen de sus botones:
+ // sirven para detectar cuándo se inserta una en una plantilla y ajustarla
+ // al ancho de la silueta y del costado que le toca a su altura.
+@@ -958,6 +1090,16 @@ export default function Home({
+   const [extrudeDepth, setExtrudeDepth] = useState(0.5);
+   // IDs de polilíneas cerradas marcadas como agujeros (sustraídos) en Extruir.
+   const [extrudeHoles, setExtrudeHoles] = useState<string[]>([]);
++  // Recorrido (Extruir): el segmento por el que se barre la figura y la
++  // plantilla de cada vértice (la que se le da forma en el lienzo Frontal).
++  const [sweepNodes, setSweepNodes] = useState<SweepNode[]>([]);
++  const [sweepActiveId, setSweepActiveId] = useState<number | null>(null);
++  const [sweepClosed, setSweepClosed] = useState(false);
++  const [sweepSubdivisions, setSweepSubdivisions] = useState(5);
++  // Ver la plantilla de cada vértice "de canto" (en perfil) en el
++  // lienzo del Recorrido, girada según su inclinación.
++  const [sweepEdgeTemplates, setSweepEdgeTemplates] = useState(false);
++  const sweepIdRef = useRef(1);
+   // Escala uniforme de la figura 2D en Extruir (slider del toolbar).
+   const [resizeScale, setResizeScale] = useState(1);
+   const resizeBaseRef = useRef<Polygon | null>(null);
+@@ -1033,6 +1175,12 @@ export default function Home({
+   const [editingViewProfile, setEditingViewProfile] = useState<
+     'front' | 'side' | 'top' | null
+   >(null);
++  // Lienzo maximizado de la pestaña Extruir: 'path' abre el Recorrido y
++  // 'profile' la plantilla a pantalla completa (ambos ocupan el sitio de
++  // las cuatro ventanas). null = rejilla normal.
++  const [editingSweepCanvas, setEditingSweepCanvas] = useState<
++    'path' | 'profile' | null
++  >(null);
+ 
+   const [useFontColor, setUseFontColor] = useState(true);
+   const [baseColor, setBaseColor] = useState('#e8e8e8');
+@@ -1053,160 +1201,1709 @@ export default function Home({
+   const [latheSegments, setLatheSegments] = useState(32);
+   const [latheClamp, setLatheClamp] = useState(true);
+ 
+-  const [meshSilhouette, setMeshSilhouette] = useState<Polygon>(
+-    DEFAULT_MESH_SILHOUETTE
+-  );
+-  // Transparencia de la figura de la pestaña Mallas (1 = opaca del todo).
+-  // Mando aparte de las plantillas: afecta al objeto 3D completo.
+-  const [meshOpacity, setMeshOpacity] = useState(1);
+-  // Igual que la silueta: el costado por defecto ocupa toda la altura
+-  // del lienzo (de y=0 arriba a y=1 abajo).
+-  const [meshSideView, setMeshSideView] = useState<Polygon>(
+-    structuredClone(DEFAULT_MESH_SIDE_VIEW)
+-  );
+-  const [editingMeshSide, setEditingMeshSide] = useState(false);
+-  const [meshSections, setMeshSections] = useState<
+-    Array<{ id: number; polygon: Polygon; y: number }>
+-  >(DEFAULT_MESH_SECTIONS);
+-  const [meshSilhouetteView, setMeshSilhouetteView] = useState<
+-    'front' | 'side' | 'both'
+-  >('both');
+-  // Polilíneas libres de los lienzos 2D, por lienzo ('views:front',
+-  // 'mesh:silhouette', 'mesh:section:<id>', 'lathe:profile'…): líneas
+-  // abiertas dibujadas con la herramienta Línea del lienzo grande. Solo
+-  // viven en el lienzo 2D: no se ven en el visor 3D ni afectan a la malla.
+-  const [polylines, setPolylines] = useState<PolylinesByCanvas>({});
+-  const getPolylines = useCallback(
+-    (key: string) => polylines[key] ?? [],
+-    [polylines]
++  const [meshSilhouette, setMeshSilhouette] = useState<Polygon>(
++    DEFAULT_MESH_SILHOUETTE
++  );
++  // Transparencia de la figura de la pestaña Mallas (1 = opaca del todo).
++  // Mando aparte de las plantillas: afecta al objeto 3D completo.
++  const [meshOpacity, setMeshOpacity] = useState(1);
++  // Igual que la silueta: el costado por defecto ocupa toda la altura
++  // del lienzo (de y=0 arriba a y=1 abajo).
++  const [meshSideView, setMeshSideView] = useState<Polygon>(
++    structuredClone(DEFAULT_MESH_SIDE_VIEW)
++  );
++  const [editingMeshSide, setEditingMeshSide] = useState(false);
++  const [meshSections, setMeshSections] = useState<
++    Array<{ id: number; polygon: Polygon; y: number }>
++  >(DEFAULT_MESH_SECTIONS);
++  const [meshSilhouetteView, setMeshSilhouetteView] = useState<
++    'front' | 'side' | 'both'
++  >('both');
++  // Vista superpuesta de plantillas: pinta TODAS las plantillas a la vez en
++  // un solo lienzo X·Z, cada una con su color y su opacidad, para ver la
++  // figura completa y poder destacar una sobre las demás. La opacidad de
++  // cada plantilla se guarda por su id (0..1); si falta, se usa 0.6.
++  const [meshOverlayTemplates, setMeshOverlayTemplates] = useState(false);
++  const [meshOverlayOpacities, setMeshOverlayOpacities] = useState<
++    Record<number, number>
++  >({});
++
++  // Conmutador de la vista superpuesta: al activarlo ocupa todo el área del
++  // editor (por encima de las ventanas, «como las cuatro») para comparar las
++  // plantillas a lo grande; se apaga con el botón del encabezado o con Esc.
++  const [meshOverlayMaximized, setMeshOverlayMaximized] = useState(false);
++
++  // Edición dentro de la vista superpuesta (Mallas): plantilla elegida para
++  // editar en el PROPIO lienzo superpuesto (null = solo lectura). Con una
++  // elegida se pueden arrastrar/crear/quitar vértices, rotar y escalar, y se
++  // pinta debajo una rejilla magnética con imán opcional (paso configurable).
++  const [meshOverlayEditId, setMeshOverlayEditId] = useState<number | null>(
++    null
++  );
++  const [meshOverlayGrid, setMeshOverlayGrid] = useState(true);
++  const [meshOverlaySnap, setMeshOverlaySnap] = useState(true);
++  const [meshOverlaySnapStep, setMeshOverlaySnapStep] = useState(0.05);
++  // Herramientas de edición de la plantilla en edición (las mismas que el lienzo
++  // 2D de la pestaña Extruir): Editar vértices / Selección por marquesina /
++  // Borrar. La herramienta 'line' no se ofrece: la plantilla es un perfil cerrado.
++  const [meshOverlayTool, setMeshOverlayTool] = useState<CanvasTool>('edit');
++  // Edición de curvas: cantidad (fracción del radio), número de vértices del
++  // arco y "Predibujar" (muestra el arco previsto al pasar el ratón).
++  const [meshOverlayCurveAmount, setMeshOverlayCurveAmount] = useState(0.35);
++  const [meshOverlayCurveSegments, setMeshOverlayCurveSegments] = useState(8);
++  const [meshOverlayCurvePreview, setMeshOverlayCurvePreview] = useState(false);
++  // Vértices seleccionados (por marquesina) de la plantilla en edición.
++  const [meshOverlaySelection, setMeshOverlaySelection] = useState<number[]>([]);
++  // Marquesina en curso (coordenadas de la malla 0..100).
++  const [meshOverlayMarquee, setMeshOverlayMarquee] = useState<{
++    x0: number;
++    y0: number;
++    x1: number;
++    y1: number;
++  } | null>(null);
++  const overlayMarqueeRef = useRef<{
++    x0: number;
++    y0: number;
++    x1: number;
++    y1: number;
++  } | null>(null);
++  // Vértice bajo el cursor (para el predibujo del arco).
++  const [meshOverlayHoverVertex, setMeshOverlayHoverVertex] = useState<
++    number | null
++  >(null);
++  // Pulsación larga sobre un vértice: redondea/endereza su esquina.
++  const overlayHoldRef = useRef<{
++    timer: number;
++    x: number;
++    y: number;
++  } | null>(null);
++  // Asa Bézier en arrastre (cualquiera de las dos del vértice, o las dos a
++  // la vez al sacarlas con la pulsación larga). `anchor` es la posición del
++  // vértice al empezar y `other` el asa opuesta de partida (para el espejo
++  // suave); con Alt se rompe esa simetría.
++  const overlayHandleRef = useRef<{
++    id: number;
++    vertex: number;
++    side: 'both' | 'in' | 'out';
++    anchor: Handle2D;
++    other: Handle2D | null;
++    moved: boolean;
++    hadHandles: boolean;
++  } | null>(null);
++  // Arrastre en grupo de los vértices seleccionados.
++  const overlayGroupDragRef = useRef<{
++    id: number;
++    vertices: number[];
++    startView: { x: number; y: number };
++    startPoly: Polygon;
++  } | null>(null);
++  // Ref del vértice que se está arrastrando en este momento. El contenedor del
++  // lienzo se localiza bajo el puntero con elementFromPoint (data-overlay-canvas)
++  // para no depender de un ref compartido entre los dos lienzos.
++  const overlayDragRef = useRef<{ id: number; vertex: number } | null>(null);
++  // Zoom y encuadre del lienzo superpuesto: acercan/alejan y desplazan SOLO
++  // la malla y la rejilla. El grosor de las líneas y el tamaño de los
++  // tiradores se compensan dividiendo por el zoom, de modo que su tamaño
++  // en pantalla NO cambia al acercar o alejar.
++  const [meshOverlayZoom, setMeshOverlayZoom] = useState(1);
++  const [meshOverlayPan, setMeshOverlayPan] = useState({ x: 0, y: 0 });
++  // Desplazamiento en curso (arrastrar el fondo): guarda el punto de pantalla
++  // de partida y el encuadre que había para aplicarle el delta.
++  const overlayPanRef = useRef<{
++    viewX: number;
++    viewY: number;
++    panX: number;
++    panY: number;
++  } | null>(null);
++  // Polilíneas libres de los lienzos 2D, por lienzo ('views:front',
++  // 'mesh:silhouette', 'mesh:section:<id>', 'lathe:profile'…): líneas
++  // abiertas dibujadas con la herramienta Línea del lienzo grande. Solo
++  // viven en el lienzo 2D: no se ven en el visor 3D ni afectan a la malla.
++  const [polylines, setPolylines] = useState<PolylinesByCanvas>({});
++  const getPolylines = useCallback(
++    (key: string) => polylines[key] ?? [],
++    [polylines]
++  );
++  const updatePolylines = useCallback((key: string, lines: Polyline[]) => {
++    setPolylines((prev) => {
++      // Sin líneas se quita la clave: el mapa no guarda lienzos vacíos
++      if (lines.length === 0) {
++        if (!(key in prev)) return prev;
++        const next = { ...prev };
++        delete next[key];
++        return next;
++      }
++      return { ...prev, [key]: lines };
++    });
++  }, []);
++
++  // Vistas que se aplican de verdad al objeto: con "Frente" el costado no
++  // limita, con "Costado" la silueta no limita, con "Ambas" limitan las dos.
++  // Se usan tanto para construir el objeto como para ajustar las plantillas
++  // al ancho que les toca, así lo que se ve en el lienzo es lo que sale.
++  const appliedMeshSilhouette =
++    meshSilhouetteView === 'side' ? FULL_BOX_VIEW : meshSilhouette;
++  const appliedMeshSideView =
++    meshSilhouetteView === 'front' ? FULL_BOX_VIEW : meshSideView;
++
++  const addMeshSection = useCallback(() => {
++    setMeshSections((prev) => {
++      const nextId =
++        prev.length > 0 ? Math.max(...prev.map((s) => s.id)) + 1 : 1;
++      // Si no hay plantillas, empezamos en 0.5. Si las hay, la nueva va por debajo
++      // de la que tenga la y más baja (la de más abajo).
++      const minY = prev.length > 0 ? Math.min(...prev.map((s) => s.y)) : 0.5;
++      const nextY = Number(Math.max(0.05, minY - 0.15).toFixed(2));
++      return [
++        ...prev,
++        {
++          id: nextId,
++          y: nextY,
++          // La plantilla nueva se estira al ancho de la silueta (X) y del
++          // costado (Z) que corresponden a su altura.
++          polygon: fitSectionToViews(
++            [
++              { x: 0.3, y: 0.3 },
++              { x: 0.7, y: 0.3 },
++              { x: 0.7, y: 0.7 },
++              { x: 0.3, y: 0.7 },
++            ],
++            nextY,
++            appliedMeshSilhouette,
++            appliedMeshSideView
++          ),
++        },
++      ];
++    });
++  }, [appliedMeshSilhouette, appliedMeshSideView]);
++
++  const removeMeshSection = useCallback((id: number) => {
++    setMeshSections((prev) => prev.filter((s) => s.id !== id));
++    // Sus polilíneas libres desaparecen con la plantilla
++    setPolylines((prev) => {
++      const key = `mesh:section:${id}`;
++      if (!(key in prev)) return prev;
++      const next = { ...prev };
++      delete next[key];
++      return next;
++    });
++  }, []);
++
++  /**
++   * Actualiza el polígono de una plantilla. Si el nuevo polígono es una
++   * forma de las de un clic (círculo, cuadrado, …) se estira al ancho de
++   * la silueta (X) y del costado (Z) que le tocan a la altura de esa
++   * plantilla; el resto de ediciones (arrastrar vértices, dibujar a mano)
++   * se guardan tal cual.
++   */
++  const updateMeshSectionPolygon = useCallback(
++    (id: number, poly: Polygon) => {
++      setMeshSections((prev) =>
++        prev.map((s) => {
++          if (s.id !== id) return s;
++          const polygon = isPresetShape(poly)
++            ? fitSectionToViews(
++                poly,
++                s.y,
++                appliedMeshSilhouette,
++                appliedMeshSideView
++              )
++            : poly;
++          return { ...s, polygon };
++        })
++      );
++    },
++    [appliedMeshSilhouette, appliedMeshSideView]
++  );
++
++  const replaceMeshSectionPolygon = useCallback((id: number, poly: Polygon) => {
++    setMeshSections((prev) =>
++      prev.map((s) =>
++        s.id !== id ? s : { ...s, polygon: structuredClone(poly) }
++      )
++    );
++  }, []);
++
++  /**
++   * Sube o baja una plantilla (su altura Y) con los botones de su cabecera.
++   * La forma no se toca, pero el polígono se reajusta al ancho de la
++   * silueta y del costado que le toca en la nueva altura, igual que al
++   * escribir la Y a mano en la vista ampliada.
++   */
++  const moveMeshSectionY = useCallback(
++    (id: number, delta: number) => {
++      setMeshSections((prev) =>
++        prev.map((s) => {
++          if (s.id !== id) return s;
++          const y = Math.min(1, Math.max(0, Number((s.y + delta).toFixed(2))));
++          return {
++            ...s,
++            y,
++            polygon: fitSectionToViews(
++              s.polygon,
++              y,
++              appliedMeshSilhouette,
++              appliedMeshSideView
++            ),
++          };
++        })
++      );
++    },
++    [appliedMeshSilhouette, appliedMeshSideView]
++  );
++
++  /** Opacidad de una plantilla en la vista superpuesta (0..1). */
++  const overlayOpacityOf = useCallback(
++    (id: number) => meshOverlayOpacities[id] ?? 0.6,
++    [meshOverlayOpacities]
++  );
++
++  const setOverlayOpacity = useCallback((id: number, value: number) => {
++    setMeshOverlayOpacities((prev) => ({ ...prev, [id]: value }));
++  }, []);
++
++  const resetOverlayOpacities = useCallback(() => {
++    setMeshOverlayOpacities({});
++  }, []);
++
++  /**
++   * Pasa coordenadas de pantalla a coordenadas del viewBox 0..100. El SVG usa
++   * viewBox "0 0 100 100" con preserveAspectRatio "meet", así que hay que
++   * descontar el letterbox para acertar con el punto pulsado. NO tiene en
++   * cuenta el zoom ni el encuadre: es la base de todo lo demás.
++   */
++  const overlayClientToViewBox = useCallback(
++    (clientX: number, clientY: number) => {
++      const el =
++        typeof document !== 'undefined'
++          ? (document.elementFromPoint(clientX, clientY) as HTMLElement | null)
++          : null;
++      const box = el?.closest('[data-overlay-canvas]') as HTMLElement | null;
++      if (!box) return { x: 50, y: 50 };
++      const r = box.getBoundingClientRect();
++      const scale = Math.min(r.width, r.height) / 100 || 1;
++      const offX = (r.width - 100 * scale) / 2;
++      const offY = (r.height - 100 * scale) / 2;
++      return {
++        x: (clientX - r.left - offX) / scale,
++        y: (clientY - r.top - offY) / scale,
++      };
++    },
++    []
++  );
++
++  /** Zoom alrededor de un punto del viewBox (deja ese punto fijo en pantalla). */
++  const overlayZoomAt = useCallback(
++    (factor: number, fv: { x: number; y: number }) => {
++      const z0 = meshOverlayZoom;
++      const z = Math.min(8, Math.max(0.5, z0 * factor));
++      if (z === z0) return;
++      const c = 50;
++      const p = meshOverlayPan;
++      setMeshOverlayZoom(z);
++      setMeshOverlayPan({
++        x: fv.x - c - (z / z0) * (fv.x - p.x - c),
++        y: fv.y - c - (z / z0) * (fv.y - p.y - c),
++      });
++    },
++    [meshOverlayZoom, meshOverlayPan]
++  );
++
++  /** Devuelve el lienzo a su encuadre original (zoom 100%, centrado). */
++  const overlayResetView = useCallback(() => {
++    setMeshOverlayZoom(1);
++    setMeshOverlayPan({ x: 0, y: 0 });
++  }, []);
++
++  // Refs siempre al día para el listener de la rueda, que se engancha una
++  // sola vez por lienzo (no pasivo) para frenar el scroll de la página.
++  const overlayClientToViewBoxRef = useRef(overlayClientToViewBox);
++  const overlayZoomAtRef = useRef(overlayZoomAt);
++  useEffect(() => {
++    overlayClientToViewBoxRef.current = overlayClientToViewBox;
++  }, [overlayClientToViewBox]);
++  useEffect(() => {
++    overlayZoomAtRef.current = overlayZoomAt;
++  }, [overlayZoomAt]);
++
++  /**
++   * Callback ref del contenedor del lienzo superpuesto: engancha la RUEDA como
++   * listener no pasivo para hacer zoom con el ratón sin que se desplace la
++   * página. Las coordenadas se resuelven con elementFromPoint + data-overlay-canvas.
++   */
++  const setOverlayCanvas = useCallback((el: HTMLDivElement | null) => {
++    if (!el) return;
++    const onWheel = (e: WheelEvent) => {
++      e.preventDefault();
++      const fv = overlayClientToViewBoxRef.current(e.clientX, e.clientY);
++      overlayZoomAtRef.current(e.deltaY < 0 ? 1.15 : 1 / 1.15, fv);
++    };
++    el.addEventListener('wheel', onWheel, { passive: false });
++  }, []);
++
++  /**
++   * Pasa coordenadas de pantalla a coordenadas de la MALLA 0..100, ya con el
++   * zoom y el encuadre deshechos (lo que usan el arrastre y el doble clic).
++   */
++  const overlayClientToView = useCallback(
++    (clientX: number, clientY: number) => {
++      const v = overlayClientToViewBox(clientX, clientY);
++      const c = 50;
++      const z = meshOverlayZoom || 1;
++      const p = meshOverlayPan;
++      return { x: (v.x - p.x - c) / z + c, y: (v.y - p.y - c) / z + c };
++    },
++    [overlayClientToViewBox, meshOverlayZoom, meshOverlayPan]
++  );
++
++  /** Empieza a desplazar el lienzo al arrastrar el fondo. */
++  const overlayBeginPan = useCallback(
++    (clientX: number, clientY: number) => {
++      const v = overlayClientToViewBox(clientX, clientY);
++      overlayPanRef.current = {
++        viewX: v.x,
++        viewY: v.y,
++        panX: meshOverlayPan.x,
++        panY: meshOverlayPan.y,
++      };
++    },
++    [overlayClientToViewBox, meshOverlayPan]
++  );
++
++  /** Aplica el imán (rejilla) a un valor del lienzo 0..100 si está activo. */
++  const overlaySnapView = useCallback(
++    (v: number) => {
++      if (!meshOverlaySnap || meshOverlaySnapStep <= 0) return v;
++      const s = meshOverlaySnapStep * 100;
++      return Math.round(v / s) * s;
++    },
++    [meshOverlaySnap, meshOverlaySnapStep]
++  );
++
++  /** Vértices de la malla que caen dentro del rectángulo (malla 0..100). */
++  const overlayApplyMarquee = useCallback(
++    (x0: number, y0: number, x1: number, y1: number) => {
++      const editId = meshOverlayEditId;
++      if (editId == null) return;
++      const section = meshSections.find((s) => s.id === editId);
++      if (!section) return;
++      const minX = Math.min(x0, x1);
++      const maxX = Math.max(x0, x1);
++      const minY = Math.min(y0, y1);
++      const maxY = Math.max(y0, y1);
++      const inside: number[] = [];
++      section.polygon.forEach((p, i) => {
++        const vx = p.x * 100;
++        const vy = p.y * 100;
++        if (vx >= minX && vx <= maxX && vy >= minY && vy <= maxY) inside.push(i);
++      });
++      setMeshOverlaySelection(inside);
++    },
++    [meshOverlayEditId, meshSections]
++  );
++
++  /** Empieza la marquesina de selección (herramienta Selección). */
++  const overlayBeginMarquee = useCallback(
++    (clientX: number, clientY: number) => {
++      const v = overlayClientToView(clientX, clientY);
++      overlayMarqueeRef.current = { x0: v.x, y0: v.y, x1: v.x, y1: v.y };
++      setMeshOverlayMarquee({ x0: v.x, y0: v.y, x1: v.x, y1: v.y });
++      setMeshOverlaySelection([]);
++    },
++    [overlayClientToView]
++  );
++
++  /** Mueve en grupo los vértices seleccionados según el puntero. */
++  const overlayMoveGroup = useCallback(
++    (clientX: number, clientY: number) => {
++      const drag = overlayGroupDragRef.current;
++      if (!drag) return;
++      const { x, y } = overlayClientToView(clientX, clientY);
++      let dx = x - drag.startView.x;
++      let dy = y - drag.startView.y;
++      if (meshOverlaySnap && meshOverlaySnapStep > 0) {
++        const s = meshOverlaySnapStep * 100;
++        dx = Math.round(dx / s) * s;
++        dy = Math.round(dy / s) * s;
++      }
++      const moved = new Set(drag.vertices);
++      const verts: Point2D[] = drag.startPoly.map((p, i) => {
++        if (!moved.has(i)) return { ...p };
++        const nx = Math.min(100, Math.max(0, p.x * 100 + dx)) / 100;
++        const ny = Math.min(100, Math.max(0, p.y * 100 + dy)) / 100;
++        const v: Point2D = { ...p, x: nx, y: ny };
++        const odx = nx - p.x;
++        const ody = ny - p.y;
++        if (p.hIn) v.hIn = { x: p.hIn.x + odx, y: p.hIn.y + ody };
++        if (p.hOut) v.hOut = { x: p.hOut.x + odx, y: p.hOut.y + ody };
++        return v;
++      });
++      setMeshSections((prev) =>
++        prev.map((s) => (s.id === drag.id ? { ...s, polygon: verts } : s))
++      );
++    },
++    [overlayClientToView, meshOverlaySnap, meshOverlaySnapStep]
++  );
++
++  /** Elimina el vértice indicado si aún quedan al menos 3. */
++  const overlayRemoveVertexAt = useCallback(
++    (vertexIndex: number) => {
++      const editId = meshOverlayEditId;
++      if (editId == null) return;
++      setMeshSections((prev) =>
++        prev.map((s) => {
++          if (s.id !== editId) return s;
++          if (s.polygon.length <= 3) return s;
++          return {
++            ...s,
++            polygon: s.polygon.filter((_, i) => i !== vertexIndex),
++          };
++        })
++      );
++      setMeshOverlaySelection((sel) =>
++        sel
++          .filter((i) => i !== vertexIndex)
++          .map((i) => (i > vertexIndex ? i - 1 : i))
++      );
++      setMeshOverlayHoverVertex(null);
++    },
++    [meshOverlayEditId]
++  );
++
++  /** Redondea en arco la esquina del vértice (sustituye el vértice por puntos). */
++  const overlayRoundCornerAt = useCallback(
++    (vertexIndex: number) => {
++      const editId = meshOverlayEditId;
++      if (editId == null) return;
++      setMeshSections((prev) =>
++        prev.map((s) => {
++          if (s.id !== editId) return s;
++          const poly = s.polygon;
++          const n = poly.length;
++          if (n < 3) return s;
++          const pts = cornerArcPoints(
++            poly,
++            vertexIndex,
++            meshOverlayCurveAmount,
++            meshOverlayCurveSegments
++          );
++          if (!pts || pts.length < 2) return s;
++          const verts = poly.map((p) => ({ ...p }));
++          verts.splice(
++            vertexIndex,
++            1,
++            ...pts.map((q) => ({ x: q.x, y: q.y }))
++          );
++          return { ...s, polygon: verts };
++        })
++      );
++      setMeshOverlaySelection([]);
++      setMeshOverlayHoverVertex(null);
++    },
++    [meshOverlayEditId, meshOverlayCurveAmount, meshOverlayCurveSegments]
++  );
++
++  /** Redondea o endereza (asas Bézier reversibles) la esquina del vértice. */
++  const overlayToggleCurveAt = useCallback(
++    (vertexIndex: number) => {
++      const editId = meshOverlayEditId;
++      if (editId == null) return;
++      setMeshSections((prev) =>
++        prev.map((s) => {
++          if (s.id !== editId) return s;
++          const poly = s.polygon;
++          const n = poly.length;
++          if (n < 3) return s;
++          const verts = poly.map((p) => ({ ...p }));
++          const v = verts[vertexIndex];
++          if (!v) return s;
++          if (v.hIn || v.hOut) {
++            delete v.hIn;
++            delete v.hOut;
++            return { ...s, polygon: verts };
++          }
++          const prevP = poly[(vertexIndex - 1 + n) % n];
++          const nextP = poly[(vertexIndex + 1) % n];
++          const d1x = v.x - prevP.x;
++          const d1y = v.y - prevP.y;
++          const d2x = nextP.x - v.x;
++          const d2y = nextP.y - v.y;
++          const k = meshOverlayCurveAmount;
++          v.hIn = { x: v.x - d1x * k, y: v.y - d1y * k };
++          v.hOut = { x: v.x + d2x * k, y: v.y + d2y * k };
++          return { ...s, polygon: verts };
++        })
++      );
++    },
++    [meshOverlayEditId, meshOverlayCurveAmount]
++  );
++
++  /** Pulsación sobre un tirador de asa Bézier: prepara su arrastre. */
++  const overlayHandlePointerDown = useCallback(
++    (id: number, vertex: number, side: 'in' | 'out') => {
++      const section = meshSections.find((s) => s.id === id);
++      const v = section?.polygon[vertex];
++      if (!section || !v) return;
++      const handle = side === 'in' ? v.hIn : v.hOut;
++      if (!handle) return;
++      overlayHandleRef.current = {
++        id,
++        vertex,
++        side,
++        anchor: { x: v.x, y: v.y },
++        other: side === 'in' ? (v.hOut ? { ...v.hOut } : null) : v.hIn ? { ...v.hIn } : null,
++        moved: false,
++        hadHandles: true,
++      };
++      setMeshOverlaySelection([vertex]);
++    },
++    [meshSections]
++  );
++
++  /** Crea las asas Bézier del vértice apuntando a sus vecinos (curva suave). */
++  const overlayCreateHandlesAt = useCallback(
++    (vertexIndex: number, amount: number) => {
++      const editId = meshOverlayEditId;
++      if (editId == null) return;
++      setMeshSections((prev) =>
++        prev.map((s) => {
++          if (s.id !== editId) return s;
++          const poly = s.polygon;
++          const n = poly.length;
++          if (n < 3) return s;
++          const verts = poly.map((p) => ({ ...p }));
++          const v = verts[vertexIndex];
++          if (!v) return s;
++          const prevP = poly[(vertexIndex - 1 + n) % n];
++          const nextP = poly[(vertexIndex + 1) % n];
++          v.hIn = {
++            x: v.x - (v.x - prevP.x) * amount,
++            y: v.y - (v.y - prevP.y) * amount,
++          };
++          v.hOut = {
++            x: v.x + (nextP.x - v.x) * amount,
++            y: v.y + (nextP.y - v.y) * amount,
++          };
++          return { ...s, polygon: verts };
++        })
++      );
++    },
++    [meshOverlayEditId]
++  );
++
++  /** Fija (o borra, con null) las asas indicadas del vértice. */
++  const overlayApplyHandles = useCallback(
++    (
++      id: number,
++      vertexIndex: number,
++      inPt: Handle2D | null,
++      outPt: Handle2D | null
++    ) => {
++      setMeshSections((prev) =>
++        prev.map((s) => {
++          if (s.id !== id) return s;
++          const verts = s.polygon.map((p) => ({ ...p }));
++          const v = verts[vertexIndex];
++          if (!v) return s;
++          if (inPt) v.hIn = { ...inPt };
++          else delete v.hIn;
++          if (outPt) v.hOut = { ...outPt };
++          else delete v.hOut;
++          return { ...s, polygon: verts };
++        })
++      );
++    },
++    []
++  );
++
++  /**
++   * Arrastra las asas del vértice según el puntero. `side` 'both' mueve las
++   * dos en oposición (salen a los dos lados); 'in'/'out' mueve una y, salvo
++   * que `symBreak` (tecla Alt) esté activo, mantiene la opuesta en espejo
++   * para que la curva siga siendo suave. Arrastrar hasta el vértice borra esa
++   * asa.
++   */
++  const overlayDragHandle = useCallback(
++    (clientX: number, clientY: number, symBreak: boolean) => {
++      const drag = overlayHandleRef.current;
++      if (!drag) return;
++      const { x, y } = overlayClientToView(clientX, clientY);
++      const px = Math.min(100, Math.max(0, overlaySnapView(x))) / 100;
++      const py = Math.min(100, Math.max(0, overlaySnapView(y))) / 100;
++      const dx = px - drag.anchor.x;
++      const dy = py - drag.anchor.y;
++      const len = Math.hypot(dx, dy);
++      const MIN = 0.02;
++      if (len < MIN) {
++        if (drag.side === 'in') {
++          overlayApplyHandles(drag.id, drag.vertex, null, drag.other);
++          drag.moved = true;
++        } else if (drag.side === 'out') {
++          overlayApplyHandles(drag.id, drag.vertex, drag.other, null);
++          drag.moved = true;
++        }
++        return;
++      }
++      drag.moved = true;
++      if (drag.side === 'both') {
++        overlayApplyHandles(
++          drag.id,
++          drag.vertex,
++          { x: drag.anchor.x - dx, y: drag.anchor.y - dy },
++          { x: px, y: py }
++        );
++        return;
++      }
++      const mirror =
++        !symBreak && drag.other
++          ? (() => {
++              const ox = drag.other.x - drag.anchor.x;
++              const oy = drag.other.y - drag.anchor.y;
++              const ol = Math.hypot(ox, oy) || len;
++              const k = ol / len;
++              return { x: drag.anchor.x - dx * k, y: drag.anchor.y - dy * k };
++            })()
++          : drag.other;
++      if (drag.side === 'in') {
++        overlayApplyHandles(drag.id, drag.vertex, { x: px, y: py }, mirror);
++      } else {
++        overlayApplyHandles(drag.id, drag.vertex, mirror, { x: px, y: py });
++      }
++    },
++    [overlayClientToView, overlaySnapView, overlayApplyHandles]
++  );
++
++  /** Pulsación sobre un tirador de vértice, según la herramienta activa. */
++  const overlayVertexPointerDown = useCallback(
++    (clientX: number, clientY: number, id: number, vertex: number) => {
++      if (meshOverlayTool === 'erase') {
++        overlayRemoveVertexAt(vertex);
++        return;
++      }
++      if (meshOverlayTool === 'select') {
++        const already = meshOverlaySelection.includes(vertex);
++        const sel = already ? meshOverlaySelection : [vertex];
++        if (!already) setMeshOverlaySelection(sel);
++        const section = meshSections.find((s) => s.id === id);
++        if (!section) return;
++        overlayGroupDragRef.current = {
++          id,
++          vertices: sel,
++          startView: overlayClientToView(clientX, clientY),
++          startPoly: section.polygon.map((p) => ({ ...p })),
++        };
++        return;
++      }
++      // Herramienta Editar: arrastre del vértice + pulsación larga para curvar.
++      // Con «Predibujar» activo, el clic sobre una esquina recta crea el arco
++      // directamente (la misma curva que se predibuja al pasar el ratón), igual
++      // que la herramienta Curva del editor 2D. Si ya está curvada, se arrastra.
++      if (meshOverlayCurvePreview) {
++        const section = meshSections.find((s) => s.id === id);
++        const v = section?.polygon[vertex];
++        if (section && v && !v.hIn && !v.hOut && section.polygon.length >= 3) {
++          overlayRoundCornerAt(vertex);
++          return;
++        }
++      }
++      const section = meshSections.find((s) => s.id === id);
++      const v = section?.polygon[vertex];
++      if (!section || !v || section.polygon.length < 3) return;
++      overlayDragRef.current = { id, vertex };
++      overlayHoldRef.current = {
++        timer: window.setTimeout(() => {
++          overlayDragRef.current = null;
++          overlayHoldRef.current = null;
++          const had = !!(v.hIn || v.hOut);
++          // Al agotarse la pulsación larga salen las asas: si la esquina era
++          // recta, se crean hacia sus vecinos (curva suave por defecto).
++          if (!had) overlayCreateHandlesAt(vertex, meshOverlayCurveAmount);
++          overlayHandleRef.current = {
++            id,
++            vertex,
++            side: 'both',
++            anchor: { x: v.x, y: v.y },
++            other: null,
++            moved: false,
++            hadHandles: had,
++          };
++        }, 380),
++        x: clientX,
++        y: clientY,
++      };
++    },
++    [
++      meshOverlayTool,
++      meshOverlaySelection,
++      meshSections,
++      overlayClientToView,
++      overlayRemoveVertexAt,
++      overlayCreateHandlesAt,
++      overlayRoundCornerAt,
++      meshOverlayCurvePreview,
++      meshOverlayCurveAmount,
++    ]
++  );
++
++  /** Arco previsto del redondeo del vértice bajo el cursor ("Predibujar"). */
++  const overlayHoverArc = useMemo(() => {
++    if (!meshOverlayCurvePreview || meshOverlayHoverVertex == null) return null;
++    const editId = meshOverlayEditId;
++    if (editId == null) return null;
++    const section = meshSections.find((s) => s.id === editId);
++    if (!section) return null;
++    const poly = section.polygon;
++    const n = poly.length;
++    if (n < 3) return null;
++    const i = meshOverlayHoverVertex;
++    if (i < 0 || i >= n) return null;
++    if (poly[i].hIn || poly[i].hOut) return null;
++    return cornerArcPoints(
++      poly,
++      i,
++      meshOverlayCurveAmount,
++      meshOverlayCurveSegments
++    );
++  }, [
++    meshOverlayCurvePreview,
++    meshOverlayHoverVertex,
++    meshOverlayEditId,
++    meshSections,
++    meshOverlayCurveAmount,
++    meshOverlayCurveSegments,
++  ]);
++
++  /** Mueve el vértice que se arrastra a la posición de pantalla indicada. */
++  const overlayMoveDraggedVertex = useCallback(
++    (clientX: number, clientY: number) => {
++      const drag = overlayDragRef.current;
++      if (!drag) return;
++      const { x, y } = overlayClientToView(clientX, clientY);
++      const nx = Math.min(100, Math.max(0, overlaySnapView(x))) / 100;
++      const ny = Math.min(100, Math.max(0, overlaySnapView(y))) / 100;
++      setMeshSections((prev) =>
++        prev.map((s) => {
++          if (s.id !== drag.id) return s;
++          const verts = s.polygon.map((p) => ({ ...p }));
++          const v = verts[drag.vertex];
++          if (!v) return s;
++          const dx = nx - v.x;
++          const dy = ny - v.y;
++          v.x = nx;
++          v.y = ny;
++          if (v.hIn) v.hIn = { x: v.hIn.x + dx, y: v.hIn.y + dy };
++          if (v.hOut) v.hOut = { x: v.hOut.x + dx, y: v.hOut.y + dy };
++          return { ...s, polygon: verts };
++        })
++      );
++    },
++    [overlayClientToView, overlaySnapView]
++  );
++
++  /** Inserta un vértice nuevo en la arista más cercana al punto pulsado. */
++  const overlayInsertVertexAt = useCallback(
++    (clientX: number, clientY: number) => {
++      const editId = meshOverlayEditId;
++      if (editId == null) return;
++      const { x, y } = overlayClientToView(clientX, clientY);
++      const px = Math.min(100, Math.max(0, overlaySnapView(x))) / 100;
++      const py = Math.min(100, Math.max(0, overlaySnapView(y))) / 100;
++      setMeshSections((prev) =>
++        prev.map((s) => {
++          if (s.id !== editId) return s;
++          const poly = s.polygon;
++          const n = poly.length;
++          if (n < 2) return s;
++          let bestI = 0;
++          let bestD = Infinity;
++          for (let i = 0; i < n; i++) {
++            const a = poly[i];
++            const b = poly[(i + 1) % n];
++            const dx = b.x - a.x;
++            const dy = b.y - a.y;
++            const lenSq = dx * dx + dy * dy || 1e-9;
++            const t = Math.max(
++              0,
++              Math.min(1, ((px - a.x) * dx + (py - a.y) * dy) / lenSq)
++            );
++            const qx = a.x + t * dx;
++            const qy = a.y + t * dy;
++            const d = Math.hypot(px - qx, py - qy);
++            if (d < bestD) {
++              bestD = d;
++              bestI = i;
++            }
++          }
++          const verts = poly.map((p) => ({ ...p }));
++          verts.splice(bestI + 1, 0, { x: px, y: py });
++          return { ...s, polygon: verts };
++        })
++      );
++    },
++    [meshOverlayEditId, overlayClientToView, overlaySnapView]
++  );
++
++  // Arrastre del vértice y desplazamiento del lienzo: los eventos viven en
++  // window para que el movimiento siga aunque el puntero salga del lienzo.
++  useEffect(() => {
++    const onMove = (e: PointerEvent) => {
++      const handleDrag = overlayHandleRef.current;
++      if (handleDrag) {
++        overlayDragHandle(e.clientX, e.clientY, e.altKey);
++        return;
++      }
++      const group = overlayGroupDragRef.current;
++      if (group) {
++        overlayMoveGroup(e.clientX, e.clientY);
++        return;
++      }
++      const marquee = overlayMarqueeRef.current;
++      if (marquee) {
++        const v = overlayClientToView(e.clientX, e.clientY);
++        marquee.x1 = v.x;
++        marquee.y1 = v.y;
++        setMeshOverlayMarquee({ ...marquee });
++        return;
++      }
++      if (overlayDragRef.current) {
++        const hold = overlayHoldRef.current;
++        if (hold) {
++          // Mientras no se supere el umbral sigue contando la pulsación larga.
++          if (Math.hypot(e.clientX - hold.x, e.clientY - hold.y) < 4) return;
++          window.clearTimeout(hold.timer);
++          overlayHoldRef.current = null;
++        }
++        overlayMoveDraggedVertex(e.clientX, e.clientY);
++        return;
++      }
++      const pan = overlayPanRef.current;
++      if (pan) {
++        const v = overlayClientToViewBox(e.clientX, e.clientY);
++        setMeshOverlayPan({
++          x: pan.panX + (v.x - pan.viewX),
++          y: pan.panY + (v.y - pan.viewY),
++        });
++      }
++    };
++    const onUp = () => {
++      const hold = overlayHoldRef.current;
++      if (hold) {
++        window.clearTimeout(hold.timer);
++        overlayHoldRef.current = null;
++      }
++      overlayDragRef.current = null;
++      const handleDrag = overlayHandleRef.current;
++      if (handleDrag) {
++        overlayHandleRef.current = null;
++        if (
++          handleDrag.side === 'both' &&
++          !handleDrag.moved &&
++          handleDrag.hadHandles
++        ) {
++          overlayToggleCurveAt(handleDrag.vertex);
++        }
++      }
++      overlayPanRef.current = null;
++      overlayGroupDragRef.current = null;
++      const marquee = overlayMarqueeRef.current;
++      if (marquee) {
++        overlayMarqueeRef.current = null;
++        overlayApplyMarquee(marquee.x0, marquee.y0, marquee.x1, marquee.y1);
++        setMeshOverlayMarquee(null);
++      }
++    };
++    window.addEventListener('pointermove', onMove);
++    window.addEventListener('pointerup', onUp);
++    window.addEventListener('pointercancel', onUp);
++    return () => {
++      window.removeEventListener('pointermove', onMove);
++      window.removeEventListener('pointerup', onUp);
++      window.removeEventListener('pointercancel', onUp);
++    };
++  }, [
++    overlayMoveDraggedVertex,
++    overlayMoveGroup,
++    overlayApplyMarquee,
++    overlayDragHandle,
++    overlayToggleCurveAt,
++    overlayClientToView,
++    overlayClientToViewBox,
++  ]);
++
++  /** Añade un vértice a la plantilla en edición (en su arista más larga). */
++  const overlayAddVertex = useCallback(() => {
++    if (meshOverlayEditId == null) return;
++    setMeshSections((prev) =>
++      prev.map((s) =>
++        s.id === meshOverlayEditId
++          ? { ...s, polygon: addPolygonVertex(s.polygon) }
++          : s
++      )
++    );
++  }, [meshOverlayEditId]);
++
++  /** Quita un vértice a la plantilla en edición. */
++  const overlayRemoveVertex = useCallback(() => {
++    if (meshOverlayEditId == null) return;
++    setMeshSections((prev) =>
++      prev.map((s) =>
++        s.id === meshOverlayEditId
++          ? { ...s, polygon: removePolygonVertex(s.polygon) }
++          : s
++      )
++    );
++  }, [meshOverlayEditId]);
++
++  /** Gira la plantilla en edición alrededor de su centro. */
++  const overlayRotate = useCallback(
++    (angle: number) => {
++      if (meshOverlayEditId == null) return;
++      setMeshSections((prev) =>
++        prev.map((s) =>
++          s.id === meshOverlayEditId
++            ? { ...s, polygon: rotatePolygonInPlace(s.polygon, angle) }
++            : s
++        )
++      );
++    },
++    [meshOverlayEditId]
++  );
++
++  /** Escala la plantilla en edición (sin salirse del lienzo). */
++  const overlayScale = useCallback(
++    (factor: number) => {
++      if (meshOverlayEditId == null) return;
++      setMeshSections((prev) =>
++        prev.map((s) =>
++          s.id === meshOverlayEditId
++            ? { ...s, polygon: scalePolygonUniform(s.polygon, factor) }
++            : s
++        )
++      );
++    },
++    [meshOverlayEditId]
++  );
++
++  // Esc cierra la vista superpuesta ampliada sin tocar el resto del editor.
++  useEffect(() => {
++    if (!meshOverlayMaximized) return;
++    const onKeyDown = (e: KeyboardEvent) => {
++      if (e.key === 'Escape') setMeshOverlayMaximized(false);
++    };
++    window.addEventListener('keydown', onKeyDown);
++    return () => window.removeEventListener('keydown', onKeyDown);
++  }, [meshOverlayMaximized]);
++
++  // Al cambiar de plantilla en edición se limpia la selección y el predibujo.
++  useEffect(() => {
++    setMeshOverlaySelection([]);
++    setMeshOverlayHoverVertex(null);
++    setMeshOverlayMarquee(null);
++    overlayMarqueeRef.current = null;
++    overlayHoldRef.current = null;
++    overlayGroupDragRef.current = null;
++  }, [meshOverlayEditId]);
++
++  /** Control deslizante de opacidad por plantilla (0..1). */
++  const renderOverlaySliders = (full: boolean) => (
++    <div
++      className={
++        full
++          ? 'shrink-0 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-5 gap-y-1.5 max-h-[32vh] overflow-y-auto custom-scrollbar pr-1'
++          : 'space-y-1.5'
++      }
++    >
++      {meshSections.map((section, index) => {
++        const color =
++          SECTION_OVERLAY_COLORS[index % SECTION_OVERLAY_COLORS.length];
++        const op = overlayOpacityOf(section.id);
++        return (
++          <div
++            key={section.id}
++            onClick={() =>
++              setMeshOverlayEditId(
++                meshOverlayEditId === section.id ? null : section.id
++              )
++            }
++            title={t('editor3D.overlayPickHint')}
++            className={`flex items-center gap-2 rounded px-1 py-0.5 cursor-pointer transition-colors ${
++              meshOverlayEditId === section.id
++                ? 'bg-green-500/15 ring-1 ring-green-500/40'
++                : 'hover:bg-white/5'
++            }`}
++          >
++            <span
++              className="w-2.5 h-2.5 rounded-sm shrink-0 border border-white/20"
++              style={{ backgroundColor: color }}
++            />
++            {meshOverlayEditId === section.id && (
++              <Pencil className="w-2.5 h-2.5 text-green-400 shrink-0" />
++            )}
++            <span className="text-[10px] text-foreground w-14 shrink-0">
++              {t('editor3D.templateN', { n: index + 1 })}
++            </span>
++            <span className="font-mono text-[9px] text-green-400 w-12 shrink-0">
++              Y={section.y.toFixed(2)}
++            </span>
++            <span
++              className="flex-1 flex items-center"
++              onClick={(e) => e.stopPropagation()}
++            >
++              <Slider
++                min={0}
++                max={1}
++                step={0.05}
++                value={[op]}
++                onValueChange={([v]) => setOverlayOpacity(section.id, v)}
++                className="flex-1"
++              />
++            </span>
++            <span className="font-mono text-[10px] text-muted-foreground w-8 text-right">
++              {Math.round(op * 100)}%
++            </span>
++          </div>
++        );
++      })}
++    </div>
++  );
++
++  /**
++   * Lienzo único con TODAS las plantillas superpuestas, en su color. También
++   * es el lienzo de EDICIÓN: la plantilla elegida (clic en su fila) se dibuja
++   * interactiva —se arrastran, crean y quitan sus vértices, se gira y se
++   * escala— con rejilla magnética de fondo y doble clic para añadir un vértice.
++   */
++  const renderOverlayCanvas = (full: boolean, heightClass: string) => {
++    const editSection =
++      meshOverlayEditId != null
++        ? meshSections.find((s) => s.id === meshOverlayEditId) ?? null
++        : null;
++    const step = meshOverlaySnapStep * 100;
++    const zoom = meshOverlayZoom || 1;
++    const gridPositions: number[] = [];
++    if (meshOverlayGrid && step > 0) {
++      for (let v = 0; v <= 100 + 1e-6; v += step) gridPositions.push(v);
++    }
++    return (
++      <div
++        data-overlay-canvas
++        ref={setOverlayCanvas}
++        className={`relative ${
++          full ? 'flex-1 min-h-0' : heightClass
++        } rounded-lg overflow-hidden border border-white/10`}
++        style={{
++          background:
++            'radial-gradient(circle at 50% 40%, rgba(255,255,255,0.07), rgba(0,0,0,0.45))',
++        }}
++      >
++        <svg
++          viewBox="0 0 100 100"
++          preserveAspectRatio="xMidYMid meet"
++          className="absolute inset-0 w-full h-full select-none touch-none"
++          onPointerDown={(e) => {
++            if (e.button === 1) {
++              overlayBeginPan(e.clientX, e.clientY);
++              return;
++            }
++            if (e.button !== 0) return;
++            if (editSection && meshOverlayTool === 'select') {
++              overlayBeginMarquee(e.clientX, e.clientY);
++              return;
++            }
++            overlayBeginPan(e.clientX, e.clientY);
++          }}
++          onDoubleClick={(e) => {
++            if (editSection && meshOverlayTool === 'edit') {
++              overlayInsertVertexAt(e.clientX, e.clientY);
++            }
++          }}
++        >
++          {/* Zoom + encuadre: solo mueven la malla y la rejilla; el grosor de las
++              líneas y el tamaño de los tiradores se dividen por el zoom para que
++              NO cambien al acercar o alejar. */}
++          <g
++            transform={`translate(${meshOverlayPan.x} ${meshOverlayPan.y}) translate(50 50) scale(${zoom}) translate(-50 -50)`}
++          >
++            {/* Rejilla magnética de fondo */}
++            {meshOverlayGrid && step > 0 && (
++              <g
++                stroke="rgba(255,255,255,0.10)"
++                strokeWidth={(full ? 0.15 : 0.25) / zoom}
++              >
++                {gridPositions.map((v) => (
++                  <line key={`gv${v}`} x1={v} y1={0} x2={v} y2={100} />
++                ))}
++                {gridPositions.map((v) => (
++                  <line key={`gh${v}`} x1={0} y1={v} x2={100} y2={v} />
++                ))}
++              </g>
++            )}
++
++            {/* Todas las plantillas; segmentos en marfil, relleno con su color */}
++            {meshSections.map((section, index) => {
++              const d = roundedPolygonPath(
++                section.polygon,
++                section.polygon.length >= 3
++              );
++              if (!d) return null;
++              const color =
++                SECTION_OVERLAY_COLORS[index % SECTION_OVERLAY_COLORS.length];
++              const isEdit = editSection?.id === section.id;
++              const baseOp = overlayOpacityOf(section.id);
++              const op = editSection && !isEdit ? baseOp * 0.35 : baseOp;
++              return (
++                <path
++                  key={section.id}
++                  d={d}
++                  fill={color}
++                  fillOpacity={isEdit ? op * 0.25 : op * 0.35}
++                  stroke={OVERLAY_SEGMENT_IVORY}
++                  strokeOpacity={isEdit ? 1 : op}
++                  strokeWidth={
++                    (isEdit ? (full ? 0.2 : 0.3) : full ? 0.11 : 0.17) / zoom
++                  }
++                  strokeLinejoin="round"
++                  strokeLinecap="round"
++                />
++              );
++            })}
++
++            {/* Tiradores de vértice de la plantilla en edición */}
++            {editSection &&
++              editSection.polygon.map((p, i) => {
++                const ci = meshSections.findIndex(
++                  (s) => s.id === editSection.id
++                );
++                const color =
++                  SECTION_OVERLAY_COLORS[
++                    (ci < 0 ? 0 : ci) % SECTION_OVERLAY_COLORS.length
++                  ];
++                const isSelected = meshOverlaySelection.includes(i);
++                return (
++                  <g key={`v${i}`}>
++                    <circle
++                      cx={p.x * 100}
++                      cy={p.y * 100}
++                      r={(full ? 2.2 : 3) / zoom}
++                      fill="transparent"
++                      style={{
++                        cursor:
++                          meshOverlayTool === 'erase' ? 'crosshair' : 'default',
++                      }}
++                      onPointerDown={(e) => {
++                        e.stopPropagation();
++                        overlayVertexPointerDown(
++                          e.clientX,
++                          e.clientY,
++                          editSection.id,
++                          i
++                        );
++                      }}
++                      onPointerEnter={() => setMeshOverlayHoverVertex(i)}
++                      onPointerLeave={() =>
++                        setMeshOverlayHoverVertex((h) => (h === i ? null : h))
++                      }
++                    />
++                    {p.hIn && (
++                      <g>
++                        <line
++                          x1={p.x * 100}
++                          y1={p.y * 100}
++                          x2={p.hIn.x * 100}
++                          y2={p.hIn.y * 100}
++                          stroke="#22c55e"
++                          strokeOpacity={0.7}
++                          strokeWidth={(full ? 0.12 : 0.18) / zoom}
++                          strokeDasharray={`${0.5 / zoom} ${0.5 / zoom}`}
++                          pointerEvents="none"
++                        />
++                        <circle
++                          cx={p.hIn.x * 100}
++                          cy={p.hIn.y * 100}
++                          r={(full ? 1.9 : 2.6) / zoom}
++                          fill="transparent"
++                          style={{ cursor: 'default' }}
++                          onPointerDown={(e) => {
++                            e.stopPropagation();
++                            overlayHandlePointerDown(editSection.id, i, 'in');
++                          }}
++                        />
++                        <circle
++                          cx={p.hIn.x * 100}
++                          cy={p.hIn.y * 100}
++                          r={(full ? 0.38 : 0.55) / zoom}
++                          fill="#22c55e"
++                          stroke="#bbf7d0"
++                          strokeWidth={(full ? 0.14 : 0.2) / zoom}
++                          pointerEvents="none"
++                        />
++                      </g>
++                    )}
++                    {p.hOut && (
++                      <g>
++                        <line
++                          x1={p.x * 100}
++                          y1={p.y * 100}
++                          x2={p.hOut.x * 100}
++                          y2={p.hOut.y * 100}
++                          stroke="#22c55e"
++                          strokeOpacity={0.7}
++                          strokeWidth={(full ? 0.12 : 0.18) / zoom}
++                          strokeDasharray={`${0.5 / zoom} ${0.5 / zoom}`}
++                          pointerEvents="none"
++                        />
++                        <circle
++                          cx={p.hOut.x * 100}
++                          cy={p.hOut.y * 100}
++                          r={(full ? 1.9 : 2.6) / zoom}
++                          fill="transparent"
++                          style={{ cursor: 'default' }}
++                          onPointerDown={(e) => {
++                            e.stopPropagation();
++                            overlayHandlePointerDown(editSection.id, i, 'out');
++                          }}
++                        />
++                        <circle
++                          cx={p.hOut.x * 100}
++                          cy={p.hOut.y * 100}
++                          r={(full ? 0.38 : 0.55) / zoom}
++                          fill="#22c55e"
++                          stroke="#bbf7d0"
++                          strokeWidth={(full ? 0.14 : 0.2) / zoom}
++                          pointerEvents="none"
++                        />
++                      </g>
++                    )}
++                    {meshOverlayCurvePreview &&
++                      meshOverlayHoverVertex === i &&
++                      overlayHoverArc && (
++                        <polyline
++                          points={overlayHoverArc
++                            .map((q) => `${q.x * 100},${q.y * 100}`)
++                            .join(' ')}
++                          fill="none"
++                          stroke="#22c55e"
++                          strokeWidth={(full ? 0.3 : 0.45) / zoom}
++                          strokeDasharray={`${0.8 / zoom} ${0.8 / zoom}`}
++                          pointerEvents="none"
++                        />
++                      )}
++                    <circle
++                      cx={p.x * 100}
++                      cy={p.y * 100}
++                      r={
++                        (isSelected ? (full ? 0.42 : 0.7) : full ? 0.25 : 0.45) /
++                        zoom
++                      }
++                      fill={isSelected ? '#22c55e' : '#ffffff'}
++                      stroke={isSelected ? '#bbf7d0' : color}
++                      strokeWidth={(full ? 0.35 : 0.5) / zoom}
++                      pointerEvents="none"
++                    />
++                  </g>
++                );
++              })}
++
++            {/* Marquesina de selección (herramienta Selección) */}
++            {meshOverlayMarquee && (
++              <rect
++                x={Math.min(meshOverlayMarquee.x0, meshOverlayMarquee.x1)}
++                y={Math.min(meshOverlayMarquee.y0, meshOverlayMarquee.y1)}
++                width={Math.abs(meshOverlayMarquee.x1 - meshOverlayMarquee.x0)}
++                height={Math.abs(meshOverlayMarquee.y1 - meshOverlayMarquee.y0)}
++                fill="rgba(34,197,94,0.12)"
++                stroke="#22c55e"
++                strokeWidth={0.3 / zoom}
++                strokeDasharray={`${0.7 / zoom} ${0.5 / zoom}`}
++                pointerEvents="none"
++              />
++            )}
++          </g>
++        </svg>
++      </div>
++    );
++  };
++
++  /** Barra de herramientas de edición de la vista superpuesta (Mallas). */
++  const renderOverlayEditTools = () => {
++    const editIndex =
++      meshOverlayEditId != null
++        ? meshSections.findIndex((s) => s.id === meshOverlayEditId)
++        : -1;
++    const hasSel = editIndex >= 0;
++    return (
++      <div className="shrink-0 flex flex-wrap items-center gap-1.5">
++        <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1 min-w-0">
++          <MousePointer2 className="w-3 h-3 shrink-0" />
++          <span className="truncate">
++            {hasSel
++              ? t('editor3D.overlayEditing', { n: editIndex + 1 })
++              : t('editor3D.overlayPickHint')}
++          </span>
++        </span>
++        <div className="flex-1" />
++        <button
++          type="button"
++          onClick={undo}
++          data-testid="overlay-undo-btn"
++          disabled={historyIndex <= 0}
++          title={t('editor3D.undoTitle')}
++          className={overlayToolChip(false, historyIndex <= 0)}
++        >
++          <Undo2 className="w-3 h-3" />
++        </button>
++        <button
++          type="button"
++          onClick={redo}
++          data-testid="overlay-redo-btn"
++          disabled={historyIndex >= history.length - 1}
++          title={t('editor3D.redoTitle')}
++          className={overlayToolChip(false, historyIndex >= history.length - 1)}
++        >
++          <Redo2 className="w-3 h-3" />
++        </button>
++        <span className="w-px h-4 bg-white/10" />
++        {(['edit', 'select', 'erase'] as CanvasTool[]).map((tool) => {
++          const meta =
++            tool === 'edit'
++              ? {
++                  icon: <MousePointer2 className="w-3 h-3" />,
++                  label: t('editor3D.overlayToolEdit'),
++                }
++              : tool === 'select'
++              ? {
++                  icon: <BoxSelect className="w-3 h-3" />,
++                  label: t('editor3D.overlayToolSelect'),
++                }
++              : {
++                  icon: <Eraser className="w-3 h-3" />,
++                  label: t('editor3D.overlayToolErase'),
++                };
++          return (
++            <button
++              key={tool}
++              type="button"
++              disabled={!hasSel}
++              onClick={() => {
++                setMeshOverlayTool(tool);
++                if (tool !== 'select') setMeshOverlaySelection([]);
++              }}
++              title={meta.label}
++              data-testid={`overlay-tool-${tool}`}
++              className={overlayToolChip(meshOverlayTool === tool, !hasSel)}
++            >
++              {meta.icon}
++              {meta.label}
++            </button>
++          );
++        })}
++        <span className="w-px h-4 bg-white/10" />
++        <label
++          title={t('editor3D.overlayCurveAmount')}
++          className="flex items-center gap-1 text-[10px] text-muted-foreground"
++        >
++          <Spline className="w-3 h-3 shrink-0" />
++          <span className="whitespace-nowrap">
++            {t('editor3D.overlayCurveAmount')}
++          </span>
++          <input
++            type="range"
++            min={0.05}
++            max={1}
++            step={0.05}
++            value={meshOverlayCurveAmount}
++            disabled={!hasSel}
++            onChange={(e) => setMeshOverlayCurveAmount(Number(e.target.value))}
++            className="w-14 accent-green-500"
++          />
++          <span className="font-mono w-6 text-right">
++            {Math.round(meshOverlayCurveAmount * 100)}
++          </span>
++        </label>
++        <label
++          title={t('editor3D.overlayCurveSegments')}
++          className="flex items-center gap-1 text-[10px] text-muted-foreground"
++        >
++          <span className="whitespace-nowrap">
++            {t('editor3D.overlayCurveSegments')}
++          </span>
++          <input
++            type="range"
++            min={2}
++            max={16}
++            step={1}
++            value={meshOverlayCurveSegments}
++            disabled={!hasSel}
++            onChange={(e) =>
++              setMeshOverlayCurveSegments(Number(e.target.value))
++            }
++            className="w-14 accent-green-500"
++          />
++          <span className="font-mono w-4 text-right">
++            {meshOverlayCurveSegments}
++          </span>
++        </label>
++        <button
++          type="button"
++          disabled={!hasSel}
++          onClick={() => setMeshOverlayCurvePreview((v) => !v)}
++          title={t('editor3D.overlayCurvePreview')}
++          data-testid="overlay-preview-btn"
++          className={overlayToolChip(meshOverlayCurvePreview, !hasSel)}
++        >
++          <Eye className="w-3 h-3" />
++          {t('editor3D.overlayCurvePreview')}
++        </button>
++        <button
++          type="button"
++          disabled={!hasSel || meshOverlaySelection.length === 0}
++          onClick={() =>
++            [...meshOverlaySelection]
++              .sort((a, b) => b - a)
++              .forEach((i) => overlayRoundCornerAt(i))
++          }
++          title={t('editor3D.overlayRound')}
++          data-testid="overlay-round-btn"
++          className={overlayToolChip(
++            false,
++            !hasSel || meshOverlaySelection.length === 0
++          )}
++        >
++          <Spline className="w-3 h-3" />
++          {t('editor3D.overlayRound')}
++        </button>
++        <button
++          type="button"
++          disabled={!hasSel || meshOverlaySelection.length === 0}
++          onClick={() =>
++            meshOverlaySelection.forEach((i) => overlayToggleCurveAt(i))
++          }
++          title={t('editor3D.overlayFlatten')}
++          data-testid="overlay-flatten-btn"
++          className={overlayToolChip(
++            false,
++            !hasSel || meshOverlaySelection.length === 0
++          )}
++        >
++          {t('editor3D.overlayFlatten')}
++        </button>
++        <span
++          className="hidden lg:flex items-center gap-1 text-[10px] text-muted-foreground/60 min-w-0"
++          title={t('editor3D.overlayHoldHint')}
++        >
++          <Spline className="w-3 h-3 shrink-0" />
++          <span className="truncate">
++            {t('editor3D.overlayHoldHint')}
++          </span>
++        </span>
++        <span className="w-px h-4 bg-white/10" />
++        <button
++          type="button"
++          onClick={() => setMeshOverlayGrid((v) => !v)}
++          title={t('editor3D.overlayGrid')}
++          className={overlayToolChip(meshOverlayGrid)}
++        >
++          <Grid3x3 className="w-3 h-3" />
++          {t('editor3D.overlayGrid')}
++        </button>
++        <button
++          type="button"
++          onClick={() => setMeshOverlaySnap((v) => !v)}
++          title={t('editor3D.overlaySnap')}
++          className={overlayToolChip(meshOverlaySnap)}
++        >
++          <Magnet className="w-3 h-3" />
++          {t('editor3D.overlaySnap')}
++        </button>
++        <select
++          value={String(meshOverlaySnapStep)}
++          onChange={(e) => setMeshOverlaySnapStep(Number(e.target.value))}
++          title={t('editor3D.overlayStep')}
++          className="px-1 py-0.5 rounded text-[10px] bg-white/5 border border-white/10 text-muted-foreground focus:outline-none"
++        >
++          {[0.025, 0.05, 0.1, 0.2].map((s) => (
++            <option key={s} value={String(s)} className="bg-[hsl(224_50%_8%)]">
++              {Math.round(s * 100)}%
++            </option>
++          ))}
++        </select>
++        <span className="w-px h-4 bg-white/10" />
++        <button
++          type="button"
++          disabled={!hasSel}
++          onClick={overlayAddVertex}
++          title={t('editor3D.overlayAddVertex')}
++          className={overlayToolChip(false, !hasSel)}
++        >
++          <Plus className="w-3 h-3" />
++          {t('editor3D.overlayAddVertex')}
++        </button>
++        <button
++          type="button"
++          disabled={!hasSel}
++          onClick={overlayRemoveVertex}
++          title={t('editor3D.overlayRemoveVertex')}
++          className={overlayToolChip(false, !hasSel)}
++        >
++          <Minus className="w-3 h-3" />
++          {t('editor3D.overlayRemoveVertex')}
++        </button>
++        <span className="w-px h-4 bg-white/10" />
++        <button
++          type="button"
++          disabled={!hasSel}
++          onClick={() => overlayRotate(-Math.PI / 12)}
++          title={t('editor3D.overlayRotateLeft')}
++          className={overlayToolChip(false, !hasSel)}
++        >
++          <RotateCcw className="w-3 h-3" />
++        </button>
++        <button
++          type="button"
++          disabled={!hasSel}
++          onClick={() => overlayRotate(Math.PI / 12)}
++          title={t('editor3D.overlayRotateRight')}
++          className={overlayToolChip(false, !hasSel)}
++        >
++          <RotateCw className="w-3 h-3" />
++        </button>
++        <button
++          type="button"
++          disabled={!hasSel}
++          onClick={() => overlayScale(1.1)}
++          title={t('editor3D.overlayScaleUp')}
++          className={overlayToolChip(false, !hasSel)}
++        >
++          <Maximize2 className="w-3 h-3" />
++        </button>
++        <button
++          type="button"
++          disabled={!hasSel}
++          onClick={() => overlayScale(1 / 1.1)}
++          title={t('editor3D.overlayScaleDown')}
++          className={overlayToolChip(false, !hasSel)}
++        >
++          <Minimize2 className="w-3 h-3" />
++        </button>
++        <span className="w-px h-4 bg-white/10" />
++        <button
++          type="button"
++          onClick={() => overlayZoomAt(1 / 1.25, { x: 50, y: 50 })}
++          title={t('editor3D.overlayZoomOut')}
++          className={overlayToolChip(false)}
++        >
++          <ZoomOut className="w-3 h-3" />
++        </button>
++        <button
++          type="button"
++          onClick={overlayResetView}
++          title={t('editor3D.overlayZoomReset')}
++          className={`${overlayToolChip(meshOverlayZoom !== 1)} min-w-[34px] justify-center font-mono`}
++        >
++          {Math.round(meshOverlayZoom * 100)}%
++        </button>
++        <button
++          type="button"
++          onClick={() => overlayZoomAt(1.25, { x: 50, y: 50 })}
++          title={t('editor3D.overlayZoomIn')}
++          className={overlayToolChip(false)}
++        >
++          <ZoomIn className="w-3 h-3" />
++        </button>
++      </div>
++    );
++  };
++
++  /** Encabezado común: título, «Restaurar» y el conmutador de área. */
++  const renderOverlayHeader = (title: string) => (
++    <div className="flex items-center justify-between shrink-0 gap-2">
++      <h4 className="text-[11px] font-semibold text-foreground flex items-center gap-1.5 min-w-0">
++        <Layers className="w-3.5 h-3.5 text-green-400 shrink-0" />
++        <span className="truncate">{title}</span>
++      </h4>
++      <div className="flex items-center gap-1.5 shrink-0">
++        <button
++          type="button"
++          onClick={resetOverlayOpacities}
++          className="px-2 py-0.5 rounded text-[10px] font-medium bg-white/5 border border-white/10 text-muted-foreground hover:bg-white/10 hover:text-foreground transition-colors"
++        >
++          {t('editor3D.overlayReset')}
++        </button>
++        <button
++          type="button"
++          onClick={() => setMeshOverlayMaximized((v) => !v)}
++          title={
++            meshOverlayMaximized
++              ? t('editor3D.overlayExitFull')
++              : t('editor3D.overlayFull')
++          }
++          className={`flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium border transition-colors ${
++            meshOverlayMaximized
++              ? 'bg-green-500/25 text-green-300 border-green-500/40'
++              : 'bg-white/5 text-muted-foreground border-white/10 hover:bg-white/10 hover:text-foreground'
++          }`}
++        >
++          {meshOverlayMaximized ? (
++            <X className="w-3 h-3" />
++          ) : (
++            <Expand className="w-3 h-3" />
++          )}
++          {meshOverlayMaximized
++            ? t('editor3D.overlayExitFull')
++            : t('editor3D.overlayFull')}
++        </button>
++      </div>
++    </div>
+   );
+-  const updatePolylines = useCallback((key: string, lines: Polyline[]) => {
+-    setPolylines((prev) => {
+-      // Sin líneas se quita la clave: el mapa no guarda lienzos vacíos
+-      if (lines.length === 0) {
+-        if (!(key in prev)) return prev;
+-        const next = { ...prev };
+-        delete next[key];
+-        return next;
+-      }
+-      return { ...prev, [key]: lines };
+-    });
+-  }, []);
+-
+-  // Vistas que se aplican de verdad al objeto: con "Frente" el costado no
+-  // limita, con "Costado" la silueta no limita, con "Ambas" limitan las dos.
+-  // Se usan tanto para construir el objeto como para ajustar las plantillas
+-  // al ancho que les toca, así lo que se ve en el lienzo es lo que sale.
+-  const appliedMeshSilhouette =
+-    meshSilhouetteView === 'side' ? FULL_BOX_VIEW : meshSilhouette;
+-  const appliedMeshSideView =
+-    meshSilhouetteView === 'front' ? FULL_BOX_VIEW : meshSideView;
+-
+-  const addMeshSection = useCallback(() => {
+-    setMeshSections((prev) => {
+-      const nextId =
+-        prev.length > 0 ? Math.max(...prev.map((s) => s.id)) + 1 : 1;
+-      // Si no hay plantillas, empezamos en 0.5. Si las hay, la nueva va por debajo
+-      // de la que tenga la y más baja (la de más abajo).
+-      const minY = prev.length > 0 ? Math.min(...prev.map((s) => s.y)) : 0.5;
+-      const nextY = Number(Math.max(0.05, minY - 0.15).toFixed(2));
+-      return [
+-        ...prev,
+-        {
+-          id: nextId,
+-          y: nextY,
+-          // La plantilla nueva se estira al ancho de la silueta (X) y del
+-          // costado (Z) que corresponden a su altura.
+-          polygon: fitSectionToViews(
+-            [
+-              { x: 0.3, y: 0.3 },
+-              { x: 0.7, y: 0.3 },
+-              { x: 0.7, y: 0.7 },
+-              { x: 0.3, y: 0.7 },
+-            ],
+-            nextY,
+-            appliedMeshSilhouette,
+-            appliedMeshSideView
+-          ),
+-        },
+-      ];
+-    });
+-  }, [appliedMeshSilhouette, appliedMeshSideView]);
+-
+-  const removeMeshSection = useCallback((id: number) => {
+-    setMeshSections((prev) => prev.filter((s) => s.id !== id));
+-    // Sus polilíneas libres desaparecen con la plantilla
+-    setPolylines((prev) => {
+-      const key = `mesh:section:${id}`;
+-      if (!(key in prev)) return prev;
+-      const next = { ...prev };
+-      delete next[key];
+-      return next;
+-    });
+-  }, []);
+ 
+   /**
+-   * Actualiza el polígono de una plantilla. Si el nuevo polígono es una
+-   * forma de las de un clic (círculo, cuadrado, …) se estira al ancho de
+-   * la silueta (X) y del costado (Z) que le tocan a la altura de esa
+-   * plantilla; el resto de ediciones (arrastrar vértices, dibujar a mano)
+-   * se guardan tal cual.
++   * Vista superpuesta de plantillas (Mallas): dibuja todas las plantillas
++   * encima en un único lienzo X·Z, cada una con su color y su opacidad, y
++   * debajo un control por plantilla para graduarla. Así se ve la figura
++   * completa formándose y se puede bajar la opacidad de una para destacar
++   * otra. Además, la plantilla elegida se puede editar ahí mismo: arrastrar,
++   * crear y quitar sus vértices, girarla y escalarla, con rejilla magnética
++   * de fondo y doble clic para añadir un vértice.
+    */
+-  const updateMeshSectionPolygon = useCallback(
+-    (id: number, poly: Polygon) => {
+-      setMeshSections((prev) =>
+-        prev.map((s) => {
+-          if (s.id !== id) return s;
+-          const polygon = isPresetShape(poly)
+-            ? fitSectionToViews(
+-                poly,
+-                s.y,
+-                appliedMeshSilhouette,
+-                appliedMeshSideView
+-              )
+-            : poly;
+-          return { ...s, polygon };
+-        })
+-      );
+-    },
+-    [appliedMeshSilhouette, appliedMeshSideView]
++  const renderTemplatesOverlay = (title: string, heightClass: string) => (
++    <div className="rounded-lg border border-white/10 bg-black/30 p-2.5 space-y-2">
++      {renderOverlayHeader(title)}
++      {renderOverlayCanvas(false, heightClass)}
++      {renderOverlayEditTools()}
++      {renderOverlaySliders(false)}
++      <p className="text-[10px] text-muted-foreground/60 flex items-center gap-1">
++        <Info className="w-2.5 h-2.5 shrink-0" />
++        {t('editor3D.overlayHint')}
++      </p>
++    </div>
+   );
+ 
+-  const replaceMeshSectionPolygon = useCallback((id: number, poly: Polygon) => {
+-    setMeshSections((prev) =>
+-      prev.map((s) =>
+-        s.id !== id ? s : { ...s, polygon: structuredClone(poly) }
+-      )
+-    );
+-  }, []);
+-
+   /**
+-   * Sube o baja una plantilla (su altura Y) con los botones de su cabecera.
+-   * La forma no se toca, pero el polígono se reajusta al ancho de la
+-   * silueta y del costado que le toca en la nueva altura, igual que al
+-   * escribir la Y a mano en la vista ampliada.
++   * Superposición a pantalla completa: la misma vista, pero ocupando TODO el
++   * área del editor —por encima de las ventanas, como si abarcara las cuatro—
++   * para comparar las plantillas a lo grande. Se monta UNA sola vez (no una
++   * copia por panel); el botón del encabezado y la tecla Esc la devuelven a su
++   * sitio.
+    */
+-  const moveMeshSectionY = useCallback(
+-    (id: number, delta: number) => {
+-      setMeshSections((prev) =>
+-        prev.map((s) => {
+-          if (s.id !== id) return s;
+-          const y = Math.min(1, Math.max(0, Number((s.y + delta).toFixed(2))));
+-          return {
+-            ...s,
+-            y,
+-            polygon: fitSectionToViews(
+-              s.polygon,
+-              y,
+-              appliedMeshSilhouette,
+-              appliedMeshSideView
+-            ),
+-          };
+-        })
+-      );
+-    },
+-    [appliedMeshSilhouette, appliedMeshSideView]
+-  );
++  const renderOverlayFullscreen = () =>
++    meshOverlayMaximized &&
++    meshOverlayTemplates &&
++    meshSections.length > 1 ? (
++      <div className="fixed inset-0 z-[80] bg-black/85 backdrop-blur-sm p-4 flex flex-col">
++        <div className="flex flex-col gap-2 w-full h-full min-h-0 rounded-xl border border-white/10 bg-[hsl(224_50%_8%)] p-3">
++          {renderOverlayHeader(
++            t('editor3D.overlayTemplatesTitle', { count: meshSections.length })
++          )}
++          {renderOverlayCanvas(true, '')}
++          {renderOverlayEditTools()}
++          {renderOverlaySliders(true)}
++          <p className="text-[10px] text-muted-foreground/60 flex items-center gap-1 shrink-0">
++            <Info className="w-2.5 h-2.5 shrink-0" />
++            {t('editor3D.overlayHint')}
++          </p>
++        </div>
++      </div>
++    ) : null;
+ 
+   /**
+    * Lienzo 2D abierto a pantalla completa (una plantilla sola, la silueta
+@@ -2084,6 +3781,10 @@ export default function Home({
+       pluginTracks,
+       effectTracks,
+       pluginBaseMeshes,
++      sweepNodes,
++      sweepClosed,
++      sweepSubdivisions,
++      sweepActiveId,
+     });
+ 
+     const currentState = capture();
+@@ -2101,6 +3802,10 @@ export default function Home({
+     if (historyTimerRef.current !== null) clearTimeout(historyTimerRef.current);
+     historyTimerRef.current = setTimeout(() => {
+       historyTimerRef.current = null;
++      // La foto ya está en el historial: se suelta el pendiente. Libera la
++      // referencia a la foto y evita volver a «volcarla» de forma redundante
++      // al deshacer/rehacer.
++      pendingSnapshotRef.current = null;
+       commitHistorySnapshot(currentState);
+     }, 400);
+ 
+@@ -2156,6 +3861,10 @@ export default function Home({
+     pluginTracks,
+     effectTracks,
+     pluginBaseMeshes,
++    sweepNodes,
++    sweepClosed,
++    sweepSubdivisions,
++    sweepActiveId,
+     isUndoRedo,
+     commitHistorySnapshot,
+   ]);
+@@ -2216,6 +3925,11 @@ export default function Home({
+     setPluginTracks(state.pluginTracks ?? []);
+     setEffectTracks(state.effectTracks ?? []);
+     setPluginBaseMeshes(state.pluginBaseMeshes ?? {});
++    // Recorrido (Extruir): fotos antiguas sin recorrido -> vacío.
++    setSweepNodes(state.sweepNodes ?? []);
++    setSweepClosed(state.sweepClosed ?? false);
++    setSweepSubdivisions(state.sweepSubdivisions ?? 5);
++    setSweepActiveId(state.sweepActiveId ?? null);
+   }, []);
+ 
+   const undo = useCallback(() => {
+@@ -3090,9 +4804,14 @@ export default function Home({
+       return m;
+     }
+ 
++    const sweepCanBuild =
++      mode === 'extrude' &&
++      sweepNodes.length >= 2 &&
++      sweepNodes.every((n) => n.polygon.length >= 3 || views.front.length >= 3);
++
+     const allHaveShapes =
+       mode === 'extrude'
+-        ? views.front.length >= 3
++        ? views.front.length >= 3 || sweepCanBuild
+         : views.front.length >= 3 &&
+           views.side.length >= 3 &&
+           views.top.length >= 3;
+@@ -3103,22 +4822,39 @@ export default function Home({
+ 
+      let mesh;
+     if (mode === 'extrude') {
+-      // Recolecta el polígono principal más las polilíneas cerradas
+-      // dibujadas con la herramienta Línea: todas se extruyen juntas.
+-      const frontPolylines = getPolylines('views:front');
+-      const shapes: Polygon[] = [views.front];
+-      const holes: Polygon[] = [];
+-      for (const line of frontPolylines) {
+-        const poly = polylineToPolygon(line);
+-        if (!poly) continue;
+-        // Si está marcada como agujero, resta del prisma principal
+-        if (extrudeHoles.includes(line.id)) {
+-          holes.push(poly);
+-        } else {
+-          shapes.push(poly);
++      // Recorrido: con un segmento de al menos 2 vértices la figura se
++      // barre a lo largo de él y la plantilla va cambiando de forma (y de
++      // inclinación) de un vértice al siguiente. Sin segmento, extrusión
++      // normal del contorno Frontal.
++      const sweepWithProfiles = sweepNodes.map((n) => ({
++        ...n,
++        polygon: n.polygon.length >= 3 ? n.polygon : views.front,
++      }));
++      const canSweep =
++        sweepNodes.length >= 2 &&
++        sweepWithProfiles.every((n) => n.polygon.length >= 3);
++      if (canSweep) {
++        mesh = buildSweepMesh(sweepWithProfiles, {
++          closed: sweepClosed,
++          subdivisions: sweepSubdivisions,
++        });
++      } else {
++        // Recolecta el polígono principal más las polilíneas cerradas
++        // dibujadas con la herramienta Línea: todas se extruyen juntas.
++        const frontPolylines = getPolylines('views:front');
++        const shapes: Polygon[] = [views.front];
++        const holes: Polygon[] = [];
++        for (const line of frontPolylines) {
++          const poly = polylineToPolygon(line);
++          if (!poly) continue;
++          if (extrudeHoles.includes(line.id)) {
++            holes.push(poly);
++          } else {
++            shapes.push(poly);
++          }
+         }
++        mesh = buildExtrudeMeshes(shapes, extrudeDepth, holes);
+       }
+-      mesh = buildExtrudeMeshes(shapes, extrudeDepth, holes);
+     } else if (meshStyle === 'suave') {
+       mesh = buildViewsMesh(views, {
+         levels: Math.min(72, Math.max(24, resolution + 8)),
+@@ -3199,6 +4935,9 @@ export default function Home({
+     meshSilhouetteView,
+     meshSideView,
+     meshOpacity,
++    sweepNodes,
++    sweepClosed,
++    sweepSubdivisions,
+   ]);
+ 
+   const mesh = useMemo(() => {
+@@ -3261,7 +5000,9 @@ export default function Home({
+     editingViewProfile !== null ||
+     editingMeshProfile !== null ||
+     editingMesh ||
+-    editingMeshSide;
++    editingMeshSide ||
++    editingSweepCanvas !== null ||
++    (mode === 'extrude' && sweepNodes.length >= 2);
+   // El área de trabajo arranca vacío: la figura de la pestaña solo se
+   // materializa en el visor si pertenece a un objeto (el dueño de la
+   // configuración) o si hay un lienzo 2D abrierto dibujándola. Sin
+@@ -3331,6 +5072,59 @@ export default function Home({
+     setEditedVertices(verts);
+   }, []);
+ 
++  // --- Recorrido (Extruir) ---
++  const defaultSweepProfile = useCallback((): Polygon => {
++    if (views.front.length >= 3) return structuredClone(views.front);
++    return [
++      { x: 0.3, y: 0.3 },
++      { x: 0.7, y: 0.3 },
++      { x: 0.7, y: 0.7 },
++      { x: 0.3, y: 0.7 },
++    ];
++  }, [views.front]);
++
++  const addSweepNode = useCallback(
++    (x: number, y: number) => {
++      const id = sweepIdRef.current;
++      sweepIdRef.current += 1;
++      setSweepNodes((prev) => [
++        ...prev,
++        { id, x, y, tilt: 0, polygon: defaultSweepProfile() },
++      ]);
++      setSweepActiveId(id);
++    },
++    [defaultSweepProfile]
++  );
++
++  const moveSweepNode = useCallback((id: number, x: number, y: number) => {
++    setSweepNodes((prev) => prev.map((n) => (n.id === id ? { ...n, x, y } : n)));
++  }, []);
++
++  const removeSweepNode = useCallback((id: number) => {
++    setSweepNodes((prev) => prev.filter((n) => n.id !== id));
++    setSweepActiveId((cur) => (cur === id ? null : cur));
++  }, []);
++
++  const updateSweepNodePolygon = useCallback((id: number, polygon: Polygon) => {
++    setSweepNodes((prev) =>
++      prev.map((n) => (n.id === id ? { ...n, polygon } : n))
++    );
++  }, []);
++
++  const setSweepNodeTilt = useCallback((id: number, tilt: number) => {
++    setSweepNodes((prev) =>
++      prev.map((n) => (n.id === id ? { ...n, tilt } : n))
++    );
++  }, []);
++
++  const activeSweepNode =
++    mode === 'extrude'
++      ? sweepNodes.find((n) => n.id === sweepActiveId) ?? null
++      : null;
++  const sweepNodeNumber = activeSweepNode
++    ? sweepNodes.findIndex((n) => n.id === activeSweepNode.id) + 1
++    : 0;
++
+   const openSaveModal = useCallback(() => {
+     if (!objectName) {
+       setObjectName(
+@@ -5013,7 +6807,11 @@ export default function Home({
+         : mode === 'mesh'
+           ? meshSilhouette.length >= 3 && meshSections.length > 0
+           : mode === 'extrude'
+-            ? views.front.length >= 3
++            ? views.front.length >= 3 ||
++              (sweepNodes.length >= 2 &&
++                sweepNodes.every(
++                  (n) => n.polygon.length >= 3 || views.front.length >= 3
++                ))
+             : views.front.length >= 3 &&
+               views.side.length >= 3 &&
+               views.top.length >= 3;
+@@ -5204,6 +7002,7 @@ export default function Home({
+       setEditingPanel(null);
+       setEditingMesh(false);
+       setEditingViewProfile(null);
++      setEditingSweepCanvas(null);
+       setEditingMeshProfile(null);
+       setEditingMeshSide(false);
+       setEditingLatheProfile(false);
+@@ -5675,7 +7474,13 @@ export default function Home({
+           ? latheProfile.length >= 3
+           : mode === 'mesh'
+             ? meshSilhouette.length >= 3 && meshSections.length > 0
+-            : views.front.length >= 3; // views y extrude
++            : mode === 'extrude'
++              ? views.front.length >= 3 ||
++                (sweepNodes.length >= 2 &&
++                  sweepNodes.every(
++                    (n) => n.polygon.length >= 3 || views.front.length >= 3
++                  ))
++              : views.front.length >= 3; // views y extrude
+     // Huella de los datos de dibujo: cambia cuando el usuario añade,
+     // mueve o borra puntos del dibujo (no con los ajustes secundarios
+     // como opacidad o profundidad).
+@@ -5687,6 +7492,7 @@ export default function Home({
+       meshSilhouette,
+       meshSections,
+       meshSideView,
++      sweepNodes,
+     });
+     const key = `${mode}|${configObjectId ?? 'none'}`;
+     const baseline = draftBaselineRef.current;
+@@ -5711,6 +7517,7 @@ export default function Home({
+     meshSilhouette,
+     meshSections,
+     meshSideView,
++    sweepNodes,
+     configObjectId,
+     isUndoRedo,
+     obj3dOpeningName,
+@@ -6732,6 +8539,7 @@ export default function Home({
+ 
+   return (
+     <div className="h-full flex flex-col overflow-hidden bg-[hsl(224_55%_6%)] text-foreground">
++      {renderOverlayFullscreen()}
+       <header className="flex items-center justify-between px-5 py-3 border-b border-white/5 bg-gradient-to-r from-[hsl(224_50%_8%)] via-[hsl(224_50%_10%)] to-[hsl(224_50%_8%)]">
+         <div className="flex items-center gap-3">
+           <img
+@@ -7588,16 +9396,93 @@ export default function Home({
+               </div>
+ 
+               {mode === 'extrude' ? (
+-                   <div className="flex-1 overflow-y-auto grid grid-rows-[320px_auto] gap-3 p-3 min-h-0 custom-scrollbar">
++                   <div className="flex-1 overflow-y-auto grid grid-rows-[260px_320px_auto] gap-3 p-3 min-h-0 custom-scrollbar">
+                     <DrawingCanvas
+-                     label={t('editor3D.panelLabels.front')}
++                     label={activeSweepNode ? t('editor3D.sweepProfileLabel', { n: sweepNodeNumber }) : t('editor3D.panelLabels.front')}
+                      axisLabel={t('editor3D.panelLabels.frontAxis')}
+-                      polygon={views.front}
+-                     onChange={updateView('front')}
++                     polygon={activeSweepNode ? activeSweepNode.polygon : views.front}
++                     onChange={activeSweepNode ? (poly) => updateSweepNodePolygon(activeSweepNode.id, poly) : updateView('front')}
+                      resolution={resolution}
+                      onEdit={() => setEditingViewProfile('front')}
++                     onMaximize={() => setEditingSweepCanvas('profile')}
+                      polylines={getPolylines('views:front')}
+                    />
++                   <div className="flex flex-col gap-2 min-h-0">
++                     <PathCanvas
++                       label={t('editor3D.sweepTitle')}
++                       axisLabel="PATH"
++                       points={sweepNodes}
++                       activeId={sweepActiveId}
++                       closed={sweepClosed}
++                       resolution={resolution}
++                       onChange={moveSweepNode}
++                       onAdd={addSweepNode}
++                       onSelect={setSweepActiveId}
++                       onRemove={removeSweepNode}
++                       emptyHint={t('editor3D.sweepEmptyHint')}
++                       helpHint={t('editor3D.sweepHelpHint')}
++                       showEdgeTemplates={sweepEdgeTemplates}
++                       onToggleEdgeTemplates={() => setSweepEdgeTemplates((v) => !v)}
++                       edgeTemplatesLabel={t('editor3D.sweepShowTemplates')}
++                       onMaximize={() => setEditingSweepCanvas('path')}
++                     />
++                     <div className="flex items-center gap-2 flex-wrap">
++                       <button
++                         onClick={() => setSweepClosed((v) => !v)}
++                         className={overlayToolChip(sweepClosed)}
++                         title={t('editor3D.sweepClosed')}
++                       >
++                         {t('editor3D.sweepClosed')}
++                       </button>
++                       {sweepActiveId !== null && (
++                         <>
++                           <button
++                             onClick={() => removeSweepNode(sweepActiveId)}
++                             className="px-1.5 py-0.5 rounded text-[10px] font-medium border border-red-500/30 bg-red-500/20 text-red-300 hover:bg-red-500/30 transition-colors"
++                             title={t('editor3D.sweepRemove')}
++                           >
++                             {t('editor3D.sweepRemove')}
++                           </button>
++                           <div className="flex items-center gap-2 flex-1 min-w-[150px]">
++                             <span className="text-[10px] text-muted-foreground/80 whitespace-nowrap">
++                               {t('editor3D.sweepTilt')}
++                             </span>
++                             <Slider
++                               min={-90}
++                               max={90}
++                               step={1}
++                               value={[activeSweepNode?.tilt ?? 0]}
++                               onValueChange={([v]) => setSweepNodeTilt(sweepActiveId, v)}
++                               className="flex-1"
++                             />
++                             <span className="font-mono text-[10px] text-green-400 w-8 text-right">
++                               {(activeSweepNode?.tilt ?? 0).toFixed(0)}°
++                             </span>
++                           </div>
++                         </>
++                       )}
++                       <div className="flex items-center gap-2 min-w-[150px]">
++                         <span className="text-[10px] text-muted-foreground/80 whitespace-nowrap">
++                           {t('editor3D.sweepSubdivisions')}
++                         </span>
++                         <Slider
++                           min={2}
++                           max={40}
++                           step={1}
++                           value={[sweepSubdivisions]}
++                           onValueChange={([v]) => setSweepSubdivisions(v)}
++                           className="flex-1"
++                         />
++                         <span className="font-mono text-[10px] text-green-400 w-6 text-right">
++                           {sweepSubdivisions}
++                         </span>
++                       </div>
++                     </div>
++                     <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
++                       <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
++                       {t('editor3D.sweepHint')}
++                     </p>
++                   </div>
+                    <div className="flex flex-col gap-3">
+                      <div className="flex flex-col gap-1.5">
+                      <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
+@@ -8269,15 +10154,41 @@ export default function Home({
+                       <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
+                       {t('editor3D.templates2d', { count: meshSections.length })}
+                     </h3>
+-                    <button
+-                      onClick={addMeshSection}
+-                      className="flex items-center gap-1 px-2 py-1 rounded bg-green-500/20 text-green-300 hover:bg-green-500/30 text-[11px] font-medium border border-green-500/30 transition-colors"
+-                    >
+-                      <Plus className="w-3 h-3" />
+-                      {t('editor3D.addTemplate')}
+-                    </button>
++                    <div className="flex items-center gap-1.5">
++                      <button
++                        onClick={addMeshSection}
++                        className="flex items-center gap-1 px-2 py-1 rounded bg-green-500/20 text-green-300 hover:bg-green-500/30 text-[11px] font-medium border border-green-500/30 transition-colors"
++                      >
++                        <Plus className="w-3 h-3" />
++                        {t('editor3D.addTemplate')}
++                      </button>
++                      {meshSections.length > 1 && (
++                        <button
++                          onClick={() => setMeshOverlayTemplates((v) => !v)}
++                          className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium border transition-colors ${
++                            meshOverlayTemplates
++                              ? 'bg-green-500/25 text-green-300 border-green-500/40'
++                              : 'bg-white/5 text-muted-foreground border-white/10 hover:bg-white/10'
++                          }`}
++                          title={t('editor3D.overlayTemplatesTitle', {
++                            count: meshSections.length,
++                          })}
++                        >
++                          <Layers className="w-3 h-3" />
++                          {t('editor3D.overlayTemplates')}
++                        </button>
++                      )}
++                    </div>
+                   </div>
+ 
++                  {meshOverlayTemplates && meshSections.length > 1 &&
++                    renderTemplatesOverlay(
++                      t('editor3D.overlayTemplatesTitle', {
++                        count: meshSections.length,
++                      }),
++                      'h-56'
++                    )}
++
+                   {meshSections.map((section, index) => (
+                     <div
+                       key={section.id}
+@@ -9713,14 +11624,39 @@ export default function Home({
+                       <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
+                       {t('editor3D.horizontalTemplates', { count: meshSections.length })}
+                     </h3>
+-                    <button
+-                      onClick={addMeshSection}
+-                      className="flex items-center gap-1 px-2.5 py-1 rounded bg-green-500/20 text-green-300 hover:bg-green-500/30 text-xs font-medium border border-green-500/30 transition-colors"
+-                    >
+-                      <Plus className="w-3.5 h-3.5" />
+-                      Añadir plantilla
+-                    </button>
++                    <div className="flex items-center gap-2">
++                      <button
++                        onClick={addMeshSection}
++                        className="flex items-center gap-1 px-2.5 py-1 rounded bg-green-500/20 text-green-300 hover:bg-green-500/30 text-xs font-medium border border-green-500/30 transition-colors"
++                      >
++                        <Plus className="w-3.5 h-3.5" />
++                        Añadir plantilla
++                      </button>
++                      {meshSections.length > 1 && (
++                        <button
++                          onClick={() => setMeshOverlayTemplates((v) => !v)}
++                          className={`flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium border transition-colors ${
++                            meshOverlayTemplates
++                              ? 'bg-green-500/25 text-green-300 border-green-500/40'
++                              : 'bg-white/5 text-muted-foreground border-white/10 hover:bg-white/10'
++                          }`}
++                          title={t('editor3D.overlayTemplatesTitle', {
++                            count: meshSections.length,
++                          })}
++                        >
++                          <Layers className="w-3.5 h-3.5" />
++                          {t('editor3D.overlayTemplates')}
++                        </button>
++                      )}
++                    </div>
+                   </div>
++                  {meshOverlayTemplates && meshSections.length > 1 &&
++                    renderTemplatesOverlay(
++                      t('editor3D.overlayTemplatesTitle', {
++                        count: meshSections.length,
++                      }),
++                      'h-[420px]'
++                    )}
+                   {meshSections.length === 0 ? (
+                     <div className="p-6 text-center rounded-lg bg-black/30 border border-dashed border-white/10 text-muted-foreground/60 text-xs space-y-2">
+                       <p>{t('editor3D.noTemplatesCreated')}</p>
+@@ -9867,6 +11803,60 @@ export default function Home({
+                   )}
+                 </div>
+               </div>
++            ) : mode === 'extrude' && editingSweepCanvas ? (
++              <div className="w-full h-full min-h-0">
++                {editingSweepCanvas === 'path' ? (
++                  <PathCanvas
++                    label={t('editor3D.sweepTitle')}
++                    axisLabel="PATH"
++                    points={sweepNodes}
++                    activeId={sweepActiveId}
++                    closed={sweepClosed}
++                    resolution={resolution}
++                    onChange={moveSweepNode}
++                    onAdd={addSweepNode}
++                    onSelect={setSweepActiveId}
++                    onRemove={removeSweepNode}
++                    emptyHint={t('editor3D.sweepEmptyHint')}
++                    helpHint={t('editor3D.sweepHelpHint')}
++                    showEdgeTemplates={sweepEdgeTemplates}
++                    onToggleEdgeTemplates={() => setSweepEdgeTemplates((v) => !v)}
++                    edgeTemplatesLabel={t('editor3D.sweepShowTemplates')}
++                    onClose={() => setEditingSweepCanvas(null)}
++                  />
++                ) : (
++                  <EditorCanvasComponent
++                    label={
++                      activeSweepNode
++                        ? t('editor3D.sweepProfileLabel', { n: sweepNodeNumber })
++                        : t('editor3D.panelLabels.front')
++                    }
++                    axisLabel={t('editor3D.panelLabels.frontAxis')}
++                    polygon={
++                      activeSweepNode ? activeSweepNode.polygon : views.front
++                    }
++                    onChange={
++                      activeSweepNode
++                        ? (poly: Polygon) =>
++                            updateSweepNodePolygon(activeSweepNode.id, poly)
++                        : updateView('front')
++                    }
++                    resolution={editorGridResolution}
++                    onClose={() => setEditingSweepCanvas(null)}
++                    gridResolution={editorGridResolution}
++                    onGridResolutionChange={setEditorGridResolution}
++                    canvasZoom={editorCanvasZoom}
++                    onCanvasZoomChange={setEditorCanvasZoom}
++                    polylines={getPolylines('views:front')}
++                    onPolylinesChange={(lines: Polyline[]) =>
++                      updatePolylines('views:front', lines)
++                    }
++                    templateImage={templateImage}
++                    templateOpacity={templateOpacity}
++                    templateScale={templateScale}
++                  />
++                )}
++              </div>
+             ) : editingPanel !== null ? (
+               renderViewerPanel(editingPanel)
+             ) : (

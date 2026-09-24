@@ -1,0 +1,34 @@
+    const onMove = (e: PointerEvent) => {
+      if (overlayDragRef.current) {
+        overlayMoveDraggedVertex(e.clientX, e.clientY);
+        return;
+      }
+      if (overlayGroupDragRef.current) {
+        overlayMoveGroup(e.clientX, e.clientY);
+        return;
+      }
+      const marq = overlayMarqueeRef.current;
+      if (marq) {
+        const v = overlayClientToView(e.clientX, e.clientY);
+        const rect = { ...marq, x1: v.x, y1: v.y };
+        overlayMarqueeRef.current = rect;
+        setOverlayMarquee(rect);
+        overlayApplyMarquee(rect);
+        return;
+      }
+      const pan = overlayPanRef.current;
+      if (pan) {
+        const v = overlayClientToViewBox(e.clientX, e.clientY);
+        setMeshOverlayPan({
+          x: pan.panX + (v.x - pan.viewX),
+          y: pan.panY + (v.y - pan.viewY),
+        });
+      }
+    };
+    const onUp = () => {
+      overlayDragRef.current = null;
+      overlayGroupDragRef.current = null;
+      overlayPanRef.current = null;
+      overlayMarqueeRef.current = null;
+      setOverlayMarquee(null);
+    };

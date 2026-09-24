@@ -1,0 +1,7 @@
+    tabs: VALID_TABS,
+    events: KNOWN_EVENTS,
+    model: llmStatus(),
+    docs: '/api-docs',
+    openapi: '/openapi.json',
+  });
+});

@@ -17,6 +17,29 @@ export type Point2D = {
 };
 export type Polygon = Point2D[];
 
+/**
+ * Agujero (calado) para extrusión/recorrido: el polígono a sustraer y,
+ * de forma opcional, su profundidad.
+ *
+ * - `depth` ausente o <= 0 → calado pasante (de lado a lado).
+ * - `depth` > 0 → calado ciego: socava esa profundidad desde la cara
+ *   delantera (extrusión) o desde el inicio del recorrido (barrido).
+ */
+export type Hole = { polygon: Polygon; depth?: number };
+
+/** Un agujero puede darse como polígono suelto (pasante) o como `Hole`. */
+export type HoleSpec = Polygon | Hole;
+
+/** Polígono de un agujero, sea `Polygon` o `Hole`. */
+export function holePolygon(h: HoleSpec): Polygon {
+  return Array.isArray(h) ? h : h.polygon;
+}
+
+/** Profundidad de un agujero (0 = pasante). */
+export function holeDepth(h: HoleSpec): number {
+  return Array.isArray(h) ? 0 : h.depth ?? 0;
+}
+
 export type Vertex3D = { x: number; y: number; z: number };
 export type Face = [number, number, number, number] | [number, number, number];
 export type Mesh = {

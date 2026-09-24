@@ -1,0 +1,5 @@
+import type {
+  PolylinesByCanvas,
+  Polyline,
+  CanvasTool,
+} from '@/lib/polylines';

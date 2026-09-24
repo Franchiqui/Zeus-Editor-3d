@@ -1,0 +1,18 @@
+# Dependencias base
+fonttools>=4.33.0
+Pillow>=9.0.0
+scikit-learn>=1.0.0
+numpy>=1.21.0
+
+# FastAPI y servidor
+fastapi>=0.95.0
+uvicorn>=0.21.0
+python-multipart>=0.0.6
+pydantic>=2.0.0
+
+# Utilidades
+python-dotenv>=1.0.0
+aiofiles>=23.1.0
+
+# SVG parsing
+svg-path>=7.1

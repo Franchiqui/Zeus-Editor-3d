@@ -1,0 +1,59 @@
+{
+  "rhythms": [
+    {
+      "id": "Tiktac_0",
+      "filePath": "F:\\Archivos Zeus\\Audio\\Ritmos\\Percusion/ComfyUI_00005_.mp3",
+      "velocity": 1,
+      "volume": 0.8
+    },
+    {
+      "id": "Tiktac_1",
+      "filePath": "F:\\Archivos Zeus\\Audio\\Ritmos\\Percusion/ComfyUI_00005_.mp3",
+      "velocity": 1,
+      "volume": 0.8
+    },
+    {
+      "id": "Tiktac_2",
+      "filePath": "F:\\Archivos Zeus\\Audio\\Ritmos\\Viento/Ritmo-Flauta.mp3",
+      "velocity": 1,
+      "volume": 0.8
+    },
+    {
+      "id": "Tiktac_3",
+      "filePath": "F:\\Archivos Zeus\\Audio\\Ritmos\\Viento/cinematic_pad_90bpm.wav",
+      "velocity": 1,
+      "volume": 0.8
+    },
+    {
+      "id": "Tiktac_4",
+      "filePath": "F:\\Archivos Zeus\\Audio\\Ritmos\\Cuerda/ritmo-violin.mp3",
+      "velocity": 1,
+      "volume": 0.8
+    },
+    {
+      "id": "Tiktac_5",
+      "filePath": "F:\\Archivos Zeus\\Audio\\Ritmos\\Cuerda/Guitarra Nolasco.mp3",
+      "velocity": 1,
+      "volume": 0.8
+    },
+    {
+      "id": "Tiktac_6",
+      "filePath": "F:\\Archivos Zeus\\Audio\\Ritmos\\Electrónica/ritmo-aa.mp3",
+      "velocity": 1,
+      "volume": 0.8
+    },
+    {
+      "id": "Tiktac_7",
+      "filePath": "F:\\Archivos Zeus\\Audio\\Ritmos\\Electrónica/Ritmo-b.mp3",
+      "velocity": 1,
+      "volume": 0.8
+    },
+    {
+      "id": "Tiktac_8",
+      "filePath": "F:\\Archivos Zeus\\Audio\\Ritmos\\Percusion/ComfyUI_00003_.mp3",
+      "velocity": 1,
+      "volume": 0.8
+    }
+  ],
+  "lastUpdated": "2026-08-06T20:27:51.938Z"
+}

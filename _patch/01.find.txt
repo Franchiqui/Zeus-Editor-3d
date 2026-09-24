@@ -1,0 +1,2 @@
+  ZoomOut,
+} from 'lucide-react';

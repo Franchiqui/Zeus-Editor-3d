@@ -1,0 +1,6 @@
+  const overlayPanRef = useRef<{
+    viewX: number;
+    viewY: number;
+    panX: number;
+    panY: number;
+  } | null>(null);

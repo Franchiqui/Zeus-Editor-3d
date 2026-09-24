@@ -1,0 +1,1 @@
+  }, [overlayMoveDraggedVertex, overlayClientToViewBox]);

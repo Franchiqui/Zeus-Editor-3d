@@ -1,0 +1,1153 @@
+import { pb, authAsAdmin } from './pocketbase';
+import express, { Request, Response } from 'express';
+import { z } from 'zod';
+import swaggerUi from 'swagger-ui-express';
+import swaggerJsdoc from 'swagger-jsdoc';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import multer from 'multer';
+
+const __zeusFilterObjectToPbFilter = (value: any): string => {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value !== 'object' || Array.isArray(value)) return String(value);
+
+  const entries = Object.entries(value as Record<string, unknown>);
+  return entries
+    .map(([k, v]) => {
+      if (v === null) return k + ' = null';
+      if (typeof v === 'number' || typeof v === 'boolean') return k + ' = ' + String(v);
+      const escaped = String(v).replace(/'/g, "\'");
+      return k + " = '" + escaped + "'";
+    })
+    .join(' && ');
+};
+
+const __zeusCollection = (pb: any, name: string) => {
+  const svc = (pb as any).collection(name) as any;
+
+  if (typeof svc.getRecord !== 'function') {
+    svc.getRecord = (id: string, options?: any) => svc.getOne(id, options);
+  }
+  if (typeof svc.createRecord !== 'function') {
+    svc.createRecord = (data: any, options?: any) => svc.create(data, options);
+  }
+  if (typeof svc.updateRecord !== 'function') {
+    svc.updateRecord = (id: string, data: any, options?: any) => svc.update(id, data, options);
+  }
+  if (typeof svc.deleteRecord !== 'function') {
+    svc.deleteRecord = (id: string, options?: any) => svc.delete(id, options);
+  }
+  if (typeof svc.getMany !== 'function') {
+    svc.getMany = async (params?: any) => {
+      const rawPage = Number(params?.page ?? 1);
+      const page = Number.isFinite(rawPage) && rawPage > 0 ? rawPage : 1;
+      const rawLimit = Number(params?.limit ?? params?.perPage ?? 30);
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : 30;
+      const options: Record<string, unknown> = {};
+
+      if (params?.sort != null) options.sort = String(params.sort);
+      if (params?.expand != null) options.expand = params.expand;
+      if (params?.fields != null) options.fields = params.fields;
+      if (params?.filter != null) {
+        const filter = __zeusFilterObjectToPbFilter(params.filter);
+        if (filter) options.filter = filter;
+      }
+
+      const res = await svc.getList(page, limit, options);
+      return {
+        records: Array.isArray(res?.items) ? res.items : [],
+        page: typeof res?.page === 'number' ? res.page : page,
+        limit: typeof res?.perPage === 'number' ? res.perPage : limit,
+        total: typeof res?.totalItems === 'number' ? res.totalItems : 0,
+        totalPages: typeof res?.totalPages === 'number' ? res.totalPages : 1
+      };
+    };
+  }
+
+  return svc;
+};
+
+
+dotenv.config();
+
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(cors());
+
+// Configure multer for file uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit
+  },
+});
+
+// Zod Schemas
+export const EditortutorialesZeusIASchema = z.object({
+  id: z.string().optional(),
+  name: z.string().min(1, 'Name is required'),
+  description: z.string().optional(),
+  createdAt: z.string().optional(),
+  updatedAt: z.string().optional(),
+});
+
+export type EditortutorialesZeusIA = z.infer<typeof EditortutorialesZeusIASchema>;
+
+// Mock Data Store
+let records: any[] = [
+  { id: '1', name: 'Sample Record', description: 'This is a sample generated record' }
+];
+
+/**
+ * @swagger
+ * /api/editor-tutoriales-zeus-ia:
+ *   get:
+ *     summary: Get all Editor tutoriales Zeus IA records
+ *     responses:
+ *       200:
+ *         description: List of records
+ */
+app.get('/api/editor-tutoriales-zeus-ia', (req: Request, res: Response) => {
+  res.json(records);
+});
+
+/**
+ * @swagger
+ * /api/editor-tutoriales-zeus-ia:
+ *   post:
+ *     summary: Create a new Editor tutoriales Zeus IA record
+ *     responses:
+ *       201:
+ *         description: Created record
+ */
+app.post('/api/editor-tutoriales-zeus-ia', (req: Request, res: Response) => {
+  try {
+    const data = EditortutorialesZeusIASchema.parse(req.body);
+    const newRecord = { ...data, id: Date.now().toString() };
+    records.push(newRecord);
+    res.status(201).json(newRecord);
+  } catch (error) {
+    res.status(400).json({ error: 'Invalid data' });
+  }
+});
+
+/**
+ * @swagger
+ * /api/editor-tutoriales-zeus-ia/{id}:
+ *   get:
+ *     summary: Get Editor tutoriales Zeus IA record by id
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Record
+ *       404:
+ *         description: Not found
+ */
+app.get('/api/editor-tutoriales-zeus-ia/:id', (req: Request, res: Response) => {
+  const rec = records.find((r) => r.id === req.params.id);
+  if (!rec) return res.status(404).json({ error: 'Not found' });
+  res.json(rec);
+});
+
+/**
+ * @swagger
+ * /api/editor-tutoriales-zeus-ia/{id}:
+ *   put:
+ *     summary: Update Editor tutoriales Zeus IA record
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *     responses:
+ *       200:
+ *         description: Updated
+ *       404:
+ *         description: Not found
+ */
+app.put('/api/editor-tutoriales-zeus-ia/:id', (req: Request, res: Response) => {
+  const i = records.findIndex((r) => r.id === req.params.id);
+  if (i === -1) return res.status(404).json({ error: 'Not found' });
+  const data = EditortutorialesZeusIASchema.partial().parse(req.body);
+  records[i] = { ...records[i], ...data };
+  res.json(records[i]);
+});
+
+/**
+ * @swagger
+ * /api/editor-tutoriales-zeus-ia/{id}:
+ *   delete:
+ *     summary: Delete Editor tutoriales Zeus IA record
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       204:
+ *         description: Deleted
+ *       404:
+ *         description: Not found
+ */
+app.delete('/api/editor-tutoriales-zeus-ia/:id', (req: Request, res: Response) => {
+  const i = records.findIndex((r) => r.id === req.params.id);
+  if (i === -1) return res.status(404).json({ error: 'Not found' });
+  records.splice(i, 1);
+  res.status(204).send();
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// In-memory job store for async generation tracking
+// ─────────────────────────────────────────────────────────────────────────────
+const generationJobs = new Map<string, {
+  id: string;
+  status: 'processing' | 'completed' | 'failed';
+  progress: number;
+  message: string;
+  tutorialId?: string;
+  tutorial?: any;
+  error?: string;
+}>();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI Provider: call the correct model based on provider type
+// ─────────────────────────────────────────────────────────────────────────────
+async function callAIModel(model: any, messages: any[]): Promise<string> {
+  const provider = (model.type || model.provider || '').toLowerCase();
+
+  // ── Deepseek ──
+  if (provider === 'deepseek') {
+    const apiKey = model.apiKey || model.api_key || '';
+    const modelName = model.modelName || model.model_name || 'deepseek-chat';
+    const baseUrl = (model.endpoint || 'https://api.deepseek.com').replace(/\/$/, '');
+
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+    const body = JSON.stringify({
+      model: modelName,
+      messages,
+      max_tokens: 4096,
+      temperature: 0.3,
+    });
+
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers,
+      body,
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Deepseek API error (${res.status}): ${err.slice(0, 500)}`);
+    }
+
+    const data = await res.json() as any;
+    return data.choices?.[0]?.message?.content || '';
+  }
+
+  // ── Ollama ──
+  if (provider === 'ollama') {
+    const modelName = model.modelName || model.model_name || 'llama3.2';
+    const baseUrl = (model.endpoint || 'http://localhost:11434').replace(/\/$/, '');
+
+    // Ollama usa /api/chat, no /chat/completions
+    const res = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: modelName,
+        messages,
+        stream: false,
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Ollama API error (${res.status}): ${err.slice(0, 500)}`);
+    }
+
+    const data = await res.json() as any;
+    return data.message?.content || '';
+  }
+
+  // ── OpenAI compatible (openai, local with openai API, custom, remote) ──
+  if (provider === 'openai' || provider === 'custom' || provider === 'local' || provider === 'remote') {
+    let baseUrl = (model.endpoint || 'https://api.openai.com/v1').replace(/\/$/, '');
+    const apiKey = model.apiKey || model.api_key || '';
+    const modelName = model.modelName || model.model_name || model.model || (baseUrl.includes('deepseek-v4-flash'));
+
+    // Si el endpoint ya incluye /chat/completions, lo quitamos para no duplicarlo
+    if (baseUrl.includes('/chat/completions')) {
+      baseUrl = baseUrl.replace('/chat/completions', '');
+    }
+
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+    const body = JSON.stringify({
+      model: modelName,
+      messages,
+      max_tokens: 4096,
+      temperature: 0.3,
+    });
+
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers,
+      body,
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`AI API error (${res.status}): ${err.slice(0, 500)}`);
+    }
+
+    const data = await res.json() as any;
+    return data.choices?.[0]?.message?.content || '';
+  }
+
+  // ── Anthropic ──
+  if (provider === 'anthropic') {
+    const apiKey = model.apiKey || model.api_key || '';
+    const modelName = model.modelName || model.model_name || 'claude-3-5-sonnet-20241022';
+    const systemMsg = messages.find((m: any) => m.role === 'system')?.content || '';
+    const userMsgs = messages.filter((m: any) => m.role !== 'system');
+
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: modelName,
+        system: systemMsg,
+        messages: userMsgs,
+        max_tokens: 4096,
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Anthropic API error (${res.status}): ${err.slice(0, 500)}`);
+    }
+
+    const data = await res.json() as any;
+    return data.content?.[0]?.text || '';
+  }
+
+  throw new Error(`Proveedor de IA no soportado: ${provider}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Take a screenshot of the preview app via serve server
+// ─────────────────────────────────────────────────────────────────────────────
+async function captureScreenshot(servePort: number, previewPort: number): Promise<string | null> {
+  try {
+    const res = await fetch(`http://localhost:${servePort}/api/tutorial/screenshot`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ previewPort }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json() as any;
+    return data.screenshot || null; // base64 png
+  } catch {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Execute an action in the serve server (click, type, scroll, wait)
+// ─────────────────────────────────────────────────────────────────────────────
+async function executeAction(servePort: number, action: any): Promise<void> {
+  try {
+    await fetch(`http://localhost:${servePort}/api/tutorial/execute-action`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(action),
+    });
+  } catch {
+    // Best effort
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Core: run the AI generation loop in background
+// ─────────────────────────────────────────────────────────────────────────────
+async function runTutorialGeneration(jobId: string, params: {
+  description: string;
+  modelId: string;
+  appPath: string;
+  servePort?: number;
+  previewPort?: number;
+}) {
+  const job = generationJobs.get(jobId)!;
+  const { description, modelId, servePort = 3032, previewPort = 3000 } = params;
+
+  try {
+    // 1. Load model config from PocketBase
+    job.message = 'Cargando configuración del modelo...';
+    job.progress = 5;
+    await authAsAdmin();
+    
+    let modelConfig: any;
+    try {
+      modelConfig = await pb.collection('models').getOne(modelId);
+    } catch {
+      // Fallback: list and find by name
+      const models = await pb.collection('models').getFullList();
+      modelConfig = models.find((m: any) => m.id === modelId || m.name === modelId);
+    }
+
+    if (!modelConfig) {
+      throw new Error(`No se encontró el modelo con ID: ${modelId}`);
+    }
+
+    job.message = `Modelo cargado: ${modelConfig.name}`;
+    job.progress = 10;
+
+    // 2. Take initial screenshot
+    job.message = 'Capturando estado inicial de la aplicación...';
+    job.progress = 15;
+    const initialScreenshot = await captureScreenshot(servePort, previewPort);
+
+    // 3. Call AI to generate the step plan
+    job.message = 'La IA está analizando la aplicación y planificando el tutorial...';
+    job.progress = 25;
+
+    const systemPrompt = `Eres un experto en crear tutoriales de aplicaciones de software. 
+Tu tarea es generar un plan detallado de pasos para un tutorial de la aplicación Zeus basándote en la descripción del usuario.
+
+Debes responder ÚNICAMENTE con un objeto JSON válido (sin markdown, sin texto adicional) con esta estructura:
+{
+  "title": "Título descriptivo del tutorial",
+  "description": "Descripción breve del tutorial",
+  "steps": [
+    {
+      "order": 1,
+      "action": "Tipo de acción: click | type | scroll | wait | navigate | highlight",
+      "description": "Descripción detallada de lo que hace este paso",
+      "target": "Selector o descripción del elemento objetivo",
+      "value": "Valor para type, coordenadas para click como '100,200', milisegundos para wait",
+      "voiceover": "Texto narración en voz para este paso",
+      "subtitle": "Subtítulo a mostrar en el video",
+      "duration": 3
+    }
+  ]
+}
+
+Genera entre 5 y 15 pasos detallados. Cada paso debe ser claro y específico.
+Para acciones de click incluye coordenadas aproximadas basadas en la interfaz estándar de Zeus.
+Las duraciones son en segundos.`;
+
+    const userContent: any[] = [];
+    
+    if (initialScreenshot) {
+      // Vision-capable models
+      const provider = (modelConfig.type || modelConfig.provider || '').toLowerCase();
+      if (provider === 'openai' || provider === 'anthropic') {
+        userContent.push({
+          type: 'image_url',
+          image_url: { url: `data:image/png;base64,${initialScreenshot}`, detail: 'high' }
+        });
+      }
+    }
+    
+    userContent.push({
+      type: 'text',
+      text: `Descripción del tutorial a crear: "${description}"\n\nRuta de la aplicación: ${params.appPath || 'Zeus Desktop'}\n\nGenera el plan completo de pasos para este tutorial.`
+    });
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent.length === 1 ? userContent[0].text : userContent }
+    ];
+
+    const aiResponse = await callAIModel(modelConfig, messages);
+
+    // 4. Parse AI response
+    job.message = 'Procesando respuesta de la IA...';
+    job.progress = 50;
+
+    let tutorialPlan: any;
+    try {
+      // Strip markdown code blocks if present
+      const cleaned = aiResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      tutorialPlan = JSON.parse(cleaned);
+    } catch (parseErr) {
+      // Try to extract JSON from the response
+      const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        tutorialPlan = JSON.parse(jsonMatch[0]);
+      } else {
+        throw new Error('La IA no devolvió un JSON válido. Respuesta: ' + aiResponse.slice(0, 200));
+      }
+    }
+
+    // 5. Execute steps and capture screenshots per step
+    job.message = 'Ejecutando pasos y capturando capturas de pantalla...';
+    const steps = tutorialPlan.steps || [];
+    const enrichedSteps: any[] = [];
+
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      job.progress = 50 + Math.round((i / steps.length) * 35);
+      job.message = `Ejecutando paso ${i + 1} de ${steps.length}: ${step.description?.slice(0, 60)}...`;
+
+      // Execute the action
+      if (step.action && step.action !== 'wait') {
+        await executeAction(servePort, {
+          type: step.action,
+          target: step.target,
+          value: step.value,
+          previewPort,
+        });
+      }
+
+      // Wait a moment for UI to update
+      const waitMs = step.action === 'wait' 
+        ? Math.min(parseInt(step.value || '1000', 10), 5000)
+        : 800;
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+
+      // Capture screenshot after action
+      const screenshot = await captureScreenshot(servePort, previewPort);
+
+      enrichedSteps.push({
+        id: `step_${i + 1}`,
+        order: i + 1,
+        action: step.action || 'highlight',
+        description: step.description || '',
+        voiceover: step.voiceover || step.description || '',
+        subtitle: step.subtitle || step.description || '',
+        duration: step.duration || 3,
+        screenshot: screenshot || undefined,
+        target: step.target,
+        value: step.value,
+      });
+    }
+
+    // 6. Save tutorial to PocketBase
+    job.message = 'Guardando tutorial en la base de datos...';
+    job.progress = 88;
+
+    const tutorialData = {
+      title: tutorialPlan.title || description.slice(0, 80),
+      description: tutorialPlan.description || description,
+      targetApp: params.appPath || 'Zeus Desktop',
+      status: 'completed',
+      steps: JSON.stringify(enrichedSteps),
+      settings: JSON.stringify({
+        resolution: '1080p',
+        fps: 30,
+        backgroundMusic: true,
+        musicVolume: 0.3,
+        voiceoverVolume: 0.8,
+        subtitleEnabled: true,
+        subtitleLanguage: 'es',
+        quality: 'high',
+        outputFormat: 'mp4',
+      }),
+      metadata: JSON.stringify({
+        duration: enrichedSteps.reduce((acc: number, s: any) => acc + (s.duration || 3), 0),
+        fileSize: 0,
+        resolution: '1920x1080',
+        fps: 30,
+        audioBitrate: 128000,
+        videoBitrate: 8000000,
+        thumbnail: enrichedSteps[0]?.screenshot || undefined,
+      }),
+      modelId: modelId,
+      prompt: description,
+    };
+
+    let savedTutorial: any;
+    try {
+      savedTutorial = await pb.collection('tutorials').create(tutorialData);
+    } catch (pbErr) {
+      console.error('[GenerateTutorial] PocketBase error:', pbErr);
+      // Fallback: return in-memory tutorial
+      savedTutorial = {
+        id: Date.now().toString(),
+        ...tutorialData,
+        created: new Date().toISOString(),
+        updated: new Date().toISOString(),
+      };
+    }
+
+    // 7. Build the response object matching the Tutorial type
+    const tutorial = {
+      id: savedTutorial.id,
+      title: savedTutorial.title,
+      description: savedTutorial.description,
+      targetApp: savedTutorial.targetApp,
+      status: 'completed' as const,
+      steps: enrichedSteps,
+      settings: JSON.parse(savedTutorial.settings || '{}'),
+      metadata: JSON.parse(savedTutorial.metadata || '{}'),
+      createdAt: savedTutorial.created || new Date().toISOString(),
+      updatedAt: savedTutorial.updated || new Date().toISOString(),
+    };
+
+    job.status = 'completed';
+    job.progress = 100;
+    job.message = '¡Tutorial generado correctamente!';
+    job.tutorialId = savedTutorial.id;
+    job.tutorial = tutorial;
+
+  } catch (error: any) {
+    console.error('[GenerateTutorial] Error:', error);
+    job.status = 'failed';
+    job.progress = 0;
+    job.message = 'Error al generar el tutorial';
+    job.error = error?.message || 'Error desconocido';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tutorial endpoints — CRUD + Generate
+// ─────────────────────────────────────────────────────────────────────────────
+
+// List tutorials
+app.get('/api/tutorials', async (req: Request, res: Response) => {
+  try {
+    await authAsAdmin();
+    const records = await pb.collection('tutorials').getFullList({ sort: '-created' });
+    const tutorials = records.map((r: any) => ({
+      id: r.id,
+      title: r.title,
+      description: r.description,
+      targetApp: r.targetApp,
+      status: r.status || 'completed',
+      steps: typeof r.steps === 'string' ? JSON.parse(r.steps || '[]') : (r.steps || []),
+      settings: typeof r.settings === 'string' ? JSON.parse(r.settings || '{}') : (r.settings || {}),
+      metadata: typeof r.metadata === 'string' ? JSON.parse(r.metadata || '{}') : (r.metadata || {}),
+      createdAt: r.created,
+      updatedAt: r.updated,
+    }));
+    res.json(tutorials);
+  } catch (error) {
+    console.error('Error fetching tutorials:', error);
+    res.json([]);
+  }
+});
+
+// Get tutorial by ID
+app.get('/api/tutorials/:id', async (req: Request, res: Response) => {
+  try {
+    await authAsAdmin();
+    const r = await pb.collection('tutorials').getOne(req.params.id);
+    res.json({
+      id: r.id,
+      title: r.title,
+      description: r.description,
+      targetApp: r.targetApp,
+      status: r.status || 'completed',
+      steps: typeof r.steps === 'string' ? JSON.parse(r.steps || '[]') : (r.steps || []),
+      settings: typeof r.settings === 'string' ? JSON.parse(r.settings || '{}') : (r.settings || {}),
+      metadata: typeof r.metadata === 'string' ? JSON.parse(r.metadata || '{}') : (r.metadata || {}),
+      createdAt: r.created,
+      updatedAt: r.updated,
+    });
+  } catch (error) {
+    res.status(404).json({ error: 'Tutorial not found' });
+  }
+});
+
+// Create tutorial manually
+app.post('/api/tutorials', async (req: Request, res: Response) => {
+  try {
+    await authAsAdmin();
+    const record = await pb.collection('tutorials').create({
+      ...req.body,
+      steps: JSON.stringify(req.body.steps || []),
+      settings: JSON.stringify(req.body.settings || {}),
+      metadata: JSON.stringify(req.body.metadata || {}),
+    });
+    res.status(201).json(record);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create tutorial' });
+  }
+});
+
+// Update tutorial
+app.put('/api/tutorials/:id', async (req: Request, res: Response) => {
+  try {
+    await authAsAdmin();
+    const record = await pb.collection('tutorials').update(req.params.id, {
+      ...req.body,
+      steps: typeof req.body.steps === 'object' ? JSON.stringify(req.body.steps) : req.body.steps,
+    });
+    res.json(record);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update tutorial' });
+  }
+});
+
+// Delete tutorial
+app.delete('/api/tutorials/:id', async (req: Request, res: Response) => {
+  try {
+    await authAsAdmin();
+    await pb.collection('tutorials').delete(req.params.id);
+    res.status(204).send();
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete tutorial' });
+  }
+});
+
+// ── Generate tutorial (async) ──
+app.post('/api/tutorials/generate', async (req: Request, res: Response) => {
+  const { description, modelId, appPath, servePort, previewPort } = req.body;
+
+  if (!description) {
+    return res.status(400).json({ error: 'description is required' });
+  }
+  if (!modelId) {
+    return res.status(400).json({ error: 'modelId is required' });
+  }
+
+  const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  generationJobs.set(jobId, {
+    id: jobId,
+    status: 'processing',
+    progress: 0,
+    message: 'Iniciando generación...',
+  });
+
+  // Run async (don't await)
+  runTutorialGeneration(jobId, {
+    description,
+    modelId,
+    appPath: appPath || '',
+    servePort: servePort || 3032,
+    previewPort: previewPort || 3000,
+  });
+
+  res.json({ id: jobId, status: 'processing', progress: 0, message: 'Iniciando generación...' });
+});
+
+// ── Poll generation status ──
+app.get('/api/tutorials/generation/:id', (req: Request, res: Response) => {
+  const job = generationJobs.get(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+  res.json(job);
+});
+
+// Download tutorial
+app.get('/api/tutorials/:id/download', (req: Request, res: Response) => {
+  res.json({ url: `/api/tutorials/${req.params.id}/download-file` });
+});
+
+// Thumbnail
+app.post('/api/tutorials/:id/thumbnail', (req: Request, res: Response) => {
+  res.json({ thumbnail: '/thumbnail.jpg' });
+});
+
+
+
+// Models endpoints
+app.get('/api/models', async (req: Request, res: Response) => {
+  try {
+    await authAsAdmin();
+    const records = await pb.collection('models').getFullList();
+    res.json(records);
+  } catch (error) {
+    console.error('Error fetching models:', error);
+    res.json([]);
+  }
+});
+
+app.post('/api/models', upload.single('documentation'), async (req: Request, res: Response) => {
+  try {
+    await authAsAdmin();
+    
+    const modelData: any = {
+      name: req.body.name,
+      type: req.body.type,
+      endpoint: req.body.endpoint,
+      apiKey: req.body.apiKey,
+    };
+
+    if (req.file) {
+      const formData = new FormData();
+      const uint8Array = new Uint8Array(req.file.buffer);
+      formData.append('name', req.body.name);
+      formData.append('type', req.body.type);
+      formData.append('endpoint', req.body.endpoint);
+      formData.append('apiKey', req.body.apiKey);
+      formData.append('documentation', new Blob([uint8Array]), req.file.originalname);
+      
+      const record = await pb.collection('models').create(formData);
+      res.json(record);
+    } else {
+      const record = await pb.collection('models').create(modelData);
+      res.json(record);
+    }
+  } catch (error) {
+    console.error('Error creating model:', error);
+    res.status(500).json({ error: 'Failed to create model' });
+  }
+});
+
+app.put('/api/models/:id', async (req: Request, res: Response) => {
+  try {
+    await authAsAdmin();
+    const record = await pb.collection('models').update(req.params.id, {
+      name: req.body.name,
+      endpoint: req.body.endpoint,
+      apiKey: req.body.apiKey,
+      updatedAt: new Date().toISOString(),
+    });
+    res.json(record);
+  } catch (error) {
+    console.error('Error updating model:', error);
+    res.status(500).json({ error: 'Failed to update model' });
+  }
+});
+
+app.delete('/api/models/:id', async (req: Request, res: Response) => {
+  try {
+    await authAsAdmin();
+    await pb.collection('models').delete(req.params.id);
+    res.status(204).send();
+  } catch (error) {
+    console.error('Error deleting model:', error);
+    res.status(500).json({ error: 'Failed to delete model' });
+  }
+});
+
+// Documentation endpoints
+app.get('/api/documentation', async (req: Request, res: Response) => {
+  try {
+    await authAsAdmin();
+    const records = await pb.collection('documentation').getFullList({
+      expand: 'file',
+    });
+    res.json(records);
+  } catch (error) {
+    console.error('Error fetching documentation:', error);
+    res.json([]);
+  }
+});
+
+app.post('/api/documentation', upload.single('file'), async (req: Request, res: Response) => {
+  try {
+    await authAsAdmin();
+    
+    if (req.file) {
+      const formData = new FormData();
+      const uint8Array = new Uint8Array(req.file.buffer);
+      formData.append('title', req.body.title);
+      formData.append('description', req.body.description || '');
+      formData.append('file', new Blob([uint8Array]), req.file.originalname);
+      
+      const record = await pb.collection('documentation').create(formData);
+      res.json(record);
+    } else {
+      const record = await pb.collection('documentation').create({
+        title: req.body.title,
+        description: req.body.description || '',
+      });
+      res.json(record);
+    }
+  } catch (error) {
+    console.error('Error creating documentation:', error);
+    res.status(500).json({ error: 'Failed to create documentation' });
+  }
+});
+
+app.delete('/api/documentation/:id', async (req: Request, res: Response) => {
+  try {
+    await authAsAdmin();
+    await pb.collection('documentation').delete(req.params.id);
+    res.status(204).send();
+  } catch (error) {
+    console.error('Error deleting documentation:', error);
+    res.status(500).json({ error: 'Failed to delete documentation' });
+  }
+});
+
+// Settings endpoints
+app.get('/api/settings', (req: Request, res: Response) => {
+  res.json({ theme: 'dark', language: 'es', outputResolution: '1080p', backgroundMusic: false });
+});
+
+app.put('/api/settings', (req: Request, res: Response) => {
+  res.json({ ...req.body });
+});
+
+// Editor endpoints
+app.get('/api/editor/state', (req: Request, res: Response) => {
+  res.json({ currentTutorial: null, clips: [] });
+});
+
+app.put('/api/editor/timeline', (req: Request, res: Response) => {
+  res.json({ success: true });
+});
+
+app.post('/api/editor/export', (req: Request, res: Response) => {
+  res.json({ status: 'processing' });
+});
+
+// Control endpoints
+app.post('/api/control/mouse', (req: Request, res: Response) => {
+  res.json({ success: true });
+});
+
+app.post('/api/control/keyboard', (req: Request, res: Response) => {
+  res.json({ success: true });
+});
+
+app.post('/api/control/screenshot', (req: Request, res: Response) => {
+  res.json({ screenshot: 'data:image/png;base64,...' });
+});
+
+// Swagger Config
+const swaggerOptions = {
+  definition: {
+    openapi: '3.0.0',
+    info: {
+      title: 'Editor tutoriales Zeus IA API',
+      version: '1.0.0',
+      description: 'Aplicación de escritorio para Windows Donde conectar mediante una API Un modelo de inteligencia artificial Tanto local como remoto Para controlar la aplicación La aplicación es un editor De tutoriales De aplicaciones Especialmente Zeus Tiene que tener un editor Donde cargo la aplicación Zeus Mediante un servidor Le paso una descripción al modelo Del tutorial que quiero hacer de la aplicación Ni el modelo Con permisos para mover El ratón sobre la aplicación Y poder controlar…',
+    },
+    servers: [{ url: 'http://localhost:8743' }],
+    paths:
+      {
+        "/api/editor-tutoriales-zeus-ia": {
+          "get": {
+            "tags": [
+              "Editor tutoriales Zeus IA"
+            ],
+            "summary": "Editor tutoriales Zeus IA: GET /api/editor-tutoriales-zeus-ia",
+            "description": "Operación GET sobre /api/editor-tutoriales-zeus-ia",
+            "responses": {
+              "200": {
+                "description": "OK"
+              }
+            },
+            "parameters": [
+              {
+                "in": "query",
+                "name": "page",
+                "required": false,
+                "description": "Número de página (empieza en 1)",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "default": 1
+                }
+              },
+              {
+                "in": "query",
+                "name": "limit",
+                "required": false,
+                "description": "Cuántos ítems devolver por página",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 500,
+                  "default": 20
+                }
+              },
+              {
+                "in": "query",
+                "name": "offset",
+                "required": false,
+                "description": "Desplazamiento alternativo a page/limit (índice base 0)",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 0
+                }
+              },
+              {
+                "in": "query",
+                "name": "search",
+                "required": false,
+                "description": "Texto de búsqueda / filtro libre",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              {
+                "in": "query",
+                "name": "sortBy",
+                "required": false,
+                "description": "Campo por el que ordenar",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              {
+                "in": "query",
+                "name": "sortOrder",
+                "required": false,
+                "description": "asc = ascendente, desc = descendente",
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "asc",
+                    "desc"
+                  ]
+                }
+              }
+            ]
+          },
+          "post": {
+            "tags": [
+              "Editor tutoriales Zeus IA"
+            ],
+            "summary": "Editor tutoriales Zeus IA: POST /api/editor-tutoriales-zeus-ia",
+            "description": "Operación POST sobre /api/editor-tutoriales-zeus-ia",
+            "responses": {
+              "200": {
+                "description": "OK"
+              },
+              "201": {
+                "description": "Created"
+              }
+            }
+          }
+        },
+        "/api/editor-tutoriales-zeus-ia/{id}": {
+          "get": {
+            "tags": [
+              "Editor tutoriales Zeus IA"
+            ],
+            "summary": "Editor tutoriales Zeus IA: GET /api/editor-tutoriales-zeus-ia/{id}",
+            "description": "Operación GET sobre /api/editor-tutoriales-zeus-ia/{id}",
+            "responses": {
+              "200": {
+                "description": "OK"
+              }
+            },
+            "parameters": [
+              {
+                "in": "path",
+                "name": "id",
+                "required": true,
+                "description": "Identificador id",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            ]
+          },
+          "put": {
+            "tags": [
+              "Editor tutoriales Zeus IA"
+            ],
+            "summary": "Editor tutoriales Zeus IA: PUT /api/editor-tutoriales-zeus-ia/{id}",
+            "description": "Operación PUT sobre /api/editor-tutoriales-zeus-ia/{id}",
+            "responses": {
+              "200": {
+                "description": "OK"
+              }
+            },
+            "parameters": [
+              {
+                "in": "path",
+                "name": "id",
+                "required": true,
+                "description": "Identificador id",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            ]
+          },
+          "delete": {
+            "tags": [
+              "Editor tutoriales Zeus IA"
+            ],
+            "summary": "Editor tutoriales Zeus IA: DELETE /api/editor-tutoriales-zeus-ia/{id}",
+            "description": "Operación DELETE sobre /api/editor-tutoriales-zeus-ia/{id}",
+            "responses": {
+              "204": {
+                "description": "No content"
+              }
+            },
+            "parameters": [
+              {
+                "in": "path",
+                "name": "id",
+                "required": true,
+                "description": "Identificador id",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            ]
+          }
+        }
+      }
+  },
+  apis: ['./runtime-api.ts'],
+};
+
+function __zeusApplyDefinitionPathsToSwaggerSpec(spec: any, definition: any): any {
+  const defPaths = definition && typeof definition === 'object' ? definition.paths : null;
+  if (!defPaths || typeof defPaths !== 'object' || !spec || typeof spec !== 'object') return spec;
+  if (!spec.paths || typeof spec.paths !== 'object') spec.paths = {};
+  const verbs = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'trace'];
+  for (const pathKey of Object.keys(defPaths)) {
+    const defItem = (defPaths as Record<string, unknown>)[pathKey];
+    if (!defItem || typeof defItem !== 'object') continue;
+    const specItem = (spec.paths as Record<string, unknown>)[pathKey];
+    if (!specItem || typeof specItem !== 'object') continue;
+    for (const verb of verbs) {
+      const defOp = (defItem as Record<string, unknown>)[verb];
+      const specOp = (specItem as Record<string, unknown>)[verb];
+      if (!defOp || typeof defOp !== 'object' || !specOp || typeof specOp !== 'object') continue;
+      if (Array.isArray((defOp as { parameters?: unknown }).parameters)) {
+        const dp = (defOp as { parameters: unknown[] }).parameters;
+        if (dp.length > 0) (specOp as { parameters: unknown[] }).parameters = dp;
+      }
+      const defRb = (defOp as { requestBody?: unknown }).requestBody;
+      if (
+        defRb &&
+        typeof defRb === 'object' &&
+        defRb !== null &&
+        typeof (defRb as { content?: unknown }).content === 'object' &&
+        (defRb as { content: unknown }).content !== null
+      ) {
+        (specOp as { requestBody: unknown }).requestBody = defRb;
+      }
+    }
+  }
+  return spec;
+}
+
+const swaggerSpec = __zeusApplyDefinitionPathsToSwaggerSpec(swaggerJsdoc(swaggerOptions), (swaggerOptions as { definition?: { paths?: unknown } }).definition);
+
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, { customCss: ".swagger-ui .info .title{font-size:1.5rem!important;line-height:1.3;font-weight:600}.swagger-ui .info .description{font-size:.875rem!important;line-height:1.55!important;max-width:56rem;color:#3b4151;font-weight:400}.swagger-ui .info .description p{margin:.45em 0}.swagger-ui .info .description ul,.swagger-ui .info .description ol{margin:.4em 0 .4em 1.15em}.swagger-ui .info .description h1,.swagger-ui .info .description h2,.swagger-ui .info .description h3,.swagger-ui .info .description h4{font-size:1rem!important;font-weight:600!important;margin:.7em 0 .35em!important;line-height:1.35!important}" }));
+app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, { customCss: ".swagger-ui .info .title{font-size:1.5rem!important;line-height:1.3;font-weight:600}.swagger-ui .info .description{font-size:.875rem!important;line-height:1.55!important;max-width:56rem;color:#3b4151;font-weight:400}.swagger-ui .info .description p{margin:.45em 0}.swagger-ui .info .description ul,.swagger-ui .info .description ol{margin:.4em 0 .4em 1.15em}.swagger-ui .info .description h1,.swagger-ui .info .description h2,.swagger-ui .info .description h3,.swagger-ui .info .description h4{font-size:1rem!important;font-weight:600!important;margin:.7em 0 .35em!important;line-height:1.35!important}" }));
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Swagger UI available on http://localhost:${PORT}/api-docs and http://localhost:${PORT}/docs`);
+});
+

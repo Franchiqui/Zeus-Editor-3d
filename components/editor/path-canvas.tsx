@@ -1,0 +1,644 @@
+'use client';
+
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { Check, Hand, Maximize2, X, ZoomIn, ZoomOut } from 'lucide-react';
+
+export type PathPoint = {
+  id: number;
+  x: number;
+  y: number;
+  /** Inclinación (grados) de la plantilla de este vértice. */
+  tilt?: number;
+  /** Plantilla (contorno 0..1) del vértice; se usa para verla "de canto". */
+  polygon?: { x: number; y: number }[];
+};
+
+export interface PathCanvasProps {
+  label: string;
+  axisLabel: string;
+  points: PathPoint[];
+  activeId: number | null;
+  closed?: boolean;
+  resolution?: number;
+  emptyHint?: string;
+  helpHint?: string;
+  onChange: (id: number, x: number, y: number) => void;
+  onAdd: (x: number, y: number) => void;
+  onSelect: (id: number | null) => void;
+  onRemove: (id: number) => void;
+  /** Muestra la plantilla de cada vértice vista "de canto" (en perfil). */
+  showEdgeTemplates?: boolean;
+  /** Activa/desactiva la vista "de canto". Si se omite, no se muestra el selector. */
+  onToggleEdgeTemplates?: () => void;
+  /** Texto del cuadrado de selección de la vista "de canto". */
+  edgeTemplatesLabel?: string;
+  /** Maximizar: abre el recorrido ocupando el sitio de las cuatro ventanas. */
+  onMaximize?: () => void;
+  /** Volver a la rejilla (visible cuando está maximizado). */
+  onClose?: () => void;
+}
+
+type P2 = { x: number; y: number };
+
+/** Punto de una curva de Catmull-Rom (para dibujar el recorrido suavizado). */
+function catmull2D(p0: P2, p1: P2, p2: P2, p3: P2, t: number): P2 {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  const f = (a: number, b: number, c: number, d: number): number =>
+    0.5 *
+    (2 * b +
+      (-a + c) * t +
+      (2 * a - 5 * b + 4 * c - d) * t2 +
+      (-a + 3 * b - 3 * c + d) * t3);
+  return { x: f(p0.x, p1.x, p2.x, p3.x), y: f(p0.y, p1.y, p2.y, p3.y) };
+}
+
+/** Trazado SVG del segmento, suavizado igual que la malla barrida. */
+function smoothPathD(points: PathPoint[], closed: boolean): string {
+  const n = points.length;
+  if (n === 0) return '';
+  const P: P2[] = points.map((p) => ({ x: p.x * 100, y: p.y * 100 }));
+  if (n === 1) return `M ${P[0].x} ${P[0].y}`;
+  const at = (i: number): P2 =>
+    closed ? P[((i % n) + n) % n] : P[Math.max(0, Math.min(n - 1, i))];
+  let d = `M ${P[0].x} ${P[0].y}`;
+  const segs = closed ? n : n - 1;
+  for (let i = 0; i < segs; i++) {
+    const p0 = at(i - 1);
+    const p1 = at(i);
+    const p2 = at(i + 1);
+    const p3 = at(i + 2);
+    for (let k = 1; k <= 16; k++) {
+      const q = catmull2D(p0, p1, p2, p3, k / 16);
+      d += ` L ${q.x} ${q.y}`;
+    }
+  }
+  if (closed) d += ' Z';
+  return d;
+}
+
+/**
+ * Dirección tangente y perpendicular ("de canto") de cada vértice, calculada
+ * a partir de los vértices vecinos (igual que la malla barrida suaviza el
+ * recorrido). La perpendicular es el eje en el que se "ve de canto" la
+ * plantilla (que es perpendicular al segmento).
+ */
+function nodeFrames(points: PathPoint[], closed: boolean): { perp: P2 }[] {
+  const n = points.length;
+  if (n === 0) return [];
+  const at = (i: number): PathPoint =>
+    closed ? points[((i % n) + n) % n] : points[Math.max(0, Math.min(n - 1, i))];
+  return points.map((_, i) => {
+    const a = at(i - 1);
+    const b = at(i + 1);
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) {
+      dx = 1;
+      dy = 0;
+    }
+    const len = Math.hypot(dx, dy) || 1;
+    dx /= len;
+    dy /= len;
+    // Perpendicular dentro del plano del lienzo.
+    return { perp: { x: dy, y: -dx } };
+  });
+}
+
+/**
+ * Radio aproximado de la plantilla (0..1 en coordenadas de lienzo), para dar
+ * el tamaño de la sección que se dibuja "de canto" en cada vértice.
+ */
+function profileRadius(polygon?: { x: number; y: number }[]): number {
+  if (!polygon || polygon.length < 3) return 0.06;
+  let cx = 0;
+  let cy = 0;
+  for (const p of polygon) {
+    cx += p.x;
+    cy += p.y;
+  }
+  cx /= polygon.length;
+  cy /= polygon.length;
+  let r = 0;
+  for (const p of polygon) {
+    r = Math.max(r, Math.hypot(p.x - cx, p.y - cy));
+  }
+  return r || 0.06;
+}
+
+/**
+ * Lienzo del Recorrido (Extruir): dibuja SOLO un segmento con sus vértices.
+ * Al pulsar en un hueco se añade un vértice; arrastrando un vértice se le da
+ * forma al segmento. El vértice seleccionado es el que se le da forma (su
+ * plantilla) en el lienzo Frontal de arriba.
+ *
+ * Con el cuadrado "de canto" activado se dibuja la plantilla de cada vértice
+ * vista en perfil (como una lámina de canto), girada según su inclinación.
+ *
+ * Zoom: rueda del ratón (alrededor del cursor). Paneo: arrastra con el botón
+ * central o con Mayús; también hay un botón de "mano". La tecla/botón "%" o el
+ * icono de mano restablecen y desplazan la vista.
+ */
+export default function PathCanvas({
+  label,
+  axisLabel,
+  points,
+  activeId,
+  closed = false,
+  resolution = 16,
+  emptyHint,
+  helpHint,
+  onChange,
+  onAdd,
+  onSelect,
+  onRemove,
+  showEdgeTemplates = false,
+  onToggleEdgeTemplates,
+  edgeTemplatesLabel,
+  onMaximize,
+  onClose,
+}: PathCanvasProps) {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const contentRef = useRef<SVGGElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const dragRef = useRef<number | null>(null);
+  const panStartRef = useRef<{ px: number; py: number; x: number; y: number } | null>(
+    null
+  );
+  const [hoverId, setHoverId] = useState<number | null>(null);
+
+  /* ---- Zoom / paneo interactivo ---- */
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [hand, setHand] = useState(false);
+  const [panDragging, setPanDragging] = useState(false);
+  // Los vértices y textos conservan su tamaño en pantalla: sus medidas van
+  // divididas por el zoom.
+  const uiScale = 1 / zoom;
+
+  // Rango de zoom del recorrido: se puede reducir bastante para ver todo.
+  const ZOOM_MIN = 0.05;
+  const ZOOM_MAX = 8;
+  const clampPan = (v: number, z: number) =>
+    Math.max(-(50 * z + 50), Math.min(50 * z + 50, v));
+  const resetView = () => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  };
+  const zoomStep = (factor: number) => {
+    const nz = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom * factor));
+    const k = nz / zoom;
+    setPan({ x: clampPan(pan.x * k, nz), y: clampPan(pan.y * k, nz) });
+    setZoom(nz);
+  };
+
+  /** Punto en coordenadas de la ventana (0..100) a partir de un evento. */
+  const viewportPoint = (e: ReactPointerEvent): P2 | null => {
+    const svg = svgRef.current;
+    if (!svg) return null;
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return null;
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX;
+    pt.y = e.clientY;
+    return pt.matrixTransform(ctm.inverse());
+  };
+
+  const toLocal = (e: ReactPointerEvent): P2 | null => {
+    const g = contentRef.current;
+    const svg = svgRef.current;
+    if (!g || !svg) return null;
+    const ctm = g.getScreenCTM();
+    if (!ctm) return null;
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX;
+    pt.y = e.clientY;
+    const loc = pt.matrixTransform(ctm.inverse());
+    return {
+      x: Math.max(0, Math.min(100, loc.x)) / 100,
+      y: Math.max(0, Math.min(100, loc.y)) / 100,
+    };
+  };
+
+  // Rueda del ratón: acerca/aleja alrededor del cursor.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const svg = svgRef.current;
+      if (!svg) return;
+      const ctm = svg.getScreenCTM();
+      if (!ctm) return;
+      const pt = svg.createSVGPoint();
+      pt.x = e.clientX;
+      pt.y = e.clientY;
+      const pv = pt.matrixTransform(ctm.inverse());
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const nz = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom * factor));
+      // Contenido bajo el cursor (unidades del viewBox 0..100).
+      const cx = (pv.x - 50 - pan.x) / zoom + 50;
+      const cy = (pv.y - 50 - pan.y) / zoom + 50;
+      setZoom(nz);
+      setPan({
+        x: clampPan(pv.x - 50 - (cx - 50) * nz, nz),
+        y: clampPan(pv.y - 50 - (cy - 50) * nz, nz),
+      });
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [zoom, pan]);
+
+  const handleBackgroundDown = (e: ReactPointerEvent) => {
+    // Botón central o Mayús: desplazar la vista (paneo).
+    if (e.button === 1 || e.shiftKey) {
+      const pv = viewportPoint(e);
+      if (pv) {
+        panStartRef.current = { px: pv.x, py: pv.y, x: pan.x, y: pan.y };
+        (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+      }
+      return;
+    }
+    const loc = toLocal(e);
+    if (loc) onAdd(loc.x, loc.y);
+  };
+
+  const handleNodeDown = (e: ReactPointerEvent, id: number) => {
+    e.stopPropagation();
+    onSelect(id);
+    dragRef.current = id;
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+  };
+
+  const handleMove = (e: ReactPointerEvent) => {
+    if (panStartRef.current) {
+      const pv = viewportPoint(e);
+      const start = panStartRef.current;
+      if (pv) {
+        setPan({
+          x: clampPan(start.x + (pv.x - start.px), zoom),
+          y: clampPan(start.y + (pv.y - start.py), zoom),
+        });
+      }
+      return;
+    }
+    if (dragRef.current === null) return;
+    const loc = toLocal(e);
+    if (loc) onChange(dragRef.current, loc.x, loc.y);
+  };
+
+  const handleUp = (e: ReactPointerEvent) => {
+    if (panStartRef.current) {
+      panStartRef.current = null;
+      (e.target as Element).releasePointerCapture?.(e.pointerId);
+    }
+    if (dragRef.current === null) return;
+    dragRef.current = null;
+    (e.target as Element).releasePointerCapture?.(e.pointerId);
+  };
+
+  const gridLines = [];
+  for (let i = 0; i <= resolution; i++) {
+    const pos = (i / resolution) * 100;
+    const major = i % 4 === 0;
+    gridLines.push(
+      <line
+        key={`v${i}`}
+        x1={pos}
+        y1={0}
+        x2={pos}
+        y2={100}
+        stroke="hsl(224 30% 26%)"
+        strokeWidth={major ? 1.2 : 1}
+        vectorEffect="non-scaling-stroke"
+        opacity={major ? 0.8 : 0.4}
+      />,
+      <line
+        key={`h${i}`}
+        x1={0}
+        y1={pos}
+        x2={100}
+        y2={pos}
+        stroke="hsl(224 30% 26%)"
+        strokeWidth={major ? 1.2 : 1}
+        vectorEffect="non-scaling-stroke"
+        opacity={major ? 0.8 : 0.4}
+      />
+    );
+  }
+
+  const lineD = smoothPathD(points, closed);
+  const frames = nodeFrames(points, closed);
+
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      <div className="flex items-center justify-between min-w-0 gap-2">
+        <div className="flex items-center gap-2 min-w-0 shrink">
+          <span className="text-xs font-semibold text-foreground/90 truncate">
+            {label}
+          </span>
+          <span className="text-[9px] uppercase tracking-wider text-green-400/70 font-mono shrink-0">
+            {axisLabel}
+          </span>
+        </div>
+        <div className="flex items-center gap-1 shrink-0">
+          <span className="text-[9px] text-muted-foreground/50 font-mono">
+            {points.length} pt{points.length === 1 ? '' : 's'}
+          </span>
+          {onToggleEdgeTemplates && (
+            <button
+              onClick={onToggleEdgeTemplates}
+              className={`flex items-center gap-1 pl-0.5 pr-1.5 py-0.5 rounded-md border text-[9px] font-medium transition-colors ${
+                showEdgeTemplates
+                  ? 'border-green-500/50 bg-green-500/20 text-green-300'
+                  : 'border-white/10 bg-white/5 text-muted-foreground hover:text-foreground/90 hover:bg-white/10'
+              }`}
+              title={edgeTemplatesLabel}
+            >
+              <span
+                className={`w-2.5 h-2.5 rounded-[3px] border flex items-center justify-center shrink-0 ${
+                  showEdgeTemplates
+                    ? 'border-green-400 bg-green-500/50'
+                    : 'border-white/40 bg-transparent'
+                }`}
+              >
+                {showEdgeTemplates && (
+                  <Check className="w-2 h-2" strokeWidth={3} />
+                )}
+              </span>
+              <span className="whitespace-nowrap">{edgeTemplatesLabel}</span>
+            </button>
+          )}
+          {onMaximize && (
+            <button
+              onClick={onMaximize}
+              className="p-1 rounded-md text-muted-foreground hover:text-green-300 hover:bg-green-500/10 transition-colors"
+              title="Maximizar (ocupar todo el espacio)"
+            >
+              <Maximize2 className="w-3 h-3" />
+            </button>
+          )}
+          {onClose && (
+            <button
+              onClick={onClose}
+              className="p-1 rounded-md text-muted-foreground hover:text-green-300 hover:bg-green-500/10 transition-colors"
+              title="Volver a la rejilla"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          )}
+        </div>
+      </div>
+      <div
+        ref={containerRef}
+        className="relative flex-1 rounded-lg overflow-hidden border border-white/10"
+        style={{
+          background:
+            'radial-gradient(ellipse at center, hsl(224 45% 14%) 0%, hsl(224 50% 9%) 100%)',
+        }}
+      >
+        <svg
+          ref={svgRef}
+          viewBox="0 0 100 100"
+          preserveAspectRatio="xMidYMid meet"
+          className="absolute inset-0 w-full h-full touch-none"
+          onPointerMove={handleMove}
+          onPointerUp={handleUp}
+          onPointerLeave={handleUp}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <rect
+            x={0}
+            y={0}
+            width={100}
+            height={100}
+            fill="transparent"
+            onPointerDown={handleBackgroundDown}
+            style={{ cursor: hand ? 'grab' : 'crosshair' }}
+          />
+          <g
+            ref={contentRef}
+            transform={`translate(${50 + pan.x} ${50 + pan.y}) scale(${zoom}) translate(-50 -50)`}
+          >
+            <g pointerEvents="none">{gridLines}</g>
+            {showEdgeTemplates &&
+              points.map((p, i) => {
+                const frame = frames[i];
+                if (!frame) return null;
+                const tiltDeg = p.tilt ?? 0;
+                const tilt = (tiltDeg * Math.PI) / 180;
+                const cos = Math.cos(tilt);
+                const sin = Math.sin(tilt);
+                // Eje "de canto" (perpendicular al segmento) girado por la inclinación.
+                const bx = frame.perp.x * cos - frame.perp.y * sin;
+                const by = frame.perp.x * sin + frame.perp.y * cos;
+                // Tamano REAL de la plantilla (misma escala que la malla barrida:
+                // el lienzo 0..1 -> 0..100 en ambos lados).
+                const r = profileRadius(p.polygon) * 100;
+                const cx = p.x * 100;
+                const cy = p.y * 100;
+                const ex = bx * r;
+                const ey = by * r;
+                // Pequeño grosor para que se lea como una lámina vista de canto.
+                const half = 0.8;
+                const nx = -by * half;
+                const ny = bx * half;
+                const slab = `${(cx + ex + nx).toFixed(2)},${(cy + ey + ny).toFixed(2)} ${(cx + ex - nx).toFixed(2)},${(cy + ey - ny).toFixed(2)} ${(cx - ex - nx).toFixed(2)},${(cy - ey - ny).toFixed(2)} ${(cx - ex + nx).toFixed(2)},${(cy - ey + ny).toFixed(2)}`;
+                const active = p.id === activeId;
+                return (
+                  <g key={`edge${p.id}`} pointerEvents="none">
+                    {/* Referencia perpendicular (inclinación 0°), solo si hay inclinación. */}
+                    {Math.abs(tiltDeg) >= 1 && (
+                      <line
+                        x1={cx - frame.perp.x * r}
+                        y1={cy - frame.perp.y * r}
+                        x2={cx + frame.perp.x * r}
+                        y2={cy + frame.perp.y * r}
+                        stroke="hsl(145 80% 60%)"
+                        strokeWidth={0.12 * uiScale}
+                        strokeDasharray="1 1"
+                        opacity={0.25}
+                      />
+                    )}
+                    <polygon
+                      points={slab}
+                      fill={
+                        active
+                          ? 'hsl(145 85% 55% / 0.45)'
+                          : 'hsl(145 80% 50% / 0.28)'
+                      }
+                      stroke={active ? 'hsl(145 95% 70%)' : 'hsl(145 85% 62%)'}
+                      strokeWidth={0.18 * uiScale}
+                    />
+                    {Math.abs(tiltDeg) >= 1 && (
+                      <text
+                        x={cx + ex * 1.2}
+                        y={cy + ey * 1.2}
+                        fontSize={2.6 * uiScale}
+                        textAnchor="middle"
+                        fill="hsl(145 90% 72%)"
+                      >
+                        {Math.round(tiltDeg)}°
+                      </text>
+                    )}
+                  </g>
+                );
+              })}
+            {points.length > 0 && (
+              <path
+                d={lineD}
+                fill="none"
+                stroke="hsl(45 95% 60%)"
+                strokeWidth={0.4 * uiScale}
+                strokeLinejoin="round"
+                strokeLinecap="round"
+                pointerEvents="none"
+              />
+            )}
+            {points.map((p, i) => {
+              const active = p.id === activeId;
+              const hovered = p.id === hoverId;
+              return (
+                <g key={p.id}>
+                  <circle
+                    cx={p.x * 100}
+                    cy={p.y * 100}
+                    r={3 * uiScale}
+                    fill="transparent"
+                    style={{ cursor: 'grab' }}
+                    onPointerDown={(e) => handleNodeDown(e, p.id)}
+                    onPointerUp={handleUp}
+                    onPointerEnter={() => setHoverId(p.id)}
+                    onPointerLeave={() =>
+                      setHoverId((h) => (h === p.id ? null : h))
+                    }
+                    onDoubleClick={(e) => {
+                      e.stopPropagation();
+                      onRemove(p.id);
+                    }}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onRemove(p.id);
+                    }}
+                  />
+                  {active && (
+                    <circle
+                      cx={p.x * 100}
+                      cy={p.y * 100}
+                      r={2 * uiScale}
+                      fill="none"
+                      stroke="hsl(145 90% 65%)"
+                      strokeWidth={0.3 * uiScale}
+                      opacity={0.6}
+                      pointerEvents="none"
+                    />
+                  )}
+                  <circle
+                    cx={p.x * 100}
+                    cy={p.y * 100}
+                    r={(hovered || active ? 1.1 : 0.9) * uiScale}
+                    fill={active ? 'hsl(145 90% 60%)' : 'hsl(45 95% 60%)'}
+                    stroke="hsl(224 50% 8%)"
+                    strokeWidth={0.25 * uiScale}
+                    pointerEvents="none"
+                  />
+                  <text
+                    x={p.x * 100}
+                    y={p.y * 100 - 2.6 * uiScale}
+                    fontSize={3 * uiScale}
+                    textAnchor="middle"
+                    fill="hsl(224 20% 75%)"
+                    pointerEvents="none"
+                  >
+                    {i + 1}
+                  </text>
+                </g>
+              );
+            })}
+          </g>
+        </svg>
+        {/* Capa de la mano: captura el arrastre para desplazar la vista */}
+        {hand && (
+          <div
+            className="absolute inset-0 z-10 touch-none select-none"
+            onPointerDown={(e) => {
+              panStartRef.current = { px: e.clientX, py: e.clientY, x: pan.x, y: pan.y };
+              setPanDragging(true);
+              (e.target as Element).setPointerCapture?.(e.pointerId);
+            }}
+            onPointerMove={(e) => {
+              const start = panStartRef.current;
+              const rect = containerRef.current?.getBoundingClientRect();
+              if (!start || !rect) return;
+              const dx = ((e.clientX - start.px) / rect.width) * 100;
+              const dy = ((e.clientY - start.py) / rect.height) * 100;
+              setPan({
+                x: clampPan(start.x + dx, zoom),
+                y: clampPan(start.y + dy, zoom),
+              });
+            }}
+            onPointerUp={() => {
+              panStartRef.current = null;
+              setPanDragging(false);
+            }}
+            onPointerCancel={() => {
+              panStartRef.current = null;
+              setPanDragging(false);
+            }}
+            onDoubleClick={resetView}
+            onContextMenu={(e) => e.preventDefault()}
+            style={{ cursor: panDragging ? 'grabbing' : 'grab' }}
+          />
+        )}
+        {/* Controles de zoom (esquina inferior derecha) */}
+        <div className="absolute bottom-1.5 right-1.5 z-20 flex items-center gap-0.5 rounded-md border border-white/10 bg-black/40 backdrop-blur-sm px-0.5 py-0.5">
+          <button
+            onClick={() => setHand((h) => !h)}
+            className={`p-1 rounded transition-colors ${
+              hand
+                ? 'text-green-300 bg-green-500/20'
+                : 'text-muted-foreground hover:text-green-300 hover:bg-green-500/10'
+            }`}
+            title="Mano: arrastra para desplazar la vista (zoom con la rueda)"
+          >
+            <Hand className="w-3 h-3" />
+          </button>
+          <button
+            onClick={() => zoomStep(1 / 1.25)}
+            disabled={zoom <= ZOOM_MIN}
+            className="p-1 rounded text-muted-foreground hover:text-green-300 hover:bg-green-500/10 disabled:opacity-30 disabled:hover:bg-transparent transition-colors"
+            title="Alejar (también con la rueda del ratón)"
+          >
+            <ZoomOut className="w-3 h-3" />
+          </button>
+          <button
+            onClick={resetView}
+            className="px-1 text-[9px] font-mono text-muted-foreground hover:text-green-300 transition-colors tabular-nums"
+            title="Restablecer zoom"
+          >
+            {Math.round(zoom * 100)}%
+          </button>
+          <button
+            onClick={() => zoomStep(1.25)}
+            disabled={zoom >= ZOOM_MAX}
+            className="p-1 rounded text-muted-foreground hover:text-green-300 hover:bg-green-500/10 disabled:opacity-30 disabled:hover:bg-transparent transition-colors"
+            title="Acercar (también con la rueda del ratón)"
+          >
+            <ZoomIn className="w-3 h-3" />
+          </button>
+        </div>
+        {points.length === 0 && emptyHint && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <span className="text-xs text-muted-foreground/50">{emptyHint}</span>
+          </div>
+        )}
+        {points.length > 0 && helpHint && (
+          <div className="absolute bottom-1.5 left-2 text-[9px] text-muted-foreground/40 font-mono pointer-events-none">
+            {helpHint}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

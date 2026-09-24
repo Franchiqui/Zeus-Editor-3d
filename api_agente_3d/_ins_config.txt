@@ -1,0 +1,23 @@
+
+/* --- Modelo de chat (LLM) -------------------------------------------------
+ * ZEIA puede delegar la interpretación de lenguaje natural al modelo de chat
+ * que ya usa el editor. Prioridad:
+ *   1) ZEIA_CHAT_URL -> puente al endpoint /api/chat de Zeus Media Studio-3D
+ *      (reutiliza el proveedor/modelo/keys ya configurados por el usuario).
+ *   2) ZEIA_LLM_URL  -> endpoint OpenAI-compatible (.../chat/completions):
+ *      OpenAI, DeepSeek, Groq, Ollama, LM Studio, llama.cpp, etc.
+ * Si ninguno está definido se usa el planificador heurístico local (sin red).
+ */
+const ZEIA_CHAT_URL = (process.env.ZEIA_CHAT_URL || '').replace(/\/+$/, '');
+const ZEIA_CHAT_PROVIDER = process.env.ZEIA_CHAT_PROVIDER || '';
+const ZEIA_CHAT_MODEL = process.env.ZEIA_CHAT_MODEL || '';
+const ZEIA_CHAT_MODEL_RECORD_ID = process.env.ZEIA_CHAT_MODEL_RECORD_ID || '';
+const ZEIA_LLM_URL = process.env.ZEIA_LLM_URL || '';
+const ZEIA_LLM_API_KEY = process.env.ZEIA_LLM_API_KEY || '';
+const ZEIA_LLM_MODEL = process.env.ZEIA_LLM_MODEL || 'gpt-4o-mini';
+/** Timeout de las llamadas al modelo de chat (ms). */
+const ZEIA_LLM_TIMEOUT_MS = Math.max(1000, Number(process.env.ZEIA_LLM_TIMEOUT_MS || 30000));
+/** Máximo de tokens de la respuesta del modelo. */
+const ZEIA_LLM_MAX_TOKENS = Math.max(64, Number(process.env.ZEIA_LLM_MAX_TOKENS || 1200));
+/** Si es 'true', no se envían datos de objetos (ids) al modelo. */
+const ZEIA_LLM_REDACT = String(process.env.ZEIA_LLM_REDACT || '').toLowerCase() === 'true';

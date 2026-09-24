@@ -1,0 +1,7 @@
+  }, [
+    overlayMoveDraggedVertex,
+    overlayMoveGroup,
+    overlayApplyMarquee,
+    overlayClientToView,
+    overlayClientToViewBox,
+  ]);

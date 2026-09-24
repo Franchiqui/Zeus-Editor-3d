@@ -1,0 +1,18 @@
+    const onMove = (e: PointerEvent) => {
+      if (overlayDragRef.current) {
+        overlayMoveDraggedVertex(e.clientX, e.clientY);
+        return;
+      }
+      const pan = overlayPanRef.current;
+      if (pan) {
+        const v = overlayClientToViewBox(e.clientX, e.clientY);
+        setMeshOverlayPan({
+          x: pan.panX + (v.x - pan.viewX),
+          y: pan.panY + (v.y - pan.viewY),
+        });
+      }
+    };
+    const onUp = () => {
+      overlayDragRef.current = null;
+      overlayPanRef.current = null;
+    };

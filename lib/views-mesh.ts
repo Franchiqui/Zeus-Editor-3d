@@ -4,6 +4,9 @@ import {
   Vertex3D,
   Point2D,
   Polygon,
+  type HoleSpec,
+  holePolygon,
+  holeDepth,
   normalizePolygon,
   Section,
   flattenPolygon,
@@ -317,10 +320,16 @@ export function polylineToPolygon(polyline: Polyline): Polygon | null {
   const first = polyline.points[0];
   const last = polyline.points[polyline.points.length - 1];
   const dist = Math.hypot(first.x - last.x, first.y - last.y);
+  // Se cierra SIEMPRE: la herramienta Línea termina con doble clic sin
+  // repetir el punto inicial, así que una figura dibujada a mano (primer
+  // punto distinto del último) también debe extruirse como sólido o
+  // restarse como agujero. Si el usuario sí repitió el primer punto, se
+  // descarta el duplicado para no dejar un vértice degenerado.
   if (dist < 0.001) {
-    return polyline.points.slice(0, -1);
+    const open = polyline.points.slice(0, -1);
+    return open.length >= 3 ? open : null;
   }
-  return null;
+  return polyline.points;
 }
 
 /**
@@ -332,16 +341,61 @@ export function polylineToPolygon(polyline: Polyline): Polygon | null {
  * generar triángulos para el exterior y los agujeros, y el winding
  * correcto (exteriores CCW, agujeros CW en el lienzo) se asegura aquí.
  */
+/** Bounding box de un polígono (en sus propias coordenadas). */
+interface Box {
+  minX: number;
+  minY: number;
+  w: number;
+  h: number;
+}
+function polygonBox(poly: Polygon): Box {
+  let minX = Infinity,
+    maxX = -Infinity,
+    minY = Infinity,
+    maxY = -Infinity;
+  for (const q of poly) {
+    minX = Math.min(minX, q.x);
+    maxX = Math.max(maxX, q.x);
+    minY = Math.min(minY, q.y);
+    maxY = Math.max(maxY, q.y);
+  }
+  return { minX, minY, w: maxX - minX || 1, h: maxY - minY || 1 };
+}
+
+/**
+ * Normaliza un polígono a [0,1] usando un bounding box EXPLÍCITO.
+ * Imprescindible para los agujeros: deben compartir el marco (bounding box)
+ * del contorno exterior para conservar su posición dentro de él. Si cada
+ * agujero se normalizara con su propio bbox se estiraría hasta cubrir toda
+ * la cara y el calado no se vería (parecía que "no hacía nada").
+ */
+function normalizeInBox(poly: Polygon, bb: Box): Polygon {
+  return poly.map((q) => {
+    const out: Point2D = {
+      x: (q.x - bb.minX) / bb.w,
+      y: (q.y - bb.minY) / bb.h,
+    };
+    if (q.hIn) out.hIn = { x: (q.hIn.x - bb.minX) / bb.w, y: (q.hIn.y - bb.minY) / bb.h };
+    if (q.hOut) out.hOut = { x: (q.hOut.x - bb.minX) / bb.w, y: (q.hOut.y - bb.minY) / bb.h };
+    return out;
+  });
+}
+
 function extrudeSinglePolygon(
   polygon: Polygon,
   depth: number,
-  holes: Polygon[] = []
+  holes: HoleSpec[] = []
 ): Mesh {
+  // CALADO-CIEGO-EXTRUDE: soporta varios agujeros y calado ciego (con fondo).
   const curveSteps = Math.max(8, 24);
 
   if (polygon.length < 3) return { vertices: [], faces: [] as number[][] };
 
-  const front = flattenPolygon(normalizePolygon(polygon), curveSteps);
+  // Marco compartido: el bbox del contorno exterior. Tanto el contorno
+  // como TODOS los agujeros se normalizan con él para que cada agujero
+  // conserve su posición relativa dentro de la figura.
+  const mainBox = polygonBox(polygon);
+  const front = flattenPolygon(normalizeInBox(polygon, mainBox), curveSteps);
   if (front.length < 3) return { vertices: [], faces: [] as number[][] };
 
   // Quitar punto final duplicado (ShapeUtils.triangulateShape lo hace
@@ -353,11 +407,13 @@ function extrudeSinglePolygon(
   // Se garantiza para que la tapa delantera mire a +Z.
   if (shoelace(frontClosed) < 0) frontClosed.reverse();
 
-  // Aplanar agujeros y garantizar winding CW en el lienzo
-  const flatHoles: Point2D[][] = [];
+  // Aplanar agujeros (winding CW en el lienzo) y anotar su profundidad.
+  // 0 (o >= profundidad total) = pasante; 0 < d < profundidad = ciego.
+  const normHoles: { flat: Point2D[]; depth: number }[] = [];
   for (const hole of holes) {
-    if (hole.length < 3) continue;
-    const flat = flattenPolygon(normalizePolygon(hole), curveSteps);
+    const poly = holePolygon(hole);
+    if (poly.length < 3) continue;
+    const flat = flattenPolygon(normalizeInBox(poly, mainBox), curveSteps);
     if (flat.length < 3) continue;
     const flatClosed = dedupe(flat);
     if (flatClosed.length < 3) continue;
@@ -365,8 +421,12 @@ function extrudeSinglePolygon(
     // exterior. Exterior is CCW (positive shoelace); holes must be CW
     // (negative shoelace). If a hole comes in CCW, reverse it to CW.
     if (shoelace(flatClosed) > 0) flatClosed.reverse();
-    flatHoles.push(flatClosed);
+    normHoles.push({ flat: flatClosed, depth: holeDepth(hole) });
   }
+
+  const isBlind = (hd: number): boolean => hd > 0 && hd < depth;
+  const throughHoles = normHoles.filter((h) => !isBlind(h.depth));
+  const blindHoles = normHoles.filter((h) => isBlind(h.depth));
 
   const vertices: Vertex3D[] = [];
   const faces: number[][] = [];
@@ -384,62 +444,82 @@ function extrudeSinglePolygon(
   const frontCap = makeVerts(frontClosed, 0);
   const backCap = makeVerts(frontClosed, -depth);
 
-  // Vértices de los agujeros (frontales y traseros)
-  const holeFronts: number[][] = [];
-  const holeBacks: number[][] = [];
-  for (const hole of flatHoles) {
-    holeFronts.push(makeVerts(hole, 0));
-    holeBacks.push(makeVerts(hole, -depth));
+  // Anillas de agujero: delantera para todos (abren en la cara frontal),
+  // trasera solo para los pasantes, y suelo relleno para los ciegos.
+  const throughFront: number[][] = [];
+  const throughBack: number[][] = [];
+  const blindFront: number[][] = [];
+  const blindFloor: number[][] = [];      // anilla del suelo en su orden de tri.
+  const blindFloorRing: Point2D[][] = []; // puntos del suelo (shoelace positivo)
+  const blindWallBack: number[][] = [];   // anilla del suelo en orden de pared
+  for (const h of throughHoles) {
+    throughFront.push(makeVerts(h.flat, 0));
+    throughBack.push(makeVerts(h.flat, -depth));
   }
+  for (const h of blindHoles) {
+    blindFront.push(makeVerts(h.flat, 0));
+    // El suelo es el polígono relleno del agujero; se invierte para que su
+    // shoelace sea positivo y la tapa mire a +Z (hacia el hueco del bolsillo).
+    const rev = [...h.flat].reverse();
+    const floor = makeVerts(rev, -h.depth);
+    blindFloor.push(floor);
+    blindFloorRing.push(rev);
+    blindWallBack.push([...floor].reverse());
+  }
+  const allHoleFronts: number[][] = [...throughFront, ...blindFront];
 
-  // --- Triangulación de las tapas usando ShapeUtils (soporta agujeros) ---
-  const contour2d = frontClosed.map((q) => new Vector2(q.x, q.y));
-  const holes2d = flatHoles.map((h) => h.map((q) => new Vector2(q.x, q.y)));
-
-  let tris: number[][] = [];
-  try {
-    const raw = ShapeUtils.triangulateShape(contour2d, holes2d);
-    tris = (Array.isArray(raw) ? raw : []) as number[][];
-    if (tris.length === 0) {
-      throw new Error('ShapeUtils returned no triangles');
+  // --- Triangulación de una tapa (con agujeros) usando ShapeUtils ---
+  const triangulate = (contour: Point2D[], hs: Point2D[][]): number[][] => {
+    try {
+      const raw = ShapeUtils.triangulateShape(
+        contour.map((q) => new Vector2(q.x, q.y)),
+        hs.map((h) => h.map((q) => new Vector2(q.x, q.y)))
+      );
+      const t = (Array.isArray(raw) ? raw : []) as number[][];
+      if (t.length) return t;
+    } catch {
+      // Fallback: triangulación con agujeros (ear-clip + bridge).
     }
-  } catch (e) {
-    // Fallback: triangulación con agujeros (ear-clip + bridge)
-    const ear = earClipWithHoles(frontClosed, flatHoles);
-    for (let i = 0; i + 2 < ear.length; i += 3) {
-      tris.push([ear[i], ear[i + 1], ear[i + 2]]);
+    const ear = earClipWithHoles(contour, hs);
+    const t: number[][] = [];
+    for (let i = 0; i + 2 < ear.length; i += 3) t.push([ear[i], ear[i + 1], ear[i + 2]]);
+    return t;
+  };
+
+  const makeOffsets = (flat: number[][]): number[] => {
+    const offs: number[] = [];
+    let acc = 0;
+    for (const f of flat) {
+      offs.push(acc);
+      acc += f.length;
     }
-  }
-
-  // ShapeUtils indices over [exterior, hole0, hole1, ...]
-  // flat3dFront/Back have identical structure so offsets are shared
-  const flat3dFront: number[][] = [frontCap, ...holeFronts];
-  const flat3dBack: number[][] = [backCap, ...holeBacks];
-
-  const offsets: number[] = [];
-  let acc = 0;
-  for (const f of flat3dFront) {
-    offsets.push(acc);
-    acc += f.length;
-  }
-
-  const idAt = (flat: number[][], i: number): number => {
+    return offs;
+  };
+  const idAt = (flat: number[][], offs: number[], i: number): number => {
     for (let g = flat.length - 1; g >= 0; g--) {
-      if (i >= offsets[g]) return flat[g][i - offsets[g]];
+      if (i >= offs[g]) return flat[g][i - offs[g]];
     }
     return flat[0][0];
   };
 
-  // Tapa delantera: winding CCW visto desde +Z
-  for (const t of tris) {
+  // Tapa delantera: en esta cara abren TODOS los agujeros (pasantes y ciegos).
+  const frontHolePolys = [...throughHoles, ...blindHoles].map((h) => h.flat);
+  const trisFront = triangulate(frontClosed, frontHolePolys);
+  const flat3dFront: number[][] = [frontCap, ...allHoleFronts];
+  const offF = makeOffsets(flat3dFront);
+  for (const t of trisFront) {
     if (t.length < 3) continue;
-    faces.push([idAt(flat3dFront, t[0]), idAt(flat3dFront, t[1]), idAt(flat3dFront, t[2])]);
+    faces.push([idAt(flat3dFront, offF, t[0]), idAt(flat3dFront, offF, t[1]), idAt(flat3dFront, offF, t[2])]);
   }
 
-  // Tapa trasera: winding CCW visto desde −Z (invertido respecto al frente)
-  for (const t of tris) {
+  // Tapa trasera: solo los agujeros PASANTES la atraviesan.
+  const throughPolys = throughHoles.map((h) => h.flat);
+  const trisBack = triangulate(frontClosed, throughPolys);
+  const flat3dBack: number[][] = [backCap, ...throughBack];
+  const offB = makeOffsets(flat3dBack);
+  for (const t of trisBack) {
     if (t.length < 3) continue;
-    faces.push([idAt(flat3dBack, t[2]), idAt(flat3dBack, t[1]), idAt(flat3dBack, t[0])]);
+    faces.push([idAt(flat3dBack, offB, t[2]), idAt(flat3dBack, offB, t[1]), idAt(flat3dBack, offB, t[0])]);
   }
 
   // Caras laterales del contorno exterior:
@@ -449,19 +529,47 @@ function extrudeSinglePolygon(
     faces.push([frontCap[k], backCap[k], backCap[k2], frontCap[k2]]);
   }
 
-  // Caras laterales de los agujeros (el interior es aire, winding hacia dentro):
-  // [hole_frente_k, hole_frente_{k+1}, hole_tras_{k+1}, hole_tras_k]
-  for (let h = 0; h < holeFronts.length; h++) {
-    const fIds = holeFronts[h];
-    const bIds = holeBacks[h];
+  // Paredes de los agujeros PASANTES (frente z=0 → fondo trasero z=-depth).
+  // El interior es aire, winding hacia dentro:
+  // [frente_k, frente_{k+1}, tras_{k+1}, tras_k]
+  for (let h = 0; h < throughFront.length; h++) {
+    const fIds = throughFront[h];
+    const bIds = throughBack[h];
     const nh = fIds.length;
     for (let k = 0; k < nh; k++) {
       const k2 = (k + 1) % nh;
-      faces.push([fIds[k], fIds[k2], bIds[k2], bIds[k]]);
+      faces.push([bIds[k], bIds[k2], fIds[k2], fIds[k]]);
     }
   }
 
-  return { vertices, faces };
+  // Paredes de los agujeros CIEGOS (frente z=0 → suelo z=-depth_ciego).
+  for (let h = 0; h < blindFront.length; h++) {
+    const fIds = blindFront[h];
+    const bIds = blindWallBack[h];
+    const nh = fIds.length;
+    for (let k = 0; k < nh; k++) {
+      const k2 = (k + 1) % nh;
+      faces.push([bIds[k], bIds[k2], fIds[k2], fIds[k]]);
+    }
+  }
+
+  // Suelo (fondo) de cada agujero ciego: polígono relleno mirando a +Z.
+  for (let h = 0; h < blindFloor.length; h++) {
+    const ring = blindFloor[h];
+    const t = triangulate(blindFloorRing[h], []);
+    for (const tri of t) {
+      if (tri.length < 3) continue;
+      faces.push([ring[tri[0]], ring[tri[1]], ring[tri[2]]]);
+    }
+  }
+
+  // Orientación hacia FUERA: este constructor deja las caras con winding
+  // INTERIOR (mismo convenio heredado que ya existía). Se invierten todas
+  // para que las normales miren hacia fuera, igual que el recorrido
+  // (buildSweepMesh), de modo que el suelo del calado ciego mire a +Z
+  // (abertura del bolsillo) y las exportaciones STL/OBJ salgan correctas.
+  const orientedFaces = faces.map((f) => [...f].reverse());
+  return { vertices, faces: orientedFaces };
 }
 
 /**
@@ -491,7 +599,7 @@ export function buildExtrudeMesh(views: Views, depth: number): Mesh {
 export function buildExtrudeMeshes(
   polygons: Polygon[],
   depth: number,
-  subtractHoles: Polygon[] = []
+  subtractHoles: HoleSpec[] = []
 ): Mesh {
   let allVertices: Vertex3D[] = [];
   let allFaces: number[][] = [];

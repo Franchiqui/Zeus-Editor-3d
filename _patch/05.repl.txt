@@ -1,0 +1,175 @@
+    [meshOverlayEditId, overlayClientToView, overlaySnapView]
+  );
+
+  /** Sustituye una esquina por un arco (Curva/Predibujar, o Mayús+clic). */
+  const overlayRoundCorner = useCallback(
+    (index: number) => {
+      const id = meshOverlayEditId;
+      if (id == null) return;
+      setMeshSections((prev) =>
+        prev.map((s) => {
+          if (s.id !== id) return s;
+          const poly = s.polygon;
+          const n = poly.length;
+          if (n < 3 || index < 0 || index >= n) return s;
+          const vertex = poly[index];
+          if (vertex.hIn || vertex.hOut) return s;
+          const prevP = poly[(index - 1 + n) % n];
+          const nextP = poly[(index + 1) % n];
+          const radius = polygonRoundRadius(poly, meshOverlayCurveAmount);
+          const arc = computeRoundCornerPoints(
+            prevP,
+            vertex,
+            nextP,
+            radius,
+            meshOverlayCurveSegments
+          );
+          if (!arc) return s;
+          const verts = poly.map((p) => ({ ...p }));
+          verts.splice(
+            index,
+            1,
+            ...arc.map((p) => ({ x: p.x, y: p.y }))
+          );
+          return { ...s, polygon: verts };
+        })
+      );
+      setMeshOverlaySelection([]);
+    },
+    [meshOverlayEditId, meshOverlayCurveAmount, meshOverlayCurveSegments]
+  );
+
+  /** Elimina un vértice concreto (herramienta Borrar). */
+  const overlayEraseVertex = useCallback(
+    (index: number) => {
+      const id = meshOverlayEditId;
+      if (id == null) return;
+      setMeshSections((prev) =>
+        prev.map((s) => {
+          if (s.id !== id) return s;
+          if (s.polygon.length <= 3) return s;
+          return { ...s, polygon: s.polygon.filter((_, i) => i !== index) };
+        })
+      );
+      setMeshOverlaySelection([]);
+    },
+    [meshOverlayEditId]
+  );
+
+  /** Elimina todos los vértices seleccionados (dejando al menos 3). */
+  const overlayDeleteSelected = useCallback(() => {
+    const id = meshOverlayEditId;
+    if (id == null || meshOverlaySelection.length === 0) return;
+    const sel = new Set(meshOverlaySelection);
+    setMeshSections((prev) =>
+      prev.map((s) => {
+        if (s.id !== id) return s;
+        const verts = s.polygon.filter((_, i) => !sel.has(i));
+        if (verts.length < 3) return s;
+        return { ...s, polygon: verts };
+      })
+    );
+    setMeshOverlaySelection([]);
+  }, [meshOverlayEditId, meshOverlaySelection]);
+
+  /** Arranca el arrastre de TODOS los vértices indicados (grupo rígido). */
+  const overlayBeginGroupDrag = useCallback(
+    (idxs: number[], clientX: number, clientY: number) => {
+      const id = meshOverlayEditId;
+      if (id == null || idxs.length === 0) return;
+      const section = meshSections.find((s) => s.id === id);
+      if (!section) return;
+      const base = idxs.map((i) => {
+        const p = section.polygon[i];
+        return {
+          x: p?.x ?? 0,
+          y: p?.y ?? 0,
+          hIn: p?.hIn ? { ...p.hIn } : undefined,
+          hOut: p?.hOut ? { ...p.hOut } : undefined,
+        };
+      });
+      const start = overlayClientToView(clientX, clientY);
+      overlayGroupDragRef.current = {
+        id,
+        idxs,
+        base,
+        startX: start.x,
+        startY: start.y,
+      };
+    },
+    [meshOverlayEditId, meshSections, overlayClientToView]
+  );
+
+  /** Mueve el grupo de vértices arrastrado a la posición de pantalla dada. */
+  const overlayMoveGroup = useCallback(
+    (clientX: number, clientY: number) => {
+      const grp = overlayGroupDragRef.current;
+      if (!grp) return;
+      const v = overlayClientToView(clientX, clientY);
+      let dx = v.x - grp.startX;
+      let dy = v.y - grp.startY;
+      const anchor = grp.base[0];
+      if (anchor) {
+        dx = overlaySnapView(anchor.x + dx) - anchor.x;
+        dy = overlaySnapView(anchor.y + dy) - anchor.y;
+      }
+      setMeshSections((prev) =>
+        prev.map((s) => {
+          if (s.id !== grp.id) return s;
+          const verts = s.polygon.map((p, i) => {
+            const pos = grp.idxs.indexOf(i);
+            if (pos < 0) return p;
+            const b = grp.base[pos];
+            return {
+              ...p,
+              x: b.x + dx,
+              y: b.y + dy,
+              ...(b.hIn ? { hIn: { x: b.hIn.x + dx, y: b.hIn.y + dy } } : {}),
+              ...(b.hOut
+                ? { hOut: { x: b.hOut.x + dx, y: b.hOut.y + dy } }
+                : {}),
+            };
+          });
+          return { ...s, polygon: verts };
+        })
+      );
+    },
+    [overlayClientToView, overlaySnapView]
+  );
+
+  /** Recalcula la selección a partir de la marquesina (malla 0..100). */
+  const overlayApplyMarquee = useCallback(
+    (rect: { x0: number; y0: number; x1: number; y1: number }) => {
+      const poly = overlayEditPolyRef.current;
+      if (!poly) return;
+      const minX = Math.min(rect.x0, rect.x1);
+      const maxX = Math.max(rect.x0, rect.x1);
+      const minY = Math.min(rect.y0, rect.y1);
+      const maxY = Math.max(rect.y0, rect.y1);
+      const next: number[] = [];
+      poly.forEach((p, i) => {
+        const X = p.x * 100;
+        const Y = p.y * 100;
+        if (X >= minX && X <= maxX && Y >= minY && Y <= maxY) next.push(i);
+      });
+      setMeshOverlaySelection(next);
+    },
+    []
+  );
+
+  // Supr/Retroceso borra los vértices seleccionados (herramienta Selección).
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+      if (meshOverlayEditId == null || meshOverlaySelection.length === 0) return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || target?.isContentEditable) {
+        return;
+      }
+      e.preventDefault();
+      overlayDeleteSelected();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [meshOverlayEditId, meshOverlaySelection, overlayDeleteSelected]);

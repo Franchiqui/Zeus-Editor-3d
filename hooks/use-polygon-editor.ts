@@ -43,7 +43,7 @@ const DEFAULT_PICK_RADIUS = 0.03;
  * arco entre ellos). null si la esquina no se puede redondear (sin
  * cerrar, casi en línea recta, radio demasiado pequeño…).
  */
-function computeRoundCornerPoints(
+export function computeRoundCornerPoints(
   prev: Point2D,
   vertex: Point2D,
   next: Point2D,
@@ -97,7 +97,7 @@ function computeRoundCornerPoints(
  * tras redondear una esquina, las demás no salen más pequeñas porque
  * una arista vecina se haya acortado.
  */
-function polygonRoundRadius(polygon: Point2D[], curveAmount: number): number {
+export function polygonRoundRadius(polygon: Point2D[], curveAmount: number): number {
   let minX = Infinity;
   let maxX = -Infinity;
   let minY = Infinity;

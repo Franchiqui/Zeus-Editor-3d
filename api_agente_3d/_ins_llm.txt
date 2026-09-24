@@ -1,0 +1,289 @@
+/* =========================================================================
+ * Cliente del modelo de chat (LLM) — planificador inteligente opcional
+ * -------------------------------------------------------------------------
+ * Conecta ZEIA con el modelo de chat (dos modos, el puente tiene prioridad):
+ *   'chat'   -> ZEIA_CHAT_URL = /api/chat del editor (reutiliza su modelo).
+ *   'openai' -> ZEIA_LLM_URL  = endpoint OpenAI-compatible /chat/completions.
+ * Si no hay modelo conectado, /ai/plan usa el planificador heurístico local.
+ * ========================================================================= */
+type LlmMode = 'chat' | 'openai';
+
+/** Modo del modelo de chat activo, o null si no hay ninguno conectado. */
+function llmMode(): LlmMode | null {
+  if (ZEIA_CHAT_URL) return 'chat';
+  if (ZEIA_LLM_URL) return 'openai';
+  return null;
+}
+
+/** Estado de la conexión con el modelo (para /health y /v1/meta). */
+function llmStatus() {
+  const mode = llmMode();
+  return {
+    connected: !!mode,
+    mode: mode || 'none',
+    endpoint: mode === 'chat' ? ZEIA_CHAT_URL : mode === 'openai' ? ZEIA_LLM_URL : null,
+    model: mode === 'chat' ? ZEIA_CHAT_MODEL || '(auto del editor)' : mode === 'openai' ? ZEIA_LLM_MODEL : null,
+    fallback: 'heuristic',
+    redact: ZEIA_LLM_REDACT,
+  };
+}
+
+/** Acciones que el planificador puede proponer (solo las ejecutables). */
+const EXECUTABLE_ACTIONS: string[] = [
+  'objects.create',
+  'objects.update',
+  'objects.delete',
+  'objects.duplicate',
+  'objects.parent',
+  'motions.create',
+  'animations.create',
+  'animations.render',
+  'plugins.install',
+  'plugins.uninstall',
+  'effects.apply',
+  'effects.create',
+  'exports.create',
+];
+
+/** Catálogo compacto "acción -> parámetros" para el prompt de sistema. */
+function actionSpec(): string {
+  const effects = EFFECT_CATALOG.map((e) => e.name).join(', ');
+  const plugins = DB.plugins.map((p) => p.id + ' (' + p.name + ')').join(', ');
+  return [
+    "objects.create     {type:'mesh'|'light'|'camera', primitive?:'cube'|'sphere'|'cylinder'|'torus'|'cone'|'plane', name?, transform?:{position:[x,y,z],rotation:[x,y,z],scale:[x,y,z]}, parent_id?}",
+    'objects.update     {id, patch:{...}}',
+    'objects.delete     {id}  /* DESTRUCTIVA */',
+    'objects.duplicate  {id}',
+    'objects.parent     {id, parent_id:null|string}',
+    "motions.create     {object_id?, type:'rotate'|'translate'|'scale'|'physics', duration?:number(s), degrees?:number, loop?:boolean}",
+    'animations.create  {name?, duration?:number, fps?:number}',
+    "animations.render  {format:'mp4', fps?:number}",
+    'plugins.install    {id}  /* catálogo: ' + plugins + ' */',
+    'plugins.uninstall  {id}  /* DESTRUCTIVA */',
+    'effects.apply      {name, target?|targets?:[], params?:{}}  /* catálogo: ' + effects + ' */',
+    'effects.create     {name, params?:{}}',
+    "exports.create     {format:'gltf'|'glb'|'fbx'|'obj'|'usdz'|'mp4', target?, options?}",
+  ].join('\n');
+}
+
+/** Ejemplos (entrada -> plan) de las tabs, como guía few-shot del modelo. */
+function fewShotExamples(tabsAllowed?: string[] | null): string {
+  const out: string[] = [];
+  for (const t of TABS) {
+    if (tabsAllowed && tabsAllowed.length && !tabsAllowed.includes(t.tab)) continue;
+    for (const ex of t.examples || []) {
+      const o: any = ex.output || {};
+      const params: any = {};
+      for (const k of Object.keys(o)) if (k !== 'action') params[k] = o[k];
+      out.push('- "' + ex.input + '" => ' + JSON.stringify({ steps: [{ action: o.action, params }] }));
+    }
+  }
+  return out.join('\n');
+}
+
+/** Prompt de sistema del planificador (acciones, parámetros y ejemplos). */
+function buildPlannerSystem(tabsAllowed?: string[] | null): string {
+  const allowed = EXECUTABLE_ACTIONS.filter((a) => {
+    const tab = tabForAction(a);
+    return !tabsAllowed || !tabsAllowed.length || !tab || tabsAllowed.includes(tab);
+  });
+  return [
+    'Eres el planificador de acciones de ZEUS EDITOR 3D (ZEIA).',
+    'Conviertes una instrucción en lenguaje natural (español o inglés) en un PLAN de acciones JSON.',
+    '',
+    'REGLAS ESTRICTAS:',
+    '- Responde ÚNICAMENTE con un objeto JSON válido (sin markdown ni texto extra).',
+    '- Formato exacto: {"steps":[{"action":"<accion>","params":{...}}],"warnings":["..."]}',
+    '- Si algo se crea y luego se anima, incluye primero objects.create y después motions.create (referenciando ese objeto).',
+    '- Reutiliza objetos existentes si el usuario los menciona por nombre.',
+    '- No inventes acciones fuera de la lista permitida.',
+    '- Añade en "warnings" cualquier suposición (unidades, radio por defecto, etc.).',
+    '',
+    'ACCIONES PERMITIDAS:',
+    allowed.join(', '),
+    '',
+    'PARÁMETROS POR ACCIÓN:',
+    actionSpec(),
+    '',
+    'EJEMPLOS:',
+    fewShotExamples(tabsAllowed),
+  ].join('\n');
+}
+
+/** Prompt de usuario con el contexto actual (objetos existentes, etc.). */
+function buildPlannerUser(intent: string, ctx: any, projectId?: string | null): string {
+  const parts = ['INSTRUCCIÓN: ' + intent];
+  if (projectId) parts.push('PROYECTO: ' + projectId);
+  if (ctx && Object.keys(ctx).length) parts.push('CONTEXTO_EXTRA: ' + JSON.stringify(ctx));
+  if (!ZEIA_LLM_REDACT) {
+    const objs = DB.objects.slice(-40).map((o) => ({ id: o.id, name: o.name, type: o.type, primitive: o.geometry ? o.geometry.primitive : undefined }));
+    parts.push('OBJETOS_ACTUALES: ' + JSON.stringify(objs));
+  }
+  return parts.join('\n');
+}
+
+/* --- Transporte HTTP (fetch con timeout) -------------------------------- */
+async function httpJson(
+  method: string,
+  url: string,
+  body: unknown,
+  headers: Record<string, string>,
+  timeoutMs: number
+): Promise<{ status: number; json: any; text: string }> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, {
+      method,
+      headers: { 'content-type': 'application/json', ...headers },
+      body: body === undefined || body === null ? undefined : JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    const text = await r.text();
+    let json: any = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      /* el cuerpo no era JSON */
+    }
+    return { status: r.status, json, text };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Resuelve proveedor/modelo del editor (puente). Cachea 5 minutos. */
+let chatModelCache: { provider: string; model: string; modelRecordId?: string; at: number } | null = null;
+async function resolveChatModel(override?: string): Promise<{ provider: string; model: string; modelRecordId?: string }> {
+  if (ZEIA_CHAT_PROVIDER && ZEIA_CHAT_MODEL) {
+    return { provider: ZEIA_CHAT_PROVIDER, model: override || ZEIA_CHAT_MODEL, modelRecordId: ZEIA_CHAT_MODEL_RECORD_ID || undefined };
+  }
+  if (chatModelCache && Date.now() - chatModelCache.at < 300000 && !override) return chatModelCache;
+  const modelsUrl = process.env.ZEIA_CHAT_MODELS_URL || ZEIA_CHAT_URL.replace(/\/api\/chat$/, '/api/modelos');
+  const userId = process.env.ZEIA_CHAT_USER_ID || '';
+  if (!userId) throw new Error('chat_model_unresolved (define ZEIA_CHAT_PROVIDER+ZEIA_CHAT_MODEL o ZEIA_CHAT_USER_ID)');
+  const { status, json } = await httpJson('GET', modelsUrl + '?user=' + encodeURIComponent(userId), null, {}, ZEIA_LLM_TIMEOUT_MS);
+  if (status >= 400 || !json || !Array.isArray(json.records)) throw new Error('chat_models_unavailable');
+  const rec = json.records.find((m: any) => !m.is_vision) || json.records[0];
+  if (!rec) throw new Error('chat_model_unresolved');
+  chatModelCache = { provider: String(rec.proveedor || ''), model: override || String(rec.id_modelo || rec.nombre_modelo || ''), modelRecordId: rec.id, at: Date.now() };
+  return chatModelCache;
+}
+
+/** Llama al modelo de chat y devuelve el texto de la respuesta. */
+async function callChatModel(
+  system: string,
+  user: string,
+  opts: { model?: string; temperature?: number; history?: Array<{ role: string; content: string }> }
+): Promise<string> {
+  const mode = llmMode();
+  if (mode === 'chat') {
+    const cfg = await resolveChatModel(opts.model);
+    const payload: any = {
+      mode: 'text',
+      provider: cfg.provider,
+      model: cfg.model,
+      history: opts.history || [],
+      newMessage: { role: 'user', content: user },
+      systemContext: system,
+    };
+    if (cfg.modelRecordId) payload.modelRecordId = cfg.modelRecordId;
+    const { status, json, text } = await httpJson('POST', ZEIA_CHAT_URL, payload, {}, ZEIA_LLM_TIMEOUT_MS);
+    if (status >= 400) throw new Error('chat_http_' + status + ':' + ((json && (json.error || json.message)) || text.slice(0, 180)));
+    const reply = json && (json.text ?? json.reply ?? json.answer ?? json.content);
+    if (typeof reply !== 'string' || !reply.trim()) throw new Error('chat_empty_reply');
+    return reply;
+  }
+  if (mode === 'openai') {
+    const headers: Record<string, string> = {};
+    if (ZEIA_LLM_API_KEY) headers.authorization = 'Bearer ' + ZEIA_LLM_API_KEY;
+    const base: any = {
+      model: opts.model || ZEIA_LLM_MODEL,
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+      temperature: opts.temperature ?? 0.2,
+      max_tokens: ZEIA_LLM_MAX_TOKENS,
+    };
+    let r = await httpJson('POST', ZEIA_LLM_URL, { ...base, response_format: { type: 'json_object' } }, headers, ZEIA_LLM_TIMEOUT_MS);
+    if (r.status === 400 || r.status === 422) r = await httpJson('POST', ZEIA_LLM_URL, base, headers, ZEIA_LLM_TIMEOUT_MS);
+    if (r.status >= 400) {
+      const msg = r.json && r.json.error ? r.json.error.message || r.json.error : r.text.slice(0, 180);
+      throw new Error('llm_http_' + r.status + ':' + msg);
+    }
+    const reply = r.json && r.json.choices && r.json.choices[0] && r.json.choices[0].message ? r.json.choices[0].message.content : r.json && (r.json.message ? r.json.message.content : r.json.response);
+    if (typeof reply !== 'string' || !reply.trim()) throw new Error('llm_empty_reply');
+    return reply;
+  }
+  throw new Error('llm_not_configured');
+}
+
+/** Extrae el primer objeto JSON de un texto (tolera vallas ```json). */
+function extractJson(text: string): any | null {
+  if (!text) return null;
+  let s = String(text).trim();
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) s = fence[1].trim();
+  try {
+    return JSON.parse(s);
+  } catch {
+    /* intenta recortar */
+  }
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start !== -1 && end > start) {
+    try {
+      return JSON.parse(s.slice(start, end + 1));
+    } catch {
+      /* no-JSON */
+    }
+  }
+  return null;
+}
+
+/** Normaliza los pasos del modelo a {action, params} validados contra la whitelist. */
+function normalizeSteps(raw: any): { steps: any[]; warnings: string[] } {
+  const warnings: string[] = [];
+  const arr = Array.isArray(raw) ? raw : raw && Array.isArray(raw.steps) ? raw.steps : [];
+  const steps: any[] = [];
+  for (const it of arr) {
+    if (!it || typeof it !== 'object') continue;
+    const action = String(it.action || '').trim();
+    if (!action) continue;
+    if (!EXECUTABLE_ACTIONS.includes(action)) {
+      warnings.push('Acción ignorada (no permitida): ' + action);
+      continue;
+    }
+    const params: any = it.params && typeof it.params === 'object' ? { ...it.params } : {};
+    for (const k of Object.keys(it)) if (k !== 'action' && k !== 'params') params[k] = it[k];
+    steps.push({ action, params });
+  }
+  return { steps, warnings };
+}
+
+/** Genera un plan usando el modelo de chat. Lanza si no hay modelo o si falla. */
+async function llmPlan(
+  intent: string,
+  opts: { project_id?: string | null; tabs_allowed?: string[]; context?: any; model?: string }
+): Promise<{ steps: any[]; warnings: string[] }> {
+  if (!llmMode()) throw new Error('llm_not_configured');
+  const system = buildPlannerSystem(opts.tabs_allowed);
+  const user = buildPlannerUser(intent, opts.context, opts.project_id);
+  const raw = await callChatModel(system, user, { model: opts.model });
+  const parsed = extractJson(raw);
+  if (!parsed) throw new Error('llm_invalid_json');
+  const norm = normalizeSteps(parsed);
+  const warnings = norm.warnings.slice();
+  if (parsed && Array.isArray(parsed.warnings)) for (const w of parsed.warnings) if (typeof w === 'string') warnings.push(w);
+  let steps = norm.steps;
+  if (opts.tabs_allowed && opts.tabs_allowed.length) {
+    const allowed = opts.tabs_allowed;
+    const filtered = steps.filter((s) => {
+      const tab = tabForAction(s.action);
+      return !tab || allowed.includes(tab);
+    });
+    if (filtered.length !== steps.length) warnings.push('Se omitieron pasos por restricciones de tabs_allowed.');
+    steps = filtered;
+  }
+  if (!steps.length) throw new Error('llm_empty_plan');
+  return { steps, warnings };
+}
+
