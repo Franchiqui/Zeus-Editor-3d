@@ -7,19 +7,23 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { Mesh, Vertex3D, LatheTextureProjection } from '@/lib/geometry';
 import {
-  evaluateCameraKeyframes,
-  evaluateTransformTrack,
-  evaluatePluginParamTrack,
+   evaluateCameraKeyframes,
+   evaluateTransformTrack,
+   evaluatePluginParamTrack,
+   evaluateEffectTrack,
 } from '@/lib/animation';
 import type {
-  AnimationTrack,
-  Keyframe,
-  KeyframeProperty,
-  CameraData,
-  CameraKeyframe,
-  Vec3,
-  TransformTrack,
-  PluginParamTrack,
+   AnimationTrack,
+   Keyframe,
+   KeyframeProperty,
+   CameraData,
+   CameraKeyframe,
+   Vec3,
+     TransformTrack,
+     PluginParamTrack,
+     EffectTrack,
+     EffectType,
+     EffectProperty,
 } from '@/lib/animation';
 import { obtenerPlugin, type PluginParams } from '@/lib/plugins';
 import { smoothVoxelMesh } from '@/lib/mesh-smooth';
@@ -41,7 +45,6 @@ import {
   Grid3x3,
   Crosshair,
   Spline,
-  Sun,
   Camera,
   Sparkles,
   Sparkle,
@@ -268,6 +271,9 @@ interface Viewer3DProps {
   onVerticesChange?: (vertices: Vertex3D[]) => void;
   showVerticesDefault?: boolean;
   camera3D?: Camera3D;
+  /** Al incrementarse, encuadra (ajusta el zoom/centro) la figura y los
+   *  objetos de la escena para que entren completos en esta ventana. */
+  frameToken?: number;
   /** Notifica al padre cuando el usuario mueve la cámara con el ratón/scroll,
    *  para que pueda mantener su estado (panelCameras) sincronizado con la
    *  posición real de la cámara. Sin esto, los botones de pan saltan al origen. */
@@ -299,7 +305,22 @@ interface Viewer3DProps {
    * dirección, la bolita AMARILLA lo estira a lo largo de esa dirección
    * y el ARO del color del eje lo rota alrededor de ese eje.
    */
-    gizmo?: boolean;
+     gizmo?: boolean;
+   /** Which gizmo handle groups are active (move/rotate/scale).
+      When omitted, all modes are available. */
+   gizmoModes?: GizmoMode[];
+  /** Whether the gizmo can be interacted with (dragged). When false the
+      handles remain visible but don't receive raycast hits, allowing
+      configuration without moving the object. */
+  gizmoInteractive?: boolean;
+  /** Override color for the gizmo handles (used during configuration mode).
+      When omitted, handles use their default per-axis colors. */
+  gizmoColorOverride?: number;
+  /** Offset del gizmo respecto al objeto (solo el manipulador). En modo
+      configuración permite desplazar/rotar el gizmo sin tocar la figura. */
+  gizmoOffset?: ObjectTransform;
+  /** Notifica al padre del nuevo offset del gizmo (modo configuración). */
+  onGizmoOffsetChange?: (t: ObjectTransform) => void;
   /** Posición, rotación y escala actuales del objeto (las fija el manipulador) */
   objectTransform?: ObjectTransform;
   onObjectTransform?: (t: ObjectTransform) => void;
@@ -347,6 +368,8 @@ interface Viewer3DProps {
     transformTracks?: TransformTrack[];
     /** Pistas de parámetros de plugin del editor de movimiento. */
     pluginTracks?: PluginParamTrack[];
+    /** Pistas de efectos visuales del editor de movimiento. */
+    effectTracks?: EffectTrack[];
     /** Malla base congelada por objectId para las pistas de plugin. */
     pluginBaseMeshes?: Record<string, unknown>;
     /** Reproducción o scrub del editor de movimiento: aplica override visual. */
@@ -459,6 +482,12 @@ function applyCamera(
     Math.abs(rotY) < 0.01 && Math.abs(rotX - Math.PI / 2) < 0.01;
   const isSideView =
     Math.abs(rotY - Math.PI / 2) < 0.01 && Math.abs(rotX) < 0.01;
+  const isSideLeftView =
+    Math.abs(rotY + Math.PI / 2) < 0.01 && Math.abs(rotX) < 0.01;
+  const isBackView =
+    Math.abs(Math.abs(rotY) - Math.PI) < 0.01 && Math.abs(rotX) < 0.01;
+  const isBottomView =
+    Math.abs(rotY) < 0.01 && Math.abs(rotX + Math.PI / 2) < 0.01;
 
   if (isFrontView) {
     camera.position.set(cam.offsetX, cam.offsetY, distance);
@@ -469,6 +498,15 @@ function applyCamera(
   } else if (isSideView) {
     camera.position.set(distance, cam.offsetY, cam.offsetX);
     controls.target.set(0, cam.offsetY, cam.offsetX);
+  } else if (isSideLeftView) {
+    camera.position.set(-distance, cam.offsetY, cam.offsetX);
+    controls.target.set(0, cam.offsetY, cam.offsetX);
+  } else if (isBackView) {
+    camera.position.set(cam.offsetX, cam.offsetY, -distance);
+    controls.target.set(cam.offsetX, cam.offsetY, 0);
+  } else if (isBottomView) {
+    camera.position.set(cam.offsetX, -distance, cam.offsetY);
+    controls.target.set(cam.offsetX, 0, cam.offsetY);
   } else {
     const x = distance * Math.cos(rotX) * Math.sin(rotY);
     const y = distance * Math.sin(rotX);
@@ -940,9 +978,11 @@ export function buildSnapshotObjectVisual(
 
 type GizmoAxis = 'x' | 'y' | 'z';
 
+export type GizmoMode = 'move' | 'rotate' | 'scale';
+
 type GizmoDrag = {
-  /** Qué transform arrastra: el del objeto o el de la pieza de textura */
-  target: 'object' | 'texture';
+  /** Qué transform arrastra: el del objeto, el de la textura o el offset del gizmo */
+  target: 'object' | 'texture' | 'gizmo';
   axis: GizmoAxis;
   mode: 'move' | 'scale' | 'uniform-scale' | 'planar-scale' | 'rotate';
   /** eje del objeto pasado a coordenadas de mundo (con su rotación) */
@@ -963,8 +1003,13 @@ type GizmoDrag = {
    * malla (las mismas con las que se calculan las UV), así que el rayo
    * del puntero se pasa a ese espacio con esta matriz antes de medir.
    */
-  rayToLocal?: THREE.Matrix4;
-};
+   rayToLocal?: THREE.Matrix4;
+   /** Para target 'gizmo': posición y rotación del objeto al empezar el
+       arrastre, para convertir el transform efectivo (mundo) de vuelta al
+       offset del gizmo. */
+   objectQuat?: THREE.Quaternion;
+   objectPos?: THREE.Vector3;
+ };
 
 /** Colores del manipulador por eje (rojo X, verde Y, azul Z) */
 const GIZMO_AXIS_COLORS: Record<GizmoAxis, number> = {
@@ -993,7 +1038,7 @@ function buildGizmoHandles(group: THREE.Group): THREE.Mesh[] {
     new THREE.BoxGeometry(0.18, 0.18, 0.18),
     new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false })
   );
-  center.userData = { axis: 'x' as GizmoAxis, mode: 'uniform-scale' };
+   center.userData = { axis: 'x' as GizmoAxis, mode: 'uniform-scale', originalColor: 0xffffff };
   center.renderOrder = 999;
   group.add(center);
   handles.push(center);
@@ -1003,7 +1048,7 @@ function buildGizmoHandles(group: THREE.Group): THREE.Mesh[] {
     new THREE.BoxGeometry(0.1, 0.1, 0.1),
     new THREE.MeshBasicMaterial({ color: 0x40e0ff, depthTest: false })
   );
-  flat.userData = { axis: 'y' as GizmoAxis, mode: 'planar-scale' };
+   flat.userData = { axis: 'y' as GizmoAxis, mode: 'planar-scale', originalColor: 0x40e0ff };
   flat.position.y = 0.28;
   flat.renderOrder = 999;
   group.add(flat);
@@ -1031,15 +1076,16 @@ function buildGizmoHandles(group: THREE.Group): THREE.Mesh[] {
     else if (axis === 'z') axisGroup.rotation.x = Math.PI / 2;
     group.add(axisGroup);
 
-    const handle = (
-      geo: THREE.BufferGeometry,
-      mat: THREE.Material,
-      mode: 'move' | 'scale' | 'rotate',
-      y: number
-    ) => {
-      const m = new THREE.Mesh(geo, mat);
-      m.userData = { axis, mode };
-      m.position.y = y;
+     const handle = (
+       geo: THREE.BufferGeometry,
+       mat: THREE.Material,
+       mode: 'move' | 'scale' | 'rotate',
+       y: number,
+       originalColor?: number
+     ) => {
+       const m = new THREE.Mesh(geo, mat);
+       m.userData = { axis, mode, originalColor };
+       m.position.y = y;
       m.renderOrder = 999; // por delante del objeto
       axisGroup.add(m);
       handles.push(m);
@@ -1067,22 +1113,24 @@ function buildGizmoHandles(group: THREE.Group): THREE.Mesh[] {
     };
 
     const axisMat = new THREE.MeshBasicMaterial({ color, depthTest: false });
+    const yellowMat = new THREE.MeshBasicMaterial({ color: 0xffd93d, depthTest: false });
     // Flecha (entera: palo + punta) = mover
-    handle(new THREE.CylinderGeometry(0.008, 0.008, 1.0, 12), axisMat, 'move', 0.5);
+    handle(new THREE.CylinderGeometry(0.008, 0.008, 1.0, 12), axisMat, 'move', 0.5, color);
     hitHandle(new THREE.CylinderGeometry(0.045, 0.045, 1.08, 12), 'move', 0.5);
-    handle(new THREE.ConeGeometry(0.035, 0.12, 16), axisMat, 'move', 1.08);
+    handle(new THREE.ConeGeometry(0.035, 0.12, 16), axisMat, 'move', 1.08, color);
     hitHandle(new THREE.ConeGeometry(0.09, 0.22, 16), 'move', 1.08);
     // Bolita del color del eje = mover
-    handle(new THREE.SphereGeometry(0.04, 16, 12), axisMat, 'move', 0.86);
+    handle(new THREE.SphereGeometry(0.04, 16, 12), axisMat, 'move', 0.86, color);
     hitHandle(new THREE.SphereGeometry(0.1, 16, 12), 'move', 0.86);
     // Bolita amarilla = estirar a lo largo del eje. Más cerca del centro
     // (0.55) que de los aros (que cruzan cada eje a 0.7): si coincidiera
     // ahí sería muy difícil cogerla con el ratón sin tocar el aro.
     handle(
       new THREE.SphereGeometry(0.038, 16, 12),
-      new THREE.MeshBasicMaterial({ color: 0xffd93d, depthTest: false }),
+      yellowMat,
       'scale',
-      0.55
+      0.55,
+      0xffd93d
     );
     hitHandle(new THREE.SphereGeometry(0.1, 16, 12), 'scale', 0.55);
     // Aro = rotar alrededor del eje
@@ -1095,7 +1143,7 @@ function buildGizmoHandles(group: THREE.Group): THREE.Mesh[] {
         opacity: 0.55,
       })
     );
-    ring.userData = { axis, mode: 'rotate' };
+    ring.userData = { axis, mode: 'rotate', originalColor: color };
     ring.rotation.x = Math.PI / 2; // normal del toro ⟂ al eje
     ring.renderOrder = 999;
     axisGroup.add(ring);
@@ -1256,7 +1304,7 @@ function buildTextureHelperVisual(
   const mat = new THREE.LineBasicMaterial({
     color: 0xffd93d,
     transparent: true,
-    opacity: 0.95,
+    opacity: 0.5,
     depthTest: false,
   });
   const pts: number[] = [];
@@ -1743,6 +1791,98 @@ function buildFaceGuideOverlay(mesh: Mesh): THREE.Points | null {
   return points;
 }
 
+/** Construye la escena aislada del gizmo de ejes (tres flechas X/Y/Z con
+ *  sus letras). Devuelve además el grupo que hay que reorientar y la
+ *  cámara ortográfica fija que lo mira desde +Z. */
+function buildAxisGizmo(): {
+  scene: THREE.Scene;
+  group: THREE.Group;
+  camera: THREE.OrthographicCamera;
+} {
+  const scene = new THREE.Scene();
+  const group = new THREE.Group();
+
+  const UP = new THREE.Vector3(0, 1, 0);
+  const SHAFT_LEN = 0.7;
+  const HEAD_LEN = 0.22;
+  const SHAFT_R = 0.028;
+  const HEAD_R = 0.085;
+
+  const axes: Array<{ dir: THREE.Vector3; color: number; label: string }> = [
+    { dir: new THREE.Vector3(1, 0, 0), color: 0xf05252, label: 'X' },
+    { dir: new THREE.Vector3(0, 1, 0), color: 0x3ddc84, label: 'Y' },
+    { dir: new THREE.Vector3(0, 0, 1), color: 0x4a9eff, label: 'Z' },
+  ];
+
+  for (const { dir, color, label } of axes) {
+    const material = new THREE.MeshBasicMaterial({
+      color,
+      toneMapped: false,
+    });
+
+    const shaft = new THREE.Mesh(
+      new THREE.CylinderGeometry(SHAFT_R, SHAFT_R, SHAFT_LEN, 16),
+      material
+    );
+    shaft.quaternion.setFromUnitVectors(UP, dir);
+    shaft.position.copy(dir).multiplyScalar(SHAFT_LEN / 2);
+    group.add(shaft);
+
+    const head = new THREE.Mesh(
+      new THREE.ConeGeometry(HEAD_R, HEAD_LEN, 20),
+      material
+    );
+    head.quaternion.setFromUnitVectors(UP, dir);
+    head.position.copy(dir).multiplyScalar(SHAFT_LEN + HEAD_LEN / 2);
+    group.add(head);
+
+    const sprite = buildAxisLabelSprite(label, color);
+    sprite.position
+      .copy(dir)
+      .multiplyScalar(SHAFT_LEN + HEAD_LEN + 0.18);
+    group.add(sprite);
+  }
+
+  scene.add(group);
+
+  const camera = new THREE.OrthographicCamera(-1.7, 1.7, 1.7, -1.7, 0.1, 100);
+  camera.position.set(0, 0, 5);
+  camera.lookAt(0, 0, 0);
+
+  return { scene, group, camera };
+}
+
+/** Etiqueta de letra de eje como sprite (siempre de cara a la cámara). */
+function buildAxisLabelSprite(text: string, color: number): THREE.Sprite {
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    ctx.clearRect(0, 0, size, size);
+    ctx.font = 'bold 46px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.9)';
+    ctx.shadowBlur = 6;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(text, size / 2, size / 2 + 2);
+  }
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const material = new THREE.SpriteMaterial({
+    map: texture,
+    color,
+    transparent: true,
+    depthTest: false,
+    toneMapped: false,
+  });
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set(0.42, 0.42, 0.42);
+  return sprite;
+}
+
 export default function Viewer3D({
    mesh,
    objects,
@@ -1783,9 +1923,15 @@ export default function Viewer3D({
   textureHelper = false,
   textureHelperTransform,
   onTextureHelperTransform,
-  gizmo = false,
-  objectTransform,
+   gizmo = false,
+   gizmoModes,
+   gizmoInteractive = true,
+   gizmoColorOverride,
+    gizmoOffset,
+    onGizmoOffsetChange,
+   objectTransform,
    camera3D,
+   frameToken,
     onCameraChange,
      onObjectTransform,
      onMultiObjectTransform,
@@ -1808,10 +1954,11 @@ export default function Viewer3D({
       animationTracks,
       animationTime = 0,
       onAnimationComplete,
-      transformTracks,
-      pluginTracks,
-      pluginBaseMeshes,
-      motionPlaying,
+       transformTracks,
+       pluginTracks,
+       effectTracks,
+       pluginBaseMeshes,
+       motionPlaying,
       showMotionPath,
       onMotionKeyframeMove,
       activeCamera,
@@ -1831,6 +1978,12 @@ export default function Viewer3D({
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  // Gizmo de ejes (esquina inferior izquierda): escena, grupo de flechas
+  // y cámara ortográfica propias, sincronizadas cada frame con la
+  // cámara principal.
+  const axisGizmoSceneRef = useRef<THREE.Scene | null>(null);
+  const axisGizmoGroupRef = useRef<THREE.Group | null>(null);
+  const axisGizmoCameraRef = useRef<THREE.OrthographicCamera | null>(null);
   const cubeCameraRef = useRef<THREE.CubeCamera | null>(null);
   const cubeRenderTargetRef = useRef<THREE.WebGLCubeRenderTarget | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
@@ -1851,15 +2004,16 @@ export default function Viewer3D({
    animationTracksRef.current = animationTracks;
     const animationTimeRef = useRef(animationTime);
     animationTimeRef.current = animationTime;
+    // Detect scrubbing: time changed even without playing (tracked in animate loop)
     // Editor de movimiento: espejos para el bucle animate.
     const transformTracksRef = useRef<TransformTrack[] | undefined>(transformTracks);
     transformTracksRef.current = transformTracks;
-    const pluginTracksRef = useRef<PluginParamTrack[] | undefined>(pluginTracks);
-    pluginTracksRef.current = pluginTracks;
+     const pluginTracksRef = useRef<PluginParamTrack[] | undefined>(pluginTracks);
+     pluginTracksRef.current = pluginTracks;
+     const effectTracksRef = useRef<EffectTrack[] | undefined>(effectTracks);
+     effectTracksRef.current = effectTracks;
     const pluginBaseMeshesRef = useRef<Record<string, unknown> | undefined>(pluginBaseMeshes);
     pluginBaseMeshesRef.current = pluginBaseMeshes;
-    const motionPlayingRef = useRef(motionPlaying);
-    motionPlayingRef.current = motionPlaying;
     // Recorrido editable del objeto seleccionado.
     const showMotionPathRef = useRef(showMotionPath);
     showMotionPathRef.current = showMotionPath;
@@ -2087,7 +2241,7 @@ export default function Viewer3D({
        else setFxConfigLocal((prev) => ({ ...DEFAULT_FX_CONFIG, ...prev, smoke: !(prev?.smoke ?? false) }));
      }, [fxConfig, onFxChange, fxConfigLocal]);
     const [fxStars, setFxStars] = useState(false);
-  const [starPlacement, setStarPlacement] = useState(false);
+  const [placeTarget, setPlaceTarget] = useState<'fire' | 'smoke' | 'sparks' | 'stars' | null>(null);
    const [starSize, setStarSize] = useState(1);
    const [showGridInternal, setShowGridInternal] = useState(true);
    const gridValue = showGridProp !== undefined ? showGridProp : showGridInternal;
@@ -2135,7 +2289,7 @@ export default function Viewer3D({
    *  efecto volvería a aplicar → bucle anidado infinito
    *  ("Maximum update depth exceeded"). */
   const ultimaCamEmitidaRef = useRef<string | null>(null);
-  const [lightPreset, setLightPreset] = useState(0);
+  const [lightPreset] = useState(0);
   const lightPresetRef = useRef(lightPreset);
   lightPresetRef.current = lightPreset;
   const [selectedVertex, setSelectedVertex] = useState<number | null>(null);
@@ -2241,13 +2395,24 @@ export default function Viewer3D({
   const rainRef = useRef<RainSystem | null>(null);
   const rainEnabledRef = useRef(false);
   const smokeRef = useRef<SmokeSystem | null>(null);
-  const smokeEnabledRef = useRef(false);
-   const fxFireRef = useRef(fireValue);
-   fxFireRef.current = fireValue;
-  const fxStarsRef = useRef(fxStars);
-  fxStarsRef.current = fxStars;
-  const starPlacementRef = useRef(starPlacement);
-  starPlacementRef.current = starPlacement;
+   const smokeEnabledRef = useRef(false);
+    const fxFireRef = useRef(fireValue);
+    fxFireRef.current = fireValue;
+   const fxStarsRef = useRef(fxStars);
+   fxStarsRef.current = fxStars;
+   const rainCountRef = useRef<number | null>(null);
+   const fireCountRef = useRef<number | null>(null);
+   const sparksCountRef = useRef<number | null>(null);
+  const placeTargetRef = useRef<'fire' | 'smoke' | 'sparks' | 'stars' | null>(placeTarget);
+  placeTargetRef.current = placeTarget;
+  // Focos de efecto (fuego/humo/chispas) colocados con el ratón. Viven en el
+  // espacio local del grupo de efectos, que sigue al objeto.
+  const fxAnchorsRef = useRef<{
+    fire: THREE.Vector3[];
+    smoke: THREE.Vector3[];
+    sparks: THREE.Vector3[];
+  }>({ fire: [], smoke: [], sparks: [] });
+  const fxAnchorGroupRef = useRef<THREE.Group | null>(null);
   const placedStarsRef = useRef<PlacedStarSystem | null>(null);
   const placeDownRef = useRef<{ x: number; y: number } | null>(null);
   const starSizeRef = useRef(starSize);
@@ -2276,8 +2441,13 @@ export default function Viewer3D({
   onTextureHelperTransformRef.current = onTextureHelperTransform;
   const [showGizmo, setShowGizmo] = useState(gizmo);
   useEffect(() => setShowGizmo(gizmo), [gizmo]);
-  const gizmoOnRef = useRef(showGizmo);
-  gizmoOnRef.current = showGizmo;
+   const gizmoOnRef = useRef(showGizmo);
+   gizmoOnRef.current = showGizmo;
+   const gizmoInteractiveRef = useRef(gizmoInteractive);
+   gizmoInteractiveRef.current = gizmoInteractive;
+    const gizmoOffsetRef = useRef<ObjectTransform>(gizmoOffset ?? IDENTITY_TRANSFORM);
+    const onGizmoOffsetChangeRef = useRef(onGizmoOffsetChange);
+   onGizmoOffsetChangeRef.current = onGizmoOffsetChange;
   // Posición/rotación/escala del objeto: el manipulador las fija
   // arrastrando y se aplican a la malla y a todo lo que la acompaña
   // (halo, partículas, estrellas, helpers de vértices).
@@ -2338,7 +2508,23 @@ export default function Viewer3D({
     full(vertexHelpersRef.current, true);
     full(placedStarsRef.current?.group ?? null, true);
     full(effectsGroupRef.current, false);
-    full(gizmoGroupRef.current, false);
+     full(gizmoGroupRef.current, false);
+     // Si hay un offset del gizmo, aplicarlo SOBRE la pose del objeto:
+     // el gizmo se desplaza/gira respecto al centro del objeto sin
+     // tocar la figura (modo configuración).
+     const giz = gizmoGroupRef.current;
+     if (giz) {
+       const off = gizmoOffsetRef.current;
+       const objQuat = new THREE.Quaternion().setFromEuler(
+         new THREE.Euler(t.rx, t.ry, t.rz)
+       );
+       const offPos = new THREE.Vector3(off.px, off.py, off.pz).applyQuaternion(objQuat);
+       giz.position.add(offPos);
+       const offQuat = new THREE.Quaternion().setFromEuler(
+         new THREE.Euler(off.rx, off.ry, off.rz)
+       );
+       giz.quaternion.multiply(offQuat);
+     }
     if (lightGizmoGroupRef.current) {
       lightGizmoGroupRef.current.visible = false;
     }
@@ -2349,9 +2535,24 @@ export default function Viewer3D({
       orientCameraBodyVisual(cuerpoCam, cameraEditorRef.current?.focus ?? null);
     }
   }, []);
-  // Espejo para el bucle animate (override del editor de movimiento).
-  const applyObjectTransformRef = useRef(applyObjectTransform);
-  applyObjectTransformRef.current = applyObjectTransform;
+   // Espejo para el bucle animate (override del editor de movimiento).
+   const applyObjectTransformRef = useRef(applyObjectTransform);
+   applyObjectTransformRef.current = applyObjectTransform;
+
+     // Sincronizar el ref del offset cuando cambia la prop: el offset viaja
+     // con el proyecto y debe sobrevivir a remounts de ventana. La sync
+     // durante el render evita desincronizaciones con el arrastre.
+     if (gizmoOffset !== undefined) {
+       gizmoOffsetRef.current = gizmoOffset;
+     }
+     // Re-aplicar el transform cuando el offset cambia desde fuera (undo,
+     // remount, carga de .zeus) — pero NO durante un arrastre activo, que
+     // ya actualiza el ref y el visual por sí mismo.
+     useEffect(() => {
+       if (gizmoOffset && !gizmoDragRef.current) {
+         applyObjectTransformRef.current(transformRef.current);
+       }
+     }, [gizmoOffset]);
 
   // Aplica el transform de la pieza de textura: al marco entero
   // (posición, rotación y escala — la escala ES el tamaño de la pieza) y
@@ -2486,6 +2687,17 @@ export default function Viewer3D({
       onCamChange(camState);
     };
     controls.addEventListener('change', handleControlsChange);
+
+    // --- Gizmo de ejes (esquina inferior izquierda) ---
+    // Escena aparte con tres flechas X/Y/Z y sus letras. Se dibuja encima
+    // del lienzo principal en un viewport reducido y se orienta cada frame
+    // con la cámara para indicar siempre hacia dónde apunta cada eje.
+    {
+      const axisGizmo = buildAxisGizmo();
+      axisGizmoSceneRef.current = axisGizmo.scene;
+      axisGizmoGroupRef.current = axisGizmo.group;
+      axisGizmoCameraRef.current = axisGizmo.camera;
+    }
 
     const initPreset = LIGHT_PRESETS[lightPresetRef.current] ?? LIGHT_PRESETS[0];
 
@@ -2934,6 +3146,12 @@ export default function Viewer3D({
     scene.add(placedGroup);
     placedStarsRef.current = { group: placedGroup, stars: [] };
 
+    // Marcadores de los focos de efecto colocados con el ratón. Cuelgan del
+    // grupo de efectos (que sigue al objeto) para viajar con él.
+    const fxAnchorGroup = new THREE.Group();
+    effectsGroup.add(fxAnchorGroup);
+    fxAnchorGroupRef.current = fxAnchorGroup;
+
     // Manipulador: flechas de ejes X/Y/Z (mover/estirar/rotar). Solo se
     // ve si el usuario lo activa con la casilla de la barra.
     const gizmoGroup = new THREE.Group();
@@ -2962,6 +3180,75 @@ export default function Viewer3D({
       }
       const v = m.vertices[(Math.random() * m.vertices.length) | 0];
       return new THREE.Vector3(v.x, v.y, v.z);
+    };
+
+    // Función de emisión por efecto: si el usuario ha colocado focos con el
+    // ratón, cada partícula nace en uno de ellos (elegido al azar -> varios
+    // clics dan varios focos); si no, se reparte por la superficie como antes.
+    const emitPointFor = (
+      kind: 'fire' | 'smoke' | 'sparks'
+    ): (() => THREE.Vector3 | null) => {
+      const list = fxAnchorsRef.current[kind];
+      if (list.length > 0) {
+        return () => list[(Math.random() * list.length) | 0];
+      }
+      return randomSurfacePoint;
+    };
+
+    // Primera intersección del rayo actual con la superficie del objeto
+    // (recorriendo el grupo entero, no sólo sus hijos directos).
+    const raycastObjectSurface = (): THREE.Intersection | null => {
+      const group = meshGroupRef.current;
+      if (!group) return null;
+      group.updateMatrixWorld(true);
+      const targets: THREE.Object3D[] = [];
+      group.traverse((o) => {
+        if ((o as THREE.Mesh).isMesh) targets.push(o);
+      });
+      if (targets.length === 0) return null;
+      const hits = raycasterRef.current.intersectObjects(targets, false);
+      return hits.length > 0 ? hits[0] : null;
+    };
+
+    // Añade un foco de efecto (fuego/humo/chispas) con su marcador visible.
+    const addFxAnchor = (
+      kind: 'fire' | 'smoke' | 'sparks',
+      local: THREE.Vector3
+    ) => {
+      const group = fxAnchorGroupRef.current;
+      if (!group) return;
+      const marker = makeAnchorMarker(kind);
+      marker.position.copy(local);
+      group.add(marker);
+      fxAnchorsRef.current[kind].push(local);
+    };
+
+    // Quita el foco del efecto dado más cercano al rayo (en espacio local).
+    const removeFxAnchorAt = (
+      kind: 'fire' | 'smoke' | 'sparks',
+      localRay: THREE.Ray
+    ): boolean => {
+      const group = fxAnchorGroupRef.current;
+      if (!group) return false;
+      const list = fxAnchorsRef.current[kind];
+      let best = -1;
+      let bestDist = 0.09;
+      for (let i = 0; i < list.length; i++) {
+        const d = localRay.distanceToPoint(list[i]);
+        if (d < bestDist) {
+          bestDist = d;
+          best = i;
+        }
+      }
+      if (best < 0) return false;
+      list.splice(best, 1);
+      const marker = group.children[best];
+      if (marker) {
+        group.remove(marker);
+        const sp = marker as THREE.Sprite;
+        sp.material?.dispose?.();
+      }
+      return true;
     };
 
     // Reconstruye el recorrido de la cámara-objeto: curva sobre las
@@ -3143,9 +3430,243 @@ export default function Viewer3D({
           for (const hijo of originales) dup.add(hijo);
         }
       }
-      motionOrigChildren.clear();
-      motionParamsCache.clear();
-      motionWarnedMissingBase.clear();
+       motionOrigChildren.clear();
+       motionParamsCache.clear();
+       motionWarnedMissingBase.clear();
+       // Restore effect systems to fx config state (in case effect tracks
+       // had activated effects independently of the fx config).
+       rainEnabledRef.current = !!rainValue;
+       smokeEnabledRef.current = !!smokeValue;
+       fxFireRef.current = !!fireValue;
+       fxStarsRef.current = fxStars;
+       if (!rainValue && rainRef.current) rainRef.current.points.visible = false;
+       if (!smokeValue && smokeRef.current) smokeRef.current.points.visible = false;
+       if (!sparksValue && sparksRef.current) sparksRef.current.points.visible = false;
+       if (!fireValue && fireRef.current) {
+         fireRef.current.points.visible = false;
+         fxFireRef.current = false;
+       }
+       if (!fxStars && starsRef.current) starsRef.current.group.visible = false;
+       if (!glowValue && glowMaterialCache) {
+         glowMaterialCache.uniforms.uIntensity.value = 0;
+       }
+       const glowGroupRestore = glowGroupRef.current;
+       if (glowGroupRestore) glowGroupRestore.visible = !!glowValue;
+     };
+
+    const applyEffectOverrides = (
+      effectType: EffectType,
+      values: Partial<Record<EffectProperty, number | string | boolean>>
+    ): void => {
+      if (values.enabled === false) {
+        switch (effectType) {
+          case 'rain':
+            if (rainRef.current) {
+              rainRef.current.points.visible = false;
+              rainEnabledRef.current = false;
+            }
+            break;
+          case 'smoke':
+            if (smokeRef.current) {
+              smokeRef.current.points.visible = false;
+              smokeEnabledRef.current = false;
+            }
+            break;
+          case 'stars':
+            if (starsRef.current) {
+              starsRef.current.group.visible = false;
+              fxStarsRef.current = false;
+            }
+            break;
+          case 'fire':
+            if (fireRef.current) fireRef.current.points.visible = false;
+            break;
+          case 'sparks':
+            if (sparksRef.current) sparksRef.current.points.visible = false;
+            break;
+          case 'glow':
+            if (glowMaterialCache) {
+              glowMaterialCache.uniforms.uIntensity.value = 0;
+            }
+            const glowGroupOff = glowGroupRef.current;
+            if (glowGroupOff) glowGroupOff.visible = false;
+            break;
+        }
+        return;
+      }
+
+      // Ensure the effect system exists when enabled is true or not specified.
+      // This allows effect tracks to activate effects independently of the fx config.
+      {
+        const group = effectsGroupRef.current;
+        if (group) {
+          switch (effectType) {
+            case 'rain':
+              if (!rainRef.current && meshRef.current?.vertices?.length > 0) {
+                const m = meshRef.current;
+                const box = new THREE.Box3();
+                for (const v of m.vertices) box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
+                const pad = box.getSize(new THREE.Vector3()).multiplyScalar(0.15);
+                box.min.sub(pad);
+                box.max.add(pad);
+                box.max.y += 0.3;
+                const sys = createRainSystem(box, fx.rainCount, fx.rainSpeed);
+                group.add(sys.points);
+                rainRef.current = sys;
+              }
+              break;
+            case 'smoke':
+              if (!smokeRef.current && meshRef.current?.vertices?.length > 0) {
+                const m = meshRef.current;
+                const box = new THREE.Box3();
+                for (const v of m.vertices) box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
+                const min = box.min.clone();
+                const center = new THREE.Vector3();
+                box.getCenter(center);
+                const origin = new THREE.Vector3(center.x, min.y, center.z);
+                const sys = createSmokeSystem(origin, fx.smokeCount, fx.smokeSize, fx.smokeColor, fx.smokeRiseSpeed, fx.fireIntensity);
+                group.add(sys.points);
+                smokeRef.current = sys;
+              }
+              break;
+            case 'fire':
+              if (!fireRef.current) {
+                const sys = createParticleSystem(fx.fireCount, fx.fireSize);
+                group.add(sys.points);
+                fireRef.current = sys;
+              }
+              break;
+            case 'sparks':
+              if (!sparksRef.current) {
+                const sys = createParticleSystem(fx.sparksCount, fx.sparksSize);
+                group.add(sys.points);
+                sparksRef.current = sys;
+              }
+              break;
+            case 'stars':
+              if (!starsRef.current) {
+                const sys = createStarSystem();
+                group.add(sys.group);
+                starsRef.current = sys;
+              }
+              break;
+            case 'glow':
+              if (!glowMaterialCache) getGlowMaterial();
+              const glowGroupCreate = glowGroupRef.current;
+              const mg = meshGroupRef.current;
+              if (glowGroupCreate && mg && glowMaterialCache) {
+                while (glowGroupCreate.children.length > 0) {
+                  const child = glowGroupCreate.children[glowGroupCreate.children.length - 1];
+                  if (child.userData?.isGlowShell) glowGroupCreate.remove(child);
+                  else break;
+                }
+                for (const child of mg.children) {
+                  if (!(child instanceof THREE.Mesh)) continue;
+                  const shell = new THREE.Mesh(child.geometry, glowMaterialCache);
+                  shell.scale.setScalar(1.1);
+                  if (child.userData.sceneObjectDuplicate && !fx.glowObjects) continue;
+                  (shell as any).userData = { isGlowShell: true };
+                  if (child.userData.sceneObjectDuplicate) {
+                    child.add(shell);
+                  } else {
+                    glowGroupCreate.add(shell);
+                  }
+                }
+                glowGroupCreate.visible = true;
+              }
+              break;
+          }
+        }
+      }
+
+      switch (effectType) {
+        case 'rain':
+          if (rainRef.current) {
+            rainRef.current.points.visible = true;
+            rainEnabledRef.current = true;
+            if (typeof values.speed === 'number') rainRef.current.speed = values.speed;
+            if (typeof values.count === 'number' && values.count !== rainCountRef.current) {
+              effectsGroupRef.current?.remove(rainRef.current.points);
+              rainRef.current.points.geometry.dispose();
+              (rainRef.current.points.material as THREE.Material)?.dispose();
+              rainCountRef.current = values.count;
+              const sys = createRainSystem(rainRef.current.box, values.count, rainRef.current.speed);
+              effectsGroupRef.current?.add(sys.points);
+              rainRef.current = sys;
+            }
+          }
+          break;
+        case 'smoke':
+          if (smokeRef.current) {
+            smokeRef.current.points.visible = true;
+            smokeEnabledRef.current = true;
+            if (typeof values.riseSpeed === 'number') smokeRef.current.riseSpeed = values.riseSpeed;
+            if (typeof values.size === 'number') {
+              (smokeRef.current.points.material as THREE.PointsMaterial).size = values.size;
+              (smokeRef.current.points.material as THREE.PointsMaterial).needsUpdate = true;
+            }
+            if (typeof values.color === 'string') {
+              smokeRef.current.color.set(values.color);
+            }
+          }
+          break;
+        case 'stars':
+          if (starsRef.current) {
+            starsRef.current.group.visible = true;
+            fxStarsRef.current = true;
+            if (typeof values.starSize === 'number') starSizeRef.current = values.starSize;
+          }
+          break;
+        case 'fire':
+          if (fireRef.current) {
+            fireRef.current.points.visible = true;
+            fxFireRef.current = true;
+            if (typeof values.intensity === 'number') fxFireRef.current = values.intensity > 0;
+            if (typeof values.size === 'number') {
+              (fireRef.current.points.material as THREE.PointsMaterial).size = values.size;
+              (fireRef.current.points.material as THREE.PointsMaterial).needsUpdate = true;
+            }
+            if (typeof values.count === 'number' && values.count !== fireCountRef.current) {
+              effectsGroupRef.current?.remove(fireRef.current.points);
+              fireRef.current.points.geometry.dispose();
+              (fireRef.current.points.material as THREE.Material)?.dispose();
+              fireCountRef.current = values.count;
+              const sys = createParticleSystem(values.count, fx.fireSize);
+              effectsGroupRef.current?.add(sys.points);
+              fireRef.current = sys;
+            }
+          }
+          break;
+        case 'sparks':
+          if (sparksRef.current) {
+            sparksRef.current.points.visible = true;
+            if (typeof values.size === 'number') {
+              (sparksRef.current.points.material as THREE.PointsMaterial).size = values.size;
+              (sparksRef.current.points.material as THREE.PointsMaterial).needsUpdate = true;
+            }
+            if (typeof values.count === 'number' && values.count !== sparksCountRef.current) {
+              effectsGroupRef.current?.remove(sparksRef.current.points);
+              sparksRef.current.points.geometry.dispose();
+              (sparksRef.current.points.material as THREE.Material)?.dispose();
+              sparksCountRef.current = values.count;
+              const sys = createParticleSystem(values.count, fx.sparksSize);
+              effectsGroupRef.current?.add(sys.points);
+              sparksRef.current = sys;
+            }
+          }
+          break;
+        case 'glow':
+          if (glowMaterialCache) {
+            if (typeof values.glowColor === 'string') {
+              glowMaterialCache.uniforms.uColor.value = new THREE.Color(values.glowColor);
+            }
+            if (typeof values.glowIntensity === 'number') {
+              glowMaterialCache.uniforms.uIntensity.value = values.glowIntensity;
+            }
+            glowMaterialCache.uniformsNeedUpdate = true;
+          }
+          break;
+      }
     };
 
     const applyMotionOverride = (time: number) => {
@@ -3340,6 +3861,16 @@ export default function Viewer3D({
           }
         }
       }
+
+      // 4) Efectos visuales: aplicar overrides de efectos (lluvia, humo, estrellas)
+      const efTracks = effectTracksRef.current;
+      if (efTracks && efTracks.length > 0) {
+        for (const tr of efTracks) {
+          const evaluated = evaluateEffectTrack(tr, time);
+          if (!evaluated) continue;
+          applyEffectOverrides(tr.effectType, evaluated);
+        }
+      }
     };
 
     const clock = new THREE.Clock();
@@ -3409,12 +3940,14 @@ export default function Viewer3D({
         ? Math.min((performance.now() - exportState.startTime) / 1000, exportState.duration)
         : animationTimeRef.current;
       // Editor de movimiento: aplicar el override visual (transformadas y
-      // parámetros de plugin) y detectar la transición a reposo para
-      // restaurar los visuales estáticos.
-      const motionActivo =
-        !!motionPlayingRef.current &&
-        ((transformTracksRef.current?.length ?? 0) +
-          (pluginTracksRef.current?.length ?? 0)) > 0;
+      // parámetros de plugin) cada frame cuando hay pistas de movimiento.
+      // Esto incluye reproducción, scrubbing y pausa en cualquier momento:
+      // el visor muestra el estado a currentTime en todo momento.
+      const hasMotionTracks =
+        (transformTracksRef.current?.length ?? 0) +
+        (pluginTracksRef.current?.length ?? 0) +
+        (effectTracksRef.current?.length ?? 0) > 0;
+      const motionActivo = hasMotionTracks;
       if (motionActivo !== motionPrev) {
         motionPrev = motionActivo;
         if (!motionActivo) restoreMotionVisuals();
@@ -3560,10 +4093,10 @@ export default function Viewer3D({
         }
       }
       if (sparksRef.current?.points.visible) {
-        updateSparks(sparksRef.current, dt, randomSurfacePoint);
+        updateSparks(sparksRef.current, dt, emitPointFor('sparks'));
       }
       if (fireRef.current?.points.visible) {
-        updateFire(fireRef.current, dt, randomSurfacePoint);
+        updateFire(fireRef.current, dt, emitPointFor('fire'));
       }
       if (starsRef.current?.group.visible) {
         updateStars(starsRef.current, dt, randomSurfacePoint, starSizeRef.current);
@@ -3574,7 +4107,7 @@ export default function Viewer3D({
       }
       if (smokeRef.current) {
         smokeRef.current.points.visible = smokeEnabledRef.current;
-        if (smokeEnabledRef.current) updateSmoke(smokeRef.current, dt);
+        if (smokeEnabledRef.current) updateSmoke(smokeRef.current, dt, emitPointFor('smoke'));
       }
       // Humo intensifica la luz cálida del fuego cuando ambos activos
       // Estrellas colocadas: latido suave + giro lento. Las aleatorias
@@ -3592,7 +4125,29 @@ export default function Viewer3D({
       }
       if (starsRef.current) {
         starsRef.current.group.visible =
-          fxStarsRef.current && !starPlacementRef.current;
+          fxStarsRef.current && !placeTargetRef.current;
+      }
+      if (fxAnchorGroupRef.current) {
+        const anchorGroup = fxAnchorGroupRef.current;
+        // Los marcadores de foco (guías) no deben salir en el vídeo exportado.
+        anchorGroup.visible = !exportActivo;
+        // Cada guía se oculta cuando su efecto ya está emitiendo (así los
+        // círculos desaparecen al activar Llamas/Humo/Chispas), salvo que se
+        // esté colocando justo ese efecto, para poder seguir editándolo.
+        const emitiendo: Record<string, boolean> = {
+          fire: !!(fireRef.current && fireRef.current.points.visible),
+          smoke: !!(smokeRef.current && smokeRef.current.points.visible),
+          sparks: !!(sparksRef.current && sparksRef.current.points.visible),
+        };
+        const colocandoAhora = placeTargetRef.current;
+        for (const child of anchorGroup.children) {
+          const kind = child.userData.kind as
+            | 'fire'
+            | 'smoke'
+            | 'sparks'
+            | undefined;
+          child.visible = !kind || !emitiendo[kind] || colocandoAhora === kind;
+        }
       }
       if (fireLightRef.current) {
         // Fuego: luz cálida que parpadea; si hay humo, la luz se atenúa
@@ -3787,6 +4342,37 @@ export default function Viewer3D({
           if (faceSelectionCircleDivRef.current) faceSelectionCircleDivRef.current.style.display = 'none';
         }
        renderer.render(scene, camera);
+
+       // Gizmo de ejes: se pinta en un viewport pequeño de la esquina
+       // inferior izquierda, reorientado con la cámara principal. Se omite
+       // durante la exportación para que no salga en el vídeo.
+       if (!exportActivo) {
+         const axisScene = axisGizmoSceneRef.current;
+         const axisGroup = axisGizmoGroupRef.current;
+         const axisCam = axisGizmoCameraRef.current;
+         if (axisScene && axisGroup && axisCam) {
+           // La inversa de la cámara hace que las flechas apunten al eje
+           // del mundo tal y como se ve en pantalla.
+           axisGroup.quaternion.copy(camera.quaternion).invert();
+           axisGroup.updateMatrixWorld(true);
+
+           const full = renderer.getSize(new THREE.Vector2());
+           const gizmoSize = Math.round(
+             Math.max(72, Math.min(120, Math.min(full.x, full.y) * 0.18))
+           );
+           const margin = Math.round(gizmoSize * 0.12);
+
+           renderer.autoClear = false;
+           renderer.setScissorTest(true);
+           renderer.setViewport(margin, margin, gizmoSize, gizmoSize);
+           renderer.setScissor(margin, margin, gizmoSize, gizmoSize);
+           renderer.clearDepth();
+           renderer.render(axisScene, axisCam);
+           renderer.setScissorTest(false);
+           renderer.setViewport(0, 0, full.x, full.y);
+           renderer.autoClear = true;
+         }
+       }
 
        if (exportState) {
          const elapsed = (performance.now() - exportState.startTime) / 1000;
@@ -3988,9 +4574,47 @@ export default function Viewer3D({
       if (!drag) return;
       raycasterRef.current.setFromCamera(pointerRef.current, camera);
       const isHelper = drag.target === 'texture';
+      const isGizmo = drag.target === 'gizmo';
+      // Para el arrastre del offset del gizmo, `t` debe ser el transform
+      // MUNDIAL del gizmo (posición + rotación del objeto combinados con
+      // el offset), no el offset puro. Si se usara el offset, los
+      // valores de rotación/posición heredados por `{...t}` serían
+      // incorrectos (espacio de offset en vez de espacio mundial), lo
+      // que haría girar o saltar el gizmo.
       const t = isHelper
         ? textureHelperTransformRef.current
-        : transformRef.current;
+        : isGizmo
+          ? (() => {
+              const objT = transformRef.current;
+              const objQuat = new THREE.Quaternion().setFromEuler(
+                new THREE.Euler(objT.rx, objT.ry, objT.rz)
+              );
+              const off = gizmoOffsetRef.current;
+              const gizmoWorldPos = new THREE.Vector3(
+                off.px, off.py, off.pz
+              ).applyQuaternion(objQuat).add(
+                new THREE.Vector3(objT.px, objT.py, objT.pz)
+              );
+              const offQuat = new THREE.Quaternion().setFromEuler(
+                new THREE.Euler(off.rx, off.ry, off.rz)
+              );
+              const gizmoWorldE = new THREE.Euler().setFromQuaternion(
+                objQuat.clone().multiply(offQuat)
+              );
+              return {
+                px: gizmoWorldPos.x,
+                py: gizmoWorldPos.y,
+                pz: gizmoWorldPos.z,
+                rx: gizmoWorldE.x,
+                ry: gizmoWorldE.y,
+                rz: gizmoWorldE.z,
+                sx: off.sx,
+                sy: off.sy,
+                sz: off.sz,
+                o: off.o,
+              };
+            })()
+          : transformRef.current;
       // La pieza de textura vive en las coordenadas locales de la malla:
       // el rayo se pasa a ese espacio antes de medir el arrastre
       const ray =
@@ -4082,11 +4706,11 @@ export default function Viewer3D({
         } else {
           // Estirado: la distancia arrastrada se
           // suma al factor de escala de ese eje
-          const s = Math.max(0.05, drag.startScale[drag.axis] + delta);
+          const scaled = Math.max(0.05, drag.startScale[drag.axis] + delta);
           next = { ...t };
-          if (drag.axis === 'x') next.sx = s;
-          else if (drag.axis === 'y') next.sy = s;
-          else next.sz = s;
+          if (drag.axis === 'x') next.sx = scaled;
+          else if (drag.axis === 'y') next.sy = scaled;
+          else next.sz = scaled;
         }
       }
       if (isHelper) {
@@ -4095,6 +4719,33 @@ export default function Viewer3D({
         textureHelperTransformRef.current = next;
         applyTextureHelperTransform(next);
         onTextureHelperTransformRef.current?.(next);
+       } else if (isGizmo) {
+          if (drag.objectQuat && drag.objectPos) {
+            const invObjQuat = drag.objectQuat.clone().invert();
+            const offsetPos = new THREE.Vector3(next.px, next.py, next.pz)
+              .sub(drag.objectPos)
+              .applyQuaternion(invObjQuat);
+            const effQuat = new THREE.Quaternion().setFromEuler(
+             new THREE.Euler(next.rx, next.ry, next.rz)
+           );
+           const offsetQuat = invObjQuat.multiply(effQuat);
+           const offsetE = new THREE.Euler().setFromQuaternion(offsetQuat);
+           const offsetNext: ObjectTransform = {
+             ...next,
+             px: offsetPos.x,
+             py: offsetPos.y,
+             pz: offsetPos.z,
+             rx: offsetE.x,
+             ry: offsetE.y,
+             rz: offsetE.z,
+           };
+          gizmoOffsetRef.current = offsetNext;
+          onGizmoOffsetChangeRef.current?.(offsetNext);
+        } else {
+          gizmoOffsetRef.current = next;
+          onGizmoOffsetChangeRef.current?.(next);
+        }
+        applyObjectTransform(transformRef.current);
       } else {
         transformRef.current = next;
         applyObjectTransform(next);
@@ -4434,19 +5085,19 @@ export default function Viewer3D({
                   : sp
               ),
             };
-              onLightConfigChangeRef.current?.(updated);
+            onLightConfigChangeRef.current?.(updated);
 
-             lightGizmoGroupRef.current?.position.add(
-               new THREE.Vector3(
-                 t.axisWorld.x * delta,
-                 t.axisWorld.y * delta,
-                 t.axisWorld.z * delta
-               )
-             );
+            lightGizmoGroupRef.current?.position.add(
+              new THREE.Vector3(
+                t.axisWorld.x * delta,
+                t.axisWorld.y * delta,
+                t.axisWorld.z * delta
+              )
+            );
 
-             // Rebuild cone + handles with updated position so forward circle
-             // and cone follow immediately as a rigid body.
-             buildLightHelpersRef.current?.(updated);
+            // Rebuild cone + handles with updated position so forward circle
+            // and cone follow immediately as a rigid body.
+            buildLightHelpersRef.current?.(updated);
           }
         } else if (t.mode === 'rotate') {
            // Rotate: compute angle on the plane perpendicular to the axis.
@@ -4535,10 +5186,10 @@ export default function Viewer3D({
 
         // Cursor de mano al pasar por encima de un asa del manipulador o de
       // la pieza de textura
-      const hoverHandles =
-        gizmoOnRef.current && gizmoGroupRef.current?.visible
-          ? gizmoHandlesRef.current
-          : [];
+       const hoverHandles =
+         gizmoOnRef.current && gizmoGroupRef.current?.visible
+           ? gizmoHandlesRef.current.filter((h) => h.visible)
+           : [];
       const helperHandles =
         textureHelperOnRef.current && textureHelperGizmoGroupRef.current?.visible
           ? textureHelperHandlesRef.current
@@ -4615,37 +5266,50 @@ export default function Viewer3D({
 
     // Colocación de estrellas: clic (sin arrastre) sobre el texto añade
     // una estrella; clic cerca de una colocada la quita.
-    const handleStarPlacementClick = (clientX: number, clientY: number) => {
-      console.log('[STAR] click', clientX, clientY);
+    const handleFxPlacementClick = (clientX: number, clientY: number) => {
+      const target = placeTargetRef.current;
+      if (!target) return;
       const rect = renderer.domElement.getBoundingClientRect();
       pointerRef.current.x = ((clientX - rect.left) / rect.width) * 2 - 1;
       pointerRef.current.y = -((clientY - rect.top) / rect.height) * 2 + 1;
       raycasterRef.current.setFromCamera(pointerRef.current, camera);
-      const placed = placedStarsRef.current;
-      // Las estrellas colocadas viven en el espacio LOCAL del grupo
-      // (que sigue la transform del objeto): el rayo se pasa a local
-      // para poder comparar contra sus posiciones.
-      if (placed) {
-        const inv = new THREE.Matrix4()
-          .copy(placed.group.matrixWorld)
-          .invert();
-        const localRay = raycasterRef.current.ray.clone().applyMatrix4(inv);
-        if (removePlacedStarAt(placed, localRay)) {
-          return;
+
+      // 1) Clic sobre un punto ya colocado del MISMO efecto -> lo quita.
+      if (target === 'stars') {
+        const placed = placedStarsRef.current;
+        if (placed) {
+          placed.group.updateMatrixWorld(true);
+          const inv = new THREE.Matrix4().copy(placed.group.matrixWorld).invert();
+          const localRay = raycasterRef.current.ray.clone().applyMatrix4(inv);
+          if (removePlacedStarAt(placed, localRay)) return;
+        }
+      } else {
+        const group = effectsGroupRef.current;
+        if (group && fxAnchorsRef.current[target].length > 0) {
+          group.updateMatrixWorld(true);
+          const inv = new THREE.Matrix4().copy(group.matrixWorld).invert();
+          const localRay = raycasterRef.current.ray.clone().applyMatrix4(inv);
+          if (removeFxAnchorAt(target, localRay)) return;
         }
       }
-      if (!placed || !meshGroupRef.current) return;
-      const meshes = meshGroupRef.current.children.filter(
-        (c): c is THREE.Mesh => c instanceof THREE.Mesh
-      );
-      const hits = raycasterRef.current.intersectObjects(meshes, false);
-      console.log('[STAR] hits', hits.length, 'meshes', meshes.length);
-      if (hits.length > 0 && placed) {
-        addPlacedStar(
-          placed,
-          placed.group.worldToLocal(hits[0].point.clone()),
-          starSizeRef.current
-        );
+
+      // 2) Si no se quitó nada, coloca un punto en la superficie del objeto.
+      const hit = raycastObjectSurface();
+      if (!hit) return;
+      if (target === 'stars') {
+        const placed = placedStarsRef.current;
+        if (placed) {
+          addPlacedStar(
+            placed,
+            placed.group.worldToLocal(hit.point.clone()),
+            starSizeRef.current
+          );
+        }
+      } else {
+        const group = effectsGroupRef.current;
+        if (group) {
+          addFxAnchor(target, group.worldToLocal(hit.point.clone()));
+        }
       }
     };
 
@@ -4663,17 +5327,28 @@ export default function Viewer3D({
       ray: THREE.Ray,
       camDir: THREE.Vector3,
       screenUp: THREE.Vector3,
-      target: 'object' | 'texture',
-      rayToLocal?: THREE.Matrix4
+      target: 'object' | 'texture' | 'gizmo',
+      rayToLocal?: THREE.Matrix4,
+      objectQuat?: THREE.Quaternion,
+      objectPos?: THREE.Vector3,
+      axisWorldOverride?: THREE.Vector3,
+      startPosOverride?: THREE.Vector3
     ): GizmoDrag | null => {
-      const pos = new THREE.Vector3(t.px, t.py, t.pz);
-      const quat = new THREE.Quaternion().setFromEuler(
-        new THREE.Euler(t.rx, t.ry, t.rz)
-      );
-      // El eje local, girado por la rotación actual
-      const axisWorld = GIZMO_AXIS_DIR[ud.axis]
-        .clone()
-        .applyQuaternion(quat);
+      const pos = startPosOverride
+        ? startPosOverride.clone()
+        : objectPos
+          ? new THREE.Vector3(t.px, t.py, t.pz).applyQuaternion(objectQuat!).add(objectPos)
+          : new THREE.Vector3(t.px, t.py, t.pz);
+
+      const effQuat = objectQuat
+        ? objectQuat.clone().multiply(
+            new THREE.Quaternion().setFromEuler(new THREE.Euler(t.rx, t.ry, t.rz))
+          )
+        : new THREE.Quaternion().setFromEuler(new THREE.Euler(t.rx, t.ry, t.rz));
+
+      const axisWorld = axisWorldOverride
+        ? axisWorldOverride.clone()
+        : GIZMO_AXIS_DIR[ud.axis].clone().applyQuaternion(effQuat);
       if (ud.mode === 'rotate') {
         const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
           axisWorld,
@@ -4699,13 +5374,15 @@ export default function Viewer3D({
           axisWorld,
           startPos: pos,
           startScale: new THREE.Vector3(t.sx, t.sy, t.sz),
-          startQuat: quat,
+          startQuat: effQuat,
           startT: 0,
           plane,
           basisU,
           basisV,
           startAngle: Math.atan2(d.dot(basisV), d.dot(basisU)),
           rayToLocal,
+          objectQuat,
+          objectPos,
         };
       }
       if (ud.mode === 'uniform-scale' || ud.mode === 'planar-scale') {
@@ -4722,13 +5399,15 @@ export default function Viewer3D({
           axisWorld: screenUp,
           startPos: hit,
           startScale: new THREE.Vector3(t.sx, t.sy, t.sz),
-          startQuat: quat,
+          startQuat: effQuat,
           startT: 0,
           plane,
           basisU: screenUp,
           basisV: new THREE.Vector3(),
           startAngle: 0,
           rayToLocal,
+          objectQuat,
+          objectPos,
         };
       }
       const t0 = closestPointOnAxis(ray, pos, axisWorld);
@@ -4740,21 +5419,22 @@ export default function Viewer3D({
         axisWorld,
         startPos: pos,
         startScale: new THREE.Vector3(t.sx, t.sy, t.sz),
-        startQuat: quat,
+        startQuat: effQuat,
         startT: t0,
         plane: new THREE.Plane(),
         basisU: new THREE.Vector3(),
         basisV: new THREE.Vector3(),
         startAngle: 0,
         rayToLocal,
+        objectQuat,
+        objectPos,
       };
     };
 
      const onPointerDown = (e: PointerEvent) => {
-       if (starPlacementRef.current) {
+       if (placeTargetRef.current) {
          // Registrar el punto inicial: solo coloca si NO hubo arrastre
          // (así girar la cámara con arrastre no coloca estrellas).
-         console.log('[STAR] pointerdown', e.clientX, e.clientY);
          placeDownRef.current = { x: e.clientX, y: e.clientY };
          return;
        }
@@ -5144,15 +5824,16 @@ export default function Viewer3D({
         }
       }
 
-      // Manipulador: si el clic cae sobre un asa, empieza su arrastre y
-      // no se toca nada más (ni vértices ni cámara)
+      // Manipulador: si el clic cae sobre un asa, empiece su arrastre (si es
+      // interactivo) o, si no lo es (modo configuración), consume el click
+      // para que no caiga en los controles de órbita y gire la escena.
       if (gizmoOnRef.current && gizmoGroupRef.current?.visible) {
         const rect = renderer.domElement.getBoundingClientRect();
         pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
         pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
         raycasterRef.current.setFromCamera(pointerRef.current, camera);
         const hits = raycasterRef.current.intersectObjects(
-          gizmoHandlesRef.current,
+          gizmoHandlesRef.current.filter((h) => h.visible),
           false
         );
         if (hits.length > 0) {
@@ -5160,19 +5841,100 @@ export default function Viewer3D({
             axis: GizmoAxis;
             mode: 'move' | 'scale' | 'uniform-scale' | 'planar-scale' | 'rotate';
           };
+          // En modo no interactivo (configuración): arrastrar el gizmo
+          // modifica SU offset, no el objeto. Se consume el click para
+          // bloquear los controles de órbita.
+          if (!gizmoInteractiveRef.current) {
+            const camDir = new THREE.Vector3();
+            camera.getWorldDirection(camDir);
+            const screenUp = camera.up
+              .clone()
+              .applyQuaternion(camera.quaternion)
+              .normalize();
+
+            // El eje REAL del gizmo, tal como está pintado: extraído de su
+            // matriz mundial. Así el arrastre siempre coincide con lo que se
+            // ve, sin recomponer rotaciones a mano.
+            const gizmoGroup = gizmoGroupRef.current;
+            const gizmoWorldQuat = new THREE.Quaternion();
+            const gizmoWorldPos = new THREE.Vector3();
+             if (gizmoGroup) {
+               gizmoGroup.updateWorldMatrix(true, true);
+               gizmoGroup.matrixWorld.decompose(gizmoWorldPos, gizmoWorldQuat, new THREE.Vector3());
+             }
+            const axisWorldOverride = GIZMO_AXIS_DIR[ud.axis]
+              .clone()
+              .applyQuaternion(gizmoWorldQuat);
+
+            const objT = transformRef.current;
+            const objectQuat = new THREE.Quaternion().setFromEuler(
+              new THREE.Euler(objT.rx, objT.ry, objT.rz)
+            );
+            const objectPos = new THREE.Vector3(objT.px, objT.py, objT.pz);
+
+            const hitHandle = hits[0].object;
+            const handleWorldPos = new THREE.Vector3();
+            hitHandle.getWorldPosition(handleWorldPos);
+            console.log('[GIZMO HIT]', {
+              axis: ud.axis, mode: ud.mode,
+              handleWorldDir: handleWorldPos.clone().sub(gizmoWorldPos).normalize().toArray(),
+              computedAxisWorld: axisWorldOverride.toArray(),
+            });
+
+            const drag = makeGizmoDrag(
+              ud,
+              gizmoOffsetRef.current,
+              raycasterRef.current.ray,
+              camDir,
+              screenUp,
+              'gizmo',
+              undefined,
+              objectQuat,
+              objectPos,
+              axisWorldOverride,
+              gizmoWorldPos
+            );
+            if (!drag) return;
+            gizmoDragRef.current = drag;
+            controls.enabled = false;
+            renderer.domElement.style.cursor = 'grabbing';
+            return;
+          }
           const camDir = new THREE.Vector3();
           camera.getWorldDirection(camDir);
           const screenUp = camera.up
             .clone()
             .applyQuaternion(camera.quaternion)
             .normalize();
+          // El eje REAL del gizmo, tal como se dibuja: si el offset del
+          // gizmo lleva rotación (modo configuración), las flechas
+          // salen giradas y el arrastre del objeto debe seguir ESA
+          // dirección, no la del objeto, para que la figura vaya adonde
+          // apunta la flecha.
+          const gizmoGroupForDrag = gizmoGroupRef.current;
+          const gizmoWorldQuatForDrag = new THREE.Quaternion();
+          if (gizmoGroupForDrag) {
+            gizmoGroupForDrag.updateWorldMatrix(true, true);
+            gizmoGroupForDrag.matrixWorld.decompose(
+              new THREE.Vector3(),
+              gizmoWorldQuatForDrag,
+              new THREE.Vector3()
+            );
+          }
+          const objectAxisOverride = GIZMO_AXIS_DIR[ud.axis]
+            .clone()
+            .applyQuaternion(gizmoWorldQuatForDrag);
           const drag = makeGizmoDrag(
             ud,
             transformRef.current,
             raycasterRef.current.ray,
             camDir,
             screenUp,
-            'object'
+            'object',
+            undefined,
+            undefined,
+            undefined,
+            objectAxisOverride
           );
           if (!drag) return;
           // Store initial transforms of all selected objects for multi-transform
@@ -5864,13 +6626,12 @@ export default function Viewer3D({
           return;
         }
 
-        if (starPlacementRef.current && placeDownRef.current) {
+        if (placeTargetRef.current && placeDownRef.current) {
         const dx = e.clientX - placeDownRef.current.x;
         const dy = e.clientY - placeDownRef.current.y;
         placeDownRef.current = null;
-        console.log('[STAR] pointerup', dx, dy, 'up?', starPlacementRef.current);
         if (dx * dx + dy * dy < 36) {
-          handleStarPlacementClick(e.clientX, e.clientY);
+          handleFxPlacementClick(e.clientX, e.clientY);
         }
         return;
       }
@@ -5909,13 +6670,15 @@ export default function Viewer3D({
 
       if (gizmoDragRef.current) {
         const wasHelper = gizmoDragRef.current.target === 'texture';
+        const wasGizmo = gizmoDragRef.current.target === 'gizmo';
         gizmoDragRef.current = null;
         controls.enabled = true;
         renderer.domElement.style.cursor = '';
         // Confirma el transform arrastrado (estado + aviso al editor).
         // La pieza de textura ya avisó en cada movimiento (la textura va
         // en vivo), así que aquí solo queda confirmar el del objeto.
-        if (!wasHelper) {
+        // El arrastre del gizmo-offset también avisó en cada movimiento.
+        if (!wasHelper && !wasGizmo) {
           const t = transformRef.current;
           setTransform(t);
           onObjectTransformRef.current?.(t);
@@ -6067,6 +6830,26 @@ export default function Viewer3D({
       }
       textureHelperHandlesRef.current = [];
       gizmoDragRef.current = null;
+      if (axisGizmoSceneRef.current) {
+        axisGizmoSceneRef.current.traverse((o) => {
+          const mesh = o as THREE.Mesh;
+          mesh.geometry?.dispose?.();
+          const mat = mesh.material as
+            | THREE.Material
+            | THREE.Material[]
+            | undefined;
+          if (Array.isArray(mat)) {
+            mat.forEach((m) => m.dispose());
+          } else if (mat) {
+            const spriteMat = mat as THREE.SpriteMaterial;
+            spriteMat.map?.dispose?.();
+            mat.dispose();
+          }
+        });
+        axisGizmoSceneRef.current = null;
+      }
+      axisGizmoGroupRef.current = null;
+      axisGizmoCameraRef.current = null;
       renderer.dispose();
       for (const sys of [sparksRef.current, fireRef.current]) {
          if (sys) {
@@ -6098,6 +6881,10 @@ export default function Viewer3D({
         }
         placedStarsRef.current.stars = [];
         placedStarsRef.current = null;
+      }
+      if (fxAnchorGroupRef.current) {
+        clearFxAnchors(fxAnchorGroupRef.current, fxAnchorsRef.current);
+        fxAnchorGroupRef.current = null;
       }
        if (mount.contains(renderer.domElement)) {
          mount.removeChild(renderer.domElement);
@@ -6643,6 +7430,21 @@ export default function Viewer3D({
               // (las caras del costado con opacidad parcial lo necesitan).
               currentMaterial.needsUpdate = true;
             }
+          },
+          undefined,
+          () => {
+            // La textura no pudo cargarse (p. ej. una ruta media:// de un
+            // archivo antiguo cuyo archivo de imagen ya no existe). Evitar
+            // que el objeto quede BLANCO PURO por el color base 0xffffff:
+            // teñirlo con un gris neutro para que siga viéndose.
+            if (cancelled) return;
+            const fallbackMaterials = Array.isArray(meshMaterials)
+              ? meshMaterials
+              : [meshMaterials];
+            for (const currentMaterial of fallbackMaterials) {
+              currentMaterial.color.set(0xdedede);
+              currentMaterial.needsUpdate = true;
+            }
           });
         }
       }
@@ -6802,6 +7604,35 @@ export default function Viewer3D({
     }
     applyTextureHelperTransform(textureHelperTransformRef.current);
   }, [textureHelper, textureProjection, mesh, applyTextureHelperTransform]);
+
+  // Escala las asas del gizmo de ayuda de textura al tamaño de la malla,
+  // igual que el gizmo principal.
+  useEffect(() => {
+    const giz = textureHelperGizmoGroupRef.current;
+    if (!giz) return;
+    const on = !!textureHelper && mesh.vertices.length > 0;
+    if (!on) return;
+    const box = new THREE.Box3();
+    for (const v of mesh.vertices) {
+      box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
+    }
+    const r = box.getSize(new THREE.Vector3()).length() / 2 || 1;
+    const objectScale =
+      Math.max(
+        Math.abs(transform.sx),
+        Math.abs(transform.sy),
+        Math.abs(transform.sz)
+      ) || 1;
+    // El manipulador cuelga del grupo de la malla, que YA lleva aplicada
+    // la escala del objeto. Como aquí ya multiplicábamos por objectScale,
+    // la escala se aplicaba dos veces (escala²): con objetos grandes el
+    // gizmo explotaba — el cubo blanco central llenaba la vista y los aros
+    // y flechas se veían como líneas enormes. Descontamos la escala del
+    // padre para que su tamaño en pantalla coincida con el del gizmo
+    // principal (que cuelga de la escena, sin escala heredada).
+    const worldScale = Math.min(Math.max(r * 0.9 * objectScale, 0.35), 8);
+    giz.scale.setScalar(worldScale / objectScale);
+  }, [textureHelper, mesh.vertices, transform]);
 
   // Clona el material del cortador para el preview boolean (no mutar el original)
   const cloneAndStyleToolMaterial = (original: THREE.Material): THREE.Material => {
@@ -7299,13 +8130,31 @@ export default function Viewer3D({
   // --- Modo colocación de estrellas: cursor de mira ---
   useEffect(() => {
     const dom = rendererRef.current?.domElement;
-    if (dom) dom.style.cursor = starPlacement ? 'crosshair' : '';
-  }, [starPlacement]);
+    if (dom) dom.style.cursor = placeTarget ? 'crosshair' : '';
+  }, [placeTarget]);
+
+  // Al activar un efecto, salir del modo colocación de ese efecto: los
+  // círculos-guía desaparecen en cuanto el efecto empieza a emitir.
+  useEffect(() => {
+    setPlaceTarget((prev) => {
+      if (
+        (prev === 'fire' && fireValue) ||
+        (prev === 'smoke' && smokeValue) ||
+        (prev === 'sparks' && sparksValue)
+      ) {
+        return null;
+      }
+      return prev;
+    });
+  }, [fireValue, smokeValue, sparksValue]);
 
   // Al cambiar el texto, las estrellas colocadas pierden su sitio:
   // se quitan para no quedar flotando fuera de la figura.
   useEffect(() => {
     clearPlacedStars(placedStarsRef.current);
+    if (fxAnchorGroupRef.current) {
+      clearFxAnchors(fxAnchorGroupRef.current, fxAnchorsRef.current);
+    }
   }, [mesh]);
 
   useEffect(() => {
@@ -7583,15 +8432,36 @@ export default function Viewer3D({
   // se ajusta al del objeto (esferas de radio de la malla). Con una
   // cámara-objeto activa no hay malla (su cuerpo es un grupo): se ve
   // igual, con un tamaño fijo razonable.
-  useEffect(() => {
-    const g = gizmoGroupRef.current;
-    if (!g) return;
-    const esCamara =
-      (objectsRef.current ?? []).find(
-        (o) => o.id === selectedObjectIdRef.current
-      )?.kind === 'camera';
-    g.visible = showGizmo && (mesh.vertices.length > 0 || esCamara);
-    if (mesh.vertices.length === 0) {
+   useEffect(() => {
+     const g = gizmoGroupRef.current;
+     if (!g) return;
+     const esCamara =
+       (objectsRef.current ?? []).find(
+         (o) => o.id === selectedObjectIdRef.current
+       )?.kind === 'camera';
+     g.visible = showGizmo && (mesh.vertices.length > 0 || esCamara);
+     // Filtra las asas del manipulador según los modos activos: si el
+     // usuario desactivó 'move', 'rotate' o 'scale', esas asas desaparecen.
+      const activeModes = gizmoModes ?? ['move', 'rotate', 'scale'];
+      for (const h of gizmoHandlesRef.current) {
+        const ud = h.userData as { mode: string; originalColor?: number };
+        const m = ud.mode as GizmoMode;
+        const enabled =
+          m === 'move'
+            ? activeModes.includes('move')
+            : m === 'rotate'
+              ? activeModes.includes('rotate')
+              : activeModes.includes('scale');
+        h.visible = enabled;
+        const mat = h.material as THREE.MeshBasicMaterial;
+        if (!mat.color) continue;
+        if (gizmoColorOverride !== undefined) {
+          mat.color.setHex(gizmoColorOverride);
+        } else if (ud.originalColor !== undefined) {
+          mat.color.setHex(ud.originalColor);
+        }
+      }
+     if (mesh.vertices.length === 0) {
       if (esCamara) g.scale.setScalar(1);
       return;
     }
@@ -7606,7 +8476,7 @@ export default function Viewer3D({
       Math.abs(transform.sz)
     );
     g.scale.setScalar(Math.min(Math.max(r * 0.9 * objectScale, 0.35), 8));
-  }, [showGizmo, mesh.vertices, transform]);
+   }, [showGizmo, mesh.vertices, transform, gizmoModes, gizmoColorOverride]);
 
   // Captura el texto 3D como PNG con fondo transparente (solo la malla).
   // Si el suavizado está activo, la captura usa una COPIA suavizada de la
@@ -7718,6 +8588,15 @@ export default function Viewer3D({
       const isSideView =
         Math.abs(camConfig.rotationY - Math.PI / 2) < 0.01 &&
         Math.abs(camConfig.rotationX) < 0.01;
+      const isSideLeftView =
+        Math.abs(camConfig.rotationY + Math.PI / 2) < 0.01 &&
+        Math.abs(camConfig.rotationX) < 0.01;
+      const isBackView =
+        Math.abs(Math.abs(camConfig.rotationY) - Math.PI) < 0.01 &&
+        Math.abs(camConfig.rotationX) < 0.01;
+      const isBottomView =
+        Math.abs(camConfig.rotationY) < 0.01 &&
+        Math.abs(camConfig.rotationX + Math.PI / 2) < 0.01;
 
       if (isFrontView) {
         cam.position.set(camConfig.offsetX, camConfig.offsetY, baseDistance);
@@ -7728,6 +8607,15 @@ export default function Viewer3D({
       } else if (isSideView) {
         cam.position.set(baseDistance, camConfig.offsetY, camConfig.offsetX);
         ctrl.target.set(0, camConfig.offsetY, camConfig.offsetX);
+      } else if (isSideLeftView) {
+        cam.position.set(-baseDistance, camConfig.offsetY, camConfig.offsetX);
+        ctrl.target.set(0, camConfig.offsetY, camConfig.offsetX);
+      } else if (isBackView) {
+        cam.position.set(camConfig.offsetX, camConfig.offsetY, -baseDistance);
+        ctrl.target.set(camConfig.offsetX, camConfig.offsetY, 0);
+      } else if (isBottomView) {
+        cam.position.set(camConfig.offsetX, -baseDistance, camConfig.offsetY);
+        ctrl.target.set(camConfig.offsetX, 0, camConfig.offsetY);
       } else {
         cam.position.set(3, 2.5, 4);
         ctrl.target.set(0, 0, 0);
@@ -7757,6 +8645,71 @@ export default function Viewer3D({
       });
     }
   }, [camera3D]);
+
+  // ── Encuadrar (Frente/Superior/Costado/3D) ───────────────────────────────
+  // El padre incrementa `frameToken` con el botón del menú de la ventana.
+  // Calcula la caja envolvente de lo que se ve (la figura y los objetos de la
+  // escena) y recoloca la cámara de esta ventana para que todo entre completo,
+  // conservando su orientación actual.
+  const frameTokenRef = useRef<number>(frameToken ?? 0);
+  useEffect(() => {
+    const token = frameToken ?? 0;
+    if (token === 0 || token === frameTokenRef.current) return;
+    frameTokenRef.current = token;
+
+    const cam = cameraRef.current;
+    const ctrl = controlsRef.current;
+    if (!cam || !ctrl) return;
+
+    const mg = meshGroupRef.current;
+    const box = new THREE.Box3();
+    if (mg) {
+      mg.updateWorldMatrix(true, true);
+      const main = findMainMesh(mg);
+      if (main) box.expandByObject(main);
+      for (const child of mg.children) {
+        if (child.userData && child.userData.sceneObjectDuplicate) {
+          box.expandByObject(child);
+        }
+      }
+    }
+    if (box.isEmpty()) {
+      box.setFromCenterAndSize(new THREE.Vector3(0, 0, 0), new THREE.Vector3(2, 2, 2));
+    }
+
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const radius = Math.max(size.x, size.y, size.z, 0.001) * 0.5;
+    const fov = (cam.fov * Math.PI) / 180;
+    const fitDist = (radius / Math.max(Math.sin(fov / 2), 0.05)) * 1.2;
+    const baseDistance = 5.5;
+    const zoom = Math.max(0.1, Math.min(5, baseDistance / Math.max(fitDist, 0.0001)));
+
+    const rotX = camera3D?.rotationX ?? 0;
+    const rotY = camera3D?.rotationY ?? 0;
+    const isTop = Math.abs(rotY) < 0.01 && Math.abs(rotX - Math.PI / 2) < 0.01;
+    const isBottom =
+      Math.abs(rotY) < 0.01 && Math.abs(rotX + Math.PI / 2) < 0.01;
+    const isSide =
+      (Math.abs(rotY - Math.PI / 2) < 0.01 ||
+        Math.abs(rotY + Math.PI / 2) < 0.01) &&
+      Math.abs(rotX) < 0.01;
+
+    let offsetX = center.x;
+    let offsetY = center.y;
+    if (isTop || isBottom) {
+      offsetX = center.x;
+      offsetY = center.z;
+    } else if (isSide) {
+      offsetX = center.z;
+      offsetY = center.y;
+    }
+
+    const onCamChange = onCameraChangeRef.current;
+    if (onCamChange) {
+      onCamChange({ zoom, offsetX, offsetY, rotationX: rotX, rotationY: rotY });
+    }
+  }, [frameToken, camera3D]);
 
   return (
     <div className="flex flex-col h-full">
@@ -7824,18 +8777,6 @@ export default function Viewer3D({
           >
             <Spline className="w-3.5 h-3.5" />
 </ToggleButton>
-          {!lightConfig && (
-            <button
-              onClick={() =>
-                setLightPreset((p) => (p + 1) % LIGHT_PRESETS.length)
-              }
-              title="Iluminación: clic para cambiar el preset"
-              className="px-1.5 py-1 rounded-md text-[10px] font-medium text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/20 transition-colors flex items-center gap-1"
-            >
-              <Sun className="w-3 h-3" />
-              {LIGHT_PRESETS[lightPreset]?.name ?? 'Natural'}
-            </button>
-          )}
           <ToggleButton
              active={gridValue}
              onClick={toggleGrid}
@@ -7982,16 +8923,55 @@ export default function Viewer3D({
                 </div>
               </DropdownMenuCheckboxItem>
               <DropdownMenuCheckboxItem
-                checked={starPlacement}
-                onCheckedChange={() => setStarPlacement(!starPlacement)}
+                checked={placeTarget !== null}
+                onCheckedChange={() =>
+                  setPlaceTarget((prev) => (prev ? null : 'fire'))
+                }
                 className="hover:bg-gray-800 cursor-pointer"
               >
                 <div className="flex items-center gap-2">
                   <Pin className="w-4 h-4 text-purple-300" />
-                  <span className="text-xs">Colocar estrellas</span>
+                  <span className="text-xs">Colocar efecto (clic en el objeto)</span>
                 </div>
               </DropdownMenuCheckboxItem>
-              {(fxStars || starPlacement) && (
+              {placeTarget !== null && (
+                <div className="px-2 py-1.5 flex flex-col gap-1.5">
+                  <div className="flex items-center gap-1">
+                    {PLACE_TARGETS.map((opt) => (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        onClick={() => setPlaceTarget(opt.value)}
+                        className={
+                          'flex-1 rounded border px-1 py-0.5 text-[10px] transition-colors ' +
+                          (placeTarget === opt.value
+                            ? 'border-purple-400 bg-purple-500/20 text-white'
+                            : 'border-gray-700 text-gray-400 hover:bg-gray-800')
+                        }
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                  <span className="text-[10px] leading-tight text-gray-500">
+                    Clic en el objeto para añadir un foco de {PLACE_TARGET_LABEL[placeTarget]}.
+                    Clic sobre un foco existente para quitarlo.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      clearPlacedStars(placedStarsRef.current);
+                      if (fxAnchorGroupRef.current) {
+                        clearFxAnchors(fxAnchorGroupRef.current, fxAnchorsRef.current);
+                      }
+                    }}
+                    className="rounded border border-gray-700 px-1.5 py-0.5 text-[10px] text-gray-400 hover:bg-gray-800"
+                  >
+                    Borrar todos los puntos
+                  </button>
+                </div>
+              )}
+              {(fxStars || placeTarget === 'stars') && (
                 <div className="px-2 py-1.5 flex items-center gap-1">
                   <Star className="w-3 h-3 text-amber-300" />
                   <Slider
@@ -8241,7 +9221,6 @@ type PlacedStarSystem = {
   stars: PlacedStar[];
 };
 
-/** Añade una estrella fija en un punto del texto. */
 function addPlacedStar(
   sys: PlacedStarSystem,
   pos: THREE.Vector3,
@@ -8598,7 +9577,11 @@ function createSmokeSystem(origin: THREE.Vector3, count: number, size: number, c
 }
 
 /** Actualiza las partículas de humo: ascienden, se dispersan y se desvanecen. */
-function updateSmoke(sys: SmokeSystem, dt: number): void {
+function updateSmoke(
+  sys: SmokeSystem,
+  dt: number,
+  randomPoint?: () => THREE.Vector3 | null
+): void {
   const count = sys.life.length;
   const baseT = 0.42 * sys.riseSpeed * 0.5;
   for (let i = 0; i < count; i++) {
@@ -8606,9 +9589,10 @@ function updateSmoke(sys: SmokeSystem, dt: number): void {
     if (sys.life[i] <= 0) {
       const r = (Math.random() * Math.PI) * 2;
       const rad = Math.random() * 0.12;
-      sys.positions[o] = sys.origin.x + Math.cos(r) * rad;
-      sys.positions[o + 1] = sys.origin.y;
-      sys.positions[o + 2] = sys.origin.z + Math.sin(r) * rad;
+      const origin = randomPoint ? randomPoint() ?? sys.origin : sys.origin;
+      sys.positions[o] = origin.x + Math.cos(r) * rad;
+      sys.positions[o + 1] = origin.y;
+      sys.positions[o + 2] = origin.z + Math.sin(r) * rad;
       sys.velocities[o] = (Math.random() - 0.5) * 0.04;
       sys.velocities[o + 1] = 0.12 * sys.riseSpeed + Math.random() * 0.18 * sys.riseSpeed;
       sys.velocities[o + 2] = (Math.random() - 0.5) * 0.04;
@@ -8746,18 +9730,95 @@ function updateStars(
         star.timer = 0.2 + Math.random() * 1.5;
       }
     }
-      if (star.timer <= 0) {
-        star.sprite.scale.setScalar(0);
-        star.state = 'wait';
-        star.timer = 0.25 + Math.random() * 1.6;
-      }
-    }
   }
+}
 
+/* ------------------------------------------------------------------ */
+/* Focos de efecto seleccionables con el ratón (fuego/humo/chispas).   */
+/* ------------------------------------------------------------------ */
 
+const PLACE_TARGETS: {
+  value: 'fire' | 'smoke' | 'sparks' | 'stars';
+  label: string;
+}[] = [
+  { value: 'fire', label: 'Fuego' },
+  { value: 'smoke', label: 'Humo' },
+  { value: 'sparks', label: 'Chispas' },
+  { value: 'stars', label: 'Estrellas' },
+];
 
+const PLACE_TARGET_LABEL: Record<
+  'fire' | 'smoke' | 'sparks' | 'stars',
+  string
+> = {
+  fire: 'fuego',
+  smoke: 'humo',
+  sparks: 'chispas',
+  stars: 'estrellas',
+};
 
+const ANCHOR_COLORS: Record<'fire' | 'smoke' | 'sparks', number> = {
+  fire: 0xff7a1a,
+  smoke: 0xb8c2cc,
+  sparks: 0x66d9ff,
+};
 
+let anchorMarkerTextureCache: THREE.Texture | null = null;
 
+/** Textura de marcador: anillo con punto central (se ve sobre el objeto). */
+function getAnchorMarkerTexture(): THREE.Texture {
+  if (anchorMarkerTextureCache) return anchorMarkerTextureCache;
+  const c = document.createElement('canvas');
+  c.width = 64;
+  c.height = 64;
+  const g = c.getContext('2d')!;
+  g.clearRect(0, 0, 64, 64);
+  g.strokeStyle = 'rgba(255,255,255,0.95)';
+  g.lineWidth = 5;
+  g.beginPath();
+  g.arc(32, 32, 20, 0, Math.PI * 2);
+  g.stroke();
+  g.fillStyle = 'rgba(255,255,255,0.9)';
+  g.beginPath();
+  g.arc(32, 32, 5, 0, Math.PI * 2);
+  g.fill();
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  anchorMarkerTextureCache = tex;
+  return tex;
+}
 
+/** Sprite-marcador de un foco de efecto, coloreado según el caso. */
+function makeAnchorMarker(kind: 'fire' | 'smoke' | 'sparks'): THREE.Sprite {
+  const material = new THREE.SpriteMaterial({
+    map: getAnchorMarkerTexture(),
+    color: ANCHOR_COLORS[kind],
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+    blending: THREE.AdditiveBlending,
+    opacity: 0.9,
+  });
+  const sprite = new THREE.Sprite(material);
+  sprite.renderOrder = 998;
+  sprite.scale.setScalar(0.14);
+  sprite.userData.kind = kind;
+  return sprite;
+}
 
+/** Vacía los focos de efecto y sus marcadores. */
+function clearFxAnchors(
+  group: THREE.Group | null,
+  anchors: { fire: THREE.Vector3[]; smoke: THREE.Vector3[]; sparks: THREE.Vector3[] }
+): void {
+  anchors.fire.length = 0;
+  anchors.smoke.length = 0;
+  anchors.sparks.length = 0;
+  if (!group) return;
+  while (group.children.length > 0) {
+    const child = group.children[group.children.length - 1];
+    group.remove(child);
+    const sp = child as THREE.Sprite;
+    sp.material?.dispose?.();
+  }
+}

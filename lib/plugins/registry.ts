@@ -46,7 +46,7 @@ export function obtenerPlugin(id: string): ZeusPlugin | undefined {
 /** Todos los plugins registrados, agrupados por categoría y ordenados. */
 export function listarPlugins(): ZeusPlugin[] {
   if (listaCacheada) return listaCacheada;
-  const ordenCategorias: string[] = ['deformadores', 'utilidades', 'efectos'];
+  const ordenCategorias: string[] = ['deformadores', 'terreno', 'utilidades', 'efectos'];
   const categorias = new Set<PluginCategoria>();
   for (const p of plugins.values()) categorias.add(p.categoria);
   const ordenadas = [...categorias].sort(

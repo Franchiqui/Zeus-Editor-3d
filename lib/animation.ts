@@ -550,10 +550,341 @@ export function createPluginParamTrack(
 /** Duración global del sistema de movimiento (segundos). */
 export function motionMaxDuration(
   transformTracks: TransformTrack[],
-  pluginTracks: PluginParamTrack[]
+  pluginTracks: PluginParamTrack[],
+  effectTracks: EffectTrack[] = []
 ): number {
   let max = 0;
   for (const t of transformTracks) max = Math.max(max, t.duration);
   for (const t of pluginTracks) max = Math.max(max, t.duration);
+  for (const t of effectTracks) max = Math.max(max, t.duration);
   return max;
 }
+
+// ---------------------------------------------------------------------------
+// Pistas de EFECTOS VISUALES: permiten animar el encendido/apagado y los
+// parámetros de los efectos (lluvia, humo, estrellas) a lo largo del tiempo.
+// ---------------------------------------------------------------------------
+
+/** Tipos de efecto visual animables. */
+export type EffectType = 'rain' | 'smoke' | 'stars' | 'fire' | 'sparks' | 'glow';
+
+/** Propiedades individuales de un efecto que pueden animarse por fotograma. */
+export interface EffectKeyframe {
+  time: number;
+  /** Parcial: solo los parámetros que cambian en este fotograma. */
+  values: Partial<Record<EffectProperty, number | string | boolean>>;
+  easing: EasingFunction;
+}
+
+/** Propiedades animables de los efectos visuales. */
+export type EffectProperty =
+  | 'enabled'        /* boolean */
+  | 'count'          /* number */
+  | 'speed'          /* number (rain) */
+  | 'size'           /* number (sparks/fire/smoke) */
+  | 'intensity'      /* number (fire/glow) */
+  | 'color'          /* string hex (smoke) */
+  | 'riseSpeed'      /* number (smoke) */
+  | 'starSize'       /* number (stars) */
+  | 'glowColor'      /* string hex (glow) */
+  | 'glowIntensity'  /* number (glow) */
+  | 'glowObjects';   /* boolean (glow) */
+
+/** Pista de efecto visual con fotogramas. */
+export interface EffectTrack {
+  id: string;
+  effectType: EffectType;
+  /** Duración en segundos. */
+  duration: number;
+  looping: boolean;
+  keyframes: EffectKeyframe[];
+}
+
+/**
+ * Evalúa una pista de efectos en un instante (segundos).
+ * Devuelve un parcial con los valores interpolados del efecto.
+ */
+export function evaluateEffectTrack(
+  track: EffectTrack,
+  time: number
+): Partial<Record<EffectProperty, number | string | boolean>> | null {
+  if (track.keyframes.length === 0) return null;
+  const sorted = [...track.keyframes].sort((a, b) => a.time - b.time);
+  const effectiveTime = track.looping && track.duration > 0
+    ? ((time % track.duration) + track.duration) % track.duration
+    : time;
+
+  if (effectiveTime <= sorted[0].time) {
+    return { ...(sorted[0].values ?? {}) };
+  }
+  if (effectiveTime >= sorted[sorted.length - 1].time) {
+    return { ...(sorted[sorted.length - 1].values ?? {}) };
+  }
+
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const start = sorted[i];
+    const end = sorted[i + 1];
+    if (effectiveTime >= start.time && effectiveTime <= end.time) {
+      const segDur = end.time - start.time;
+      const progress = segDur > 0 ? (effectiveTime - start.time) / segDur : 0;
+      const eased = getEasingFunction(end.easing)(progress);
+      const props = Array.from(
+        new Set([...Object.keys(start.values ?? {}), ...Object.keys(end.values ?? {})])
+      ) as EffectProperty[];
+      const result: Partial<Record<EffectProperty, number | string | boolean>> = {};
+      for (const prop of props) {
+        const from = (start.values ?? {})[prop];
+        const to = (end.values ?? {})[prop];
+        if (from === undefined && to === undefined) continue;
+        if (typeof from === 'boolean' || typeof to === 'boolean') {
+          result[prop] = to ?? from;
+        } else if (typeof from === 'string' || typeof to === 'string') {
+          result[prop] = to ?? from;
+        } else {
+          const numFrom = from as number | undefined;
+          const numTo = to as number | undefined;
+          if (numFrom !== undefined && numTo !== undefined) {
+            result[prop] = numFrom + (numTo - numFrom) * eased;
+          } else {
+            result[prop] = to ?? from;
+          }
+        }
+      }
+      return result;
+    }
+  }
+  return { ...(sorted[sorted.length - 1].values ?? {}) };
+}
+
+/** Propiedades por defecto para cada tipo de efecto. */
+export const EFFECT_PROPERTY_PRESETS: Record<EffectType, EffectProperty[]> = {
+  rain: ['enabled', 'count', 'speed'],
+  smoke: ['enabled', 'count', 'size', 'color', 'riseSpeed'],
+  stars: ['enabled', 'starSize'],
+  fire: ['enabled', 'count', 'size', 'intensity'],
+  sparks: ['enabled', 'count', 'size'],
+  glow: ['enabled', 'glowColor', 'glowIntensity', 'glowObjects'],
+};
+
+/** Etiquetas amigables para los tipos de efecto. */
+export const EFFECT_TYPE_LABELS: Record<EffectType, string> = {
+  rain: 'Lluvia',
+  smoke: 'Humo',
+  stars: 'Estrellas',
+  fire: 'Fuego',
+  sparks: 'Chispas',
+  glow: 'Brillo',
+};
+
+/** Crea una pista de efecto con un fotograma inicial en tiempo 0. */
+export function createEffectTrack(
+  effectType: EffectType,
+  duration: number = 5
+): EffectTrack {
+  return {
+    id: `etrack-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    effectType,
+    duration,
+    looping: false,
+    keyframes: [
+      {
+        time: 0,
+        values: { enabled: true },
+        easing: 'linear',
+      },
+    ],
+  };
+}
+
+// ============================================================================
+// UNIFIED TRACK REPRESENTATION
+// A common format so the scene tab's animation editor can display ALL tracks
+// (animation, transform, plugin, effect) in a single synchronized timeline.
+// All times are normalized to **seconds**.
+// ============================================================================
+
+export type TrackKind = 'animation' | 'transform' | 'plugin' | 'effect';
+
+/** A keyframe whose values are a flat record (works for every track kind). */
+export interface UnifiedKeyframe {
+  time: number;
+  values: Record<string, number | string | boolean>;
+  easing: EasingFunction;
+}
+
+/** Metadata for a single animatable property: its key, display label, and value type. */
+export interface PropertyInfo {
+  key: string;
+  label: string;
+  valueType: 'number' | 'string' | 'boolean';
+}
+
+/** Any track converted to a uniform structure for unified display/editing. */
+export interface UnifiedTrack {
+  id: string;
+  kind: TrackKind;
+  name: string;
+  objectId: string | null;
+  /** Original track object id / reference for dispatching edits back. */
+  originalId: string;
+  /** Duration in seconds. */
+  duration: number;
+  looping: boolean;
+  keyframes: UnifiedKeyframe[];
+  properties: PropertyInfo[];
+}
+
+function msToSeconds(ms: number): number {
+  return ms / 1000;
+}
+
+function sToMs(s: number): number {
+  return s * 1000;
+}
+
+export function animationTrackToUnified(track: AnimationTrack): UnifiedTrack {
+  const properties: PropertyInfo[] = OBJECT_PROPERTIES.map((p) => ({
+    key: p,
+    label: KEYFRAME_PROPERTY_LABELS[p],
+    valueType: 'number' as const,
+  }));
+  return {
+    id: track.id,
+    kind: 'animation',
+    name: track.name,
+    objectId: track.objectId,
+    originalId: track.id,
+    duration: msToSeconds(track.duration),
+    looping: track.looping,
+    keyframes: track.keyframes.map((kf) => ({
+      time: msToSeconds(kf.time),
+      values: { ...(kf.values ?? {}) },
+      easing: kf.easing,
+    })),
+    properties,
+  };
+}
+
+export function transformTrackToUnified(track: TransformTrack): UnifiedTrack {
+  const properties: PropertyInfo[] = TRANSFORM_PROPERTIES.map((p) => ({
+    key: p,
+    label: TRANSFORM_PROPERTY_LABELS[p],
+    valueType: 'number' as const,
+  }));
+  return {
+    id: `ttrack-${track.id}`,
+    kind: 'transform',
+    name: track.name || `Objeto: ${track.objectId}`,
+    objectId: track.objectId,
+    originalId: track.id,
+    duration: track.duration,
+    looping: track.looping,
+    keyframes: track.keyframes.map((kf) => ({
+      time: kf.time,
+      values: { ...(kf.values ?? {}) },
+      easing: kf.easing,
+    })),
+    properties,
+  };
+}
+
+export function pluginParamTrackToUnified(track: PluginParamTrack): UnifiedTrack {
+  const label = `${track.paramId}`;
+  const properties: PropertyInfo[] = [
+    { key: 'value', label, valueType: 'number' as const },
+  ];
+  return {
+    id: `ptrack-${track.id}`,
+    kind: 'plugin',
+    name: `${track.pluginId} › ${track.paramId}`,
+    objectId: track.objectId,
+    originalId: track.id,
+    duration: track.duration,
+    looping: track.looping,
+    keyframes: track.keyframes.map((kf) => ({
+      time: kf.time,
+      values: { value: kf.value },
+      easing: kf.easing,
+    })),
+    properties,
+  };
+}
+
+export function effectTrackToUnified(track: EffectTrack): UnifiedTrack {
+  const presets = EFFECT_PROPERTY_PRESETS[track.effectType];
+  const properties: PropertyInfo[] = presets.map((p) => {
+    const labels: Record<string, string> = {
+      enabled: 'Activado',
+      count: 'Cuenta',
+      speed: 'Velocidad',
+      size: 'Tamaño',
+      intensity: 'Intensidad',
+      color: 'Color',
+      riseSpeed: 'Vel. Elevación',
+      starSize: 'Tamaño Estrella',
+      glowColor: 'Color Brillo',
+      glowIntensity: 'Intensidad Brillo',
+      glowObjects: 'Objetos Brillo',
+    };
+    const valueType: 'number' | 'string' | 'boolean' =
+      p === 'color' || p === 'glowColor' ? 'string' :
+      p === 'enabled' || p === 'glowObjects' ? 'boolean' : 'number';
+    return { key: p, label: labels[p] || p, valueType };
+  });
+  return {
+    id: `etrack-${track.id}`,
+    kind: 'effect',
+    name: `${EFFECT_TYPE_LABELS[track.effectType]}`,
+    objectId: null,
+    originalId: track.id,
+    duration: track.duration,
+    looping: track.looping,
+    keyframes: track.keyframes.map((kf) => ({
+      time: kf.time,
+      values: { ...(kf.values ?? {}) },
+      easing: kf.easing,
+    })),
+    properties,
+  };
+}
+
+/** Max duration in seconds across any number of unified tracks. */
+export function unifiedTracksMaxDuration(tracks: UnifiedTrack[]): number {
+  return tracks.reduce((max, t) => Math.max(max, t.duration), 0);
+}
+
+/**
+ * Build a combined list of unified tracks from all track arrays.
+ * Animation tracks are normalized from ms → seconds.
+ */
+export function buildUnifiedTracks(
+  animationTracks: AnimationTrack[] = [],
+  transformTracks: TransformTrack[] = [],
+  pluginTracks: PluginParamTrack[] = [],
+  effectTracks: EffectTrack[] = []
+): UnifiedTrack[] {
+  return [
+    ...animationTracks.map(animationTrackToUnified),
+    ...transformTracks.map(transformTrackToUnified),
+    ...pluginTracks.map(pluginParamTrackToUnified),
+    ...effectTracks.map(effectTrackToUnified),
+  ];
+}
+
+/**
+ * Max duration in seconds across animation + motion tracks.
+ */
+export function allTracksMaxDuration(
+  animationTracks: AnimationTrack[] = [],
+  transformTracks: TransformTrack[] = [],
+  pluginTracks: PluginParamTrack[] = [],
+  effectTracks: EffectTrack[] = []
+): number {
+  let max = 0;
+  const unified = buildUnifiedTracks(animationTracks, transformTracks, pluginTracks, effectTracks);
+  for (const t of unified) max = Math.max(max, t.duration);
+  return max;
+}
+
+/** Convert a unified keyframe time back to ms for AnimationTrack edits. */
+export { sToMs as unifiedTimeMs };

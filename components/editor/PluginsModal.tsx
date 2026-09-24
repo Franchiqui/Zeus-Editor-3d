@@ -16,6 +16,7 @@ import {
   listarPlugins,
   suscribirsePlugins,
   obtenerPlugin,
+  DESTINO_NUEVO_OBJETO,
   type ZeusPlugin,
   type PluginParams,
 } from '@/lib/plugins';
@@ -31,6 +32,9 @@ interface PluginsModalProps {
    * Aplica el plugin al objeto elegido. El editor resuelve la malla,
    * ejecuta `aplicar`, guarda el resultado en el objeto y lo mete en el
    * historial. Devolver false indica error (el modal no se cierra).
+   *
+   * Si `targetObjectId` es `DESTINO_NUEVO_OBJETO`, el editor crea un
+   * objeto nuevo con la malla que devuelva el plugin (generadores).
    */
   onApply: (params: {
     pluginId: string;
@@ -64,7 +68,8 @@ function IconoCategoria({ categoria }: { categoria: string }) {
  * Modal «Plugins»: lista las herramientas registradas en
  * lib/plugins/registry.ts agrupadas por categoría, genera su panel de
  * parámetros a partir de la definición del plugin y aplica el resultado
- * sobre el objeto de la escena elegido.
+ * sobre el objeto de la escena elegido. Los plugins generadores pueden
+ * además crear un objeto nuevo desde cero.
  */
 export default function PluginsModal({
   isOpen,
@@ -91,14 +96,19 @@ export default function PluginsModal({
   const plugin: ZeusPlugin | undefined = pluginId
     ? obtenerPlugin(pluginId)
     : undefined;
+  // ¿El plugin elegido sabe generar la malla desde cero?
+  const esGenerador = !!plugin?.generador;
 
   // Al abrir (o cambiar la lista): plugin por defecto = el primero;
-  // objeto destino = el activo si existe, si no el primero.
+  // objeto destino = el activo si existe, si no el primero. Para los
+  // plugins generadores el destino por defecto es «Nuevo objeto».
   useEffect(() => {
     if (!isOpen) return;
     if (!pluginId && plugins.length > 0) setPluginId(plugins[0].id);
-    const inicial =
-      selectedObjectId && sceneObjects.some((o) => o.id === selectedObjectId)
+    const pluginInicial = pluginId ? obtenerPlugin(pluginId) : plugins[0];
+    const inicial = pluginInicial?.generador
+      ? DESTINO_NUEVO_OBJETO
+      : selectedObjectId && sceneObjects.some((o) => o.id === selectedObjectId)
         ? selectedObjectId
         : sceneObjects[0]?.id ?? '';
     setTargetId(inicial);
@@ -109,13 +119,40 @@ export default function PluginsModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, plugins.length, selectedObjectId, sceneObjects]);
 
-  // Al cambiar de plugin se restauran los valores por defecto.
+  // Al cambiar de plugin se restauran los valores por defecto y se ajusta
+  // el destino: los generadores apuntan a «Nuevo objeto», el resto a un
+  // objeto de la escena (el seleccionado o el primero).
   useEffect(() => {
     if (!plugin) return;
     const iniciales: PluginParams = {};
     for (const p of plugin.params) iniciales[p.id] = p.valor;
     setValores(iniciales);
+    if (plugin.generador) {
+      setTargetId(DESTINO_NUEVO_OBJETO);
+    } else {
+      setTargetId((prev) => {
+        if (prev && prev !== DESTINO_NUEVO_OBJETO) return prev;
+        return selectedObjectId &&
+          sceneObjects.some((o) => o.id === selectedObjectId)
+          ? selectedObjectId
+          : sceneObjects[0]?.id ?? '';
+      });
+    }
   }, [pluginId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Si el plugin elegido NO es generador y el destino quedó en «Nuevo
+  // objeto» (p. ej. al cambiar desde un generador), volvemos a un objeto
+  // válido para que el botón Aplicar no apunte a un destino inexistente.
+  useEffect(() => {
+    if (!plugin) return;
+    if (!plugin.generador && targetId === DESTINO_NUEVO_OBJETO) {
+      const fallback =
+        selectedObjectId && sceneObjects.some((o) => o.id === selectedObjectId)
+          ? selectedObjectId
+          : sceneObjects[0]?.id ?? '';
+      setTargetId(fallback);
+    }
+  }, [plugin, targetId, sceneObjects, selectedObjectId]);
 
   // Agrupar por categoría manteniendo el orden del registro.
   const grupos = useMemo(() => {
@@ -160,6 +197,7 @@ export default function PluginsModal({
   };
 
   const nombreObjeto = (id: string) => {
+    if (id === DESTINO_NUEVO_OBJETO) return t('editor3D.plugins.newObject');
     const idx = sceneObjects.findIndex((o) => o.id === id);
     return idx >= 0
       ? t('editor3D.plugins.object', { n: idx + 1 })
@@ -238,6 +276,11 @@ export default function PluginsModal({
                       onChange={(e) => setTargetId(e.target.value)}
                       className="bg-gray-900 border border-white/15 rounded-md px-2.5 py-2 text-xs text-foreground focus:outline-none focus:border-violet-500"
                     >
+                      {esGenerador && (
+                        <option value={DESTINO_NUEVO_OBJETO}>
+                          ✨ {t('editor3D.plugins.newObject')}
+                        </option>
+                      )}
                       {sceneObjects.map((objeto, index) => (
                         <option key={objeto.id} value={objeto.id}>
                           {nombreObjeto(objeto.id)}{' '}
@@ -338,10 +381,14 @@ export default function PluginsModal({
                   <div className="flex items-start gap-2.5 p-3 rounded-lg bg-white/5 border border-white/10 text-[11px] text-muted-foreground mt-auto">
                     <Info className="w-4 h-4 text-violet-400 shrink-0 mt-0.5" />
                     <span>
-                      {t('editor3D.plugins.willApply', {
-                        plugin: plugin.nombre,
-                        objeto: nombreObjeto(targetId),
-                      })}
+                      {targetId === DESTINO_NUEVO_OBJETO
+                        ? t('editor3D.plugins.willCreate', {
+                            plugin: plugin.nombre,
+                          })
+                        : t('editor3D.plugins.willApply', {
+                            plugin: plugin.nombre,
+                            objeto: nombreObjeto(targetId),
+                          })}
                     </span>
                   </div>
                 </>

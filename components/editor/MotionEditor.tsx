@@ -27,15 +27,22 @@ import {
   PluginParamKeyframe,
   TransformProperty,
   TransformTrack,
-  TRANSFORM_PROPERTIES,
-  TRANSFORM_PROPERTY_LABELS,
+  EffectTrack,
+  EffectKeyframe,
+  EffectType,
+  EFFECT_TYPE_LABELS,
+  EFFECT_PROPERTY_PRESETS,
+  evaluateTransformTrack,
+  evaluatePluginParamTrack,
+  evaluateEffectTrack,
+  motionMaxDuration,
+  upsertKeyframeAt,
   createPluginParamTrack,
   createTransformTrack,
   createGroupTransformTrack,
-  evaluateTransformTrack,
-  evaluatePluginParamTrack,
-  motionMaxDuration,
-  upsertKeyframeAt,
+  createEffectTrack,
+  TRANSFORM_PROPERTIES,
+  TRANSFORM_PROPERTY_LABELS,
   type TransformKeyframe,
 } from '@/lib/animation';
 import { cloneMesh } from '@/lib/plugins/clone';
@@ -47,6 +54,93 @@ import {
   type PluginParams,
 } from '@/lib/plugins';
 import { useI18n } from '@/lib/i18n';
+
+/** Valores base de cada efecto (tomados de FxConfig por defecto). */
+const EFFECT_DEFAULTS: Record<EffectType, Record<string, number | string | boolean>> = {
+  rain: { enabled: true, count: 320, speed: 2 },
+  smoke: { enabled: true, count: 120, size: 0.11, color: '#444a52', riseSpeed: 1 },
+  stars: { enabled: true, starSize: 1 },
+  fire: { enabled: true, count: 160, size: 0.11, intensity: 1 },
+  sparks: { enabled: true, count: 140, size: 0.035 },
+  glow: { enabled: true, glowColor: '#5fd4ff', glowIntensity: 1.4, glowObjects: false },
+};
+
+/** Inspector de propiedades para un fotograma de efecto. */
+const EffectKeyframeInspector: React.FC<{
+  effectType: EffectType;
+  kf: EffectKeyframe;
+  onValuesChange: (values: Partial<Record<string, number | string | boolean>>) => void;
+}> = ({ effectType, kf, onValuesChange }) => {
+  const props = EFFECT_PROPERTY_PRESETS[effectType];
+  return (
+    <>
+      {props.map((p) => {
+        const val = kf.values?.[p];
+        const common = {
+          label: EFFECT_PARAM_LABELS[p] ?? p,
+          value: val,
+          onChange: (v: number | string | boolean) =>
+            onValuesChange({ [p]: v }),
+        };
+        if (typeof val === 'boolean') {
+          return (
+            <label key={p} className="flex items-center gap-1 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={!!val}
+                onChange={(e) => common.onChange(e.target.checked)}
+              />
+              {common.label}
+            </label>
+          );
+        }
+        if (typeof val === 'string') {
+          return (
+            <div key={p} className="flex items-center gap-1 text-xs">
+              <label className="text-muted-foreground">{common.label}</label>
+              <input
+                type="color"
+                value={val.length > 0 ? val : '#000000'}
+                onChange={(e) => common.onChange(e.target.value)}
+                className="w-6 h-5 p-0 border rounded cursor-pointer bg-gray-800 border-gray-600"
+              />
+            </div>
+          );
+        }
+        return (
+          <label key={p} className="flex items-center gap-1 text-xs text-muted-foreground">
+            {common.label}
+            <input
+              type="number"
+              step={p === 'size' || p === 'glowIntensity' || p === 'starSize' || p === 'riseSpeed' ? 0.01 : p === 'speed' ? 0.1 : 10}
+              value={typeof val === 'number' ? val : ''}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                if (!isNaN(v)) common.onChange(v);
+              }}
+              className="w-16 px-1 py-0.5 rounded bg-black/30 border border-white/10 text-foreground"
+            />
+          </label>
+        );
+      })}
+    </>
+  );
+};
+
+/** Etiquetas para las propiedades de efecto. */
+const EFFECT_PARAM_LABELS: Record<string, string> = {
+  enabled: 'Activo',
+  count: 'Partículas',
+  speed: 'Velocidad',
+  size: 'Tamaño',
+  intensity: 'Intensidad',
+  color: 'Color',
+  riseSpeed: 'Ascenso',
+  starSize: 'Tamaño',
+  glowColor: 'Color',
+  glowIntensity: 'Intensidad',
+  glowObjects: 'Objetos',
+};
 
 /** Objeto de escena reducido a lo que el editor de movimiento necesita. */
 export interface MotionEditorObject {
@@ -70,6 +164,8 @@ export interface MotionEditorProps {
   setTransformTracks: (tracks: TransformTrack[]) => void;
   pluginTracks: PluginParamTrack[];
   setPluginTracks: (tracks: PluginParamTrack[]) => void;
+  effectTracks: EffectTrack[];
+  setEffectTracks: (tracks: EffectTrack[]) => void;
   /** Malla base congelada por objectId (para animar parámetros de plugin). */
   pluginBaseMeshes: Record<string, Mesh>;
   setPluginBaseMeshes: Dispatch<SetStateAction<Record<string, Mesh>>>;
@@ -135,6 +231,8 @@ export const MotionEditor: FC<MotionEditorProps> = ({
   setTransformTracks,
   pluginTracks,
   setPluginTracks,
+  effectTracks,
+  setEffectTracks,
   pluginBaseMeshes,
   setPluginBaseMeshes,
   playing,
@@ -167,13 +265,13 @@ export const MotionEditor: FC<MotionEditorProps> = ({
   const [selectedObjectGroupId, setSelectedObjectGroupId] = useState<string | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   // Arrastre en curso: { pista, time original del kf } → time flotante local.
-  const dragRef = useRef<{ trackId: string; originalTime: number; kind: 'transform' | 'plugin' } | null>(null);
+  const dragRef = useRef<{ trackId: string; originalTime: number; kind: 'transform' | 'plugin' | 'effect' } | null>(null);
   const [dragTime, setDragTime] = useState<number | null>(null);
   // `dragTime` en el closure de `up` quedaría obsoleto: se lee vía ref.
   const dragTimeRef = useRef<number | null>(null);
   dragTimeRef.current = dragTime;
 
-  const globalDuration = Math.max(5, motionMaxDuration(transformTracks, pluginTracks));
+  const globalDuration = Math.max(5, motionMaxDuration(transformTracks, pluginTracks, effectTracks));
   const timelineWidth = globalDuration * pxPerSecond;
 
   const visibleObjects = useMemo(
@@ -301,9 +399,14 @@ export const MotionEditor: FC<MotionEditorProps> = ({
     setPluginTracks(pluginTracks.map((tr) => (tr.id === id ? { ...tr, ...patch } : tr)));
   };
 
+  const updateEffectTrack = (id: string, patch: Partial<EffectTrack>) => {
+    setEffectTracks(effectTracks.map((tr) => (tr.id === id ? { ...tr, ...patch } : tr)));
+  };
+
   const deleteTrack = (id: string) => {
     setTransformTracks(transformTracks.filter((tr) => tr.id !== id));
     setPluginTracks(pluginTracks.filter((tr) => tr.id !== id));
+    setEffectTracks(effectTracks.filter((tr) => tr.id !== id));
     if (selectedTrackId === id) {
       setSelectedTrackId(null);
       setSelectedKeyframeTime(null);
@@ -357,11 +460,42 @@ export const MotionEditor: FC<MotionEditorProps> = ({
         keyframes: upsertKeyframeAt(pTrack.keyframes, kf),
         duration: Math.max(pTrack.duration, currentTime),
       });
-      setSelectedKeyframeTime(currentTime);
+       setSelectedKeyframeTime(currentTime);
     }
   };
 
-  /** Crea la pista de parámetro de plugin desde el panel izquierdo. */
+  /**
+   * Valores por defecto que debe conservar un fotograma de efecto: los
+   * parámetros que no se animan toman el valor base del FxConfig.
+   */
+  const defaultEffectValues = (effectType: EffectType): Record<string, number | string | boolean> => {
+    return { ...EFFECT_DEFAULTS[effectType] };
+  };
+
+  /** Añade fotograma de efecto en currentTime a la pista seleccionada. */
+  const addEffectKeyframeAtCurrentTime = () => {
+    if (!selectedTrackId) return;
+    const eTrack = effectTracks.find((tr) => tr.id === selectedTrackId);
+    if (!eTrack) return;
+     // Heredar valores del fotograma anterior (o del keyframe más cercano)
+     // para que solo los parámetros modificados cambien.
+     const sortedEfs = [...eTrack.keyframes].sort((a, b) => a.time - b.time);
+     const prevKf = sortedEfs
+       .slice()
+       .reverse()
+       .find((k) => k.time <= currentTime) ?? sortedEfs[0];
+    const prevValues = { ...defaultEffectValues(eTrack.effectType), ...(prevKf?.values ?? {}) };
+    const nuevo: EffectKeyframe = {
+      time: currentTime,
+      values: { ...prevValues },
+      easing: 'linear',
+    };
+    updateEffectTrack(eTrack.id, {
+      keyframes: upsertKeyframeAt(eTrack.keyframes, nuevo),
+      duration: Math.max(eTrack.duration, currentTime),
+    });
+    setSelectedKeyframeTime(currentTime);
+  };
   const addPluginTrack = () => {
     if (!plugin || !selectedParam) return;
 
@@ -437,6 +571,28 @@ export const MotionEditor: FC<MotionEditorProps> = ({
     setPluginTracks([...pluginTracks, ...nuevas]);
     setSelectedTrackId(nuevas[0].id);
     setSelectedKeyframeTime(0);
+  };
+
+  /** Estado del selector de efectos en el panel izquierdo. */
+  const [selectedEffectType, setSelectedEffectType] = useState<EffectType | ''>('');
+
+  /** Crea una pista de efecto visual. */
+  const addEffectTrack = () => {
+    if (!selectedEffectType) return;
+    const existing = effectTracks.find((tr) => tr.effectType === selectedEffectType);
+    if (existing) {
+      setSelectedTrackId(existing.id);
+      return;
+    }
+    const nueva = createEffectTrack(selectedEffectType, Math.max(5, currentTime));
+    nueva.keyframes = upsertKeyframeAt(nueva.keyframes, {
+      time: currentTime,
+      values: { ...EFFECT_DEFAULTS[selectedEffectType], enabled: true },
+      easing: 'linear',
+    } as EffectKeyframe);
+    setEffectTracks([...effectTracks, nueva]);
+    setSelectedTrackId(nueva.id);
+    setSelectedKeyframeTime(currentTime);
   };
 
   /** Crea pista(s) de transformada del(los) objeto(s) seleccionado(s). */
@@ -562,11 +718,11 @@ export const MotionEditor: FC<MotionEditorProps> = ({
   const keyframeDragRef = useRef<{
     trackId: string;
     kfTime: number;
-    kind: 'transform' | 'plugin';
-    startX: number;
-    startTime: number;
-    active: boolean;
-  } | null>(null);
+     kind: 'transform' | 'plugin' | 'effect';
+     startX: number;
+     startTime: number;
+     active: boolean;
+   } | null>(null);
    const DRAG_THRESHOLD = 4; // px mínimos para iniciar el arrastre
    // Indica que el último pointerup terminó un arrastre de fotograma:
    // el onClick posterior no debe saltar currentTime al tiempo origen.
@@ -576,8 +732,8 @@ export const MotionEditor: FC<MotionEditorProps> = ({
     e: React.PointerEvent,
     trackId: string,
     kfTime: number,
-    kind: 'transform' | 'plugin'
-  ) => {
+     kind: 'transform' | 'plugin' | 'effect'
+   ) => {
     e.stopPropagation();
     e.preventDefault();
     keyframeDragRef.current = {
@@ -624,7 +780,7 @@ export const MotionEditor: FC<MotionEditorProps> = ({
     trackId: string,
     originalTime: number,
     newTime: number,
-    kind: 'transform' | 'plugin'
+    kind: 'transform' | 'plugin' | 'effect'
   ) => {
     if (Math.abs(newTime - originalTime) < 1e-4) return;
     if (kind === 'transform') {
@@ -637,7 +793,7 @@ export const MotionEditor: FC<MotionEditorProps> = ({
         keyframes: upsertKeyframeAt(resto, { ...kf, time: newTime }),
         duration: Math.max(tr.duration, newTime),
       });
-    } else {
+    } else if (kind === 'plugin') {
       const tr = pluginTracks.find((t) => t.id === trackId);
       if (!tr) return;
       const kf = tr.keyframes.find((k) => Math.abs(k.time - originalTime) < 1e-4);
@@ -647,21 +803,37 @@ export const MotionEditor: FC<MotionEditorProps> = ({
         keyframes: upsertKeyframeAt(resto, { ...kf, time: newTime }),
         duration: Math.max(tr.duration, newTime),
       });
+    } else {
+      const tr = effectTracks.find((t) => t.id === trackId);
+      if (!tr) return;
+      const kf = tr.keyframes.find((k) => Math.abs(k.time - originalTime) < 1e-4);
+      if (!kf) return;
+      const resto = tr.keyframes.filter((k) => Math.abs(k.time - originalTime) >= 1e-4);
+      updateEffectTrack(trackId, {
+        keyframes: upsertKeyframeAt(resto, { ...kf, time: newTime }),
+        duration: Math.max(tr.duration, newTime),
+      });
     }
     setSelectedKeyframeTime(newTime);
   };
 
-  const deleteKeyframe = (trackId: string, kfTime: number, kind: 'transform' | 'plugin') => {
+  const deleteKeyframe = (trackId: string, kfTime: number, kind: 'transform' | 'plugin' | 'effect') => {
     if (kind === 'transform') {
       const tr = transformTracks.find((t) => t.id === trackId);
       if (!tr) return;
       updateTransformTrack(trackId, {
         keyframes: tr.keyframes.filter((k) => Math.abs(k.time - kfTime) >= 1e-4),
       });
-    } else {
+     } else if (kind === 'plugin') {
       const tr = pluginTracks.find((t) => t.id === trackId);
       if (!tr) return;
       updatePluginTrack(trackId, {
+        keyframes: tr.keyframes.filter((k) => Math.abs(k.time - kfTime) >= 1e-4),
+      });
+    } else {
+      const tr = effectTracks.find((t) => t.id === trackId);
+      if (!tr) return;
+      updateEffectTrack(trackId, {
         keyframes: tr.keyframes.filter((k) => Math.abs(k.time - kfTime) >= 1e-4),
       });
     }
@@ -672,7 +844,7 @@ export const MotionEditor: FC<MotionEditorProps> = ({
     trackId: string,
     kfTime: number,
     easing: EasingFunction,
-    kind: 'transform' | 'plugin'
+    kind: 'transform' | 'plugin' | 'effect'
   ) => {
     if (kind === 'transform') {
       const tr = transformTracks.find((t) => t.id === trackId);
@@ -682,10 +854,18 @@ export const MotionEditor: FC<MotionEditorProps> = ({
           Math.abs(k.time - kfTime) < 1e-4 ? { ...k, easing } : k
         ),
       });
-    } else {
+    } else if (kind === 'plugin') {
       const tr = pluginTracks.find((t) => t.id === trackId);
       if (!tr) return;
       updatePluginTrack(trackId, {
+        keyframes: tr.keyframes.map((k) =>
+          Math.abs(k.time - kfTime) < 1e-4 ? { ...k, easing } : k
+        ),
+      });
+    } else {
+      const tr = effectTracks.find((t) => t.id === trackId);
+      if (!tr) return;
+      updateEffectTrack(trackId, {
         keyframes: tr.keyframes.map((k) =>
           Math.abs(k.time - kfTime) < 1e-4 ? { ...k, easing } : k
         ),
@@ -718,9 +898,19 @@ export const MotionEditor: FC<MotionEditorProps> = ({
     const tr = pluginTracks.find((tk) => tk.id === selectedTrackId);
     return tr?.keyframes.find((k) => Math.abs(k.time - selectedKeyframeTime) < 1e-4) ?? null;
   }, [selectedTrackId, selectedKeyframeTime, pluginTracks]);
+  const selectedEffectKf = useMemo(() => {
+    if (!selectedTrackId || selectedKeyframeTime === null) return null;
+    const tr = effectTracks.find((tk) => tk.id === selectedTrackId);
+    return tr?.keyframes.find((k) => Math.abs(k.time - selectedKeyframeTime) < 1e-4) ?? null;
+  }, [selectedTrackId, selectedKeyframeTime, effectTracks]);
+  const selectedEffectTrack = useMemo(() => {
+    if (!selectedTrackId) return null;
+    return effectTracks.find((tk) => tk.id === selectedTrackId) ?? null;
+  }, [selectedTrackId, effectTracks]);
 
   const selectedTrack = transformTracks.find((tk) => tk.id === selectedTrackId)
     ?? pluginTracks.find((tk) => tk.id === selectedTrackId)
+    ?? effectTracks.find((tk) => tk.id === selectedTrackId)
     ?? null;
 
   // Marcas de regla: paso adaptativo para no saturar con zoom bajo.
@@ -730,54 +920,18 @@ export const MotionEditor: FC<MotionEditorProps> = ({
     marks.push(Math.round(tt * 100) / 100);
   }
 
-   const renderKeyframeRow = (
-     track: TransformTrack | PluginParamTrack,
-     kind: 'transform' | 'plugin'
-   ) => {
+    const renderKeyframeRow = (
+      track: TransformTrack | PluginParamTrack | EffectTrack,
+      kind: 'transform' | 'plugin' | 'effect'
+    ) => {
      const isSel = track.id === selectedTrackId;
-     const isGroupTrack =
-       kind === 'transform' &&
-       (track as TransformTrack).objectIds &&
-       (track as TransformTrack).objectIds!.length > 0;
-     const groupMemberCount = isGroupTrack
-       ? (track as TransformTrack).objectIds!.length + 1
-       : 0;
      return (
        <div
          key={track.id}
          className={`flex items-center border-t border-white/5 ${isSel ? 'bg-purple-500/10' : 'hover:bg-white/5'}`}
          style={{ height: ROW_HEIGHT }}
        >
-         <div
-           className="w-44 shrink-0 px-2 truncate text-[10px] cursor-pointer"
-           onClick={() => { setSelectedTrackId(track.id); setSelectedKeyframeTime(null); }}
-           title={kind === 'transform' ? t('editor3D.motion.transformTrack') : pluginTrackLabel(track as PluginParamTrack)}
-         >
-           {kind === 'transform' ? (
-             <span
-               className={`flex items-center gap-1 ${
-                 isGroupTrack ? 'text-fuchsia-300' : 'text-sky-300'
-               }`}
-             >
-               {isGroupTrack && <FolderOpen className="w-3 h-3" />}
-               {isGroupTrack
-                 ? `${t('editor3D.motion.groupTrack')} (${groupMemberCount})`
-                 : t('editor3D.motion.transformTrack')}
-             </span>
-           ) : (
-             <span className="text-emerald-300">{pluginTrackLabel(track as PluginParamTrack)}</span>
-           )}
-         </div>
-         {isGroupTrack && (
-           <button
-             onClick={() => unmergeGroupTrack(track.id)}
-             className="px-1 rounded hover:bg-white/10 text-fuchsia-300 shrink-0"
-             title={t('editor3D.motion.unmergeGroup')}
-           >
-             <Unlink className="w-3 h-3" />
-           </button>
-         )}
-         <div className="relative flex-1 h-full">
+          <div className="relative flex-1 h-full">
           {track.keyframes.map((kf) => {
             const shownTime = dragRef.current?.trackId === track.id && Math.abs(kf.time - dragRef.current.originalTime) < 1e-4 && dragTime !== null
               ? dragTime
@@ -807,7 +961,9 @@ key={kf.time}
                     ? 'bg-amber-300 border-amber-100'
                     : kind === 'transform'
                       ? 'bg-sky-400 border-sky-200 hover:bg-sky-300'
-                      : 'bg-emerald-400 border-emerald-200 hover:bg-emerald-300'
+                      : kind === 'plugin'
+                        ? 'bg-emerald-400 border-emerald-200 hover:bg-emerald-300'
+                        : 'bg-orange-400 border-orange-200 hover:bg-orange-300'
                 }`}
                 style={{ left: shownTime * pxPerSecond }}
                 title={`${formatTime(kf.time)}s`}
@@ -824,6 +980,10 @@ key={kf.time}
     const param = def?.params.find((p) => p.id === track.paramId);
     const nombre = def?.nombre ?? track.pluginId;
     return param ? `${nombre} · ${param.etiqueta}` : nombre;
+  };
+
+  const effectTrackLabel = (track: EffectTrack): string => {
+    return EFFECT_TYPE_LABELS[track.effectType] ?? track.effectType;
   };
 
   // Aviso: pistas de plugin cuyo aplicar() produce malla inválida en
@@ -1076,12 +1236,45 @@ key={kf.time}
               </>
             )
           )}
-          {pluginId && (
-            <div className="text-[10px] text-muted-foreground mt-1">{t('editor3D.motion.baseMeshHint')}</div>
-          )}
+           {pluginId && (
+             <div className="text-[10px] text-muted-foreground mt-1">{t('editor3D.motion.baseMeshHint')}</div>
+           )}
+
+          {/* Efectos visuales: lluvia, humo, estrellas, etc. */}
+          <div className="px-2 py-1.5 border-t border-white/10">
+            <div className="text-muted-foreground mb-1 flex items-center gap-1">
+              <span>🎨</span>
+              {t('editor3D.motion.effectSection')}
+            </div>
+            <select
+              value={selectedEffectType ?? ''}
+              onChange={(e) => setSelectedEffectType(e.target.value as EffectType | '')}
+              className="w-full px-1.5 py-1 rounded bg-black/30 border border-white/10 text-foreground mb-1"
+            >
+              <option value="">{t('editor3D.motion.pickEffect')}</option>
+              {(Object.keys(EFFECT_TYPE_LABELS) as EffectType[]).map((et) => (
+                <option key={et} value={et}>{EFFECT_TYPE_LABELS[et]}</option>
+              ))}
+            </select>
+            {selectedEffectType && (
+              <button
+                onClick={addEffectTrack}
+                disabled={effectTracks.some((tr) => tr.effectType === selectedEffectType)}
+                className="w-full px-2 py-1 rounded bg-orange-500/20 hover:bg-orange-500/30 text-orange-300 disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-1"
+              >
+                <Plus className="w-3 h-3" />
+                {t('editor3D.motion.addEffectTrack')}
+              </button>
+            )}
+            {effectTracks.length > 0 && (
+              <div className="mt-1 text-[10px] text-muted-foreground">
+                {effectTracks.length} {t('editor3D.motion.effectTracks', { count: effectTracks.length })}
+              </div>
+            )}
+          </div>
 
           {/* Restaurar objeto: transform estático de vuelta y borrar sus
-              pistas. Para recuperarse de un plugin deformado a lo loco. */}
+               pistas. Para recuperarse de un plugin deformado a lo loco. */}
           {selectedObjectId &&
             (transformTracks.some((tk) => tk.objectId === selectedObjectId) ||
               pluginTracks.some((tk) => tk.objectId === selectedObjectId)) && (
@@ -1307,28 +1500,84 @@ key={kf.time}
               <div className="h-7 border-b border-white/10 flex items-center px-2 text-muted-foreground">
                 {t('editor3D.motion.time')}
               </div>
-              {transformTracks.map((tr) => (
-                <div key={tr.id} className="border-t border-white/5 flex items-center px-2" style={{ height: ROW_HEIGHT }}>
-                  <span className="text-[10px] text-sky-300 truncate">
-                    {sceneObjects.find((o) => o.id === tr.objectId)?.name ?? tr.objectId}
-                  </span>
-                </div>
-              ))}
-              {pluginTracks.map((tr) => (
-                <div key={tr.id} className="border-t border-white/5 flex items-center px-2" style={{ height: ROW_HEIGHT }}>
-                  <span className="text-[10px] text-emerald-300 truncate">
-                    {sceneObjects.find((o) => o.id === tr.objectId)?.name ?? tr.objectId}
-                  </span>
-                  {degenerateTracks.has(tr.id) && (
-                    <span
-                      className="ml-auto shrink-0"
-                      title={t('editor3D.motion.degenerateWarning')}
-                    >
-                      <AlertTriangle className="w-3 h-3 text-amber-300" />
+              {transformTracks.map((tr) => {
+                const isGroupTrack = !!(tr.objectIds && tr.objectIds.length > 0);
+                const groupMemberCount = isGroupTrack ? tr.objectIds!.length + 1 : 0;
+                const isSel = tr.id === selectedTrackId;
+                return (
+                  <div
+                    key={tr.id}
+                    className={`border-t border-white/5 flex items-center px-2 cursor-pointer ${
+                      isSel ? 'bg-purple-500/10' : 'hover:bg-white/5'
+                    }`}
+                    style={{ height: ROW_HEIGHT }}
+                    onClick={() => { setSelectedTrackId(tr.id); setSelectedKeyframeTime(null); }}
+                    title={
+                      isGroupTrack
+                        ? `${t('editor3D.motion.groupTrack')} (${groupMemberCount})`
+                        : t('editor3D.motion.transformTrack')
+                    }
+                  >
+                    {isGroupTrack && <FolderOpen className="w-3 h-3 shrink-0 text-fuchsia-300 mr-1" />}
+                    <span className={`text-[10px] truncate ${isGroupTrack ? 'text-fuchsia-300' : 'text-sky-300'}`}>
+                      {sceneObjects.find((o) => o.id === tr.objectId)?.name ?? tr.objectId}
                     </span>
-                  )}
-                </div>
-              ))}
+                    {isGroupTrack && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); unmergeGroupTrack(tr.id); }}
+                        className="ml-auto px-1 rounded hover:bg-white/10 text-fuchsia-300 shrink-0"
+                        title={t('editor3D.motion.unmergeGroup')}
+                      >
+                        <Unlink className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+              {pluginTracks.map((tr) => {
+                const isSel = tr.id === selectedTrackId;
+                return (
+                  <div
+                    key={tr.id}
+                    className={`border-t border-white/5 flex items-center px-2 cursor-pointer ${
+                      isSel ? 'bg-purple-500/10' : 'hover:bg-white/5'
+                    }`}
+                    style={{ height: ROW_HEIGHT }}
+                    onClick={() => { setSelectedTrackId(tr.id); setSelectedKeyframeTime(null); }}
+                    title={pluginTrackLabel(tr)}
+                  >
+                    <span className="text-[10px] text-emerald-300 truncate">
+                      {sceneObjects.find((o) => o.id === tr.objectId)?.name ?? tr.objectId}
+                    </span>
+                    {degenerateTracks.has(tr.id) && (
+                      <span
+                        className="ml-auto shrink-0"
+                        title={t('editor3D.motion.degenerateWarning')}
+                      >
+                        <AlertTriangle className="w-3 h-3 text-amber-300" />
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+              {effectTracks.map((tr) => {
+                const isSel = tr.id === selectedTrackId;
+                return (
+                  <div
+                    key={tr.id}
+                    className={`border-t border-white/5 flex items-center px-2 cursor-pointer ${
+                      isSel ? 'bg-purple-500/10' : 'hover:bg-white/5'
+                    }`}
+                    style={{ height: ROW_HEIGHT }}
+                    onClick={() => { setSelectedTrackId(tr.id); setSelectedKeyframeTime(null); }}
+                    title={effectTrackLabel(tr)}
+                  >
+                    <span className="text-[10px] text-orange-300 truncate">
+                      {effectTrackLabel(tr)}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
             <div className="flex-1 relative" ref={timelineRef}>
               {/* Regla */}
@@ -1343,14 +1592,15 @@ key={kf.time}
                   </div>
                 ))}
               </div>
-              {/* Filas */}
-              {transformTracks.map((tr) => renderKeyframeRow(tr, 'transform'))}
-              {pluginTracks.map((tr) => renderKeyframeRow(tr, 'plugin'))}
-              {transformTracks.length === 0 && pluginTracks.length === 0 && (
-                <div className="absolute inset-0 top-7 flex items-center justify-center text-muted-foreground pointer-events-none">
-                  {t('editor3D.motion.selectObject')}
-                </div>
-              )}
+               {/* Filas */}
+               {transformTracks.map((tr) => renderKeyframeRow(tr, 'transform'))}
+               {pluginTracks.map((tr) => renderKeyframeRow(tr, 'plugin'))}
+               {effectTracks.map((tr) => renderKeyframeRow(tr, 'effect'))}
+               {transformTracks.length === 0 && pluginTracks.length === 0 && effectTracks.length === 0 && (
+                 <div className="absolute inset-0 top-7 flex items-center justify-center text-muted-foreground pointer-events-none">
+                   {t('editor3D.motion.selectObject')}
+                 </div>
+               )}
               {/* Playhead */}
               <div
                 className="absolute top-0 bottom-0 w-px bg-red-400 pointer-events-none z-10"
@@ -1364,19 +1614,19 @@ key={kf.time}
         </div>
 
         {/* Inspector del fotograma seleccionado */}
-        {(selectedTransformKf || selectedPluginKf) && selectedTrackId && (
+        {(selectedTransformKf || selectedPluginKf || selectedEffectKf) && selectedTrackId && (
           <div className="border-t border-white/10 px-2 py-1.5 flex items-center gap-2 flex-wrap">
             <span className="text-muted-foreground">
               {t('editor3D.motion.keyframe')} @ {formatTime(selectedKeyframeTime ?? 0)}s
             </span>
             <select
-              value={(selectedTransformKf ?? selectedPluginKf)?.easing ?? 'linear'}
+              value={(selectedTransformKf ?? selectedPluginKf ?? selectedEffectKf)?.easing ?? 'linear'}
               onChange={(e) =>
                 setKeyframeEasing(
                   selectedTrackId,
                   selectedKeyframeTime ?? 0,
                   e.target.value as EasingFunction,
-                  transformTracks.some((tk) => tk.id === selectedTrackId) ? 'transform' : 'plugin'
+                  transformTracks.some((tk) => tk.id === selectedTrackId) ? 'transform' : pluginTracks.some((tk) => tk.id === selectedTrackId) ? 'plugin' : 'effect'
                 )
               }
               className="px-1.5 py-0.5 rounded bg-black/30 border border-white/10 text-foreground"
@@ -1422,11 +1672,27 @@ key={kf.time}
                   .join(', ')}
               </span>
             )}
+            {selectedEffectKf && selectedEffectTrack && (
+              <EffectKeyframeInspector
+                effectType={selectedEffectTrack.effectType}
+                kf={selectedEffectKf}
+                onValuesChange={(newValues) => {
+                  if (selectedKeyframeTime === null) return;
+                  updateEffectTrack(selectedTrackId, {
+                    keyframes: selectedEffectTrack.keyframes.map((k) =>
+                      Math.abs(k.time - selectedKeyframeTime) < 1e-4
+                        ? { ...k, values: { ...k.values, ...newValues } }
+                        : k
+                    ),
+                  });
+                }}
+              />
+            )}
             <button
               onClick={() => selectedKeyframeTime !== null && deleteKeyframe(
                 selectedTrackId,
                 selectedKeyframeTime,
-                transformTracks.some((tk) => tk.id === selectedTrackId) ? 'transform' : 'plugin'
+                transformTracks.some((tk) => tk.id === selectedTrackId) ? 'transform' : pluginTracks.some((tk) => tk.id === selectedTrackId) ? 'plugin' : 'effect'
               )}
               className="p-1 rounded hover:bg-red-500/20 text-red-300"
               title={t('editor3D.motion.deleteKeyframe')}
@@ -1434,7 +1700,11 @@ key={kf.time}
               <Trash2 className="w-3.5 h-3.5" />
             </button>
             <button
-              onClick={addKeyframeAtCurrentTime}
+              onClick={
+                effectTracks.some((tk) => tk.id === selectedTrackId)
+                  ? addEffectKeyframeAtCurrentTime
+                  : addKeyframeAtCurrentTime
+              }
               className="px-2 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 flex items-center gap-1"
             >
               <Plus className="w-3 h-3" />

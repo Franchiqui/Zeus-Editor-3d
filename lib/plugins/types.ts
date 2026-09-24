@@ -9,6 +9,10 @@ import type { Mesh } from '@/lib/geometry';
  * (lib/plugins/registry.ts), lo muestra en el modal «Plugins» con su UI
  * de parámetros generada automáticamente y le pasa la malla del objeto
  * elegido cuando el usuario pulsa Aplicar.
+ *
+ * Un plugin marcado como `generador` puede además crear la malla desde
+ * cero: si no hay objeto base, el editor le pasa una malla vacía y usa el
+ * resultado para añadir un objeto nuevo a la escena.
  */
 
 /** Definición de un control de la UI del plugin. */
@@ -62,6 +66,13 @@ export type ZeusPlugin = {
   /** Descripción corta de lo que hace (una línea). */
   descripcion: string;
   /**
+   * Si es `true`, el plugin sabe crear la malla desde cero. En el modal
+   * aparece la opción «Nuevo objeto» y, al elegirla, `aplicar` recibe una
+   * malla vacía (`{ vertices: [], faces: [] }`) y el resultado se añade a
+   * la escena como un objeto nuevo.
+   */
+  generador?: boolean;
+  /**
    * Definición de los controles del panel. El orden aquí es el orden en
    * la UI; los valores iniciales son los que viajan a `aplicar` si el
    * usuario no los toca.
@@ -73,7 +84,15 @@ export type ZeusPlugin = {
    * guarda la original en el historial (deshacer/rehacer).
    *
    * La malla llega en el espacio local del objeto (sin su transformada),
-   * igual que la usan las booleanas.
+   * igual que la usan las booleanas. En los plugins generadores puede
+   * llegar vacía (modo «Nuevo objeto»).
    */
   aplicar: (mesh: Mesh, params: PluginParams) => Mesh;
 };
+
+/**
+ * Destino especial que el modal «Plugins» envía cuando el usuario elige
+ * «Nuevo objeto» en un plugin generador: el editor crea un objeto nuevo
+ * con la malla que devuelva el plugin en lugar de tocar uno existente.
+ */
+export const DESTINO_NUEVO_OBJETO = '__nuevo_objeto__';

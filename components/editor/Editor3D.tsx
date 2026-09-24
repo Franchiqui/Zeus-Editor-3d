@@ -6,7 +6,18 @@ import * as THREE from 'three';
 import DrawingCanvas from '@/components/drawing-canvas';
 import EditorCanvas from '@/components/editor-canvas';
 import Viewer3D from '@/components/viewer-3d';
-import { ViewerPanel } from '@/components/editor/viewer-panel';
+import { ViewerPanel, type PanelSlot, type PanelViewKind } from '@/components/editor/viewer-panel';
+
+/** Clave i18n del rótulo (arriba-izquierda) de cada vista de ventana. */
+const PANEL_VIEW_LABEL_KEY: Record<PanelViewKind, string> = {
+  front: 'editor3D.panelLabels.frontAxis',
+  back: 'editor3D.panelLabels.backAxis',
+  top: 'editor3D.panelLabels.topAxis',
+  bottom: 'editor3D.panelLabels.bottomAxis',
+  side: 'editor3D.panelLabels.sideRightAxis',
+  sideLeft: 'editor3D.panelLabels.sideLeftAxis',
+  '3d': 'editor3D.panelLabels.threeDFree',
+};
 import { KeyframeEditor } from '@/components/editor/keyframe-editor';
 import type { LightConfig } from '@/components/viewer-3d';
 import type { FxConfig } from '@/components/viewer-3d';
@@ -16,34 +27,43 @@ import type {
   CameraData,
   CameraKeyframe,
   Vec3,
-   TransformTrack,
-   TransformProperty,
-   PluginParamTrack,
+  TransformTrack,
+  TransformProperty,
+  PluginParamTrack,
+  EffectTrack,
+  UnifiedTrack,
+  EasingFunction,
 } from '@/lib/animation';
 import {
   createDefaultCameraData,
   evaluateCameraKeyframes,
   evaluateTransformTrack,
   evaluatePluginParamTrack,
+  evaluateEffectTrack,
   motionMaxDuration,
+  buildUnifiedTracks,
   TRANSFORM_PROPERTIES,
   upsertKeyframeAt,
   createTransformTrack,
   createPluginParamTrack,
+  createEffectTrack,
+  EFFECT_TYPE_LABELS,
+  type EffectType,
   EASING_OPTIONS,
 } from '@/lib/animation';
 import LightingModal from '@/components/LightingModal';
 import TextureBrowserModal from '@/components/texture-browser-modal';
 import BooleanCSGModal from './BooleanCSGModal';
 import PluginsModal from './PluginsModal';
+import WindowLayoutModal, { type WindowLayout } from './WindowLayoutModal';
 import { MotionEditor } from './MotionEditor';
 import { cloneMesh } from '@/lib/plugins/clone';
 import { performCSGOperation, type BooleanOperationType } from '@/lib/csg-mesh';
-import { obtenerPlugin, type PluginParams } from '@/lib/plugins';
+import { obtenerPlugin, listarPlugins, DESTINO_NUEVO_OBJETO, type PluginParams } from '@/lib/plugins';
 import { toast } from 'sonner';
 import MeshEditor from './MeshEditor';
 import { buildLoftMesh } from '@/lib/loft-mesh';
-import type { ObjectTransform, Camera3D } from '@/components/viewer-3d';
+import type { ObjectTransform, Camera3D, GizmoMode } from '@/components/viewer-3d';
 import {
   IDENTITY_TRANSFORM,
   isIdentityTransform,
@@ -175,6 +195,10 @@ import {
    EyeOff,
    Puzzle,
    Clapperboard,
+   Settings,
+   Move3D,
+   Rotate3D,
+   Scale3D,
 } from 'lucide-react';
 
 const EditorCanvasComponent = EditorCanvas as unknown as ComponentType<any>;
@@ -347,6 +371,7 @@ type HistoryState = {
   latheSegments: number;
   latheClamp: boolean;
   latheFigureColor: string;
+  gizmoOffset: ObjectTransform;
   sceneObjects: SceneObject[];
   selectedObjectId: string | null;
   configObjectId: string | null;
@@ -360,11 +385,13 @@ type HistoryState = {
   polylines: PolylinesByCanvas;
   /** Editor de movimiento: pistas de transformada (auto-key). */
   transformTracks: TransformTrack[];
-  /** Editor de movimiento: pistas de parámetros de plugin. */
-  pluginTracks: PluginParamTrack[];
-  /** Mallas base congeladas para las pistas de plugin, por objectId. */
-  pluginBaseMeshes: Record<string, Mesh>;
-};
+   /** Editor de movimiento: pistas de parámetros de plugin. */
+   pluginTracks: PluginParamTrack[];
+   /** Editor de movimiento: pistas de efectos visuales. */
+   effectTracks: EffectTrack[];
+   /** Mallas base congeladas para las pistas de plugin, por objectId. */
+   pluginBaseMeshes: Record<string, Mesh>;
+ };
 
 // Plantillas por defecto: vacías. Los lienzos 2D arrancan en blanco
 // — el usuario dibuja desde cero o inserta una forma de un clic. El
@@ -842,7 +869,29 @@ export default function Home({
   const [greedyMesh, setGreedyMesh] = useState(true);
   const [textRes, setTextRes] = useState(144);
 
-  const [showGizmo, setShowGizmo] = useState(false);
+   const [showGizmo, setShowGizmo] = useState(true);
+  // Modos del gizmo activos: qué asas del manipulador están visibles.
+  // Por defecto el gizmo completo (mover, rotar, escalar).
+  const [gizmoModes, setGizmoModes] = useState<GizmoMode[]>([
+    'move', 'rotate', 'scale',
+  ]);
+  // Modos en borrador mientras se configura el gizmo. No afectan al visor
+  // hasta que se aplica (se sale del modo configuración).
+  const [gizmoModesDraft, setGizmoModesDraft] = useState<GizmoMode[]>([
+    'move', 'rotate', 'scale',
+  ]);
+  // Entra en configuración del gizmo: los toggles de move/rotate/scale
+  // ajustan el borrador (no el activo) y el gizmo se muestra en gris sin
+  // interactuar, para que no afecte al objeto mientras se ajusta. Al salir,
+  // el borrador se aplica y el gizmo vuelve a interactuar.
+  const [gizmoConfigMode, setGizmoConfigMode] = useState(false);
+  // Offset del gizmo respecto al objeto (solo el manipulador, no la figura).
+  // Se ajusta en modo configuración y se guarda con el proyecto.
+  const [gizmoOffset, setGizmoOffset] = useState<ObjectTransform>(
+    structuredClone(IDENTITY_TRANSFORM)
+  );
+  // Guarda el estado showGizmo previo a la configuración para restaurarlo.
+  const prevGizmoVisibleRef = useRef<boolean>(false);
   const [fontVersion, setFontVersion] = useState(0);
   const [textOpacity, setTextOpacity] = useState(0.85);
   // Transparencia de la figura de la pestaña Vistas (1 = opaca del todo).
@@ -1264,7 +1313,7 @@ export default function Home({
    // Cómo se MUESTRA la figura del objeto seleccionado en la pestaña
    // Escena: fusionada (tal cual), suave (sombreado suave) o voxeles
    // (voxelización de la superficie en vivo; no cambia la figura real).
-   const [sceneMeshStyle, setSceneMeshStyle] = useState<'fusionada' | 'suave' | 'voxeles'>('fusionada');
+   const [sceneMeshStyle, setSceneMeshStyle] = useState<'fusionada' | 'suave' | 'voxeles'>('suave');
    // Input oculto para elegir la imagen de la textura por caras.
    const faceTextureInputRef = useRef<HTMLInputElement | null>(null);
    const [viewRefreshTick, setViewRefreshTick] = useState(0);
@@ -1321,6 +1370,29 @@ export default function Home({
     },
     });
 
+  // Vista (Frente/Superior/Costado/3D Libre) que muestra cada VENTANA. Cada
+  // ventana conserva su propia cámara (panelCameras); al cambiar la vista se
+  // recoloca esa cámara al preset correspondiente. Se guarda en el .zeus.
+  const [panelViews, setPanelViews] = useState<Record<PanelSlot, PanelViewKind>>({
+    front: 'front',
+    top: 'top',
+    side: 'side',
+    '3d': '3d',
+  });
+
+  // Composición de ventanas del área de trabajo (cuántos visores y cómo se
+  // reparten). Se guarda en el .zeus.
+  const [windowLayout, setWindowLayout] = useState<WindowLayout>('grid4');
+  // Modal "Diseño ventanas".
+  const [layoutModalOpen, setLayoutModalOpen] = useState(false);
+
+  // Contadores que disparan «encuadrar» (ajustar el zoom/centro para que los
+  // objetos entren en la ventana). Al subir el de una ventana, ese visor
+  // encuadra lo que ve; «encuadrar las 4» sube los cuatro a la vez.
+  const [frameTokens, setFrameTokens] = useState<
+    Record<'front' | 'top' | 'side' | '3d', number>
+  >({ front: 0, top: 0, side: 0, '3d': 0 });
+
   // Cámara-objeto activa por VENTANA (null = vista libre del panel): cada
   // visor se maneja con la pose de SU cámara elegida; se guarda en el .zeus.
   const [panelCamerasObjeto, setPanelCamerasObjeto] = useState<
@@ -1339,9 +1411,9 @@ export default function Home({
 
    const [animationTracks, setAnimationTracks] = useState<AnimationTrack[]>([]);
    const [selectedTrackId, setSelectedTrackId] = useState<string | null>(null);
-   const [playing, setPlaying] = useState(false);
-     const [currentTime, setCurrentTime] = useState(0);
-    const [showKeyframeEditor, setShowKeyframeEditor] = useState(false);
+    const [playing, setPlaying] = useState(false);
+      const [currentTime, setCurrentTime] = useState(0);
+     const [showKeyframeEditor, setShowKeyframeEditor] = useState(false);
     const [showGroupsPanel, setShowGroupsPanel] = useState(true);
 
     // Editor de movimiento: pistas de transformada (auto-key) y de
@@ -1349,9 +1421,319 @@ export default function Home({
     // al crear la primera pista de plugin del objeto.
     const [transformTracks, setTransformTracks] = useState<TransformTrack[]>([]);
     const [pluginTracks, setPluginTracks] = useState<PluginParamTrack[]>([]);
+    const [effectTracks, setEffectTracks] = useState<EffectTrack[]>([]);
     const [pluginBaseMeshes, setPluginBaseMeshes] = useState<Record<string, Mesh>>({});
     const [motionEditorOpen, setMotionEditorOpen] = useState(false);
     const [autoKey, setAutoKey] = useState(false);
+
+    // --- Derived unified motion tracks for the scene animation editor ---
+    // Each UnifiedTrack carries its `kind` and `originalId` so we can
+    // dispatch edits back to the correct state array (TransformTrack,
+    // PluginParamTrack, or EffectTrack).
+    const motionTracks: UnifiedTrack[] = useMemo(
+       () => buildUnifiedTracks([], transformTracks, pluginTracks, effectTracks),
+      [transformTracks, pluginTracks, effectTracks]
+    );
+
+    // Helpers to locate and update a motion track by its UnifiedTrack.id
+    const findMotionTrackOwner = (
+      unifiedId: string
+    ): { kind: 'transform' | 'plugin' | 'effect'; originalId: string } | null => {
+      if (unifiedId.startsWith('ttrack-')) {
+        const originalId = unifiedId.slice('ttrack-'.length);
+        if (transformTracks.some((t) => t.id === originalId)) return { kind: 'transform', originalId };
+      } else if (unifiedId.startsWith('ptrack-')) {
+        const originalId = unifiedId.slice('ptrack-'.length);
+        if (pluginTracks.some((t) => t.id === originalId)) return { kind: 'plugin', originalId };
+      } else if (unifiedId.startsWith('etrack-')) {
+        const originalId = unifiedId.slice('etrack-'.length);
+        if (effectTracks.some((t) => t.id === originalId)) return { kind: 'effect', originalId };
+      }
+      return null;
+    };
+
+    const handleMotionKeyframeTimeChange = useCallback(
+      (trackId: string, kfIndex: number, newTime: number) => {
+        const owner = findMotionTrackOwner(trackId);
+        if (!owner) return;
+        if (owner.kind === 'transform') {
+          setTransformTracks((prev) =>
+            prev.map((t) =>
+              t.id === owner.originalId
+                ? {
+                    ...t,
+                    keyframes: t.keyframes.map((kf, i) =>
+                      i === kfIndex ? { ...kf, time: newTime } : kf
+                    ),
+                  }
+                : t
+            )
+          );
+        } else if (owner.kind === 'plugin') {
+          setPluginTracks((prev) =>
+            prev.map((t) =>
+              t.id === owner.originalId
+                ? {
+                    ...t,
+                    keyframes: t.keyframes.map((kf, i) =>
+                      i === kfIndex ? { ...kf, time: newTime } : kf
+                    ),
+                  }
+                : t
+            )
+          );
+        } else {
+          setEffectTracks((prev) =>
+            prev.map((t) =>
+              t.id === owner.originalId
+                ? {
+                    ...t,
+                    keyframes: t.keyframes.map((kf, i) =>
+                      i === kfIndex ? { ...kf, time: newTime } : kf
+                    ),
+                  }
+                : t
+            )
+          );
+        }
+      },
+      [transformTracks, pluginTracks, effectTracks, setTransformTracks, setPluginTracks, setEffectTracks]
+    );
+
+    const handleMotionKeyframeDelete = useCallback(
+      (trackId: string, kfIndex: number) => {
+        const owner = findMotionTrackOwner(trackId);
+        if (!owner) return;
+        if (owner.kind === 'transform') {
+          setTransformTracks((prev) =>
+            prev.map((t) =>
+              t.id === owner.originalId
+                ? { ...t, keyframes: t.keyframes.filter((_, i) => i !== kfIndex) }
+                : t
+            )
+          );
+        } else if (owner.kind === 'plugin') {
+          setPluginTracks((prev) =>
+            prev.map((t) =>
+              t.id === owner.originalId
+                ? { ...t, keyframes: t.keyframes.filter((_, i) => i !== kfIndex) }
+                : t
+            )
+          );
+        } else {
+          setEffectTracks((prev) =>
+            prev.map((t) =>
+              t.id === owner.originalId
+                ? { ...t, keyframes: t.keyframes.filter((_, i) => i !== kfIndex) }
+                : t
+            )
+          );
+        }
+      },
+      [transformTracks, pluginTracks, effectTracks, setTransformTracks, setPluginTracks, setEffectTracks]
+    );
+
+    const handleMotionKeyframeEasingChange = useCallback(
+      (trackId: string, kfIndex: number, easing: EasingFunction) => {
+        const owner = findMotionTrackOwner(trackId);
+        if (!owner) return;
+        if (owner.kind === 'transform') {
+          setTransformTracks((prev) =>
+            prev.map((t) =>
+              t.id === owner.originalId
+                ? {
+                    ...t,
+                    keyframes: t.keyframes.map((kf, i) =>
+                      i === kfIndex ? { ...kf, easing } : kf
+                    ),
+                  }
+                : t
+            )
+          );
+        } else if (owner.kind === 'plugin') {
+          setPluginTracks((prev) =>
+            prev.map((t) =>
+              t.id === owner.originalId
+                ? {
+                    ...t,
+                    keyframes: t.keyframes.map((kf, i) =>
+                      i === kfIndex ? { ...kf, easing } : kf
+                    ),
+                  }
+                : t
+            )
+          );
+        } else {
+          setEffectTracks((prev) =>
+            prev.map((t) =>
+              t.id === owner.originalId
+                ? {
+                    ...t,
+                    keyframes: t.keyframes.map((kf, i) =>
+                      i === kfIndex ? { ...kf, easing } : kf
+                    ),
+                  }
+                : t
+            )
+          );
+        }
+      },
+      [transformTracks, pluginTracks, effectTracks, setTransformTracks, setPluginTracks, setEffectTracks]
+    );
+
+    const handleMotionKeyframeValueChange = useCallback(
+      (trackId: string, kfIndex: number, propKey: string, value: number | string | boolean) => {
+        const owner = findMotionTrackOwner(trackId);
+        if (!owner) return;
+        if (owner.kind === 'transform') {
+          setTransformTracks((prev) =>
+            prev.map((t) =>
+              t.id === owner.originalId
+                ? {
+                    ...t,
+                    keyframes: t.keyframes.map((kf, i) =>
+                      i === kfIndex
+                        ? {
+                            ...kf,
+                            values: { ...(kf.values ?? {}), [propKey]: value as number },
+                          }
+                        : kf
+                    ),
+                  }
+                : t
+            )
+          );
+        } else if (owner.kind === 'plugin') {
+          // Plugin tracks have a flat `value` field, not a `values` object
+          if (propKey === 'value' && typeof value === 'number') {
+            setPluginTracks((prev) =>
+              prev.map((t) =>
+                t.id === owner.originalId
+                  ? {
+                      ...t,
+                      keyframes: t.keyframes.map((kf, i) =>
+                        i === kfIndex ? { ...kf, value } : kf
+                      ),
+                    }
+                  : t
+              )
+            );
+          }
+        } else {
+          setEffectTracks((prev) =>
+            prev.map((t) =>
+              t.id === owner.originalId
+                ? {
+                    ...t,
+                    keyframes: t.keyframes.map((kf, i) =>
+                      i === kfIndex
+                        ? {
+                            ...kf,
+                            values: { ...(kf.values ?? {}), [propKey]: value },
+                          }
+                        : kf
+                    ),
+                  }
+                : t
+            )
+          );
+        }
+      },
+      [transformTracks, pluginTracks, effectTracks, setTransformTracks, setPluginTracks, setEffectTracks]
+    );
+
+    const handleMotionTrackUpdate = useCallback(
+      (trackId: string, updates: { duration?: number; looping?: boolean }) => {
+        const owner = findMotionTrackOwner(trackId);
+        if (!owner) return;
+        if (owner.kind === 'transform') {
+          setTransformTracks((prev) =>
+            prev.map((t) => (t.id === owner.originalId ? { ...t, ...updates } : t))
+          );
+        } else if (owner.kind === 'plugin') {
+          setPluginTracks((prev) =>
+            prev.map((t) => (t.id === owner.originalId ? { ...t, ...updates } : t))
+          );
+        } else {
+           setEffectTracks((prev) =>
+            prev.map((t) => (t.id === owner.originalId ? { ...t, ...updates } : t))
+          );
+        }
+      },
+      [transformTracks, pluginTracks, effectTracks, setTransformTracks, setPluginTracks, setEffectTracks]
+    );
+
+    const handleMotionAddKeyframe = useCallback(
+      (trackId: string, timeSec: number) => {
+        const owner = findMotionTrackOwner(trackId);
+        if (!owner) return;
+        const newKf = { time: timeSec, easing: 'linear' as EasingFunction };
+        if (owner.kind === 'transform') {
+          setTransformTracks((prev) =>
+            prev
+              .map((t) =>
+                t.id === owner.originalId
+                  ? {
+                      ...t,
+                      keyframes: [...t.keyframes, { ...newKf, values: {} }].sort(
+                        (a, b) => a.time - b.time
+                      ),
+                    }
+                  : t
+              )
+          );
+        } else if (owner.kind === 'plugin') {
+          // Evaluate current value from the track
+          const track = pluginTracks.find((t) => t.id === owner.originalId);
+          if (track) {
+            const evaluated = evaluatePluginParamTrack(track, timeSec);
+            if (evaluated !== null) {
+              setPluginTracks((prev) =>
+                prev.map((t) =>
+                  t.id === owner.originalId
+                    ? {
+                        ...t,
+                        keyframes: [...t.keyframes, { ...newKf, value: evaluated }].sort(
+                          (a, b) => a.time - b.time
+                        ),
+                      }
+                    : t
+                )
+              );
+            }
+          }
+        } else {
+          const track = effectTracks.find((t) => t.id === owner.originalId);
+          if (track) {
+            const evaluated = evaluateEffectTrack(track, timeSec);
+            if (evaluated !== null) {
+              setEffectTracks((prev) =>
+                prev.map((t) =>
+                  t.id === owner.originalId
+                    ? {
+                        ...t,
+                        keyframes: [...t.keyframes, { ...newKf, values: { ...evaluated } }].sort(
+                          (a, b) => a.time - b.time
+                        ),
+                      }
+                    : t
+                )
+              );
+            }
+          }
+        }
+      },
+      [
+        transformTracks,
+        pluginTracks,
+        effectTracks,
+        setTransformTracks,
+        setPluginTracks,
+        setEffectTracks,
+        findMotionTrackOwner,
+      ]
+    );
+
     // Altura del editor de movimiento en px (null = 40vh por defecto).
     // Se cambia arrastrando el separador entre visor y línea de tiempo.
     const [motionEditorHeight, setMotionEditorHeight] = useState<number | null>(null);
@@ -1446,7 +1828,7 @@ export default function Home({
           ? Math.max(...animationTracks.map((t) => t.duration)) / 1000
           : 0,
         camSpan,
-        motionMaxDuration(transformTracks, pluginTracks)
+        motionMaxDuration(transformTracks, pluginTracks, effectTracks)
       );
       if (!playing || maxDuration <= 0) {
         animationStartTimeRef.current = null;
@@ -1585,16 +1967,18 @@ export default function Home({
       latheOpacity,
       latheSegments,
       latheClamp,
-      latheFigureColor,
-      sceneObjects,
+       latheFigureColor,
+       gizmoOffset: { ...gizmoOffset },
+       sceneObjects,
       selectedObjectId,
       configObjectId,
       mode,
       groups,
       polylines,
-      transformTracks,
-      pluginTracks,
-      pluginBaseMeshes,
+       transformTracks,
+       pluginTracks,
+       effectTracks,
+       pluginBaseMeshes,
     });
 
     if (history.length === 0 && historyIndex === -1) {
@@ -1621,6 +2005,7 @@ export default function Home({
           // base son enormes; stringify sería muy costoso).
           lastState.transformTracks === currentState.transformTracks &&
           lastState.pluginTracks === currentState.pluginTracks &&
+          lastState.effectTracks === currentState.effectTracks &&
           lastState.pluginBaseMeshes === currentState.pluginBaseMeshes;
         const isSame =
           sceneSame &&
@@ -1762,7 +2147,7 @@ export default function Home({
     setLatheSegments(state.latheSegments);
     setLatheClamp(state.latheClamp);
     setLatheFigureColor(state.latheFigureColor);
-    setSceneObjects(state.sceneObjects);
+    setGizmoOffset(state.gizmoOffset ?? structuredClone(IDENTITY_TRANSFORM));
     setSelectedObjectId(state.selectedObjectId);
     setConfigObjectId(state.configObjectId);
     // La pestaña activa también se restaura: deshacer tras un cambio
@@ -1775,6 +2160,7 @@ export default function Home({
     // Editor de movimiento: fotos antiguas sin pistas nuevas, vacío.
     setTransformTracks(state.transformTracks ?? []);
     setPluginTracks(state.pluginTracks ?? []);
+    setEffectTracks(state.effectTracks ?? []);
     setPluginBaseMeshes(state.pluginBaseMeshes ?? {});
   }, []);
 
@@ -2831,6 +3217,12 @@ export default function Home({
     : textureProjection;
 
   const visibleSceneObjects = useMemo(() => sceneObjects, [sceneObjects]);
+  // ¿Hay algún plugin capaz de crear la malla desde cero? Si es así, el
+  // modal de plugins se puede abrir aunque la escena esté vacía.
+  const hayPluginGenerador = useMemo(
+    () => listarPlugins().some((p) => p.generador),
+    []
+  );
 
   // ¿Alguno de los objetos seleccionados lleva textura en su malla? El
   // botón «Quitar textura» también debe verse (y funcionar) cuando la
@@ -3037,6 +3429,17 @@ export default function Home({
         ? ownerMesh.textureRelief
         : 0.25
       : textureRelief;
+    // Estado de la ayuda de textura que viaja con el proyecto. Con un objeto
+    // congelado se respeta el de su instantánea; si no, el del panel activo.
+    const ownerHelper = frozenSaving
+      ? (ownerMesh?.textureHelper ?? false)
+      : textureHelper;
+    const ownerHelperTransform = frozenSaving
+      ? (ownerMesh?.textureHelperTransform &&
+        typeof ownerMesh.textureHelperTransform === 'object'
+          ? structuredClone(ownerMesh.textureHelperTransform)
+          : structuredClone(textureHelperTransform))
+      : structuredClone(textureHelperTransform);
 
     const projectData = {
       type: 'editor3d',
@@ -3061,6 +3464,8 @@ export default function Home({
       figureColor,
       texture,
       textureProjection,
+      textureHelper: ownerHelper,
+      textureHelperTransform: ownerHelperTransform,
       textureFinish,
       textureRelief,
       textureRepeat,
@@ -3071,6 +3476,7 @@ export default function Home({
       latheSegments,
       latheClamp,
       latheFigureColor,
+       gizmoOffset: { ...gizmoOffset },
       // Cada objeto se guarda CON su figura (su instantánea de malla):
       // al reabrir el archivo cada pieza vuelve a ser ella misma, venga
       // de esta pestaña o de otra. El dueño se guarda con la figura que
@@ -3093,6 +3499,8 @@ export default function Home({
           ownerConfig.textureProjection = ownerProjection;
           ownerConfig.textureFinish = ownerFinish;
           ownerConfig.textureRelief = ownerRelief;
+          ownerConfig.textureHelper = ownerHelper;
+          ownerConfig.textureHelperTransform = ownerHelperTransform;
         }
         return {
           ...object,
@@ -3107,6 +3515,8 @@ export default function Home({
             textureColor: ownerTexture ? '#ffffff' : undefined,
             textureRelief: ownerRelief,
             textureFinish: ownerFinish,
+            textureHelper: ownerHelper,
+            textureHelperTransform: ownerHelperTransform,
           },
           smooth: smoothShadingValue,
           textureProjection: ownerProjection,
@@ -3129,6 +3539,8 @@ export default function Home({
        showGround,
        showLightHelpers,
        panelCameras,
+       panelViews,
+       windowLayout,
        showGrid,
         fxConfig,
         groundTexture,
@@ -3141,6 +3553,7 @@ export default function Home({
         // de plugin, con sus mallas base congeladas.
         transformTracks,
         pluginTracks,
+        effectTracks,
         pluginBaseMeshes,
         panelCamerasObjeto,
         // Fuentes importadas (Google Fonts y locales): viajan con el
@@ -3728,6 +4141,18 @@ export default function Home({
         ) {
           setTextureProjection(data.textureProjection);
         }
+        if (typeof data.textureHelper === 'boolean') {
+          setTextureHelper(data.textureHelper);
+        }
+        if (
+          data.textureHelperTransform &&
+          typeof data.textureHelperTransform === 'object'
+        ) {
+          setTextureHelperTransform({
+            ...IDENTITY_TRANSFORM,
+            ...data.textureHelperTransform,
+          });
+        }
         if (['matte', 'semi-matte', 'glossy', 'metallic'].includes(data.textureFinish)) {
           setTextureFinish(data.textureFinish);
         }
@@ -3755,8 +4180,11 @@ export default function Home({
           setLatheClamp(data.latheClamp);
         if (typeof data.latheFigureColor === 'string')
           setLatheFigureColor(data.latheFigureColor);
-        setEditedVertices(
-          Array.isArray(data.editedVertices) && data.editedVertices.length > 0
+          if (data.gizmoOffset && typeof data.gizmoOffset === 'object') {
+            setGizmoOffset({ ...IDENTITY_TRANSFORM, ...data.gizmoOffset });
+          }
+          setEditedVertices(
+            Array.isArray(data.editedVertices) && data.editedVertices.length > 0
             ? data.editedVertices
             : null
         );
@@ -3858,6 +4286,10 @@ export default function Home({
                   ? selectedLoadedMesh.textureRelief
                   : 0.25
               );
+              setTextureHelper(selectedLoadedMesh.textureHelper ?? false);
+              setTextureHelperTransform(
+                selectedLoadedMesh.textureHelperTransform ?? IDENTITY_TRANSFORM
+              );
             }
           }
         } else {
@@ -3896,6 +4328,12 @@ export default function Home({
           }
           if (data.panelCameras && typeof data.panelCameras === 'object') {
             setPanelCameras((prev) => ({ ...prev, ...data.panelCameras }));
+          }
+          if (data.panelViews && typeof data.panelViews === 'object') {
+            setPanelViews((prev) => ({ ...prev, ...data.panelViews }));
+          }
+          if (typeof data.windowLayout === 'string') {
+            setWindowLayout(data.windowLayout as WindowLayout);
           }
           if (data.fxConfig && typeof data.fxConfig === 'object') {
            setFxConfig(data.fxConfig);
@@ -3963,6 +4401,19 @@ export default function Home({
                   typeof t.paramId === 'string' &&
                   Array.isArray(t.keyframes) &&
                   obtenerPlugin(t.pluginId) !== undefined
+              )
+            );
+          }
+          if (Array.isArray(data.effectTracks)) {
+            const validEffectTypes = new Set(['rain', 'smoke', 'stars', 'fire', 'sparks', 'glow']);
+            setEffectTracks(
+              data.effectTracks.filter(
+                (t: { id?: unknown; effectType?: unknown; duration?: unknown; keyframes?: unknown }) =>
+                  typeof t.id === 'string' &&
+                  typeof t.effectType === 'string' &&
+                  validEffectTypes.has(t.effectType as string) &&
+                  typeof t.duration === 'number' &&
+                  Array.isArray(t.keyframes)
               )
             );
           }
@@ -5755,7 +6206,7 @@ export default function Home({
             return {
               ...obj,
               mesh: res.resultMesh,
-              smooth: false,
+              smooth: true,
             };
           }
           return obj;
@@ -5816,12 +6267,52 @@ export default function Home({
       valores: PluginParams;
     }) => {
       const plugin = obtenerPlugin(pluginId);
-      const obj = sceneObjects.find((o) => o.id === targetObjectId);
 
       if (!plugin) {
         toast.error(t('editor3D.plugins.errNotRegistered'));
         return false;
       }
+
+      // Modo generador: crear un objeto nuevo desde cero (malla vacía).
+      if (targetObjectId === DESTINO_NUEVO_OBJETO) {
+        if (!plugin.generador) {
+          toast.error(t('editor3D.plugins.errSelect'));
+          return false;
+        }
+        try {
+          const resultado = plugin.aplicar({ vertices: [], faces: [] }, valores);
+          if (!resultado || !resultado.vertices.length) {
+            toast.error(t('editor3D.plugins.errInvalidMesh'));
+            return false;
+          }
+          const nuevoId = `object-${Date.now()}`;
+          const nuevoObjeto: SceneObject = {
+            id: nuevoId,
+            name: t('editor3D.objectN', { n: sceneObjects.length + 1 }),
+            transform: { ...IDENTITY_TRANSFORM },
+            mesh: resultado,
+            smooth: true,
+          };
+          setSceneObjects((current) => [...current, nuevoObjeto]);
+          setSelectedObjectId(nuevoId);
+          setSelectedObjectIds([nuevoId]);
+          toast.success(
+            t('editor3D.plugins.created', { plugin: plugin.nombre })
+          );
+          return true;
+        } catch (err) {
+          console.error('[plugins] Error al generar:', err);
+          toast.error(
+            err instanceof Error
+              ? err.message
+              : t('editor3D.plugins.errUnexpected')
+          );
+          return false;
+        }
+      }
+
+      const obj = sceneObjects.find((o) => o.id === targetObjectId);
+
       if (!obj) {
         toast.error(t('editor3D.objectsNotFound'));
         return false;
@@ -5859,9 +6350,9 @@ export default function Home({
               ? {
                   ...o,
                   mesh: resultado,
-                  // La deformación rompe el estilo original: la malla
-                  // resultante se muestra tal cual.
-                  smooth: false,
+                  // El resultado se muestra con el tipo de malla «Suave»
+                  // por defecto (sombreado suave).
+                  smooth: true,
                 }
               : o
           )
@@ -5891,14 +6382,142 @@ export default function Home({
   // según la herramienta activa. Es una función que devuelve JSX, no un
   // componente: definirla como componente remontaría los visores WebGL
   // (una instancia de THREE.WebGLRenderer por ventana) en cada render.
-  const renderViewerPanel = (viewName: 'front' | 'top' | 'side' | '3d') => (
+  // Cambia la vista (Frente/Superior/Costado/3D Libre) que muestra una
+  // ventana y recoloca su cámara al preset de esa vista.
+  const handlePanelViewChange = (slot: PanelSlot, view: PanelViewKind) => {
+    if (panelViews[slot] === view) return;
+    setPanelViews((prev) => ({ ...prev, [slot]: view }));
+    const presets: Record<
+      PanelViewKind,
+      { zoom: number; offsetX: number; offsetY: number; rotationX: number; rotationY: number }
+    > = {
+      front: { zoom: 1, offsetX: 0, offsetY: 0, rotationX: 0, rotationY: 0 },
+      back: { zoom: 1, offsetX: 0, offsetY: 0, rotationX: 0, rotationY: Math.PI },
+      top: { zoom: 1, offsetX: 0, offsetY: 0, rotationX: Math.PI / 2, rotationY: 0 },
+      bottom: { zoom: 1, offsetX: 0, offsetY: 0, rotationX: -Math.PI / 2, rotationY: 0 },
+      side: { zoom: 1, offsetX: 0, offsetY: 0, rotationX: 0, rotationY: Math.PI / 2 },
+      sideLeft: { zoom: 1, offsetX: 0, offsetY: 0, rotationX: 0, rotationY: -Math.PI / 2 },
+      '3d': { zoom: 1.2, offsetX: 0, offsetY: 0, rotationX: Math.PI / 6, rotationY: -Math.PI / 4 },
+    };
+    setPanelCameras((prev) => ({ ...prev, [slot]: presets[view] }));
+  };
+
+  // Encuadra lo que se ve en una sola ventana.
+  const frameWindow = (slot: 'front' | 'top' | 'side' | '3d') => {
+    setFrameTokens((prev) => ({ ...prev, [slot]: prev[slot] + 1 }));
+  };
+
+  // Encuadra lo que se ve en las cuatro ventanas a la vez.
+  const frameAllWindows = () => {
+    setFrameTokens((prev) => ({
+      front: prev.front + 1,
+      top: prev.top + 1,
+      side: prev.side + 1,
+      '3d': prev['3d'] + 1,
+    }));
+  };
+
+  /**
+   * Pinta las ventanas del área de trabajo según la composición elegida
+   * ("Diseño ventanas"). La rejilla 2x2 clásica son cuatro celdas de una
+   * cuadrícula; el resto de composiciones envuelven los visores en filas y
+   * columnas flexibles. Cada celda sigue siendo una ventana normal (con su
+   * menú de vista, su encuadre, etc.).
+   */
+  const renderWindowLayout = () => {
+    if (windowLayout === 'grid4') {
+      return (
+        <>
+          {renderViewerPanel('front')}
+          {renderViewerPanel('top')}
+          {renderViewerPanel('side')}
+          {renderViewerPanel('3d')}
+        </>
+      );
+    }
+    const cell = (name: PanelSlot, extra = 'flex-1') => (
+      <div className={`min-w-0 min-h-0 [&>*]:h-full ${extra}`}>
+        {renderViewerPanel(name)}
+      </div>
+    );
+    switch (windowLayout) {
+      case 'twoH':
+        return (
+          <div className="flex gap-1.5 flex-1 min-w-0 min-h-0">
+            {cell('front')}
+            {cell('3d')}
+          </div>
+        );
+      case 'twoV':
+        return (
+          <div className="flex flex-col gap-1.5 flex-1 min-w-0 min-h-0">
+            {cell('front')}
+            {cell('3d')}
+          </div>
+        );
+      case 'threeLeft':
+        return (
+          <div className="flex gap-1.5 flex-1 min-w-0 min-h-0">
+            <div className="flex flex-col gap-1.5 flex-1 min-w-0 min-h-0">
+              {cell('front')}
+              {cell('top')}
+            </div>
+            {cell('3d')}
+          </div>
+        );
+      case 'threeRight':
+        return (
+          <div className="flex gap-1.5 flex-1 min-w-0 min-h-0">
+            {cell('3d')}
+            <div className="flex flex-col gap-1.5 flex-1 min-w-0 min-h-0">
+              {cell('front')}
+              {cell('top')}
+            </div>
+          </div>
+        );
+      case 'threeOne':
+        return (
+          <div className="flex gap-1.5 flex-1 min-w-0 min-h-0">
+            <div className="flex flex-col gap-1.5 flex-[1] min-w-0 min-h-0">
+              {cell('front')}
+              {cell('top')}
+              {cell('side')}
+            </div>
+            <div className="flex flex-col gap-1.5 flex-[2] min-w-0 min-h-0">
+              {cell('3d')}
+            </div>
+          </div>
+        );
+      case 'threeOneRight':
+        return (
+          <div className="flex gap-1.5 flex-1 min-w-0 min-h-0">
+            <div className="flex flex-col gap-1.5 flex-[2] min-w-0 min-h-0">
+              {cell('3d')}
+            </div>
+            <div className="flex flex-col gap-1.5 flex-[1] min-w-0 min-h-0">
+              {cell('front')}
+              {cell('top')}
+              {cell('side')}
+            </div>
+          </div>
+        );
+      default:
+        return null;
+    }
+  };
+
+  const renderViewerPanel = (viewName: PanelSlot) => {
+    const viewKind = panelViews[viewName];
+    return (
     <ViewerPanel
       viewName={viewName}
-      label={
-        viewName === '3d'
-          ? t('editor3D.panelLabels.threeDFree')
-          : t(`editor3D.panelLabels.${viewName}Axis`)
-      }
+      viewKind={viewKind}
+      onViewKindChange={(v) => handlePanelViewChange(viewName, v)}
+      onFrameWindow={() => frameWindow(viewName)}
+      onFrameAll={frameAllWindows}
+      onOpenLayout={() => setLayoutModalOpen(true)}
+      frameToken={frameTokens[viewName]}
+      label={t(PANEL_VIEW_LABEL_KEY[viewKind])}
       editingState={editingPanel === viewName}
       onSetEditing={(v: boolean) => setEditingPanel(v ? viewName : null)}
       onActiveView={() => setActiveView(viewName)}
@@ -5947,6 +6566,11 @@ export default function Home({
         setSelectedEdgeIds([]);
       }}
       showGizmo={showGizmo}
+      gizmoModes={gizmoConfigMode ? gizmoModesDraft : gizmoModes}
+      gizmoInteractive={!gizmoConfigMode}
+      gizmoColorOverride={gizmoConfigMode ? 0x888888 : undefined}
+       gizmoOffset={gizmoOffset}
+       onGizmoOffsetChange={gizmoConfigMode ? setGizmoOffset : undefined}
       handleObjectTransform={handleObjectTransform}
       activeCamera={camaraObjetoDeVista(viewName)}
       exportCamera={activeCameraValue}
@@ -6008,6 +6632,7 @@ export default function Home({
       onAnimationComplete={() => {}}
       transformTracks={transformTracks}
       pluginTracks={pluginTracks}
+      effectTracks={effectTracks}
       pluginBaseMeshes={pluginBaseMeshes}
       motionPlaying={playing || motionEditorOpen}
       showMotionPath={showMotionPath}
@@ -6017,7 +6642,8 @@ export default function Home({
       zoom3D={zoom3D}
       orbit3D={orbit3D}
     />
-  );
+    );
+  };
 
 
   return (
@@ -6113,7 +6739,7 @@ export default function Home({
                   // modal (mismo motivo que en el modal «Objeto 3D»).
                   setPluginsModalOpen(true);
                 }}
-                disabled={visibleSceneObjects.length < 1}
+                disabled={visibleSceneObjects.length < 1 && !hayPluginGenerador}
                 data-testid="open-plugins-modal"
                 className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5 disabled:opacity-40"
                 title={t('editor3D.plugins.menuDesc')}
@@ -6700,26 +7326,29 @@ export default function Home({
             </button>
             {showKeyframeEditor && (
               <div className="pt-1">
-                <KeyframeEditor
-                  tracks={animationTracks}
-                  setTracks={setAnimationTracks}
-                  selectedTrackId={selectedTrackId}
-                  setSelectedTrackId={setSelectedTrackId}
-                  playing={playing}
-                  setPlaying={(v) => {
-                    // Reproducir durante la grabación la corta: el reloj
-                    // pelearía con el manejo manual de la cámara.
-                    if (v && grabacionRef.current) setGrabacion(null);
-                    setPlaying(v);
-                  }}
-                  currentTime={currentTime}
-                  setCurrentTime={setCurrentTime}
-                  sceneObjects={visibleSceneObjects}
-                  canExportMp4={!!activeCameraValue}
-                  cameraSpan={cameraSpanValue}
+                 <KeyframeEditor
+                   tracks={animationTracks}
+                   setTracks={setAnimationTracks}
+                   motionTracks={motionTracks}
+                   onMotionKeyframeTimeChange={handleMotionKeyframeTimeChange}
+                   onMotionKeyframeDelete={handleMotionKeyframeDelete}
+                   onMotionKeyframeEasingChange={handleMotionKeyframeEasingChange}
+                    onMotionKeyframeValueChange={handleMotionKeyframeValueChange}
+                    onMotionTrackUpdate={handleMotionTrackUpdate}
+                    onMotionAddKeyframe={handleMotionAddKeyframe}
+                    selectedTrackId={selectedTrackId}
+                   setSelectedTrackId={setSelectedTrackId}
+                   playing={playing}
+                   setPlaying={(v) => {
+                     if (v && grabacionRef.current) setGrabacion(null);
+                     setPlaying(v);
+                   }}
+                    currentTime={currentTime}
+                    setCurrentTime={setCurrentTime}
+                    sceneObjects={visibleSceneObjects}
+                   canExportMp4={!!activeCameraValue}
+                   cameraSpan={cameraSpanValue}
                    onExportMp4={() => {
-                     // La exportación maneja el visor con su propia rama:
-                     // corta la grabación para no pelear con ella.
                      setGrabacion(null);
                      setExportProgress(null);
                      setExportResult(null);
@@ -7708,9 +8337,98 @@ export default function Home({
                   className="mt-2 w-full flex items-center justify-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-medium text-purple-200 bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/30 transition-colors"
                 >
                   <Video className="w-3 h-3" />
-                  {t('editor3D.addCamera')}
-                </button>
-              </div>
+                 {t('editor3D.addCamera')}
+                 </button>
+               </div>
+
+               {/* Herramienta de configuración del gizmo del objeto: permite
+                   activar/desactivar el manipulador y, en modo configuración,
+                   ajustar qué asas están disponibles (mover, rotar, escalar)
+                   antes de reactivarlo. */}
+               <div className="mt-2 border-t border-white/5 pt-2 space-y-1.5">
+                 <div className="flex items-center justify-between">
+                   <button
+                     onClick={() => setShowGizmo(!showGizmo)}
+                     data-testid="toggle-gizmo-btn"
+                     title={showGizmo ? t('editor3D.gizmoHide') : t('editor3D.gizmoShow')}
+                     className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1 rounded-md text-[10px] font-medium transition-colors ${
+                       showGizmo
+                         ? 'bg-green-500/20 text-green-300 border border-green-500/30'
+                         : 'bg-black/40 text-foreground/60 hover:text-foreground border border-white/10'
+                     }`}
+                   >
+                     <Settings className="w-3 h-3" />
+                     {t('editor3D.gizmoTool')}
+                   </button>
+                    <button
+                      onClick={() => {
+                        if (gizmoConfigMode) {
+                          // Salir del modo configuración: aplicar el borrador
+                          // y restaurar la interactividad del gizmo.
+                          setGizmoModes(gizmoModesDraft);
+                          setGizmoConfigMode(false);
+                          setShowGizmo(prevGizmoVisibleRef.current);
+                        } else {
+                          if (!selectedObjectId) return;
+                          // Entrar en modo configuración: guardar si el gizmo
+                          // estaba visible, mostrarlo (en gris) y desactivar
+                          // la interacción para que no afecte al objeto.
+                          prevGizmoVisibleRef.current = showGizmo;
+                          setShowGizmo(true);
+                          setGizmoModesDraft([...gizmoModes]);
+                          setGizmoConfigMode(true);
+                        }
+                      }}
+                      data-testid="gizmo-config-btn"
+                      title={gizmoConfigMode ? t('editor3D.gizmoApply') : t('editor3D.gizmoConfigure')}
+                      disabled={!selectedObjectId}
+                      className={`px-1.5 py-1 rounded-md text-[10px] font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${
+                        gizmoConfigMode
+                          ? 'bg-green-500/20 text-green-300 border border-green-500/30'
+                          : 'bg-black/40 text-foreground/60 hover:text-foreground border border-white/10'
+                      }`}
+                    >
+                      {gizmoConfigMode ? <Check className="w-3 h-3" /> : '⚙'}
+                    </button>
+                  </div>
+
+                  {gizmoConfigMode && (
+                    <div className="space-y-1">
+                      {[
+                        { key: 'move' as const, icon: Move3D, label: t('editor3D.gizmoMove') },
+                        { key: 'rotate' as const, icon: Rotate3D, label: t('editor3D.gizmoRotate') },
+                        { key: 'scale' as const, icon: Scale3D, label: t('editor3D.gizmoScale') },
+                      ].map(({ key, icon: Icon, label }) => {
+                        const draftActive = gizmoModesDraft.includes(key);
+                        const toggle = () => {
+                          setGizmoModesDraft(draftActive
+                            ? gizmoModesDraft.filter((m) => m !== key)
+                            : [...gizmoModesDraft, key]
+                          )
+                        };
+                        return (
+                          <button
+                            key={key}
+                            onClick={toggle}
+                            data-testid={`gizmo-mode-${key}`}
+                            title={draftActive ? t('editor3D.gizmoDisableMode', { mode: label }) : t('editor3D.gizmoEnableMode', { mode: label })}
+                            className={`w-full flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] font-medium transition-colors ${
+                              draftActive
+                                ? 'bg-green-500/15 text-green-300 border border-green-500/30 hover:bg-green-500/25'
+                                : 'bg-red-500/15 text-red-300 border border-red-500/30 hover:bg-red-500/25'
+                            }`}
+                          >
+                            <Icon className="w-3 h-3" />
+                            <span>{label}</span>
+                            <span className="ml-auto font-mono">
+                              {draftActive ? '✓' : '×'}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+               </div>
               {/* ▼ Apariencia centralizada: un solo juego de color y
                   textura, aquí en Escena, que se aplica a los objetos
                   seleccionados (y queda como base de lo que se
@@ -8577,7 +9295,7 @@ export default function Home({
 
          <div className="flex-1 flex flex-col min-w-0 min-h-0">
            <div
-            className={`relative flex-1 ${motionEditorOpen ? 'flex flex-col' : isEditingCanvas ? 'grid grid-cols-1 grid-rows-1' : 'grid grid-cols-2 grid-rows-2'} gap-1.5 p-1.5 min-w-0 min-h-0`}
+            className={`relative flex-1 ${motionEditorOpen ? 'flex flex-col' : isEditingCanvas ? 'grid grid-cols-1 grid-rows-1' : windowLayout === 'grid4' ? 'grid grid-cols-2 grid-rows-2' : 'flex'} gap-1.5 p-1.5 min-w-0 min-h-0`}
           >
             {motionEditorOpen ? (
               <>
@@ -8609,11 +9327,13 @@ export default function Home({
                   selectedObjectId={selectedObjectId}
                   onSelectObject={handleObjectSelect}
                   groups={groups}
-                  transformTracks={transformTracks}
-                  setTransformTracks={setTransformTracks}
-                  pluginTracks={pluginTracks}
-                  setPluginTracks={setPluginTracks}
-                  pluginBaseMeshes={pluginBaseMeshes}
+                   transformTracks={transformTracks}
+                   setTransformTracks={setTransformTracks}
+                   pluginTracks={pluginTracks}
+                   setPluginTracks={setPluginTracks}
+                   effectTracks={effectTracks}
+                   setEffectTracks={setEffectTracks}
+                   pluginBaseMeshes={pluginBaseMeshes}
                   setPluginBaseMeshes={setPluginBaseMeshes}
                   playing={playing}
                   setPlaying={setPlaying}
@@ -9027,12 +9747,7 @@ export default function Home({
             ) : editingPanel !== null ? (
               renderViewerPanel(editingPanel)
             ) : (
-              <>
-                {renderViewerPanel('front')}
-                {renderViewerPanel('top')}
-                {renderViewerPanel('side')}
-                {renderViewerPanel('3d')}
-              </>
+              renderWindowLayout()
             )}
           </div>
 
@@ -9603,6 +10318,21 @@ export default function Home({
                            </button>
                          ))}
                      </div>
+
+                     {/* Offset actual del gizmo con botón de reset. */}
+                     <div className="flex items-center gap-1 mt-1">
+                       <span className="text-[9px] text-muted-foreground/60 font-mono">
+                         {t('editor3D.gizmoOffset')} {Math.round(gizmoOffset.px * 10) / 10}, {Math.round(gizmoOffset.py * 10) / 10}, {Math.round(gizmoOffset.pz * 10) / 10}
+                       </span>
+                       <button
+                         onClick={() => setGizmoOffset(structuredClone(IDENTITY_TRANSFORM))}
+                         data-testid="gizmo-reset-offset"
+                         title={t('editor3D.gizmoResetOffset')}
+                         className="ml-auto px-1.5 py-0.5 rounded text-[10px] text-muted-foreground/60 hover:text-foreground hover:bg-white/5 border border-white/10 transition-colors"
+                       >
+                         ↺
+                       </button>
+                     </div>
                    </div>
                  )}
 
@@ -9664,6 +10394,12 @@ export default function Home({
         onClose={() => setTextureBrowserOpen(false)}
         onSelectTexture={handleTextureSelect}
         mode={mode}
+      />
+      <WindowLayoutModal
+        isOpen={layoutModalOpen}
+        current={windowLayout}
+        onSelect={setWindowLayout}
+        onClose={() => setLayoutModalOpen(false)}
       />
        <LightingModal
          isOpen={isLightingModalOpen}

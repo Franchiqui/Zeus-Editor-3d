@@ -1,20 +1,39 @@
 'use client';
 
-import type { FC } from 'react';
-import Viewer3D, { type ObjectTransform } from '@/components/viewer-3d';
+import { useState, useRef, useEffect, type FC } from 'react';
+import { createPortal } from 'react-dom';
+import Viewer3D, { type ObjectTransform, type GizmoMode } from '@/components/viewer-3d';
 import { PanelButtons } from '@/components/editor/Editor3D';
 import { useI18n } from '@/lib/i18n';
 import type {
   AnimationTrack,
   CameraKeyframe,
   Vec3,
-  TransformTrack,
-  PluginParamTrack,
+   TransformTrack,
+   PluginParamTrack,
+   EffectTrack,
 } from '@/lib/animation';
 
+/** Vista que puede mostrar una ventana (incluye los dos costados). */
+export type PanelViewKind = 'front' | 'back' | 'top' | 'bottom' | 'side' | 'sideLeft' | '3d';
+/** Ventana física del área de trabajo (su posición en la rejilla 2x2). */
+export type PanelSlot = 'front' | 'top' | 'side' | '3d';
+
 interface ViewerPanelProps {
-  viewName: 'front' | 'top' | 'side' | '3d';
+  viewName: PanelSlot;
   label: string;
+  /** Vista que muestra ESTA ventana (puede diferir de su posición). */
+  viewKind?: PanelViewKind;
+  /** Cambia la vista que muestra esta ventana. */
+  onViewKindChange?: (v: PanelViewKind) => void;
+  /** Encuadra los objetos solo en esta ventana. */
+  onFrameWindow?: () => void;
+  /** Encuadra los objetos en las cuatro ventanas. */
+  onFrameAll?: () => void;
+  /** Abre el modal de diseño de ventanas del área de trabajo. */
+  onOpenLayout?: () => void;
+  /** Al cambiar, el visor encuadra (ajusta zoom/centro) lo que se ve. */
+  frameToken?: number;
   editingState: boolean;
   onSetEditing: (v: boolean) => void;
   onActiveView: () => void;
@@ -50,6 +69,13 @@ interface ViewerPanelProps {
     objectName?: string;
     onObjectNameChange?: (name: string) => void;
    showGizmo: boolean;
+   gizmoModes?: GizmoMode[];
+   gizmoInteractive?: boolean;
+   gizmoColorOverride?: number;
+   /** Offset del gizmo respecto al objeto (solo el manipulador). */
+   gizmoOffset?: ObjectTransform;
+   /** Notifica al padre del nuevo offset del gizmo (modo configuración). */
+   onGizmoOffsetChange?: (t: ObjectTransform) => void;
    handleObjectTransform: (transform: any) => void;
    handleVerticesChange: (vertices: any) => void;
    showLatheAxis: boolean;
@@ -81,10 +107,12 @@ interface ViewerPanelProps {
   animationTracks?: AnimationTrack[];
   animationTime?: number;
   onAnimationComplete?: (trackId: string) => void;
-  /** Pistas de transformada del editor de movimiento (segundos). */
-  transformTracks?: TransformTrack[];
-  /** Pistas de parámetros de plugin del editor de movimiento. */
-  pluginTracks?: PluginParamTrack[];
+   /** Pistas de transformada del editor de movimiento (segundos). */
+   transformTracks?: TransformTrack[];
+   /** Pistas de parámetros de plugin del editor de movimiento. */
+   pluginTracks?: PluginParamTrack[];
+   /** Pistas de efectos visuales del editor de movimiento. */
+   effectTracks?: EffectTrack[];
   /** Malla base congelada por objectId para las pistas de plugin. */
   pluginBaseMeshes?: Record<string, unknown>;
   /** Reproducción o scrub del editor de movimiento activo: el visor aplica override. */
@@ -136,6 +164,12 @@ interface ViewerPanelProps {
 
 export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
   label,
+  viewKind,
+  onViewKindChange,
+  onFrameWindow,
+  onFrameAll,
+  onOpenLayout,
+  frameToken,
   editingState,
   onSetEditing,
   onActiveView,
@@ -171,7 +205,12 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
     objectName,
     onObjectNameChange,
    showGizmo,
-  handleObjectTransform,
+   gizmoModes,
+   gizmoInteractive,
+   gizmoColorOverride,
+   gizmoOffset,
+   onGizmoOffsetChange,
+   handleObjectTransform,
   handleVerticesChange,
   showLatheAxis,
    viewerProjection,
@@ -201,11 +240,12 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
   animationTracks,
   animationTime,
   onAnimationComplete,
-  transformTracks,
-  pluginTracks,
+   transformTracks,
+   pluginTracks,
+   effectTracks,
   pluginBaseMeshes,
   motionPlaying,
-  showMotionPath,
+   showMotionPath,
   onMotionKeyframeMove,
   viewerSmooth,
   pan3D,
@@ -229,6 +269,48 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
     onExportComplete,
 }) => {
   const { t } = useI18n();
+  const vk: PanelViewKind = viewKind ?? viewName;
+  const [viewMenuOpen, setViewMenuOpen] = useState(false);
+  const [viewMenuPos, setViewMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const viewMenuBtnRef = useRef<HTMLButtonElement | null>(null);
+  const viewMenuPanelRef = useRef<HTMLDivElement | null>(null);
+  const toggleViewMenu = () => {
+    setViewMenuOpen((open) => {
+      if (!open) {
+        const rect = viewMenuBtnRef.current?.getBoundingClientRect();
+        if (rect) setViewMenuPos({ top: rect.bottom + 4, left: rect.left });
+      }
+      return !open;
+    });
+  };
+  useEffect(() => {
+    if (!viewMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      // Clic dentro del panel (portal) o en el propio botón: no cerrar aquí.
+      if (viewMenuPanelRef.current?.contains(target)) return;
+      if (viewMenuBtnRef.current?.contains(target)) return;
+      setViewMenuOpen(false);
+    };
+    const close = () => setViewMenuOpen(false);
+    document.addEventListener('mousedown', onDown);
+    window.addEventListener('resize', close);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('scroll', close, true);
+    };
+  }, [viewMenuOpen]);
+  const VISTA_LABELS: Record<PanelViewKind, string> = {
+    front: t('editor3D.views.front'),
+    back: t('editor3D.views.back'),
+    top: t('editor3D.views.top'),
+    bottom: t('editor3D.views.bottom'),
+    side: t('editor3D.views.sideRight'),
+    sideLeft: t('editor3D.views.sideLeft'),
+    '3d': t('editor3D.panelLabels.threeDFree'),
+  };
   return (
   <div
     onClick={onActiveView}
@@ -243,6 +325,82 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
         <span className="text-[10px] font-semibold uppercase tracking-wider text-green-300 shrink-0">
           {label}
         </span>
+        <div className="shrink-0">
+          <button
+            ref={viewMenuBtnRef}
+            data-testid={`view-menu-${viewName}`}
+            onClick={toggleViewMenu}
+            title={t('editor3D.panelViewTitle')}
+            className="flex items-center gap-0.5 px-1 py-0.5 rounded bg-black/40 border border-white/10 text-[10px] text-foreground/90 hover:bg-white/10 cursor-pointer"
+          >
+            <span>{VISTA_LABELS[vk]}</span>
+            <span className="text-[8px] leading-none">▼</span>
+          </button>
+        </div>
+        {viewMenuOpen &&
+          viewMenuPos &&
+          createPortal(
+            <div
+              ref={viewMenuPanelRef}
+              style={{
+                position: 'fixed',
+                top: viewMenuPos.top,
+                left: viewMenuPos.left,
+                zIndex: 9999,
+              }}
+              className="min-w-[190px] rounded-md border border-white/15 bg-gray-900/95 backdrop-blur shadow-lg py-1"
+            >
+              {(['front', 'back', 'side', 'sideLeft', 'top', 'bottom', '3d'] as const).map((v) => (
+                <button
+                  key={v}
+                  data-testid={`view-opt-${viewName}-${v}`}
+                  onClick={() => {
+                    onViewKindChange?.(v);
+                    setViewMenuOpen(false);
+                  }}
+                  className={`w-full text-left px-2 py-1 text-[11px] hover:bg-white/10 cursor-pointer flex items-center justify-between gap-3 ${
+                    vk === v ? 'text-green-300' : 'text-foreground/90'
+                  }`}
+                >
+                  <span>{VISTA_LABELS[v]}</span>
+                  {vk === v && <span>✓</span>}
+                </button>
+              ))}
+              <div className="my-1 h-px bg-white/10" />
+              <button
+                data-testid={`frame-window-${viewName}`}
+                onClick={() => {
+                  onFrameWindow?.();
+                  setViewMenuOpen(false);
+                }}
+                className="w-full text-left px-2 py-1 text-[11px] hover:bg-white/10 cursor-pointer text-foreground/90"
+              >
+                ⤡ {t('editor3D.panelFrameThis')}
+              </button>
+              <button
+                data-testid={`frame-all-${viewName}`}
+                onClick={() => {
+                  onFrameAll?.();
+                  setViewMenuOpen(false);
+                }}
+                className="w-full text-left px-2 py-1 text-[11px] hover:bg-white/10 cursor-pointer text-foreground/90"
+              >
+                ⛶ {t('editor3D.panelFrameAll')}
+              </button>
+              <div className="my-1 h-px bg-white/10" />
+              <button
+                data-testid={`layout-window-${viewName}`}
+                onClick={() => {
+                  onOpenLayout?.();
+                  setViewMenuOpen(false);
+                }}
+                className="w-full text-left px-2 py-1 text-[11px] hover:bg-white/10 cursor-pointer text-foreground/90"
+              >
+                ▦ {t('editor3D.panelLayout')}
+              </button>
+            </div>,
+            document.body
+          )}
         {camarasObjeto && camarasObjeto.length > 0 && (
           <select
             value={camaraObjetoId ?? ''}
@@ -322,7 +480,12 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
           onMultiObjectTransform={onMultiObjectTransform}
            objectName={objectName}
            onObjectNameChange={onObjectNameChange}
-           gizmo={showGizmo}
+            gizmo={showGizmo}
+            gizmoModes={gizmoModes}
+            gizmoInteractive={gizmoInteractive}
+            gizmoColorOverride={gizmoColorOverride}
+            gizmoOffset={gizmoOffset}
+            onGizmoOffsetChange={onGizmoOffsetChange}
            booleanToolObjectId={booleanToolObjectId}
            forceObjectsUpdate={forceUpdate}
           objectTransform={
@@ -353,6 +516,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
          onFxChange={(fx) => setFxConfig((prev) => ({ ...prev, ...fx }))}
          onLightConfigChange={setLightConfig}
          camera3D={panelCameras[viewName]}
+         frameToken={frameToken}
          onCameraChange={(cam) => handleCameraChange(viewName, cam)}
          activeCamera={activeCamera}
          exportCamera={exportCamera}
@@ -367,9 +531,10 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
          animationTime={animationTime}
          onAnimationComplete={onAnimationComplete}
          transformTracks={transformTracks}
-         pluginTracks={pluginTracks}
+          pluginTracks={pluginTracks}
+          effectTracks={effectTracks}
          pluginBaseMeshes={pluginBaseMeshes}
-         motionPlaying={motionPlaying}
+          motionPlaying={motionPlaying}
          showMotionPath={showMotionPath}
          onMotionKeyframeMove={onMotionKeyframeMove}
          smoothShading={viewerSmooth}
@@ -377,18 +542,6 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
          onExportProgress={onExportProgress}
          onExportComplete={onExportComplete}
        />
-       {viewName !== '3d' && (
-         <div className="absolute bottom-2 left-2 flex items-center gap-2 pointer-events-none z-10">
-           <div className="flex items-center gap-0.5 text-xs text-green-400 font-mono">
-             <span>→</span>
-             <span>{viewName === 'front' ? 'X' : viewName === 'side' ? 'Z' : 'X'}</span>
-           </div>
-           <div className="flex items-center gap-0.5 text-xs text-pink-400 font-mono">
-             <span>↑</span>
-             <span>{viewName === 'front' || viewName === 'side' ? 'Y' : 'Z'}</span>
-           </div>
-         </div>
-       )}
      </div>
    </div>
   );

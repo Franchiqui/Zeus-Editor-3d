@@ -13,6 +13,7 @@ import { UTILIDADES } from './builtin/utilidades';
 import { doblarEje } from './builtin/doblar';
 import { fragmentar } from './builtin/fragmentar';
 import { disolver } from './builtin/disolver';
+import { generarTerreno } from './builtin/terreno';
 
 export type {
   ZeusPlugin,
@@ -20,6 +21,7 @@ export type {
   PluginParams,
   PluginCategoria,
 } from './types';
+export { DESTINO_NUEVO_OBJETO } from './types';
 export {
   registrarPlugin,
   quitarPlugin,
@@ -34,7 +36,15 @@ let registrado = false;
 export function registrarPluginsIntegrados(): void {
   if (registrado) return;
   registrado = true;
-  for (const p of [...DEFORMADORES, ...UTILIDADES, doblarEje, fragmentar, disolver]) registrarPlugin(p);
+  for (const p of [
+    ...DEFORMADORES,
+    ...UTILIDADES,
+    doblarEje,
+    fragmentar,
+    disolver,
+    generarTerreno,
+  ])
+    registrarPlugin(p);
 }
 
 // Auto-registro al importar: cualquier módulo que importe

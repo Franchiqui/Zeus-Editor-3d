@@ -13,6 +13,7 @@
 | `lib/plugins/registry.ts` | Registro: alta/baja/listado de plugins (reactivo) |
 | `lib/plugins/index.ts` | Punto de entrada: **aquí se registra cada plugin nuevo** |
 | `lib/plugins/builtin/deformadores.ts` | Plugins integrados de deformación (Bend, Twist, Taper, Noise) |
+| `lib/plugins/builtin/terreno.ts` | Generador de terreno/montañas (crea la superficie o transforma una existente; rejilla + ruido fractal) |
 | `lib/plugins/builtin/utilidades.ts` | Plugins de utilidad (suavizar, decimar) |
 | `components/editor/PluginsModal.tsx` | El modal «Plugins» (menú **Acciones** del editor) |
 | `components/editor/Editor3D.tsx` | `handleApplyPlugin`: ejecuta el plugin sobre el objeto |
@@ -142,6 +143,7 @@ hacen los plugins integrados) porque el usuario puede no haberlos tocado.
 ## Categorías
 
 - `'deformadores'` — modifican la forma (aparecen primero)
+- `'terreno'` — generadores de relieve; pueden crear la superficie o transformar una existente (montañas)
 - `'utilidades'` — procesado de malla (suavizar, decimar)
 - Cualquier otra string crea una categoría nueva al final de la lista.
 
@@ -165,6 +167,23 @@ Checks mínimos para cualquier plugin nuevo:
 
 ---
 
+## Plugins generadores (crear la malla desde cero)
+
+Un plugin puede declarar `generador: true`. En ese caso el modal muestra la
+opción **«✨ Nuevo objeto»** en el desplegable de destino y, al elegirla, el
+editor **no** busca un objeto base: llama a `aplicar` con una **malla vacía**
+(`{ vertices: [], faces: [] }`) y añade el resultado como un objeto nuevo a la
+escena (centrado en el origen, transformada identidad).
+
+- El plugin debe saber construir su propia geometría cuando
+  `mesh.vertices.length === 0` (p. ej. a partir de parámetros de tamaño como
+  `ancho`/`largo`). Con una malla no vacía, se comporta como un transformador.
+- El modal envía el destino especial `DESTINO_NUEVO_OBJETO` (exportado desde
+  `@/lib/plugins`); `handleApplyPlugin` lo detecta y crea el objeto nuevo.
+- Los generadores pueden aplicarse igualmente sobre una superficie existente
+  (basta con elegirla en el desplegable), así que no dependen de tener un
+  suelo dibujado.
+
 ## Flujo al aplicar (lo que hace el editor por ti)
 
 `handleApplyPlugin` en `components/editor/Editor3D.tsx`:
@@ -176,3 +195,7 @@ Checks mínimos para cualquier plugin nuevo:
    "horneada", como en las booleanas).
 4. Guarda `{ ...obj, mesh: resultado, smooth: false }` en la escena.
 5. La acción queda en el historial → **Ctrl+Z la deshace**.
+
+Si el plugin es **generador** y el destino es «Nuevo objeto», en vez de los
+pasos 1-4 se crea un objeto nuevo con la malla que devuelve `aplicar` (misma
+entrada al historial, también deshacible con Ctrl+Z).

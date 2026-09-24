@@ -176,7 +176,14 @@ export default function Object3DPreview({ mesh }: { mesh: Mesh | null }) {
         material.map = texture;
         material.needsUpdate = true;
         textureRef.current = texture;
-      });
+      },
+        undefined,
+        () => {
+          // Textura rota o de un archivo antiguo (media://) que ya no existe:
+          // no dejar el material en blanco, usar el color de la figura.
+          material.color.set(figureColorOf(mesh));
+          material.needsUpdate = true;
+        });
     }
 
     const meshObj = new THREE.Mesh(geometry, material);
