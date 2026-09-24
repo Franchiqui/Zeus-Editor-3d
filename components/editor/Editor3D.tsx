@@ -57,6 +57,8 @@ import BooleanCSGModal from './BooleanCSGModal';
 import PluginsModal from './PluginsModal';
 import WindowLayoutModal, { type WindowLayout } from './WindowLayoutModal';
 import { MotionEditor } from './MotionEditor';
+import { ObjectTransformFields } from './object-transform-fields';
+import { AxisHeader } from './axis-header';
 import { cloneMesh } from '@/lib/plugins/clone';
 import { performCSGOperation, type BooleanOperationType } from '@/lib/csg-mesh';
 import { obtenerPlugin, listarPlugins, DESTINO_NUEVO_OBJETO, type PluginParams } from '@/lib/plugins';
@@ -392,6 +394,61 @@ type HistoryState = {
    /** Mallas base congeladas para las pistas de plugin, por objectId. */
    pluginBaseMeshes: Record<string, Mesh>;
  };
+
+// Comparación de dos fotos del editor (para saber si un cambio es real o
+// solo una actualización idéntica). La escena y el editor de movimiento van
+// por referencia: sus actualizaciones son inmutables (mismo array ⇒ mismo
+// contenido) y sus mallas son enormes, compararlas valor a valor sería muy
+// costoso. El resto de la configuración se compara por valor.
+const sameHistoryValue = (a: unknown, b: unknown) =>
+  JSON.stringify(a) === JSON.stringify(b);
+
+const isSameHistoryState = (a: HistoryState, b: HistoryState): boolean =>
+  a.sceneObjects === b.sceneObjects &&
+  a.selectedObjectId === b.selectedObjectId &&
+  a.configObjectId === b.configObjectId &&
+  a.mode === b.mode &&
+  a.transformTracks === b.transformTracks &&
+  a.pluginTracks === b.pluginTracks &&
+  a.effectTracks === b.effectTracks &&
+  a.pluginBaseMeshes === b.pluginBaseMeshes &&
+  sameHistoryValue(a.views, b.views) &&
+  sameHistoryValue(a.editedVertices, b.editedVertices) &&
+  a.text === b.text &&
+  a.fontCss === b.fontCss &&
+  a.textDepth === b.textDepth &&
+  a.hollowText === b.hollowText &&
+  a.greedyMesh === b.greedyMesh &&
+  a.textRes === b.textRes &&
+  a.textOpacity === b.textOpacity &&
+  a.viewsOpacity === b.viewsOpacity &&
+  a.extrudeDepth === b.extrudeDepth &&
+  sameHistoryValue(a.extrudeHoles ?? [], b.extrudeHoles ?? []) &&
+  a.textMode === b.textMode &&
+  a.useFontColor === b.useFontColor &&
+  a.baseColor === b.baseColor &&
+  a.figureColor === b.figureColor &&
+  a.texture === b.texture &&
+  a.latheTexture === b.latheTexture &&
+  a.textureProjection === b.textureProjection &&
+  a.textureFinish === b.textureFinish &&
+  a.textureRelief === b.textureRelief &&
+  a.textureRepeat === b.textureRepeat &&
+  a.resolution === b.resolution &&
+  a.meshStyle === b.meshStyle &&
+  sameHistoryValue(a.meshSilhouette, b.meshSilhouette) &&
+  sameHistoryValue(a.meshSections, b.meshSections) &&
+  a.meshSilhouetteView === b.meshSilhouetteView &&
+  sameHistoryValue(a.meshSideView, b.meshSideView) &&
+  a.meshOpacity === b.meshOpacity &&
+  sameHistoryValue(a.latheProfile, b.latheProfile) &&
+  a.latheOpacity === b.latheOpacity &&
+  a.latheSegments === b.latheSegments &&
+  a.latheClamp === b.latheClamp &&
+  a.latheFigureColor === b.latheFigureColor &&
+  sameHistoryValue(a.gizmoOffset, b.gizmoOffset) &&
+  sameHistoryValue(a.groups, b.groups) &&
+  sameHistoryValue(a.polylines, b.polylines);
 
 // Plantillas por defecto: vacías. Los lienzos 2D arrancan en blanco
 // — el usuario dibuja desde cero o inserta una forma de un clic. El
@@ -1329,6 +1386,16 @@ export default function Home({
   const [history, setHistory] = useState<HistoryState[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [isUndoRedo, setIsUndoRedo] = useState(false);
+  // Espejos del historial en refs: deshacer/rehacer los leen para trabajar
+  // siempre con el estado MÁS reciente, sin depender de closures desfasadas.
+  const historyRef = useRef<HistoryState[]>([]);
+  const historyIndexRef = useRef(-1);
+  // Cambio recién hecho que aún espera para entrar en el historial (el
+  // antirrebote agrupa una ráfaga de cambios —arrastrar, teclear— en un solo
+  // paso). Se «vuelca» antes de deshacer/rehacer (flushPendingHistory) para
+  // no perder nunca el último cambio hecho justo antes de pulsar.
+  const pendingSnapshotRef = useRef<HistoryState | null>(null);
+  const historyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [activeView, setActiveView] = useState<'front' | 'top' | 'side' | '3d'>(
     'front'
   );
@@ -1926,6 +1993,44 @@ export default function Home({
     };
   }, [fontCss]);
 
+  // Confirma una foto como nuevo paso del historial. Si no ha cambiado nada
+  // respecto al paso actual, no añade nada (así el antirrebote no ensucia el
+  // historial ni rompe el rehacer).
+  const commitHistorySnapshot = useCallback((snapshot: HistoryState) => {
+    const current = historyRef.current;
+    const index = historyIndexRef.current;
+    const lastState = current[index];
+    if (lastState && isSameHistoryState(lastState, snapshot)) return;
+
+    const newHistory = current.slice(0, index + 1);
+    newHistory.push(snapshot);
+    while (newHistory.length > 50) newHistory.shift();
+
+    historyRef.current = newHistory;
+    historyIndexRef.current = newHistory.length - 1;
+    setHistory(newHistory);
+    setHistoryIndex(newHistory.length - 1);
+  }, []);
+
+  // Vuelca al historial el cambio pendiente (el que aún aguardaba al
+  // antirrebote). Se llama antes de deshacer/rehacer para que un cambio
+  // hecho justo antes de pulsar no se pierda.
+  const flushPendingHistory = useCallback(() => {
+    if (historyTimerRef.current !== null) {
+      clearTimeout(historyTimerRef.current);
+      historyTimerRef.current = null;
+    }
+    const pending = pendingSnapshotRef.current;
+    if (pending) {
+      pendingSnapshotRef.current = null;
+      commitHistorySnapshot(pending);
+    }
+  }, [commitHistorySnapshot]);
+
+  // Antirrebote: agrupa una ráfaga de cambios (arrastrar el gizmo, teclear,
+  // mover un deslizador) en un solo paso del historial. La foto pendiente se
+  // guarda en pendingSnapshotRef para poder volcarla de inmediato al
+  // deshacer/rehacer (ver flushPendingHistory).
   useEffect(() => {
     if (isUndoRedo) return;
 
@@ -1967,99 +2072,44 @@ export default function Home({
       latheOpacity,
       latheSegments,
       latheClamp,
-       latheFigureColor,
-       gizmoOffset: { ...gizmoOffset },
-       sceneObjects,
+      latheFigureColor,
+      gizmoOffset: { ...gizmoOffset },
+      sceneObjects,
       selectedObjectId,
       configObjectId,
       mode,
       groups,
       polylines,
-       transformTracks,
-       pluginTracks,
-       effectTracks,
-       pluginBaseMeshes,
+      transformTracks,
+      pluginTracks,
+      effectTracks,
+      pluginBaseMeshes,
     });
 
-    if (history.length === 0 && historyIndex === -1) {
-      setHistory([capture()]);
+    const currentState = capture();
+
+    if (historyRef.current.length === 0 && historyIndexRef.current === -1) {
+      // Primera foto del historial: el punto de partida.
+      historyRef.current = [currentState];
+      historyIndexRef.current = 0;
+      setHistory([currentState]);
       setHistoryIndex(0);
+      return;
     }
 
-    const timer = setTimeout(() => {
-      const currentState = capture();
+    pendingSnapshotRef.current = currentState;
+    if (historyTimerRef.current !== null) clearTimeout(historyTimerRef.current);
+    historyTimerRef.current = setTimeout(() => {
+      historyTimerRef.current = null;
+      commitHistorySnapshot(currentState);
+    }, 400);
 
-      const lastState = history[historyIndex];
-      if (lastState) {
-        const same = (a: unknown, b: unknown) =>
-          JSON.stringify(a) === JSON.stringify(b);
-        // La escena se compara por referencia: sus actualizaciones son
-        // inmutables, así que mismo array ⇒ mismo contenido. Comparar
-        // las mallas valor a valor sería muy costoso.
-        const sceneSame =
-          lastState.sceneObjects === currentState.sceneObjects &&
-          lastState.selectedObjectId === currentState.selectedObjectId &&
-          lastState.configObjectId === currentState.configObjectId &&
-          lastState.mode === currentState.mode &&
-          // Editor de movimiento: también por referencia (las mallas
-          // base son enormes; stringify sería muy costoso).
-          lastState.transformTracks === currentState.transformTracks &&
-          lastState.pluginTracks === currentState.pluginTracks &&
-          lastState.effectTracks === currentState.effectTracks &&
-          lastState.pluginBaseMeshes === currentState.pluginBaseMeshes;
-        const isSame =
-          sceneSame &&
-          same(lastState.views, currentState.views) &&
-          same(lastState.editedVertices, currentState.editedVertices) &&
-          lastState.text === currentState.text &&
-          lastState.fontCss === currentState.fontCss &&
-          lastState.textDepth === currentState.textDepth &&
-          lastState.hollowText === currentState.hollowText &&
-          lastState.greedyMesh === currentState.greedyMesh &&
-          lastState.textRes === currentState.textRes &&
-          lastState.textOpacity === currentState.textOpacity &&
-          lastState.viewsOpacity === currentState.viewsOpacity &&
-          lastState.extrudeDepth === currentState.extrudeDepth &&
-          same(lastState.extrudeHoles ?? [], currentState.extrudeHoles ?? []) &&
-          lastState.textMode === currentState.textMode &&
-          lastState.useFontColor === currentState.useFontColor &&
-          lastState.baseColor === currentState.baseColor &&
-          lastState.figureColor === currentState.figureColor &&
-          lastState.texture === currentState.texture &&
-          lastState.latheTexture === currentState.latheTexture &&
-          lastState.textureProjection === currentState.textureProjection &&
-          lastState.textureFinish === currentState.textureFinish &&
-          lastState.textureRelief === currentState.textureRelief &&
-          lastState.resolution === currentState.resolution &&
-          lastState.meshStyle === currentState.meshStyle &&
-          same(lastState.meshSilhouette, currentState.meshSilhouette) &&
-          same(lastState.meshSections, currentState.meshSections) &&
-          lastState.meshSilhouetteView === currentState.meshSilhouetteView &&
-          same(lastState.meshSideView, currentState.meshSideView) &&
-          lastState.meshOpacity === currentState.meshOpacity &&
-          same(lastState.latheProfile, currentState.latheProfile) &&
-          lastState.latheOpacity === currentState.latheOpacity &&
-          lastState.latheSegments === currentState.latheSegments &&
-          lastState.latheClamp === currentState.latheClamp &&
-          lastState.latheFigureColor === currentState.latheFigureColor &&
-          same(lastState.groups, currentState.groups) &&
-          same(lastState.polylines, currentState.polylines);
-
-        if (isSame) return;
+    return () => {
+      if (historyTimerRef.current !== null) {
+        clearTimeout(historyTimerRef.current);
+        historyTimerRef.current = null;
       }
-
-      const newHistory = history.slice(0, historyIndex + 1);
-      newHistory.push(currentState);
-
-      while (newHistory.length > 50) {
-        newHistory.shift();
-      }
-
-      setHistory(newHistory);
-      setHistoryIndex(newHistory.length - 1);
-    }, 500);
-
-    return () => clearTimeout(timer);
+    };
   }, [
     views,
     editedVertices,
@@ -2080,10 +2130,10 @@ export default function Home({
     texture,
     latheTexture,
     textureProjection,
-     textureFinish,
-     textureRelief,
-     textureRepeat,
-     resolution,
+    textureFinish,
+    textureRelief,
+    textureRepeat,
+    resolution,
     meshStyle,
     meshSilhouette,
     meshSections,
@@ -2095,17 +2145,19 @@ export default function Home({
     latheSegments,
     latheClamp,
     latheFigureColor,
+    gizmoOffset,
     sceneObjects,
     selectedObjectId,
     configObjectId,
     mode,
+    groups,
     polylines,
     transformTracks,
     pluginTracks,
+    effectTracks,
     pluginBaseMeshes,
-    history,
-    historyIndex,
     isUndoRedo,
+    commitHistorySnapshot,
   ]);
 
   // Restaura una foto del historial: configuración de la pestaña Y
@@ -2126,6 +2178,7 @@ export default function Home({
     setExtrudeDepth(state.extrudeDepth);
     setExtrudeHoles(state.extrudeHoles ?? []);
     setTextMode(state.textMode);
+    setUseFontColor(state.useFontColor !== false);
     setBaseColor(state.baseColor);
     setFigureColor(state.figureColor);
     setTexture(state.texture);
@@ -2135,6 +2188,7 @@ export default function Home({
     setTextureProjection(state.textureProjection);
     setTextureFinish(state.textureFinish);
     setTextureRelief(state.textureRelief);
+    setTextureRepeat(state.textureRepeat ?? 1);
     setResolution(state.resolution);
     setMeshStyle(state.meshStyle);
     setMeshSilhouette(state.meshSilhouette);
@@ -2165,28 +2219,58 @@ export default function Home({
   }, []);
 
   const undo = useCallback(() => {
-    if (historyIndex <= 0) return;
+    // Vuelca primero el último cambio (aún pendiente del antirrebote) para
+    // que deshacer no deje atrás un cambio recién hecho.
+    flushPendingHistory();
+
+    const index = historyIndexRef.current;
+    if (index <= 0) return;
 
     setIsUndoRedo(true);
-    const prevState = history[historyIndex - 1];
+    const prevState = historyRef.current[index - 1];
     if (prevState) {
       applyHistoryState(prevState);
-      setHistoryIndex(historyIndex - 1);
+      historyIndexRef.current = index - 1;
+      setHistoryIndex(index - 1);
     }
     setTimeout(() => setIsUndoRedo(false), 50);
-  }, [history, historyIndex, applyHistoryState]);
+  }, [applyHistoryState, flushPendingHistory]);
 
   const redo = useCallback(() => {
-    if (historyIndex >= history.length - 1) return;
+    flushPendingHistory();
+
+    const index = historyIndexRef.current;
+    if (index >= historyRef.current.length - 1) return;
 
     setIsUndoRedo(true);
-    const nextState = history[historyIndex + 1];
+    const nextState = historyRef.current[index + 1];
     if (nextState) {
       applyHistoryState(nextState);
-      setHistoryIndex(historyIndex + 1);
+      historyIndexRef.current = index + 1;
+      setHistoryIndex(index + 1);
     }
     setTimeout(() => setIsUndoRedo(false), 50);
-  }, [history, historyIndex, applyHistoryState]);
+  }, [applyHistoryState, flushPendingHistory]);
+
+  // Atajos de teclado estándar: Ctrl/Cmd+Z deshace; Ctrl/Cmd+Shift+Z o
+  // Ctrl/Cmd+Y rehacen. No roban el atajo mientras se escribe en un campo
+  // (ahí el navegador ya deshace el texto) ni con un modal abierto.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const key = e.key.toLowerCase();
+      if (key !== 'z' && key !== 'y') return;
+      if (document.querySelector('[role="dialog"]')) return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) return;
+      e.preventDefault();
+      if (key === 'y' || e.shiftKey) redo();
+      else undo();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [undo, redo]);
 
   // Viewport control functions
   const panView = useCallback((view: keyof Views, dx: number, dy: number) => {
@@ -8670,6 +8754,32 @@ export default function Home({
                   />
                 </div>
               </div>
+              {selectedSceneObject && (
+                <div
+                  className="shrink-0 px-3 py-2 border-b border-white/5 space-y-1.5"
+                  data-testid="object-transform-panel"
+                >
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      {t('editor3D.objTransform')}
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={() => handleObjectTransform(IDENTITY_TRANSFORM)}
+                      className="px-1.5 py-0.5 rounded border border-white/10 bg-black/40 hover:bg-white/10 text-[10px] text-muted-foreground"
+                      title={t('editor3D.resetTransform')}
+                      data-testid="object-transform-reset"
+                    >
+                      ↺
+                    </button>
+                  </div>
+                  <ObjectTransformFields
+                    transform={selectedSceneObject.transform}
+                    onChange={handleObjectTransform}
+                    t={t}
+                  />
+                </div>
+              )}
               <div
                 className="shrink-0 overflow-y-auto custom-scrollbar max-h-[320px] px-2 py-2 space-y-1"
                 data-testid="scene-object-list"
@@ -8965,6 +9075,13 @@ export default function Home({
                       <label className="text-[10px] text-muted-foreground">
                         {t('editor3D.cameraFocus')}
                       </label>
+                      <AxisHeader
+                        t={t}
+                        gap="gap-1"
+                        className="mt-0.5 mb-0.5"
+                        testId="camera-focus-axis-header"
+                        testIdPrefix="camera-focus-axis"
+                      />
                       <div className="flex items-center gap-1">
                         {(['x', 'y', 'z'] as const).map((axis) => (
                           <input
@@ -9092,6 +9209,12 @@ export default function Home({
                                 <Trash2 className="w-3 h-3" />
                               </button>
                             </div>
+                            <AxisHeader
+                              t={t}
+                              gap="gap-1"
+                              testId={`camera-kf-axis-header-${i}`}
+                              testIdPrefix={`camera-kf-pos-axis-${i}`}
+                            />
                             <div className="flex items-center gap-1">
                               {(['x', 'y', 'z'] as const).map((axis) => (
                                 <input
@@ -10406,6 +10529,7 @@ export default function Home({
          onClose={() => setIsLightingModalOpen(false)}
          lightConfig={lightConfig}
          onSave={setLightConfig}
+         objects={sceneObjects.map((o) => ({ id: o.id, name: o.name }))}
        />
       <input
         ref={textureInputRef}

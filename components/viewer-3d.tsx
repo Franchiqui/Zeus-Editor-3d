@@ -155,6 +155,12 @@ export interface SpotlightConfig {
   enabled: boolean;
   position: { x: number; y: number; z: number };
   target: { x: number; y: number; z: number };
+  /**
+   * Si está definido, el foco apunta SIEMPRE a este objeto de la escena y lo
+   * sigue aunque se mueva. Tiene prioridad sobre `target`, que queda como
+   * respaldo cuando el objeto no existe o no hay vínculo.
+   */
+  targetObjectId?: string;
   color: number;
   intensity: number;
   angle: number;
@@ -174,6 +180,10 @@ export interface LightConfig {
     intensity: number;
   };
   spotlights: SpotlightConfig[];
+  /** Opcional: si está activo, el fondo (cielo) también sigue a las luces.
+   *  Se oscurece al bajar la intensidad total (0 = cielo negro) y vuelve a
+   *  su brillo original al subirla. Si falta o es false, el cielo no cambia. */
+  affectSky?: boolean;
 }
 
 const IDENTITY_CAMERA3D: Camera3D = {
@@ -183,6 +193,29 @@ const IDENTITY_CAMERA3D: Camera3D = {
   rotationX: 0,
   rotationY: 0,
 };
+
+/**
+ * Posición a la que apunta un foco. Si está vinculado a un objeto
+ * (`targetObjectId`), devuelve la del objeto según su transform actual de la
+ * escena —así lo sigue aunque se mueva—; si no, la de las coordenadas
+ * manuales `target`. Fuente única usada por la luz real y por los ayudantes.
+ */
+export function resolveSpotTarget(
+  sp: SpotlightConfig,
+  objs?: Array<{ id: string; transform: ObjectTransform }> | null
+): { x: number; y: number; z: number } {
+  if (sp.targetObjectId && objs) {
+    const obj = objs.find((o) => o.id === sp.targetObjectId);
+    if (obj) {
+      return { x: obj.transform.px, y: obj.transform.py, z: obj.transform.pz };
+    }
+  }
+  return {
+    x: sp.target?.x ?? 0,
+    y: sp.target?.y ?? 0,
+    z: sp.target?.z ?? 0,
+  };
+}
 
 interface Viewer3DProps {
   mesh: Mesh;
@@ -2304,6 +2337,8 @@ export default function Viewer3D({
    const gridGroupRef = useRef<THREE.Group | null>(null);
    const groundRef = useRef<THREE.Mesh | null>(null);
    const skyboxRef = useRef<THREE.Mesh | null>(null);
+  // Color base del fondo (cielo) sin luces: permite atenuarlo/realzarlo.
+  const skyBaseColorRef = useRef<THREE.Color>(new THREE.Color('hsl(224, 50%, 7%)'));
   // Recorrido de la cámara-objeto (curva + asas arrastrables por fotograma)
   const cameraObjectPathRef = useRef<{
     group: THREE.Group;
@@ -2446,6 +2481,10 @@ export default function Viewer3D({
    const gizmoInteractiveRef = useRef(gizmoInteractive);
    gizmoInteractiveRef.current = gizmoInteractive;
     const gizmoOffsetRef = useRef<ObjectTransform>(gizmoOffset ?? IDENTITY_TRANSFORM);
+    // Escala base del gizmo, fijada por el efecto de tamano segun el
+    // objeto. El offset de configuracion la multiplica por eje para
+    // poder escalar el propio manipulador sin tocar la figura.
+    const gizmoBaseScaleRef = useRef(1);
     const onGizmoOffsetChangeRef = useRef(onGizmoOffsetChange);
    onGizmoOffsetChangeRef.current = onGizmoOffsetChange;
   // Posición/rotación/escala del objeto: el manipulador las fija
@@ -2524,6 +2563,10 @@ export default function Viewer3D({
          new THREE.Euler(off.rx, off.ry, off.rz)
        );
        giz.quaternion.multiply(offQuat);
+      // La escala del offset tambien se aplica al gizmo (por eje), de
+      // modo que en modo configuracion se puede escalar el manipulador.
+      const baseScale = gizmoBaseScaleRef.current || 1;
+      giz.scale.set(baseScale * off.sx, baseScale * off.sy, baseScale * off.sz);
      }
     if (lightGizmoGroupRef.current) {
       lightGizmoGroupRef.current.visible = false;
@@ -2934,10 +2977,11 @@ export default function Viewer3D({
           const fwdCircle = new THREE.Mesh(fwdGeo, fwdMat);
           fwdCircle.name = `spotlight-forward-${idx}`;
           fwdCircle.position.copy(posHandle.position);
+          const fwdTgt = resolveSpotTarget(sp, objectsRef.current);
           const lightDir = new THREE.Vector3(
-            (sp.target?.x ?? 0) - sp.position.x,
-            (sp.target?.y ?? 0) - sp.position.y,
-            (sp.target?.z ?? 0) - sp.position.z
+            fwdTgt.x - sp.position.x,
+            fwdTgt.y - sp.position.y,
+            fwdTgt.z - sp.position.z
           );
           if (lightDir.lengthSq() > 1e-9) {
             lightDir.normalize();
@@ -3881,14 +3925,34 @@ export default function Viewer3D({
       const dt = Math.min(clock.getDelta(), 0.05);
 
       const exportState = exportStateRef.current;
-      // Durante la exportación no deben salir ayudas de edición en el
-      // vídeo: el gizmo del objeto (con su bola amarilla de estirar), el
-      // recorrido de la cámara con sus asas y su bola de foco, el gizmo
-      // del foco de luz y las esferas de vértice. Se mantienen ocultas
-      // cada frame (otros efectos podrían reactivarlas) y, al terminar,
-      // una sola vez se restauran a su visibilidad normal.
+      // Cámara-objeto: la cámara elegida en ESTA ventana maneja el visor
+      // con SU pose (estática con 1 fotograma, recorrido con ≥2); durante
+      // la exportación manda la cámara de exportación. OrbitControls queda
+      // deshabilitado y sus eventos no llegan a los paneles; al salir se
+      // restaura la vista del panel.
+      const camVentana = activeCameraRef.current;
+      const camExport = exportState ? exportCameraRef.current ?? camVentana : null;
+      const camObjeto = exportState ? camExport : camVentana;
+      const manejaCamara =
+        !!camObjeto &&
+        camObjeto.keyframes.length >= (exportState ? 2 : 1);
+      // Modo grabación: la vista grabadora SÍ sigue a la cámara en vivo
+      // (evaluación de keyframes como en el manejo) — mover la cámara es
+      // ver el mundo moverse, «la cámara en la mano». La evaluación se
+      // pausa solo durante un arrastre de la vista: OrbitControls orbita
+      // en mano alrededor del foco y al soltar se captura el fotograma.
+      const grabaVista =
+        !exportState && !!grabacionActivaRef.current && !!camVentana;
+      // Durante la exportación o la vista de cámara no deben salir ayudas
+      // de edición: el gizmo del objeto (con sus aros de giro y su bola de
+      // estirar), los focos (cono, aros y bola de dirección), el recorrido de
+      // la cámara con sus asas y su bola de foco, el gizmo del foco de luz,
+      // las esferas de vértice, el resaltado de caras y los marcadores de FX.
+      // Lo que se ve por la cámara es justo lo que se captura.
       const exportActivo = !!exportState;
-      if (exportActivo) {
+      const ayudasOcultas =
+        exportActivo || grabaVista || (manejaCamara && !!camObjeto);
+      if (ayudasOcultas) {
         if (gizmoGroupRef.current) gizmoGroupRef.current.visible = false;
         if (cameraObjectPathRef.current)
           cameraObjectPathRef.current.group.visible = false;
@@ -3932,7 +3996,7 @@ export default function Viewer3D({
           faceSelectionOverlayRef.current.visible = true;
         if (faceGuideRef.current) faceGuideRef.current.visible = true;
       }
-      exportPrevioRef.current = exportActivo;
+      exportPrevioRef.current = ayudasOcultas;
       // El tiempo efectivo SIEMPRE viene del reloj de la animación
       // (scrubbing): el reloj-de-pared rompía el scrubbing con pistas de
       // cámara. Durante la exportación, el reloj real acota la duración.
@@ -3953,24 +4017,6 @@ export default function Viewer3D({
         if (!motionActivo) restoreMotionVisuals();
       }
       if (motionActivo) applyMotionOverride(effectiveTime);
-      // Cámara-objeto: la cámara elegida en ESTA ventana maneja el visor
-      // con SU pose (estática con 1 fotograma, recorrido con ≥2); durante
-      // la exportación manda la cámara de exportación. OrbitControls queda
-      // deshabilitado y sus eventos no llegan a los paneles; al salir se
-      // restaura la vista del panel.
-      const camVentana = activeCameraRef.current;
-      const camExport = exportState ? exportCameraRef.current ?? camVentana : null;
-      const camObjeto = exportState ? camExport : camVentana;
-      const manejaCamara =
-        !!camObjeto &&
-        camObjeto.keyframes.length >= (exportState ? 2 : 1);
-      // Modo grabación: la vista grabadora SÍ sigue a la cámara en vivo
-      // (evaluación de keyframes como en el manejo) — mover la cámara es
-      // ver el mundo moverse, «la cámara en la mano». La evaluación se
-      // pausa solo durante un arrastre de la vista: OrbitControls orbita
-      // en mano alrededor del foco y al soltar se captura el fotograma.
-      const grabaVista =
-        !exportState && !!grabacionActivaRef.current && !!camVentana;
       if (grabaVista && camVentana) {
         const kfs = camVentana.keyframes;
         // La maquinaria de restauración al salir sigue funcionando igual
@@ -4129,8 +4175,9 @@ export default function Viewer3D({
       }
       if (fxAnchorGroupRef.current) {
         const anchorGroup = fxAnchorGroupRef.current;
-        // Los marcadores de foco (guías) no deben salir en el vídeo exportado.
-        anchorGroup.visible = !exportActivo;
+        // Los marcadores de foco (guías) no deben salir en el vídeo ni en la
+        // vista de cámara.
+        anchorGroup.visible = !ayudasOcultas;
         // Cada guía se oculta cuando su efecto ya está emitiendo (así los
         // círculos desaparecen al activar Llamas/Humo/Chispas), salvo que se
         // esté colocando justo ese efecto, para poder seguir editándolo.
@@ -4161,6 +4208,19 @@ export default function Viewer3D({
 
        // Update light helper visuals each frame so cones follow lights
       const cfg = lightConfigRef.current;
+      if (cfg) {
+        // Focos vinculados a un objeto: recolocar su objetivo cada frame para
+        // que sigan apuntándolo aunque se mueva.
+        for (const s of spotlightRefs.current) {
+          const sIdx = s.userData?.spotlightIdx;
+          if (sIdx === undefined) continue;
+          const sCfg = cfg.spotlights[sIdx];
+          if (sCfg?.targetObjectId) {
+            const sTgt = resolveSpotTarget(sCfg, objectsRef.current);
+            s.target.position.set(sTgt.x, sTgt.y, sTgt.z);
+          }
+        }
+      }
       if (lightHelpersGroupRef.current && cfg) {
         for (const child of lightHelpersGroupRef.current.children) {
           const ud = child.userData as { lightType?: string; handleType?: string; spotlightIdx?: number };
@@ -4175,10 +4235,11 @@ export default function Viewer3D({
           }
           if (!helperShouldShow) continue;
           const lightPos = new THREE.Vector3(sp.position.x, sp.position.y, sp.position.z);
+          const spTgt = resolveSpotTarget(sp, objectsRef.current);
           const lightDir = new THREE.Vector3(
-            (sp.target?.x ?? 0) - lightPos.x,
-            (sp.target?.y ?? 0) - lightPos.y,
-            (sp.target?.z ?? 0) - lightPos.z
+            spTgt.x - lightPos.x,
+            spTgt.y - lightPos.y,
+            spTgt.z - lightPos.z
           );
           const hasDir = lightDir.lengthSq() > 1e-9;
           if (hasDir) lightDir.normalize();
@@ -4425,6 +4486,23 @@ export default function Viewer3D({
         camera.aspect = exportWidth / exportHeight;
         camera.updateProjectionMatrix();
         renderer.setAnimationLoop(null);
+        // Ocultar ya las ayudas de edición en el primer fotograma exportado,
+        // para que no aparezcan ni un instante (gizmo, focos con su bola
+        // amarilla, recorrido de la cámara con su asa amarilla/bola de foco,
+        // recorrido del objeto, vértices, caras y marcadores de FX).
+        if (gizmoGroupRef.current) gizmoGroupRef.current.visible = false;
+        if (cameraObjectPathRef.current)
+          cameraObjectPathRef.current.group.visible = false;
+        if (objectMotionPathRef.current)
+          objectMotionPathRef.current.group.visible = false;
+        if (lightGizmoGroupRef.current) lightGizmoGroupRef.current.visible = false;
+        if (lightHelpersGroupRef.current)
+          lightHelpersGroupRef.current.visible = false;
+        if (vertexHelpersRef.current) vertexHelpersRef.current.visible = false;
+        if (faceSelectionOverlayRef.current)
+          faceSelectionOverlayRef.current.visible = false;
+        if (faceGuideRef.current) faceGuideRef.current.visible = false;
+        if (fxAnchorGroupRef.current) fxAnchorGroupRef.current.visible = false;
         renderer.render(scene, camera);
         const fps = 30;
         const stream = canvas.captureStream(fps);
@@ -5159,6 +5237,8 @@ export default function Viewer3D({
                            ...s,
                            position: { x: lightPos.x, y: lightPos.y, z: lightPos.z },
                            target: { x: newTarget.x, y: newTarget.y, z: newTarget.z },
+                           // Al re-apuntar a mano se suelta el vínculo con el objeto.
+                           targetObjectId: undefined,
                          }
                        : s
                    ),
@@ -8230,6 +8310,33 @@ export default function Viewer3D({
     ground.visible = showGround;
   }, [showGround]);
 
+  // ---- Fondo (cielo) opcionalmente afectado por las luces ----------------
+  // Factor de brillo del fondo según la luz total. Solo actúa si el usuario
+  // lo activa (lightConfig.affectSky); si no, devuelve 1 (sin cambios).
+  const computeSkyLightFactor = (): number => {
+    const cfg = lightConfigRef.current;
+    if (!cfg?.affectSky) return 1;
+    let total = 0;
+    if (cfg.ambient.enabled) total += cfg.ambient.intensity;
+    for (const s of cfg.spotlights) {
+      if (s.enabled) total += s.intensity * 0.15;
+    }
+    return Math.min(1, Math.max(0, total));
+  };
+
+  const applySkyLighting = () => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    const factor = computeSkyLightFactor();
+    const skybox = skyboxRef.current;
+    if (skybox) {
+      (skybox.material as THREE.MeshBasicMaterial).color.setScalar(factor);
+    }
+    if (scene.background instanceof THREE.Color) {
+      scene.background.copy(skyBaseColorRef.current).multiplyScalar(factor);
+    }
+  };
+
   // Skybox background image
   useEffect(() => {
     const scene = sceneRef.current;
@@ -8248,8 +8355,9 @@ export default function Viewer3D({
       material.map = null;
       material.needsUpdate = true;
       skybox.visible = false;
-      scene.background = new THREE.Color('hsl(224, 50%, 7%)');
+      scene.background = skyBaseColorRef.current.clone();
     }
+    applySkyLighting();
   }, [skyboxImage]);
 
    // Ground texture
@@ -8327,16 +8435,22 @@ export default function Viewer3D({
 
     if (lightConfig) {
       // Modo personalizado: aplicar configuración de luces.
-      // Always maintain a minimum ambient floor so the object is evenly
-      // lit from all camera angles, regardless of spotlight direction.
+      // La intensidad del ambiente la decide el usuario (puede llegar a 0).
       if (ambientLightRef.current) {
         ambientLightRef.current.color.setHex(lightConfig.ambient.color);
-        ambientLightRef.current.intensity = Math.max(
-          lightConfig.ambient.enabled ? lightConfig.ambient.intensity : 0,
-          0.45
-        );
+        // La intensidad se respeta tal cual (puede llegar a 0): antes se
+        // forzaba un mínimo de 0.45 y, al bajar las luces personalizadas
+        // al mínimo, la escena nunca oscurecía del todo.
+        ambientLightRef.current.intensity = lightConfig.ambient.enabled
+          ? lightConfig.ambient.intensity
+          : 0;
         ambientLightRef.current.visible = true;
       }
+      // En modo personalizado la iluminación la marcan el ambiente y los
+      // focos, así que se anula la luz de entorno (IBL) genérica. Los
+      // reflejos de espejo siguen intactos porque usan su propio envMap
+      // (scene.environmentIntensity solo afecta a materiales sin envMap).
+      scene.environmentIntensity = 0;
       if (dirLightRef.current) dirLightRef.current.visible = false;
       if (fillLightRef.current) fillLightRef.current.visible = false;
       if (rimLightRef.current) rimLightRef.current.visible = false;
@@ -8349,8 +8463,8 @@ export default function Viewer3D({
       spotlightRefs.current = [];
 
       // Crear nuevos spotlights
-      for (const sp of lightConfig.spotlights) {
-        if (!sp.enabled) continue;
+      lightConfig.spotlights.forEach((sp, idx) => {
+        if (!sp.enabled) return;
         const spotlight = new THREE.SpotLight(
           sp.color,
           sp.intensity,
@@ -8360,12 +8474,12 @@ export default function Viewer3D({
         );
         spotlight.decay = 0; // no distance attenuation - light visible at all distances
         spotlight.position.set(sp.position.x, sp.position.y, sp.position.z);
-        // Set target so the spotlight points toward the model
-        spotlight.target.position.set(
-          sp.target?.x ?? 0,
-          sp.target?.y ?? 0,
-          sp.target?.z ?? 0
-        );
+        // Apunta al modelo o al objeto vinculado (siguiéndolo si se mueve).
+        const spotTarget = resolveSpotTarget(sp, objectsRef.current);
+        spotlight.target.position.set(spotTarget.x, spotTarget.y, spotTarget.z);
+        // Recordar a qué entrada del config pertenece esta luz para poder
+        // re-apuntarla cada frame hacia su objeto objetivo.
+        spotlight.userData.spotlightIdx = idx;
         scene.add(spotlight);
         scene.add(spotlight.target);
         spotlight.castShadow = sp.castShadow;
@@ -8378,9 +8492,10 @@ export default function Viewer3D({
           spotlight.shadow.camera.far = 20;
         }
         spotlightRefs.current.push(spotlight);
-      }
+      });
     } else {
       const preset = LIGHT_PRESETS[lightPreset] ?? LIGHT_PRESETS[0];
+      scene.environmentIntensity = 1;
       if (ambientLightRef.current) {
         ambientLightRef.current.color.setHex(preset.ambient);
         ambientLightRef.current.intensity = preset.ambientIntensity;
@@ -8401,6 +8516,9 @@ export default function Viewer3D({
         rimLightRef.current.visible = true;
       }
     }
+
+    // El fondo (cielo) sigue a las luces si el usuario lo activa.
+    applySkyLighting();
 
     // Rebuild light helpers for whichever config is active
     buildLightHelpersRef.current?.(lightConfig ?? null);
@@ -8439,7 +8557,14 @@ export default function Viewer3D({
        (objectsRef.current ?? []).find(
          (o) => o.id === selectedObjectIdRef.current
        )?.kind === 'camera';
-     g.visible = showGizmo && (mesh.vertices.length > 0 || esCamara);
+    // Fija la escala base del gizmo multiplicada por la escala del
+    // offset (modo configuracion): asi el manipulador se puede escalar.
+    const applyScale = (base: number) => {
+      gizmoBaseScaleRef.current = base;
+      const off = gizmoOffsetRef.current;
+      g.scale.set(base * off.sx, base * off.sy, base * off.sz);
+    };
+    g.visible = showGizmo && (mesh.vertices.length > 0 || esCamara);
      // Filtra las asas del manipulador según los modos activos: si el
      // usuario desactivó 'move', 'rotate' o 'scale', esas asas desaparecen.
       const activeModes = gizmoModes ?? ['move', 'rotate', 'scale'];
@@ -8462,7 +8587,7 @@ export default function Viewer3D({
         }
       }
      if (mesh.vertices.length === 0) {
-      if (esCamara) g.scale.setScalar(1);
+      if (esCamara) applyScale(1);
       return;
     }
     const box = new THREE.Box3();
@@ -8475,8 +8600,8 @@ export default function Viewer3D({
       Math.abs(transform.sy),
       Math.abs(transform.sz)
     );
-    g.scale.setScalar(Math.min(Math.max(r * 0.9 * objectScale, 0.35), 8));
-   }, [showGizmo, mesh.vertices, transform, gizmoModes, gizmoColorOverride]);
+    applyScale(Math.min(Math.max(r * 0.9 * objectScale, 0.35), 8));
+   }, [showGizmo, mesh.vertices, transform, gizmoModes, gizmoColorOverride, gizmoOffset]);
 
   // Captura el texto 3D como PNG con fondo transparente (solo la malla).
   // Si el suavizado está activo, la captura usa una COPIA suavizada de la
@@ -8498,6 +8623,42 @@ export default function Viewer3D({
     if (gridGroup) gridGroup.visible = false;
     if (vertexGroup) vertexGroup.visible = false;
     if (gizmoGroup) gizmoGroup.visible = false;
+    // Los focos (cono, aros y bola de dirección) y su gizmo también son
+    // ayudas de edición: fuera de la imagen capturada.
+    const lightHelpersGroup = lightHelpersGroupRef.current;
+    const lightGizmoGroup = lightGizmoGroupRef.current;
+    const prevLightHelpersVisible = lightHelpersGroup?.visible ?? false;
+    const prevLightGizmoVisible = lightGizmoGroup?.visible ?? false;
+    if (lightHelpersGroup) lightHelpersGroup.visible = false;
+    if (lightGizmoGroup) lightGizmoGroup.visible = false;
+    // Resto de ayudas de edición que tampoco deben salir en la imagen: el
+    // recorrido de la cámara (su asa amarilla y su bola de foco), el del
+    // objeto, el resaltado de caras, los marcadores de FX y la ayuda de
+    // proyección de textura.
+    const cameraObjectPath = cameraObjectPathRef.current;
+    const objectMotionPath = objectMotionPathRef.current;
+    const faceSelectionOverlay = faceSelectionOverlayRef.current;
+    const faceGuide = faceGuideRef.current;
+    const fxAnchorGroup = fxAnchorGroupRef.current;
+    const textureHelperGroup = textureHelperGroupRef.current;
+    const textureHelperGizmoGroup = textureHelperGizmoGroupRef.current;
+    const latheAxis = latheAxisRef.current;
+    const prevCameraObjectPathVisible = cameraObjectPath?.group.visible ?? false;
+    const prevObjectMotionPathVisible = objectMotionPath?.group.visible ?? false;
+    const prevFaceSelectionOverlayVisible = faceSelectionOverlay?.visible ?? false;
+    const prevFaceGuideVisible = faceGuide?.visible ?? false;
+    const prevFxAnchorGroupVisible = fxAnchorGroup?.visible ?? false;
+    const prevTextureHelperVisible = textureHelperGroup?.visible ?? false;
+    const prevTextureHelperGizmoVisible = textureHelperGizmoGroup?.visible ?? false;
+    const prevLatheAxisVisible = latheAxis?.visible ?? false;
+    if (cameraObjectPath) cameraObjectPath.group.visible = false;
+    if (objectMotionPath) objectMotionPath.group.visible = false;
+    if (faceSelectionOverlay) faceSelectionOverlay.visible = false;
+    if (faceGuide) faceGuide.visible = false;
+    if (fxAnchorGroup) fxAnchorGroup.visible = false;
+    if (textureHelperGroup) textureHelperGroup.visible = false;
+    if (textureHelperGizmoGroup) textureHelperGizmoGroup.visible = false;
+    if (latheAxis) latheAxis.visible = false;
 
     const currentMesh = meshRef.current;
     const doSmooth =
@@ -8564,6 +8725,17 @@ export default function Viewer3D({
     if (gridGroup) gridGroup.visible = prevGridVisible;
     if (vertexGroup) vertexGroup.visible = prevVertexVisible;
     if (gizmoGroup) gizmoGroup.visible = prevGizmoVisible;
+    if (lightHelpersGroup) lightHelpersGroup.visible = prevLightHelpersVisible;
+    if (lightGizmoGroup) lightGizmoGroup.visible = prevLightGizmoVisible;
+    if (cameraObjectPath) cameraObjectPath.group.visible = prevCameraObjectPathVisible;
+    if (objectMotionPath) objectMotionPath.group.visible = prevObjectMotionPathVisible;
+    if (faceSelectionOverlay) faceSelectionOverlay.visible = prevFaceSelectionOverlayVisible;
+    if (faceGuide) faceGuide.visible = prevFaceGuideVisible;
+    if (fxAnchorGroup) fxAnchorGroup.visible = prevFxAnchorGroupVisible;
+    if (textureHelperGroup) textureHelperGroup.visible = prevTextureHelperVisible;
+    if (textureHelperGizmoGroup)
+      textureHelperGizmoGroup.visible = prevTextureHelperGizmoVisible;
+    if (latheAxis) latheAxis.visible = prevLatheAxisVisible;
 
     const link = document.createElement('a');
     link.href = dataURL;

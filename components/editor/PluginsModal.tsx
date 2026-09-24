@@ -205,7 +205,7 @@ export default function PluginsModal({
   };
 
   return (
-    <Modal isOpen={isOpen} onClose={isProcessing ? () => {} : onClose}>
+    <Modal isOpen={isOpen} onClose={isProcessing ? () => {} : onClose} bodyClassName="modal-scrollbar">
       <div className="flex flex-col gap-4 p-1 w-full max-w-2xl text-foreground">
         {/* Cabecera */}
         <div className="flex items-center gap-3 border-b border-white/10 pb-3">

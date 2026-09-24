@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { LightConfig, SpotlightConfig } from '@/components/viewer-3d';
 import {
   Sun,
+  Moon,
   Plus,
   Trash2,
   ToggleLeft,
@@ -22,6 +23,8 @@ interface LightingModalProps {
   onClose: () => void;
   lightConfig: LightConfig | null;
   onSave: (config: LightConfig) => void;
+  /** Objetos de la escena a los que un foco puede apuntar (y seguir). */
+  objects?: Array<{ id: string; name: string }>;
 }
 
 const DEFAULT_AMBIENT_COLOR = 0xffffff;
@@ -32,6 +35,7 @@ export default function LightingModal({
   onClose,
   lightConfig,
   onSave,
+  objects = [],
 }: LightingModalProps) {
   const [config, setConfig] = useState<LightConfig>({
     ambient: {
@@ -179,6 +183,25 @@ export default function LightingModal({
           </div>
         </div>
 
+        {/* Fondo (cielo) afectado por las luces */}
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <Moon className="w-4 h-4 text-indigo-300" />
+            Fondo (cielo)
+          </div>
+          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={config.affectSky ?? false}
+              onChange={(e) =>
+                setConfig((prev) => ({ ...prev, affectSky: e.target.checked }))
+              }
+              className="w-3 h-3 accent-indigo-500 cursor-pointer"
+            />
+            Las luces afectan al fondo (se oscurece con poca luz)
+          </label>
+        </div>
+
         {/* Spotlights section */}
         <div className="space-y-3">
           <div className="flex items-center justify-between">
@@ -319,6 +342,38 @@ export default function LightingModal({
                         />
                       </div>
                     </div>
+                  </div>
+
+                  {/* Apuntar a objeto: el foco lo sigue aunque se mueva. */}
+                  <div className="space-y-1">
+                    <label className="flex justify-between text-xs text-muted-foreground">
+                      <span>Apuntar a objeto</span>
+                      {spot.targetObjectId && (
+                        <span className="text-amber-400">Siguiendo</span>
+                      )}
+                    </label>
+                    <select
+                      value={spot.targetObjectId ?? ''}
+                      onChange={(e) =>
+                        updateSpotlight(spot.id, {
+                          targetObjectId: e.target.value || undefined,
+                        })
+                      }
+                      disabled={!spot.enabled}
+                      className="w-full text-xs px-2 py-1 bg-black/40 border border-white/10 rounded disabled:opacity-50"
+                    >
+                      <option value="">Dirección manual</option>
+                      {objects.map((o) => (
+                        <option key={o.id} value={o.id}>
+                          {o.name}
+                        </option>
+                      ))}
+                    </select>
+                    {spot.targetObjectId && (
+                      <p className="text-[10px] text-muted-foreground/60">
+                        El foco apunta a este objeto y lo sigue al moverlo.
+                      </p>
+                    )}
                   </div>
 
                   {/* Color + Intensity */}
