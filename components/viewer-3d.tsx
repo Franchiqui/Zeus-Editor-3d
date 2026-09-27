@@ -1031,6 +1031,10 @@ type GizmoDrag = {
   basisU: THREE.Vector3;
   basisV: THREE.Vector3;
   startAngle: number;
+  /** Ángulo de arrastre acumulado continuamente (desenrolla el salto ±π del
+   *  atan2) y ángulo del frame anterior: inician en 0 y startAngle. */
+  sweptAngle?: number;
+  prevAngle?: number;
   /**
    * Pieza de textura: su transform vive en las coordenadas LOCALES de la
    * malla (las mismas con las que se calculan las UV), así que el rayo
@@ -1040,9 +1044,15 @@ type GizmoDrag = {
    /** Para target 'gizmo': posición y rotación del objeto al empezar el
        arrastre, para convertir el transform efectivo (mundo) de vuelta al
        offset del gizmo. */
-   objectQuat?: THREE.Quaternion;
-   objectPos?: THREE.Vector3;
- };
+    objectQuat?: THREE.Quaternion;
+    objectPos?: THREE.Vector3;
+    /** Pivot de giro (posición de mundo del gizmo) cuando el offset está
+     * activo: el objeto rota alrededor de él en vez de sobre su centro. */
+    rotatePivot?: THREE.Vector3;
+    /** Posición MUNDIAL del objeto al empezar el arrastre: base fija para
+     *  la órbita, evita acumular la posición por frame (dq es ángulo total). */
+    startObjectPos?: THREE.Vector3;
+  };
 
 /** Colores del manipulador por eje (rojo X, verde Y, azul Z) */
 const GIZMO_AXIS_COLORS: Record<GizmoAxis, number> = {
@@ -2170,12 +2180,6 @@ export default function Viewer3D({
     const selectionStartRef = useRef<{ x: number; y: number; rect: DOMRect } | null>(null);
     const selectionRectRef = useRef<HTMLDivElement | null>(null);
     const multiTransformStartRef = useRef<Record<string, ObjectTransform>>({});
-    // Gizmo GRUPAL con rotación ORBITAL: al girar un grupo, el pivote es el
-    // centro del conjunto (no el centro de cada pieza) y las piezas orbitan
-    // alrededor de él. groupPivotRef guarda ese centro al empezar el arrastre
-    // y groupOrbitRef el giro acumulado, para que las copias giren en vivo.
-    const groupPivotRef = useRef<THREE.Vector3 | null>(null);
-    const groupOrbitRef = useRef<THREE.Quaternion | null>(null);
     const lightConfigRef = useRef(lightConfig);
     lightConfigRef.current = lightConfig;
 
@@ -2492,7 +2496,7 @@ export default function Viewer3D({
     // poder escalar el propio manipulador sin tocar la figura.
     const gizmoBaseScaleRef = useRef(1);
     const onGizmoOffsetChangeRef = useRef(onGizmoOffsetChange);
-   onGizmoOffsetChangeRef.current = onGizmoOffsetChange;
+    onGizmoOffsetChangeRef.current = onGizmoOffsetChange;
   // Posición/rotación/escala del objeto: el manipulador las fija
   // arrastrando y se aplican a la malla y a todo lo que la acompaña
   // (halo, partículas, estrellas, helpers de vértices).
@@ -2532,36 +2536,17 @@ export default function Viewer3D({
         new THREE.Vector3(t.sx, t.sy, t.sz)
       );
       const inverseSelected = selectedMatrix.invert();
-      const orbitDq = groupOrbitRef.current;
-      const orbitPivot = groupPivotRef.current;
-      const orbitSelIds = selectedObjectIdsRef.current ?? [];
       for (const child of meshGroup.children) {
         if (!child.userData.sceneObjectDuplicate) continue;
         const object = objectsRef.current?.find(
           (candidate) => candidate.id === child.userData.sceneObjectId
         );
         if (!object) continue;
-        const basePos = new THREE.Vector3(
-          object.transform.px, object.transform.py, object.transform.pz
-        );
-        let baseQuat = new THREE.Quaternion().setFromEuler(
-          new THREE.Euler(object.transform.rx, object.transform.ry, object.transform.rz)
-        );
-        // Giro GRUPAL: cuando el conjunto está orbitando, cada copia
-        // seleccionada gira ALREDEDOR del centro del grupo (no sobre sí
-        // misma), para que todo el grupo se comporte como un sólido rígido.
-        if (
-          orbitDq &&
-          orbitPivot &&
-          object.id !== selectedId &&
-          orbitSelIds.includes(object.id)
-        ) {
-          basePos.sub(orbitPivot).applyQuaternion(orbitDq).add(orbitPivot);
-          baseQuat = orbitDq.clone().multiply(baseQuat);
-        }
         const objectMatrix = new THREE.Matrix4().compose(
-          basePos,
-          baseQuat,
+          new THREE.Vector3(object.transform.px, object.transform.py, object.transform.pz),
+          new THREE.Quaternion().setFromEuler(
+            new THREE.Euler(object.transform.rx, object.transform.ry, object.transform.rz)
+          ),
           new THREE.Vector3(object.transform.sx, object.transform.sy, object.transform.sz)
         );
         child.matrix.copy(inverseSelected).multiply(objectMatrix);
@@ -2573,70 +2558,26 @@ export default function Viewer3D({
     full(placedStarsRef.current?.group ?? null, true);
     full(effectsGroupRef.current, false);
      full(gizmoGroupRef.current, false);
-     // Gizmo GRUPAL: con varios objetos seleccionados el manipulador se
-     // coloca en el CENTRO del grupo y con los ejes alineados al mundo,
-     // de modo que se mueve/gira/escala el conjunto como una sola
-     // unidad (un único manipulador), en vez de uno por pieza. Con una
-     // sola pieza seleccionada se conserva el comportamiento de siempre
-     // (gizmo sobre el objeto y su posible offset de configuración).
+     // Si hay un offset del gizmo, aplicarlo SOBRE la pose del objeto:
+     // el gizmo se desplaza/gira respecto al centro del objeto sin
+     // tocar la figura (modo configuración).
      const giz = gizmoGroupRef.current;
      if (giz) {
-       const selIds = selectedObjectIdsRef.current ?? [];
-       const groupObjs =
-         selIds.length > 1
-           ? (objectsRef.current ?? []).filter((o) => selIds.includes(o.id))
-           : [];
-       if (groupObjs.length > 1) {
-         const min = new THREE.Vector3(Infinity, Infinity, Infinity);
-         const max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
-         for (const o of groupObjs) {
-           const p = o.transform;
-           // La pieza activa puede estar arrastrándose: su transform vive
-           // en `t` (aún no ha vuelto al estado), así el centro del grupo
-           // sigue al dedo sin retraso.
-           const isActive = o.id === selectedObjectIdRef.current;
-           const px = isActive ? t.px : p.px;
-           const py = isActive ? t.py : p.py;
-           const pz = isActive ? t.pz : p.pz;
-           min.x = Math.min(min.x, px);
-           min.y = Math.min(min.y, py);
-           min.z = Math.min(min.z, pz);
-           max.x = Math.max(max.x, px);
-           max.y = Math.max(max.y, py);
-           max.z = Math.max(max.z, pz);
-         }
-         giz.position.set(
-           (min.x + max.x) / 2,
-           (min.y + max.y) / 2,
-           (min.z + max.z) / 2
-         );
-         // Los ejes del grupo van alineados al mundo.
-         giz.rotation.set(0, 0, 0);
-         giz.quaternion.identity();
-         // Mientras el grupo orbita, el manipulador se queda FIJO en el
-         // pivote (centro del grupo) en vez de seguir el centro móvil.
-         if (groupPivotRef.current && groupOrbitRef.current) {
-           giz.position.copy(groupPivotRef.current);
-         }
-         const baseScaleG = gizmoBaseScaleRef.current || 1;
-         giz.scale.set(baseScaleG, baseScaleG, baseScaleG);
-       } else {
-         const off = gizmoOffsetRef.current;
-         const objQuat = new THREE.Quaternion().setFromEuler(
-           new THREE.Euler(t.rx, t.ry, t.rz)
-         );
-         const offPos = new THREE.Vector3(off.px, off.py, off.pz).applyQuaternion(objQuat);
-         giz.position.add(offPos);
-         const offQuat = new THREE.Quaternion().setFromEuler(
-           new THREE.Euler(off.rx, off.ry, off.rz)
-         );
-         giz.quaternion.multiply(offQuat);
-        // La escala del offset tambien se aplica al gizmo (por eje), de
-        // modo que en modo configuracion se puede escalar el manipulador.
-        const baseScale = gizmoBaseScaleRef.current || 1;
-        giz.scale.set(baseScale * off.sx, baseScale * off.sy, baseScale * off.sz);
-       }
-     }
+       const off = gizmoOffsetRef.current;
+       const objQuat = new THREE.Quaternion().setFromEuler(
+         new THREE.Euler(t.rx, t.ry, t.rz)
+       );
+       const offPos = new THREE.Vector3(off.px, off.py, off.pz).applyQuaternion(objQuat);
+       giz.position.add(offPos);
+       const offQuat = new THREE.Quaternion().setFromEuler(
+         new THREE.Euler(off.rx, off.ry, off.rz)
+       );
+       giz.quaternion.multiply(offQuat);
+      // La escala del offset tambien se aplica al gizmo (por eje), de
+      // modo que en modo configuracion se puede escalar el manipulador.
+      const baseScale = gizmoBaseScaleRef.current || 1;
+      giz.scale.set(baseScale * off.sx, baseScale * off.sy, baseScale * off.sz);
+      }
     if (lightGizmoGroupRef.current) {
       lightGizmoGroupRef.current.visible = false;
     }
@@ -2650,19 +2591,13 @@ export default function Viewer3D({
    // Espejo para el bucle animate (override del editor de movimiento).
    const applyObjectTransformRef = useRef(applyObjectTransform);
    applyObjectTransformRef.current = applyObjectTransform;
-  // Recolocar el gizmo (individual o grupal) al cambiar la selección
-  // múltiple, sin esperar a que cambie el transform: con varios objetos
-  // seleccionados el manipulador salta al centro del grupo.
-  useEffect(() => {
-    applyObjectTransformRef.current(transformRef.current);
-  }, [selectedObjectIds]);
 
      // Sincronizar el ref del offset cuando cambia la prop: el offset viaja
      // con el proyecto y debe sobrevivir a remounts de ventana. La sync
      // durante el render evita desincronizaciones con el arrastre.
-     if (gizmoOffset !== undefined) {
-       gizmoOffsetRef.current = gizmoOffset;
-     }
+      if (gizmoOffset !== undefined) {
+        gizmoOffsetRef.current = gizmoOffset;
+      }
      // Re-aplicar el transform cuando el offset cambia desde fuera (undo,
      // remount, carga de .zeus) — pero NO durante un arrastre activo, que
      // ya actualiza el ref y el visual por sí mismo.
@@ -4812,28 +4747,39 @@ export default function Viewer3D({
           drag.axisWorld,
           ang - drag.startAngle
         );
-        const e = new THREE.Euler().setFromQuaternion(
-          drag.startQuat.clone().premultiply(dq)
+        // Ángulo continuo (sin salto ±π) para la órbita: permite dar toda la
+        // vuelta y revertir el arrastre sin que el gizmo se corte a los 180°.
+        const prev = drag.prevAngle ?? drag.startAngle;
+        const swept =
+          (drag.sweptAngle ?? 0) +
+          Math.atan2(Math.sin(ang - prev), Math.cos(ang - prev));
+        drag.sweptAngle = swept;
+        drag.prevAngle = ang;
+        const dqOrbit = new THREE.Quaternion().setFromAxisAngle(
+          drag.axisWorld,
+          swept
         );
-        // Giro GRUPAL: con varios objetos seleccionados el conjunto gira
-        // como un sólido rígido alrededor del centro del grupo. La pieza
-        // activa además ORBITA: su posición también gira respecto al pivote.
-        const pivoteGrupo = groupPivotRef.current;
-        if (pivoteGrupo && !isHelper && !isGizmo) {
-          groupOrbitRef.current = dq.clone();
-          const orbita = new THREE.Vector3(
-            drag.startPos.x, drag.startPos.y, drag.startPos.z
-          )
-            .sub(pivoteGrupo)
-            .applyQuaternion(dq)
-            .add(pivoteGrupo);
-          next = {
-            ...t,
-            rx: e.x, ry: e.y, rz: e.z,
-            px: orbita.x, py: orbita.y, pz: orbita.z,
-          };
+        if (drag.rotatePivot) {
+          // Gizmo desplazado (offset activo) sobre un único objeto: el objeto
+          // rota ORBITANDO alrededor del pivote (posición de mundo del gizmo).
+          // Rotación rígida: la posición traslada y la orientación rota con el
+          // mismo ángulo. Al atar el gizmo al objeto mediante el offset,
+          // objPos+offset == pivote siempre → el gizmo se queda en el centro
+          // y los ejes apuntan a donde quedó el objeto al soltar, por lo que
+          // sirve para seguir inclinándolo.
+          const startObjPos = drag.startObjectPos ?? new THREE.Vector3(t.px, t.py, t.pz);
+          const newPos = new THREE.Vector3()
+            .subVectors(startObjPos, drag.startPos)
+            .applyQuaternion(dqOrbit)
+            .add(drag.startPos);
+          const e = new THREE.Euler().setFromQuaternion(
+            drag.startQuat.clone().premultiply(dqOrbit)
+          );
+          next = { ...t, px: newPos.x, py: newPos.y, pz: newPos.z, rx: e.x, ry: e.y, rz: e.z };
         } else {
-          groupOrbitRef.current = null;
+          const e = new THREE.Euler().setFromQuaternion(
+            drag.startQuat.clone().premultiply(dq)
+          );
           next = { ...t, rx: e.x, ry: e.y, rz: e.z };
         }
       } else if (drag.mode === 'uniform-scale') {
@@ -5509,11 +5455,39 @@ export default function Viewer3D({
       axisWorldOverride?: THREE.Vector3,
       startPosOverride?: THREE.Vector3
     ): GizmoDrag | null => {
-      const pos = startPosOverride
-        ? startPosOverride.clone()
-        : objectPos
-          ? new THREE.Vector3(t.px, t.py, t.pz).applyQuaternion(objectQuat!).add(objectPos)
-          : new THREE.Vector3(t.px, t.py, t.pz);
+      // Si el gizmo fue desplazado del centro del objeto (offset activo) y
+      // se rota un único objeto, el gizmo actúa como pivote: el objeto gira
+      // alrededor de su posición de mundo en vez de sobre su centro. El
+      // offset es LOCAL, así que al orbitar el gizmo vuelve a quedar en el
+      // mismo punto de mundo (se re-deriva al render).
+      let gizmoPivot: THREE.Vector3 | undefined;
+      if (target === 'object' && ud.mode === 'rotate') {
+        const off = gizmoOffsetRef.current;
+        if (off.px || off.py || off.pz) {
+          const isSingle =
+            !selectionModeRef.current &&
+            (selectedObjectIdsRef.current?.length ?? 0) <= 1;
+          if (isSingle) {
+            const objQuat = new THREE.Quaternion().setFromEuler(
+              new THREE.Euler(t.rx, t.ry, t.rz)
+            );
+            const objPos = new THREE.Vector3(t.px, t.py, t.pz);
+            gizmoPivot = new THREE.Vector3(off.px, off.py, off.pz)
+              .applyQuaternion(objQuat)
+              .add(objPos);
+          }
+        }
+      }
+      let pos: THREE.Vector3;
+      if (gizmoPivot) {
+        pos = gizmoPivot;
+      } else if (startPosOverride) {
+        pos = startPosOverride.clone();
+      } else if (objectPos) {
+        pos = new THREE.Vector3(t.px, t.py, t.pz).applyQuaternion(objectQuat!).add(objectPos);
+      } else {
+        pos = new THREE.Vector3(t.px, t.py, t.pz);
+      }
 
       const effQuat = objectQuat
         ? objectQuat.clone().multiply(
@@ -5555,9 +5529,12 @@ export default function Viewer3D({
           basisU,
           basisV,
           startAngle: Math.atan2(d.dot(basisV), d.dot(basisU)),
+          sweptAngle: 0,
           rayToLocal,
           objectQuat,
           objectPos,
+          rotatePivot: gizmoPivot,
+          startObjectPos: new THREE.Vector3(t.px, t.py, t.pz),
         };
       }
       if (ud.mode === 'uniform-scale' || ud.mode === 'planar-scale') {
@@ -6112,36 +6089,14 @@ export default function Viewer3D({
             objectAxisOverride
           );
           if (!drag) return;
-          // Guardar los transforms iniciales de los objetos seleccionados
-          // (para el multi-transform) y calcular el CENTRO del grupo: será
-          // el pivote de la rotación orbital (con una sola pieza, null).
+          // Store initial transforms of all selected objects for multi-transform
           const selIds = selectedObjectIdsRef.current ?? [];
           multiTransformStartRef.current = {};
-          const pivMin = new THREE.Vector3(Infinity, Infinity, Infinity);
-          const pivMax = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
-          let pivCount = 0;
           for (const obj of objectsRef.current ?? []) {
             if (selIds.includes(obj.id)) {
               multiTransformStartRef.current[obj.id] = { ...obj.transform };
-              const pp = obj.transform;
-              pivMin.x = Math.min(pivMin.x, pp.px);
-              pivMin.y = Math.min(pivMin.y, pp.py);
-              pivMin.z = Math.min(pivMin.z, pp.pz);
-              pivMax.x = Math.max(pivMax.x, pp.px);
-              pivMax.y = Math.max(pivMax.y, pp.py);
-              pivMax.z = Math.max(pivMax.z, pp.pz);
-              pivCount++;
             }
           }
-          groupPivotRef.current =
-            pivCount > 1
-              ? new THREE.Vector3(
-                  (pivMin.x + pivMax.x) / 2,
-                  (pivMin.y + pivMax.y) / 2,
-                  (pivMin.z + pivMax.z) / 2
-                )
-              : null;
-          groupOrbitRef.current = null;
           gizmoDragRef.current = drag;
           controls.enabled = false;
           renderer.domElement.style.cursor = 'grabbing';
@@ -6921,10 +6876,6 @@ export default function Viewer3D({
           const startTransforms = multiTransformStartRef.current;
           const selIds = selectedObjectIdsRef.current ?? [];
           const activeId = selectedObjectIdRef.current;
-          // Giro orbital del grupo (si este arrastre fue una rotación de
-          // varios objetos): las piezas orbitan alrededor del centro.
-          const orbitDq = groupOrbitRef.current;
-          const orbitPivot = groupPivotRef.current;
           if (selIds.length > 0 && selIds.includes(activeId ?? '')) {
             const updatedTransforms: { id: string; transform: ObjectTransform }[] = [];
             const startActive = startTransforms[activeId ?? ''];
@@ -6941,9 +6892,7 @@ export default function Viewer3D({
               const endQuat = new THREE.Quaternion().setFromEuler(
                 new THREE.Euler(t.rx, t.ry, t.rz)
               );
-              const deltaQuat = orbitDq
-                ? orbitDq.clone()
-                : endQuat.clone().multiply(startQuat.invert());
+              const deltaQuat = endQuat.clone().multiply(startQuat.invert());
               // Scale delta (factor)
               const deltaScale = {
                 x: startActive.sx !== 0 ? t.sx / startActive.sx : 1,
@@ -6959,32 +6908,12 @@ export default function Viewer3D({
                 );
                 const newQuat = deltaQuat.clone().multiply(objQuat);
                 const newEuler = new THREE.Euler().setFromQuaternion(newQuat, 'XYZ');
-                // Giro GRUPAL: cada pieza ORBITA alrededor del centro del
-                // grupo (no se traslada en bloque) cuando hay órbita activa.
-                let px: number;
-                let py: number;
-                let pz: number;
-                if (orbitDq && orbitPivot) {
-                  const orb = new THREE.Vector3(
-                    startObj.px, startObj.py, startObj.pz
-                  )
-                    .sub(orbitPivot)
-                    .applyQuaternion(orbitDq)
-                    .add(orbitPivot);
-                  px = orb.x;
-                  py = orb.y;
-                  pz = orb.z;
-                } else {
-                  px = startObj.px + deltaPos.x;
-                  py = startObj.py + deltaPos.y;
-                  pz = startObj.pz + deltaPos.z;
-                }
                 updatedTransforms.push({
                   id,
                   transform: {
-                    px,
-                    py,
-                    pz,
+                    px: startObj.px + deltaPos.x,
+                    py: startObj.py + deltaPos.y,
+                    pz: startObj.pz + deltaPos.z,
                     rx: newEuler.x,
                     ry: newEuler.y,
                     rz: newEuler.z,
@@ -7001,9 +6930,6 @@ export default function Viewer3D({
           }
         }
         multiTransformStartRef.current = {};
-        // Terminado el arrastre: desactivar la órbita/pivote del grupo.
-        groupOrbitRef.current = null;
-        groupPivotRef.current = null;
         return;
       }
       if (dragRef.current) {
@@ -8024,34 +7950,11 @@ export default function Viewer3D({
          continue;
        }
 
-       // Si el duplicado no existe se crea; si ya existía pero su
-       // instantánea cambió (p. ej. le han puesto transparencia encima) se
-       // reconstruye su visual EN EL SITIO. Antes se construía una sola vez,
-       // así que con varios objetos seleccionados la transparencia —u otro
-       // cambio de material hecho en multi-selección— solo se veía en el
-       // objeto activo (la malla principal) hasta reseleccionar y forzar la
-       // reconstrucción de la copia.
-       const snapshotMeshChanged =
-         !!duplicate && duplicate.userData.snapshotMesh !== object.mesh;
-       if (!duplicate || snapshotMeshChanged) {
-        if (!duplicate) {
-          duplicate = new THREE.Group();
-          duplicate.userData.sceneObjectId = object.id;
-          duplicate.userData.sceneObjectDuplicate = true;
-        } else {
-          // Vaciar el visual anterior (liberando geometrías y materiales)
-          // antes de rehacerlo; el estado congelado se reaplica al final.
-          for (const child of [...duplicate.children]) {
-            duplicate.remove(child);
-            child.traverse((item) => {
-              const childMesh = item as THREE.Mesh;
-              childMesh.geometry?.dispose();
-              if (childMesh.material) disposeMaterial(childMesh.material);
-            });
-          }
-          duplicate.userData.isFrozen = false;
-        }
-        duplicate.userData.snapshotMesh = object.mesh;
+       // If the duplicate doesn't exist, create it
+       if (!duplicate) {
+        duplicate = new THREE.Group();
+        duplicate.userData.sceneObjectId = object.id;
+        duplicate.userData.sceneObjectDuplicate = true;
         // Cada objeto muestra SU propia instantánea congelada, sea o no
         // el dueño de la configuración: la figura de un objeto no puede
         // mutar porque cambie la pestaña activa del editor (el dueño se
@@ -8091,9 +7994,7 @@ export default function Viewer3D({
           const focoDuplicada = object.camera?.keyframes[0]?.target ?? object.camera?.target;
           orientCameraBodyVisual(duplicate, focoDuplicada ?? null);
         }
-        if (!meshGroup.children.includes(duplicate)) {
-          meshGroup.add(duplicate);
-        }
+        meshGroup.add(duplicate);
       }
         // En modo boolean preview: el objeto cortador (duplicate) se muestra transparente
         if (booleanToolObjectId === object.id) {
@@ -8185,10 +8086,7 @@ export default function Viewer3D({
     textureProjection,
     ]);
 
-    // --- Resaltado de la selección: con VARIOS objetos se dibuja UNA
-    // --- sola caja que engloba a todo el grupo (nada de una caja por
-    // --- pieza); con uno solo, su propia caja. El gizmo de
-    // --- transformación es asimismo único y grupal.
+    // --- Highlight for multi-selected objects: draw a wireframe box ---
     useEffect(() => {
      const meshGroup = meshGroupRef.current;
      if (!meshGroup) return;
@@ -8202,19 +8100,14 @@ export default function Viewer3D({
       highlightGroup.clear();
       const selectedIds = selectedObjectIdsRef.current ?? [];
        if (selectedIds.length === 0) return;
-       const box = new THREE.Box3();
-       let any = false;
        for (const child of meshGroup.children) {
         if (!child.userData.sceneObjectDuplicate) continue;
         if (!selectedIds.includes(child.userData.sceneObjectId)) continue;
-        const childBox = new THREE.Box3().setFromObject(child);
-        if (childBox.isEmpty()) continue;
-        box.union(childBox);
-        any = true;
+        const box = new THREE.Box3().setFromObject(child);
+        if (box.isEmpty()) continue;
+        const helper = new THREE.Box3Helper(box, 0x38bdf8);
+        highlightGroup.add(helper);
       }
-      if (!any || box.isEmpty()) return;
-      const helper = new THREE.Box3Helper(box, 0x38bdf8);
-      highlightGroup.add(helper);
      }, [selectedObjectIds, objects?.length, forceObjectsUpdate]);
     // --- (toolId) tanto si es un duplicate como si es el mesh principal
     // --- (activa). El resto de objetos se muestran normales.
@@ -8765,30 +8658,6 @@ export default function Viewer3D({
           mat.color.setHex(ud.originalColor);
         }
       }
-     // Gizmo GRUPAL: con varios objetos seleccionados, el tamaño del
-     // manipulador se ajusta al conjunto (no solo a la pieza activa).
-     const selIdsForScale = selectedObjectIdsRef.current ?? [];
-     if (selIdsForScale.length > 1) {
-       const mg = meshGroupRef.current;
-       let anyGroup = false;
-       const groupBox = new THREE.Box3();
-       if (mg) {
-         mg.updateMatrixWorld();
-         for (const child of mg.children) {
-           if (!child.userData.sceneObjectDuplicate) continue;
-           if (!selIdsForScale.includes(child.userData.sceneObjectId)) continue;
-           const cb = new THREE.Box3().setFromObject(child);
-           if (cb.isEmpty()) continue;
-           groupBox.union(cb);
-           anyGroup = true;
-         }
-       }
-       if (anyGroup) {
-         const gr = groupBox.getSize(new THREE.Vector3()).length() / 2 || 1;
-         applyScale(Math.min(Math.max(gr * 0.7, 0.5), 12));
-         return;
-       }
-     }
      if (mesh.vertices.length === 0) {
       if (esCamara) applyScale(1);
       return;
@@ -8804,7 +8673,7 @@ export default function Viewer3D({
       Math.abs(transform.sz)
     );
     applyScale(Math.min(Math.max(r * 0.9 * objectScale, 0.35), 8));
-   }, [showGizmo, mesh.vertices, transform, gizmoModes, gizmoColorOverride, gizmoOffset, selectedObjectIds]);
+   }, [showGizmo, mesh.vertices, transform, gizmoModes, gizmoColorOverride, gizmoOffset]);
 
   // Captura el texto 3D como PNG con fondo transparente (solo la malla).
   // Si el suavizado está activo, la captura usa una COPIA suavizada de la

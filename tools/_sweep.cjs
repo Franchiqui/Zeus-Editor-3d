@@ -1,7 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.buildSweepMesh = buildSweepMesh;
-const geometry_1 = require("./_geo.cjs");
+const geometry_1 = require('./_geo.cjs');
 const three_1 = require("three");
 // 0..1 -> -1..1: la misma escala que usa el extrusor para el lienzo Frontal,
 // de modo que una figura dibujada a pantalla completa ocupa lo mismo.

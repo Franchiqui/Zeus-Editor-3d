@@ -47,6 +47,9 @@ declare global {
       windowMinimize: () => void;
       windowMaximize: () => void;
       windowClose: () => void;
+      // --- ZEUS 3D Viewer ---
+      zeusProcessAction: (actionText: string) => Promise<any>;
+      zeusAction: (actionText: string) => Promise<any>;
     };
   }
 }

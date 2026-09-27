@@ -282,13 +282,15 @@ export const generarTerreno: ZeusPlugin = {
     },
     {
       tipo: 'slider',
-      id: 'formaciones',
-      etiqueta: 'Formaciones',
-      min: 2,
-      max: 40,
+      id: 'montanas',
+      etiqueta: 'Montañas',
+      min: 0,
+      max: 60,
       paso: 1,
       valor: 9,
-      descripcion: 'Cuántas montañas caben a lo ancho de la superficie.',
+      unidad: 'u',
+      descripcion:
+        'Número de montañas/picos que quiere que te cree (0 = terreno suave, sin picos). Cuántos picos caben en el ancho del terreno: más = más cumbres.',
     },
     {
       tipo: 'slider',
@@ -389,7 +391,10 @@ export const generarTerreno: ZeusPlugin = {
     const paleta = PALETAS[estilo] ?? PALETAS.montanas;
     const res = Math.max(8, Math.min(400, Math.round(num(params, 'resolucion', 140))));
     const altura = Math.max(0, num(params, 'altura', 38)) / 100;
-    const formaciones = Math.max(1, num(params, 'formaciones', 9));
+    // Montañas: número de picos que caben en el ancho del terreno. 0 =
+    // terreno suave sin picos. Con `n` picos en cada dirección el ruido
+    // fractal produce ≈ n² cumbres.
+    const formaciones = Math.max(1, Math.round(num(params, 'montanas', 9)));
     const octavas = Math.max(1, Math.min(8, Math.round(num(params, 'detalle', 6))));
     const persistencia = Math.max(0.05, Math.min(0.95, num(params, 'rugosidad', 55) / 100));
     const cresta = Math.max(0, Math.min(1, num(params, 'crestas', 45) / 100));

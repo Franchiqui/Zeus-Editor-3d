@@ -1,24 +1,20 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
 let pptxgenjsCache = null;
 
+// Exponer APIs del main process al renderer
 contextBridge.exposeInMainWorld('electronAPI', {
-  platform: process.platform,
-  versions: process.versions,
-  windowMinimize: () => ipcRenderer.send('window:minimize'),
-  windowMaximize: () => ipcRenderer.send('window:maximize'),
-  windowClose: () => ipcRenderer.send('window:close'),
-  toggleDevTools: () => ipcRenderer.send('window:toggle-devtools'),
-  refreshFocus: () => ipcRenderer.send('window:refresh-focus'),
-  /** Navegar a una URL en la misma ventana (evita destello de la página anterior) */
-  navigateTo: (url) => ipcRenderer.send('navigate-to', url),
-  // Zoom controls
-  zoomIn: () => ipcRenderer.send('zoom:in'),
-  zoomOut: () => ipcRenderer.send('zoom:out'),
-  zoomReset: () => ipcRenderer.send('zoom:reset'),
-  zoomSet: (factor) => ipcRenderer.send('zoom:set', factor),
-  zoomGet: () => ipcRenderer.invoke('zoom:get'),
-
-  // Filesystem APIs
+  // --- ZEUS 3D VIEWER APIs ---
+  zeusProcessAction: (actionText) => ipcRenderer.invoke('zeus:process-action', actionText),
+  zeusAction: (actionText) => {
+    ipcRenderer.send('zeus:action', actionText);
+    return new Promise((resolve) => {
+      const listener = (_event, result) => resolve(result);
+      ipcRenderer.on('zeus:action-result', listener);
+      return () => ipcRenderer.removeListener('zeus:action-result', listener);
+    });
+  },
+  
+  // --- Filesystem APIs ---
   selectFolder: () => ipcRenderer.invoke('fs:selectFolder'),
   fsListDirectory: (folderPath, category) => ipcRenderer.invoke('fs:listDirectory', folderPath, category),
   fsReadFile: (filePath, encoding) => ipcRenderer.invoke('fs:readFile', filePath, encoding),
@@ -33,10 +29,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   fsReadProject: (projectPath) => ipcRenderer.invoke('fs:readProject', projectPath),
   fsSaveProject: (projectPath, data) => ipcRenderer.invoke('fs:saveProject', projectPath, data),
   getMediaUrl: (filePath) => 'media://file?path=' + encodeURIComponent(filePath),
-  // Portapapeles (vía main; navigator.clipboard falla con NotAllowedError en Electron)
+  
+  // --- Clipboard APIs ---
   clipboardWriteImage: (dataUrl) => ipcRenderer.invoke('clipboard:write-image', dataUrl),
   clipboardReadImage: () => ipcRenderer.invoke('clipboard:read-image'),
   clipboardWriteText: (text) => ipcRenderer.invoke('clipboard:write-text', text),
+  
+  // --- Video APIs ---
   transcodeVideo: (inputPath, outputPath) => ipcRenderer.invoke('video:transcode', inputPath, outputPath),
   onTranscodeProgress: (callback) => {
     const listener = (_event, data) => callback(data);
@@ -55,15 +54,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('video:html-to-mp4-progress', listener);
     return () => ipcRenderer.removeListener('video:html-to-mp4-progress', listener);
   },
-  // Captura de pantalla (desktopCapturer)
+  
+  // --- Screen APIs ---
   getDesktopSources: (types) => ipcRenderer.invoke('screen:getSources', types),
-   saveCapture: (opts) => ipcRenderer.invoke('screen:saveCapture', opts),
-   getTempDir: () => ipcRenderer.invoke('app:get-temp-dir'),
-  // Overlay icon de la barra de tareas (estado de captura)
+  saveCapture: (opts) => ipcRenderer.invoke('screen:saveCapture', opts),
   setCaptureOverlay: (opts) => ipcRenderer.send('capture:overlay', opts),
-  // Audio export
+  
+  // --- Audio APIs ---
   exportAudioToMp3: (inputPath, outputPath) => ipcRenderer.invoke('audio:export-mp3', inputPath, outputPath),
-  // Demucs / separación de stems de audio
   checkDemucs: () => ipcRenderer.invoke('audio:check-demucs'),
   installDemucs: () => ipcRenderer.invoke('audio:install-demucs'),
   separateAudio: (opts) => ipcRenderer.invoke('audio:separate', opts),
@@ -73,24 +71,34 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('audio:separate-progress', listener);
     return () => ipcRenderer.removeListener('audio:separate-progress', listener);
   },
-  getFilePath: (file) => {
-    try {
-      return webUtils.getPathForFile(file);
-    } catch (e) {
-      return (file && file.path) || null;
-    }
-  },
-  // pptxgenjs (no funciona import() dinámico en app empaquetada por node:fs)
-  getPptxGenJS: () => {
-    if (!pptxgenjsCache) pptxgenjsCache = require('pptxgenjs');
-    return pptxgenjsCache;
-  },
-  // Server management APIs
+  
+  // --- Server Management APIs ---
   startComfyUI: () => ipcRenderer.invoke('server:start-comfyui'),
-  startFluxBridge: () => ipcRenderer.invoke('server:start-fluxbridge'),
   stopComfyUI: () => ipcRenderer.invoke('server:stop-comfyui'),
+  startFluxBridge: () => ipcRenderer.invoke('server:start-fluxbridge'),
   stopFluxBridge: () => ipcRenderer.invoke('server:stop-fluxbridge'),
   startTextureApi: () => ipcRenderer.invoke('server:start-textureapi'),
   stopTextureApi: () => ipcRenderer.invoke('server:stop-textureapi'),
   getServerStatus: () => ipcRenderer.invoke('server:status'),
+  
+  // --- Window & Zoom ---
+  windowMinimize: () => ipcRenderer.send('window:minimize'),
+  windowMaximize: () => ipcRenderer.send('window:maximize'),
+  windowClose: () => ipcRenderer.send('window:close'),
+  toggleDevTools: () => ipcRenderer.send('window:toggle-devtools'),
+  refreshFocus: () => ipcRenderer.send('window:refresh-focus'),
+  navigateTo: (url) => ipcRenderer.send('navigate-to', url),
+  zoomIn: () => ipcRenderer.send('zoom:in'),
+  zoomOut: () => ipcRenderer.send('zoom:out'),
+  zoomReset: () => ipcRenderer.send('zoom:reset'),
+  zoomSet: (factor) => ipcRenderer.send('zoom:set', factor),
+  zoomGet: () => ipcRenderer.invoke('zoom:get'),
+  
+  // --- PPTX ---
+  getPptxGenJS: () => {
+    if (!pptxgenjsCache) pptxgenjsCache = require('pptxgenjs');
+    return pptxgenjsCache;
+  },
 });
+
+console.log('✅ Preload API expuesta correctamente');

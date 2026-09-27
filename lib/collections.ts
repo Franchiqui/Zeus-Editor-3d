@@ -81,7 +81,6 @@ export type ModeloRecord = {
   is_vision?: boolean;
 };
 
-// ——— proveedores de IA admitidos
 export const USERS_EDITOR_3D_COLLECTION_NAME = 'users_editor_3d';
 export type UserEditor3DRecord = {
   id: string;
@@ -91,6 +90,8 @@ export type UserEditor3DRecord = {
   created: string;
   updated: string;
 };
+
+// ——— proveedores de IA admitidos
 // Todos los OpenAI-compatibles (Ollama local/Cloud, llama.cpp, custom) usan el
 // mismo formato /v1/chat/completions que OpenAI; solo varían la URL base y si
 // requieren API key. Deepseek mantiene su propio formato (callDeepseek).

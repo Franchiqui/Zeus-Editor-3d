@@ -19,6 +19,7 @@ let fluxBridgeProcess = null;
 let demucsProcess = null;
 let zeusApiProcess = null;
 let zeusServeProcess = null;
+let zeiaApiProcess = null;
 let textureApiProcess = null;
 
 // CONFIGURACIÓN DE ZOOM POR EDITOR
@@ -320,14 +321,6 @@ ipcMain.handle('fs:saveLocalPaths', async (_, paths) => {
   }
 });
 
-ipcMain.handle('app:get-temp-dir', async () => {
-  try {
-    return { success: true, path: app.getPath('temp') };
-  } catch (e) {
-    return { success: false, error: e.message };
-  }
-});
-
 // Captura de pantalla: enumerar fuentes (pantallas enteras y ventanas) con desktopCapturer.
 // Devuelve [{id, name, display_id, thumbnail}] para que el renderer muestre un selector.
 ipcMain.handle('screen:getSources', async (_event, types) => {
@@ -462,8 +455,10 @@ ipcMain.handle('video:transcode', async (_, inputPath, outputPath) => {
         // cuya zona dejó una dimensión impar).
         '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
         '-c:v libx264',
-        '-preset fast',
-        '-crf 23',
+        // Alta calidad: CRF bajo (17 ≈ casi sin pérdida visible) y preset
+        // medium (el slow tarda demasiado para vídeos largos).
+        '-preset medium',
+        '-crf 17',
         '-movflags +faststart',
         '-c:a aac',
         '-b:a 192k',
@@ -1296,6 +1291,80 @@ function startZeusApi() {
   });
 }
 
+// --- API de ZEIA (api_agente_3d, puerto 3012) ---
+// Resuelve el directorio de ZEIA en dev (junto a electron/) y empaquetado.
+function resolveZeiaDir() {
+  const candidates = [
+    path.join(__dirname, '..', 'api_agente_3d'),
+    path.join(process.resourcesPath || '', 'app', 'api_agente_3d'),
+  ];
+  for (const c of candidates) {
+    if (c && (fs.existsSync(path.join(c, 'api.ts')) || fs.existsSync(path.join(c, 'dist', 'api.js')))) return c;
+  }
+  return null;
+}
+
+function startZeiaApi() {
+  if (zeiaApiProcess && isProcessRunning(zeiaApiProcess)) {
+    console.log('[ZEIA] ya está en ejecución');
+    return;
+  }
+  const zeiaDir = resolveZeiaDir();
+  if (!zeiaDir) {
+    console.warn('[ZEIA] No se encontró api_agente_3d — omitiendo inicio de la API ZEIA.');
+    return;
+  }
+
+  const isWin = process.platform === 'win32';
+  // Puerto configurable (por defecto 3012, igual que api.ts y lib/zeia.ts).
+  const env = { ...process.env, PORT: process.env.ZEIA_PORT || '3012' };
+  const distApi = path.join(zeiaDir, 'dist', 'api.js');
+  let proc;
+  if (fs.existsSync(distApi)) {
+    // Build compilado (CommonJS): no requiere runtime de TypeScript. Ideal para el paquete.
+    proc = spawn(process.execPath, [distApi], {
+      cwd: zeiaDir,
+      env: { ...env, ELECTRON_RUN_AS_NODE: '1' },
+      windowsHide: true,
+    });
+  } else {
+    // Sin build: ejecutar el TS en vivo con tsx (preferible) o ts-node, usando el
+    // runtime de Electron como Node (ELECTRON_RUN_AS_NODE=1) — igual que la API de Zeus.
+    const tsxCli = [
+      path.join(zeiaDir, 'node_modules', 'tsx', 'dist', 'cli.mjs'),
+      path.join(__dirname, '..', 'API', 'node_modules', 'tsx', 'dist', 'cli.mjs'),
+      path.join(process.resourcesPath || '', 'app', 'API', 'node_modules', 'tsx', 'dist', 'cli.mjs'),
+    ].find((p) => p && fs.existsSync(p));
+    const tsNodeBin = path.join(zeiaDir, 'node_modules', 'ts-node', 'dist', 'bin.js');
+    if (tsxCli) {
+      proc = spawn(process.execPath, [tsxCli, 'api.ts'], {
+        cwd: zeiaDir,
+        env: { ...env, ELECTRON_RUN_AS_NODE: '1' },
+        windowsHide: true,
+      });
+    } else if (fs.existsSync(tsNodeBin)) {
+      proc = spawn(process.execPath, [tsNodeBin, 'api.ts'], {
+        cwd: zeiaDir,
+        env: { ...env, ELECTRON_RUN_AS_NODE: '1' },
+        windowsHide: true,
+      });
+    } else {
+      // Último recurso (sólo dev): npx tsx
+      proc = spawn(isWin ? 'npx.cmd' : 'npx', ['tsx', 'api.ts'], { cwd: zeiaDir, env, shell: isWin, windowsHide: true });
+    }
+  }
+
+  zeiaApiProcess = proc;
+  console.log(`[ZEIA] Iniciada en ${zeiaDir} (PID ${proc.pid || '?'})`);
+  proc.stdout.on('data', (d) => console.log('[ZEIA]', d.toString().trim()));
+  proc.stderr.on('data', (d) => console.error('[ZEIA]', d.toString().trim()));
+  proc.on('error', (err) => console.error('[ZEIA] error al iniciar:', err));
+  proc.on('exit', (code) => {
+    console.log(`[ZEIA] proceso finalizado (code ${code})`);
+    zeiaApiProcess = null;
+  });
+}
+
 app.whenReady().then(async () => {
   // Registrar protocolo personalizado para servir archivos locales (imágenes, video, audio)
   protocol.handle('media', async (request) => {
@@ -1458,6 +1527,9 @@ app.whenReady().then(async () => {
 
     // Iniciar el servidor de preview (serve/server.js, puerto 3032) junto a la app
     startZeusServe();
+
+    // Iniciar ZEIA (api_agente_3d, puerto 3012) junto a la app
+    startZeiaApi();
 
     createWindow();
   } catch (err) {
@@ -1982,7 +2054,7 @@ ipcMain.handle('server:start-textureapi', async () => {
 ipcMain.handle('server:stop-textureapi', () => stopTextureApi());
 
 function cleanup() {
-  [mainServerProcess, pbProcess, pbDatosProcess, comfyuiProcess, fluxBridgeProcess, zeusApiProcess, zeusServeProcess, textureApiProcess].forEach(p => {
+  [mainServerProcess, pbProcess, pbDatosProcess, comfyuiProcess, fluxBridgeProcess, zeusApiProcess, zeusServeProcess, zeiaApiProcess, textureApiProcess].forEach(p => {
     if (p && p.pid) {
       killWindowsTree(p.pid);
     }

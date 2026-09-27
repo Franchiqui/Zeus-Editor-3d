@@ -59,7 +59,6 @@ import WindowLayoutModal, { type WindowLayout } from './WindowLayoutModal';
 import { MotionEditor } from './MotionEditor';
 import { ObjectTransformFields } from './object-transform-fields';
 import { AxisHeader } from './axis-header';
-import PathCanvas from './path-canvas';
 import { cloneMesh } from '@/lib/plugins/clone';
 import { performCSGOperation, type BooleanOperationType } from '@/lib/csg-mesh';
 import { obtenerPlugin, listarPlugins, DESTINO_NUEVO_OBJETO, type PluginParams } from '@/lib/plugins';
@@ -67,6 +66,7 @@ import { toast } from 'sonner';
 import MeshEditor from './MeshEditor';
 import { buildLoftMesh } from '@/lib/loft-mesh';
 import { buildSweepMesh, type SweepNode } from '@/lib/sweep-mesh';
+import PathCanvas from './path-canvas';
 import type { ObjectTransform, Camera3D, GizmoMode } from '@/components/viewer-3d';
 import {
   IDENTITY_TRANSFORM,
@@ -96,13 +96,14 @@ import {
    pointInPolygon,
    polygonArea,
    roundedPolygonPath,
-  type LatheTextureProjection,
+type LatheTextureProjection,
   type TextureFinish,
   type Mesh,
   type Point2D,
   type Handle2D,
   type HoleSpec,
 } from '@/lib/geometry';
+import { resolveLatheProfile, LATHE_PRESET_NAMES } from '@/lib/lathe-profiles';
 import { extractObj3dMesh, decimateMesh } from '@/lib/obj3d-thumbnails';
 import { buildViewsMesh, buildExtrudeMesh, buildExtrudeMeshes, polylineToPolygon } from '@/lib/views-mesh';
 import { sanitizePolylinesByCanvas, newPolylineId } from '@/lib/polylines';
@@ -222,6 +223,9 @@ import {
   ZoomOut,
   Eraser,
 } from 'lucide-react';
+import { useAIEditorBridgeOptional } from '@/components/AIEditorBridgeContext';
+import { applyZeiaPlansToScene, type ZeiaSceneObject } from '@/lib/zeia-scene';
+import type { ZeiaAppliedPlan } from '@/lib/zeia';
 
 const EditorCanvasComponent = EditorCanvas as unknown as ComponentType<any>;
 
@@ -311,16 +315,18 @@ type EditorClipboard = {
   textRes: number;
   textOpacity: number;
   /** Opacidad de la figura construida en la pestaña Vistas (1 = sólida) */
-  viewsOpacity: number;
-  /** Profundidad de extrusión en la pestaña Extruir (eje Z, hacia -Z) */
-  extrudeDepth: number;
-  /** IDs de polilíneas cerradas marcadas como agujeros en Extruir */
-  extrudeHoles: string[];
-  textMode: 'voxel' | 'plane' | 'smooth';
-  useFontColor: boolean;
-  baseColor: string;
-  figureColor: string;
-  texture: string | null;
+   viewsOpacity: number;
+/** Profundidad de extrusión en la pestaña Extruir (eje Z, hacia -Z) */
+    extrudeDepth: number;
+    /** IDs de polilíneas cerradas marcadas como agujeros en Extruir */
+    extrudeHoles: string[];
+    /** Profundidad de corte de cada agujero (id de polilínea → profundidad; 0 = atraviesa) */
+    extrudeHoleDepths: Record<string, number>;
+    textMode: 'voxel' | 'plane' | 'smooth';
+    useFontColor: boolean;
+    baseColor: string;
+    figureColor: string;
+    texture: string | null;
   textureProjection: LatheTextureProjection;
    textureFinish: TextureFinish;
    textureRelief: number;
@@ -431,17 +437,19 @@ type HistoryState = {
   textRes: number;
   textOpacity: number;
   /** Opacidad de la figura construida en la pestaña Vistas (1 = sólida) */
-  viewsOpacity: number;
-  /** Profundidad de extrusión en la pestaña Extruir (eje Z, hacia -Z) */
-  extrudeDepth: number;
-  /** IDs de polilíneas cerradas marcadas como agujeros en Extruir */
-  extrudeHoles: string[];
-  textMode: 'voxel' | 'plane' | 'smooth';
-  useFontColor: boolean;
-  baseColor: string;
-  figureColor: string;
-  texture: string | null;
-  latheTexture: string | null;
+   viewsOpacity: number;
+/** Profundidad de extrusión en la pestaña Extruir (eje Z, hacia -Z) */
+    extrudeDepth: number;
+    /** IDs de polilíneas cerradas marcadas como agujeros en Extruir */
+    extrudeHoles: string[];
+    /** Profundidad de corte de cada agujero (id de polilínea → profundidad; 0 = atraviesa) */
+    extrudeHoleDepths: Record<string, number>;
+    textMode: 'voxel' | 'plane' | 'smooth';
+    useFontColor: boolean;
+    baseColor: string;
+    figureColor: string;
+    texture: string | null;
+    latheTexture: string | null;
   textureProjection: LatheTextureProjection;
    textureFinish: TextureFinish;
    textureRelief: number;
@@ -477,17 +485,17 @@ type HistoryState = {
    pluginTracks: PluginParamTrack[];
    /** Editor de movimiento: pistas de efectos visuales. */
    effectTracks: EffectTrack[];
-   /** Mallas base congeladas para las pistas de plugin, por objectId. */
-   pluginBaseMeshes: Record<string, Mesh>;
-   /** Recorrido (Extruir): vértices con su posición, plantilla e inclinación. */
-   sweepNodes: SweepNode[];
-   /** Recorrido (Extruir): ¿tramo cerrado? */
-   sweepClosed: boolean;
-   /** Recorrido (Extruir): número de subdivisiones del barrido. */
-   sweepSubdivisions: number;
-   /** Recorrido (Extruir): vértice activo (selección). */
-   sweepActiveId: number | null;
- };
+/** Mallas base congeladas para las pistas de plugin, por objectId. */
+    pluginBaseMeshes: Record<string, Mesh>;
+    /** Recorrido (Extruir): vértices con su posición, plantilla e inclinación. */
+    sweepNodes: SweepNode[];
+    /** Recorrido (Extruir): ¿tramo cerrado? */
+    sweepClosed: boolean;
+    /** Recorrido (Extruir): número de subdivisiones del barrido. */
+    sweepSubdivisions: number;
+    /** Recorrido (Extruir): vértice activo (selección). */
+    sweepActiveId: number | null;
+  };
 
 // Comparación de dos fotos del editor (para saber si un cambio es real o
 // solo una actualización idéntica). La escena y el editor de movimiento van
@@ -517,6 +525,7 @@ const isSameHistoryState = (a: HistoryState, b: HistoryState): boolean =>
   a.textOpacity === b.textOpacity &&
   a.viewsOpacity === b.viewsOpacity &&
   a.extrudeDepth === b.extrudeDepth &&
+  sameHistoryValue(a.extrudeHoleDepths ?? {}, b.extrudeHoleDepths ?? {}) &&
   sameHistoryValue(a.extrudeHoles ?? [], b.extrudeHoles ?? []) &&
   a.textMode === b.textMode &&
   a.useFontColor === b.useFontColor &&
@@ -654,6 +663,7 @@ const DEFAULT_OBJECT_CONFIG: ObjectConfig = {
   extrudeDepth: 0.5,
   /** IDs de polilíneas cerradas marcadas como agujeros en Extruir */
   extrudeHoles: [],
+  extrudeHoleDepths: {},
   textMode: 'voxel',
   useFontColor: true,
   baseColor: '#e8e8e8',
@@ -724,6 +734,12 @@ function sanitizeObjectConfig(raw: unknown): ObjectConfig | null {
       typeof c.viewsOpacity === 'number' ? c.viewsOpacity : d.viewsOpacity,
     extrudeDepth:
       typeof c.extrudeDepth === 'number' ? c.extrudeDepth : d.extrudeDepth,
+    extrudeHoleDepths:
+      c.extrudeHoleDepths &&
+      typeof c.extrudeHoleDepths === 'object' &&
+      !Array.isArray(c.extrudeHoleDepths)
+        ? (c.extrudeHoleDepths as Record<string, number>)
+        : d.extrudeHoleDepths,
     extrudeHoles: Array.isArray(c.extrudeHoles) ? c.extrudeHoles : d.extrudeHoles,
     textMode: oneOf(
       c.textMode,
@@ -3048,6 +3064,7 @@ export default function Home({
   // declaran aquí arriba porque el historial de deshacer/rehacer los
   // fotografía en cada paso.
   const [sceneObjects, setSceneObjects] = useState<SceneObject[]>([]);
+  const aiBridge = useAIEditorBridgeOptional();
   // Cuadradito de textura que salta la primera aplicación tras un
   // cambio de pestaña, de selección o de restauración del panel (lo
   // arman syncTextureStateToSelection y applyObjectConfig).
@@ -3100,6 +3117,13 @@ export default function Home({
   const [activeView, setActiveView] = useState<'front' | 'top' | 'side' | '3d'>(
     'front'
   );
+  // Espejo del visor activo en ref: el getter de registerDocumentImages se
+  // registra una sola vez (deps [aiBridge]) y debe leer el visor ACTUAL, no el
+  // de su render de registro.
+  const activeViewRef = useRef(activeView);
+  useEffect(() => {
+    activeViewRef.current = activeView;
+  }, [activeView]);
   const [viewports, setViewports] = useState({
     front: { zoom: 1, offsetX: 0, offsetY: 0, gridResolution: 32 },
     top: { zoom: 1, offsetX: 0, offsetY: 0, gridResolution: 32 },
@@ -3581,6 +3605,322 @@ export default function Home({
     const sceneObjectsPlaybackRef = useRef(sceneObjects);
     sceneObjectsPlaybackRef.current = sceneObjects;
 
+    // ── ZEIA: aplicar los planes (plan+execute) del servidor a la escena REAL ──
+    const zeiaIdMapRef = useRef<Record<string, string>>({});
+    const lastCreatedIdRef = useRef<string | null>(null);
+    useEffect(() => {
+      if (!aiBridge?.registerZeiaPlanApplier) return;
+      const unregister = aiBridge.registerZeiaPlanApplier((plans) => {
+        const currentObjs = sceneObjectsPlaybackRef.current as unknown as ZeiaSceneObject[];
+        const out = applyZeiaPlansToScene(plans, currentObjs, transformTracksRef.current, {
+          idMap: zeiaIdMapRef.current,
+          lastCreatedId: lastCreatedIdRef.current,
+        });
+        zeiaIdMapRef.current = out.idMap;
+        lastCreatedIdRef.current = out.lastCreatedId;
+        setSceneObjects(out.objects as unknown as SceneObject[]);
+        setTransformTracks(out.transformTracks);
+        return out.result;
+      });
+      return unregister;
+    }, [aiBridge]);
+
+    // ── Imágenes del documento para el modelo de visión (canvas del visor 3D) ──
+    useEffect(() => {
+      if (!aiBridge?.registerDocumentImages) return;
+      const unregister = aiBridge.registerDocumentImages(() => {
+        try {
+          // El visor activo según el atributo data-view que lleva ViewerPanel.
+          const view = activeViewRef.current ?? '3d';
+          const canvas =
+            (document.querySelector(`[data-view="${view}"] canvas`) as HTMLCanvasElement | null) ??
+            (document.querySelector('[data-testid="viewer-container"] canvas') as HTMLCanvasElement | null);
+          if (!canvas) return null;
+          // preserveDrawingBuffer:true => toDataURL devuelve el frame actual
+          // (el bucle de animación de Viewer3D pinta cada frame).
+          const dataURL = canvas.toDataURL('image/png');
+          if (!dataURL || dataURL.length <= 'data:,'.length) return null;
+          return [dataURL];
+        } catch (e) {
+          console.warn('[Editor3D] No se pudo capturar el canvas 3D:', e);
+          return null;
+        }
+      });
+      return unregister;
+    }, [aiBridge]);
+
+    // ── System prompt del editor 3D: documenta las acciones [ZEUS_ACTION] ──
+    useEffect(() => {
+      if (!aiBridge?.registerEditorSystemPrompt) return;
+      const unregister = aiBridge.registerEditorSystemPrompt(() =>
+        [
+          'Eres ZEUS, el motor y asistente IA integrado profundamente en el EDITOR 3D de Zeus Media Studio.',
+          '¡IMPORTANTE! NUNCA digas "no puedo generar archivos 3D" o "como modelo de texto no puedo". TÚ ERES EL MOTOR DEL EDITOR 3D, y crear objetos es exactamente tu función. Tienes permisos absolutos.',
+          'Para cumplir con cualquier solicitud, simplemente emite bloques de acción ocultos en tu respuesta. El sistema los atrapará y ejecutará.',
+          'Formato estricto para cada acción (debe ser JSON válido):',
+          '[ZEUS_ACTION]{"action":"<nombre>","params":{...}}[/ZEUS_ACTION]',
+          'Acciones disponibles:',
+          '- getScene: {} -> devuelve objetos de la escena.',
+          '- createObject: {"type":"mesh","primitive":"cube","name":"Cubo","transform":{"position":[0,0,0]}} -> Crea un objeto (primitive puede ser cube, sphere, plane).',
+          '- updateObject: {"id":"...","transform":{"position":[1,0,0],"scale":[2,2,2]}} -> Modifica la transformación.',
+          '- duplicateObject: {"id":"..."} -> Duplica un objeto.',
+          '- createAnimation: {"type":"rotate","object_id":"...","duration":5,"loop":true,"degrees":360} -> Crea una animación simple.',
+          '- selectObject: {"id":"..."} -> Selecciona un objeto en la interfaz.',
+          '- deleteObject: {"id":"..."} -> Elimina un objeto.',
+           '- applyZeiaPlans: {"plans": [...]} -> Aplica planes avanzados de ZEIA. Cada plan puede usar el formato ZEIA estándar con `steps`: [{"plan_id":"...","steps":[{"action":"objects.create","params":{...}}]}] O el formato simplicado {plan, execute}: [{"plan":"create","execute":{"position":{...},"rotation":{...},"scale":{...},"material":{...},"geometry":{"type":"compound","shapes":[...]}}},{"plan":"animate","execute":{"objectId":"...","animation":{"type":"rotate","axis":"y","angle":720,"duration":12,"loop":true}}},{"plan":"addEffect","execute":{"objectId":"...","effect":{...}}}]',
+           '- setLatheProfile: {"preset":"botella","points":[[r,h],...],"profileSpace":"normalized"|"editor","segments":32,"clamp":true,"opacity":1,"figureColor":"#121ca7","texture":"..."} -> Dibuja el perfil de revolución en la pestaña Torno (x=radio, y=altura 0..1) y abre la pestaña. "preset" ∈ {botella, jarron, taza, cuenco, copa, cono, cilindro, esfera}; "points"/"profile" aportan [radio, altura] normalizados o, con profileSpace:"editor", coordenadas del lienzo. Ideal para aplicar coordenadas que el modelo de visión extrajo del render del visor.',
+           '- createLatheObject: {"preset":"botella"|"profile":[[r,h],...],"name":"Botella","segments":32,"clamp":true,"opacity":1,"figureColor":"#121ca7","transform":{"position":[0,0,0]}} -> Crea un objeto de revolución (botella/jarrón/...) en la escena: construye su malla con buildLatheMesh, la añade, la selecciona y abre la pestaña Torno con su perfil adoptando el panel como dueño.',
+           'El modelo de visión inspecciona el render del visor activo (registerDocumentImages capta el canvas vía toDataURL). Puede pedirle coordenadas de perfil precisas y aplicarlas con setLatheProfile.',
+           'Si la acción depende del id de un objeto que no conoces, llama PRIMERO a getScene sin hacer nada más, y usa los ids en el siguiente turno. NO inventes ids.',
+        ].join('\n')
+      );
+      return unregister;
+    }, [aiBridge]);
+
+    // ── Executor de acciones [ZEUS_ACTION] del editor 3D ──
+    useEffect(() => {
+      if (!aiBridge?.registerActionExecutor) return;
+      const unregister = aiBridge.registerActionExecutor(async (action, params) => {
+        switch (action) {
+          case 'getScene':
+            return {
+              objects: (sceneObjectsPlaybackRef.current ?? []).map((o) => ({
+                id: o.id,
+                name: o.name,
+                kind: o.kind ?? 'figure',
+                transform: o.transform,
+              })),
+              transformTracks: (transformTracksRef.current ?? []).map((t) => ({
+                id: t.id,
+                name: t.name,
+                objectId: t.objectId,
+                duration: t.duration,
+              })),
+            };
+          case 'applyZeiaPlans': {
+            const rawPlans = params.plans;
+            const plans: ZeiaAppliedPlan[] = Array.isArray(rawPlans)
+              ? (rawPlans as ZeiaAppliedPlan[])
+              : [];
+            const currentObjs = sceneObjectsPlaybackRef.current as unknown as ZeiaSceneObject[];
+            const out = applyZeiaPlansToScene(plans, currentObjs, transformTracksRef.current, {
+              idMap: zeiaIdMapRef.current,
+              lastCreatedId: lastCreatedIdRef.current,
+            });
+            zeiaIdMapRef.current = out.idMap;
+            lastCreatedIdRef.current = out.lastCreatedId;
+            setSceneObjects(out.objects as unknown as SceneObject[]);
+            setTransformTracks(out.transformTracks);
+            return out.result;
+          }
+
+          case 'createObject':
+          case 'updateObject':
+          case 'duplicateObject':
+          case 'createAnimation': {
+            const actionMap: Record<string, string> = {
+              createObject: 'objects.create',
+              updateObject: 'objects.update',
+              duplicateObject: 'objects.duplicate',
+              createAnimation: 'motions.create'
+            };
+            const planStepAction = actionMap[action];
+            const plans: ZeiaAppliedPlan[] = [{ steps: [{ action: planStepAction, params }] }];
+            const currentObjs = sceneObjectsPlaybackRef.current as unknown as ZeiaSceneObject[];
+            const out = applyZeiaPlansToScene(plans, currentObjs, transformTracksRef.current, {
+              idMap: zeiaIdMapRef.current,
+              lastCreatedId: lastCreatedIdRef.current,
+            });
+            zeiaIdMapRef.current = out.idMap;
+            lastCreatedIdRef.current = out.lastCreatedId;
+            setSceneObjects(out.objects as unknown as SceneObject[]);
+            setTransformTracks(out.transformTracks);
+            return out.result;
+          }
+          case 'selectObject': {
+            const id = (params.id ?? params.objectId) as string | undefined;
+            setSelectedObjectId(id ?? null);
+            return { selected: id ?? null };
+          }
+          case 'deleteObject': {
+            const id = (params.id ?? params.objectId) as string | undefined;
+            if (!id) throw new Error('deleteObject: falta el id del objeto');
+            setSceneObjects((prev) => prev.filter((o) => o.id !== id));
+            setTransformTracks((prev) => prev.filter((t) => t.objectId !== id));
+            return { deleted: id };
+           }
+           case 'setLatheProfile': {
+             let polygon: Polygon;
+             try {
+                polygon = resolveLatheProfile({
+                  preset: params.preset,
+                  profile: params.profile ?? params.points,
+                  profileSpace: params.profileSpace,
+                  worldHeight:
+                    typeof params.worldHeight === 'number'
+                      ? params.worldHeight
+                      : undefined,
+                  radiusScale:
+                    typeof params.radiusScale === 'number'
+                      ? params.radiusScale
+                      : undefined,
+                });
+             } catch (e) {
+               return {
+                 ok: false,
+                 error:
+                   e instanceof Error
+                     ? e.message
+                     : 'Perfil de torno inválido',
+               };
+             }
+             setMode('lathe');
+             setLatheProfile(polygon);
+             if (typeof params.segments === 'number') setLatheSegments(params.segments);
+             if (typeof params.clamp === 'boolean') setLatheClamp(params.clamp);
+             if (typeof params.opacity === 'number') setLatheOpacity(params.opacity);
+             if (typeof params.figureColor === 'string' && params.figureColor)
+               setLatheFigureColor(params.figureColor);
+             if (typeof params.texture === 'string') setLatheTexture(params.texture);
+             else if (params.texture === null) setLatheTexture(null);
+             return { ok: true, mode: 'lathe', profilePoints: polygon.length };
+           }
+           case 'createLatheObject': {
+             let polygon: Polygon;
+             try {
+                polygon = resolveLatheProfile({
+                  preset: params.preset,
+                  profile: params.profile ?? params.points,
+                  profileSpace: params.profileSpace,
+                  worldHeight:
+                    typeof params.worldHeight === 'number'
+                      ? params.worldHeight
+                      : undefined,
+                  radiusScale:
+                    typeof params.radiusScale === 'number'
+                      ? params.radiusScale
+                      : undefined,
+                });
+             } catch (e) {
+               return {
+                 ok: false,
+                 error:
+                   e instanceof Error
+                     ? e.message
+                     : 'Perfil de torno inválido',
+               };
+             }
+             const segments =
+               typeof params.segments === 'number' ? params.segments : latheSegments;
+             const clamp =
+               typeof params.clamp === 'boolean' ? params.clamp : latheClamp;
+             const opacity =
+               typeof params.opacity === 'number' ? params.opacity : latheOpacity;
+             const figureColor =
+               typeof params.figureColor === 'string' && params.figureColor
+                 ? params.figureColor
+                 : latheFigureColor;
+             const textureUrl =
+               typeof params.texture === 'string' ? params.texture : null;
+
+             // Congelar el dueño de la configuración actual (si lo hay) con su
+             // malla viva ANTES de tocar el panel, para no perder su edición.
+             if (configObjectId) {
+               freezeObjectSnapshot(configObjectId);
+               setConfigObjectId(null);
+             }
+
+             setMode('lathe');
+             setLatheProfile(polygon);
+             setLatheSegments(segments);
+             setLatheClamp(clamp);
+             setLatheOpacity(opacity);
+             setLatheFigureColor(figureColor);
+             setLatheTexture(textureUrl);
+
+             // Malla del torno: espejo del branch `mode === 'lathe'` de baseMesh.
+             const mesh = buildLatheMesh(polygon, segments, clamp, textureProjection);
+             mesh.opacity = opacity;
+             if (textureUrl) {
+               mesh.texture = textureUrl;
+               mesh.textureColor = '#ffffff';
+               mesh.textureRelief = textureRelief;
+               mesh.textureFinish = textureFinish;
+               mesh.textureRepeat = textureRepeat;
+               mesh.textureHelper = textureHelper;
+               mesh.textureHelperTransform = structuredClone(textureHelperTransform);
+             } else if (mesh.faces) {
+               mesh.faceColors = mesh.faces.map(() => figureColor);
+             }
+
+             const currentObjs = sceneObjectsPlaybackRef.current;
+             const id = `object-${Date.now()}-${currentObjs.length}`;
+             const nombre =
+               typeof params.name === 'string' && params.name.trim()
+                 ? params.name.trim()
+                 : t('editor3D.objectN', { n: currentObjs.length + 1 });
+
+             const tp =
+               params.transform && typeof params.transform === 'object'
+                 ? (params.transform as Record<string, unknown>)
+                 : {};
+             const numTriple = (
+               v: unknown,
+               fb: [number, number, number],
+             ): [number, number, number] =>
+               Array.isArray(v) && v.length >= 3
+                 ? [Number(v[0]) || 0, Number(v[1]) || 0, Number(v[2]) || 0]
+                 : fb;
+             const [px, py, pz] = numTriple(tp.position, [0, 0, 0]);
+             const [rx, ry, rz] = numTriple(tp.rotation, [0, 0, 0]);
+             const [sx, sy, sz] = numTriple(tp.scale, [1, 1, 1]);
+             const RAD = Math.PI / 180;
+             const transform: ObjectTransform = {
+               px: px || 0,
+               py: py || 0,
+               pz: pz || 0,
+               rx: rx * RAD,
+               ry: ry * RAD,
+               rz: rz * RAD,
+               sx: sx || 1,
+               sy: sy || 1,
+               sz: sz || 1,
+             };
+
+             setSceneObjects((current) => [
+               ...current,
+               {
+                 id,
+                 name: nombre,
+                 mode: 'lathe',
+                 transform,
+                 mesh,
+                 smooth: smoothShadingValue,
+                 textureProjection,
+               },
+             ]);
+             setSelectedObjectId(id);
+             setConfigObjectId(id);
+             return {
+               ok: true,
+               id,
+               name: nombre,
+               mode: 'lathe',
+               vertices: mesh.vertices.length,
+               faces: mesh.faces.length,
+               profilePoints: polygon.length,
+             };
+           }
+           case 'exportMp4':
+             setExportMp4Trigger((t) => t + 1);
+             return { exporting: true };
+          default:
+            throw new Error(`Acción 3D desconocida: ${action}`);
+        }
+      });
+      return unregister;
+    }, [aiBridge]);
+
     useEffect(() => {
       // Duración de reproducción: la mayor pista de objeto o, si no hay
       // pistas, el recorrido de la primera cámara-objeto (escenas solo
@@ -3751,7 +4091,12 @@ export default function Home({
       textOpacity,
       viewsOpacity,
       extrudeDepth,
+      extrudeHoleDepths,
       extrudeHoles,
+      sweepNodes: structuredClone(sweepNodes),
+      sweepClosed,
+      sweepSubdivisions,
+      sweepActiveId,
       textMode,
       useFontColor,
       baseColor,
@@ -3785,10 +4130,6 @@ export default function Home({
       pluginTracks,
       effectTracks,
       pluginBaseMeshes,
-      sweepNodes,
-      sweepClosed,
-      sweepSubdivisions,
-      sweepActiveId,
     });
 
     const currentState = capture();
@@ -3804,14 +4145,11 @@ export default function Home({
 
     pendingSnapshotRef.current = currentState;
     if (historyTimerRef.current !== null) clearTimeout(historyTimerRef.current);
-    historyTimerRef.current = setTimeout(() => {
-      historyTimerRef.current = null;
-      // La foto ya está en el historial: se suelta el pendiente. Libera la
-      // referencia a la foto y evita volver a «volcarla» de forma redundante
-      // al deshacer/rehacer.
-      pendingSnapshotRef.current = null;
-      commitHistorySnapshot(currentState);
-    }, 400);
+     historyTimerRef.current = setTimeout(() => {
+       historyTimerRef.current = null;
+       pendingSnapshotRef.current = null;
+       commitHistorySnapshot(currentState);
+     }, 400);
 
     return () => {
       if (historyTimerRef.current !== null) {
@@ -3829,10 +4167,15 @@ export default function Home({
     greedyMesh,
     textRes,
     textOpacity,
-    viewsOpacity,
-    extrudeDepth,
-    extrudeHoles,
-    textMode,
+viewsOpacity,
+      extrudeDepth,
+      extrudeHoleDepths,
+      extrudeHoles,
+      sweepNodes,
+      sweepClosed,
+      sweepSubdivisions,
+      sweepActiveId,
+      textMode,
     useFontColor,
     baseColor,
     figureColor,
@@ -3862,16 +4205,16 @@ export default function Home({
     groups,
     polylines,
     transformTracks,
-    pluginTracks,
-    effectTracks,
-    pluginBaseMeshes,
-    sweepNodes,
-    sweepClosed,
-    sweepSubdivisions,
-    sweepActiveId,
-    isUndoRedo,
-    commitHistorySnapshot,
-  ]);
+pluginTracks,
+      effectTracks,
+      pluginBaseMeshes,
+      sweepNodes,
+      sweepClosed,
+      sweepSubdivisions,
+      sweepActiveId,
+      isUndoRedo,
+      commitHistorySnapshot,
+    ]);
 
   // Restaura una foto del historial: configuración de la pestaña Y
   // escena completa (objetos con sus instantáneas, selección y dueño
@@ -3890,7 +4233,7 @@ export default function Home({
     setViewsOpacity(state.viewsOpacity);
     setExtrudeDepth(state.extrudeDepth);
     setExtrudeHoles(state.extrudeHoles ?? []);
-    setExtrudeHoleDepths({});
+    setExtrudeHoleDepths(state.extrudeHoleDepths ?? {});
     setTextMode(state.textMode);
     setUseFontColor(state.useFontColor !== false);
     setBaseColor(state.baseColor);
@@ -3916,6 +4259,7 @@ export default function Home({
     setLatheClamp(state.latheClamp);
     setLatheFigureColor(state.latheFigureColor);
     setGizmoOffset(state.gizmoOffset ?? structuredClone(IDENTITY_TRANSFORM));
+    setSceneObjects(state.sceneObjects);
     setSelectedObjectId(state.selectedObjectId);
     setConfigObjectId(state.configObjectId);
     // La pestaña activa también se restaura: deshacer tras un cambio
@@ -4931,8 +5275,8 @@ export default function Home({
     textOpacity,
     viewsOpacity,
     extrudeDepth,
-    extrudeHoles,
     extrudeHoleDepths,
+    extrudeHoles,
     figureColor,
      texture,
       textureProjection,
@@ -4949,13 +5293,14 @@ export default function Home({
     latheOpacity,
     meshSilhouette,
     meshSections,
-    meshSilhouetteView,
-    meshSideView,
-    meshOpacity,
-    sweepNodes,
-    sweepClosed,
-    sweepSubdivisions,
-  ]);
+     meshSilhouetteView,
+     meshSideView,
+     meshOpacity,
+     sweepNodes,
+     sweepClosed,
+     sweepSubdivisions,
+     resizeScale,
+   ]);
 
   const mesh = useMemo(() => {
     if (editedVertices && editedVertices.length === baseMesh.vertices.length) {
@@ -5018,8 +5363,7 @@ export default function Home({
     editingMeshProfile !== null ||
     editingMesh ||
     editingMeshSide ||
-    editingSweepCanvas !== null ||
-    (mode === 'extrude' && sweepNodes.length >= 2);
+    editingSweepCanvas !== null;
   // El área de trabajo arranca vacío: la figura de la pestaña solo se
   // materializa en el visor si pertenece a un objeto (el dueño de la
   // configuración) o si hay un lienzo 2D abrierto dibujándola. Sin
@@ -5171,6 +5515,7 @@ export default function Home({
       textOpacity,
       viewsOpacity,
       extrudeDepth,
+      extrudeHoleDepths,
       extrudeHoles,
       textMode,
       useFontColor,
@@ -5261,7 +5606,7 @@ export default function Home({
     setViewsOpacity(config.viewsOpacity);
     setExtrudeDepth(config.extrudeDepth);
     setExtrudeHoles(config.extrudeHoles ?? []);
-    setExtrudeHoleDepths({});
+    setExtrudeHoleDepths(config.extrudeHoleDepths ?? {});
     setTextMode(config.textMode);
     setUseFontColor(config.useFontColor);
     setBaseColor(config.baseColor);
@@ -5528,14 +5873,17 @@ export default function Home({
     textRes,
     textOpacity,
     viewsOpacity,
-    extrudeDepth,
-    extrudeHoles,
-    textMode,
-    useFontColor,
-    baseColor,
-    figureColor,
-    texture,
-    textureProjection,
+     extrudeDepth,
+     extrudeHoles,
+     sweepNodes,
+     sweepClosed,
+     sweepSubdivisions,
+     textMode,
+     useFontColor,
+     baseColor,
+     figureColor,
+     texture,
+     textureProjection,
       textureFinish,
       textureRelief,
       textureRepeat,
@@ -6017,7 +6365,12 @@ export default function Home({
           setExtrudeDepth(data.extrudeDepth);
         if (Array.isArray(data.extrudeHoles))
           setExtrudeHoles(data.extrudeHoles);
-        setExtrudeHoleDepths({});
+        if (
+          typeof data.extrudeHoleDepths === 'object' &&
+          data.extrudeHoleDepths !== null &&
+          !Array.isArray(data.extrudeHoleDepths)
+        )
+          setExtrudeHoleDepths(data.extrudeHoleDepths as Record<string, number>);
         if (['voxel', 'plane', 'smooth'].includes(data.textMode))
           setTextMode(data.textMode);
         setUseFontColor(data.useFontColor !== false);
@@ -7022,7 +7375,6 @@ export default function Home({
       setEditingPanel(null);
       setEditingMesh(false);
       setEditingViewProfile(null);
-      setEditingSweepCanvas(null);
       setEditingMeshProfile(null);
       setEditingMeshSide(false);
       setEditingLatheProfile(false);
@@ -7492,15 +7844,17 @@ export default function Home({
         ? text.trim().length > 0
         : mode === 'lathe'
           ? latheProfile.length >= 3
-          : mode === 'mesh'
-            ? meshSilhouette.length >= 3 && meshSections.length > 0
-            : mode === 'extrude'
-              ? views.front.length >= 3 ||
-                (sweepNodes.length >= 2 &&
-                  sweepNodes.every(
-                    (n) => n.polygon.length >= 3 || views.front.length >= 3
-                  ))
-              : views.front.length >= 3; // views y extrude
+: mode === 'mesh'
+          ? meshSilhouette.length >= 3 && meshSections.length > 0
+          : mode === 'extrude'
+            ? views.front.length >= 3 ||
+              (sweepNodes.length >= 2 &&
+                sweepNodes.every(
+                  (n) => n.polygon.length >= 3 || views.front.length >= 3
+                ))
+            : views.front.length >= 3 &&
+              views.side.length >= 3 &&
+              views.top.length >= 3;
     // Huella de los datos de dibujo: cambia cuando el usuario añade,
     // mueve o borra puntos del dibujo (no con los ajustes secundarios
     // como opacidad o profundidad).
@@ -7512,7 +7866,6 @@ export default function Home({
       meshSilhouette,
       meshSections,
       meshSideView,
-      sweepNodes,
     });
     const key = `${mode}|${configObjectId ?? 'none'}`;
     const baseline = draftBaselineRef.current;
@@ -7537,7 +7890,6 @@ export default function Home({
     meshSilhouette,
     meshSections,
     meshSideView,
-    sweepNodes,
     configObjectId,
     isUndoRedo,
     obj3dOpeningName,
@@ -8573,6 +8925,7 @@ export default function Home({
               alt="Zeus Editor 3D"
               className="h-6 object-contain"
             />
+            <div className="text-sm text-gray-400">Diseño y animación 3D</div>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -9415,9 +9768,9 @@ export default function Home({
                 </p>
               </div>
 
-              {mode === 'extrude' ? (
-                   <div className="flex-1 overflow-y-auto grid grid-rows-[260px_320px_auto] gap-3 p-3 min-h-0 custom-scrollbar">
-                    <DrawingCanvas
+{mode === 'extrude' ? (
+                   <div className="flex-1 overflow-y-auto grid grid-rows-[320px_320px_auto] gap-3 p-3 min-h-0 custom-scrollbar">
+                     <DrawingCanvas
                      label={activeSweepNode ? t('editor3D.sweepProfileLabel', { n: sweepNodeNumber }) : t('editor3D.panelLabels.front')}
                      axisLabel={t('editor3D.panelLabels.frontAxis')}
                      polygon={activeSweepNode ? activeSweepNode.polygon : views.front}
@@ -9446,151 +9799,106 @@ export default function Home({
                        edgeTemplatesLabel={t('editor3D.sweepShowTemplates')}
                        onMaximize={() => setEditingSweepCanvas('path')}
                      />
-                     <div className="flex items-center gap-2 flex-wrap">
+<div className="flex flex-col gap-1.5">
+                      <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
+                         <span>{t('editor3D.extrusionDepth')}</span>
+                        <span className="font-mono text-[10px] text-green-400">
+                          {extrudeDepth.toFixed(2)}
+                        </span>
+                      </label>
+                      <Slider
+                        min={0.1}
+                        max={3}
+                        step={0.1}
+                        value={[extrudeDepth]}
+                        onValueChange={([v]) => {
+                          setExtrudeDepth(v);
+                          setEditedVertices(null);
+                        }}
+                        className="w-full"
+                      />
+                      <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
+                        <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
+                         {t('editor3D.extrusionHint', { depth: extrudeDepth.toFixed(2) })}
+                      </p>
+                    </div>
+                    
+                    <div className="flex flex-col gap-2">
                        <button
-                         onClick={() => setSweepClosed((v) => !v)}
-                         className={overlayToolChip(sweepClosed)}
-                         title={t('editor3D.sweepClosed')}
-                       >
-                         {t('editor3D.sweepClosed')}
+                         onClick={() => {
+                           const frontPolylines = getPolylines('views:front');
+                           const drawnInside = frontPolylines.filter((line) => {
+                             if (line.points.length < 3) return false;
+                             if (extrudeHoles.includes(line.id)) return false;
+                             // Un contorno dibujado con >= 3 puntos se considera cerrado:
+                             // la herramienta Línea no repite el punto inicial al terminar.
+                             // Comprobar si el centroide está dentro del polígono principal
+                             const cx =
+                               line.points.reduce((s, p) => s + p.x, 0) / line.points.length;
+                             const cy =
+                               line.points.reduce((s, p) => s + p.y, 0) / line.points.length;
+                             return pointInPolygon({ x: cx, y: cy }, views.front);
+                           });
+                           if (drawnInside.length === 0) {
+                             if (extrudeHoles.length > 0) {
+                               setExtrudeHoles([]);
+                               setExtrudeHoleDepths({});
+                             }
+                             return;
+                           }
+                           setExtrudeHoles((prev) =>
+                             Array.from(
+                               new Set([...prev, ...drawnInside.map((l) => l.id)])
+                             )
+                           );
+                         }}
+                         className="w-full px-3 py-1.5 text-[10px] font-medium rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/30 transition-colors flex items-center justify-center gap-1"
+                          title={t('editor3D.subtractDrawn')}
+                        >
+                          <Scissors className="w-3 h-3" />
+                          {t('editor3D.subtract')}
                        </button>
-                       {sweepActiveId !== null && (
-                         <>
-                           <button
-                             onClick={() => removeSweepNode(sweepActiveId)}
-                             className="px-1.5 py-0.5 rounded text-[10px] font-medium border border-red-500/30 bg-red-500/20 text-red-300 hover:bg-red-500/30 transition-colors"
-                             title={t('editor3D.sweepRemove')}
-                           >
-                             {t('editor3D.sweepRemove')}
-                           </button>
-                           <div className="flex items-center gap-2 flex-1 min-w-[150px]">
-                             <span className="text-[10px] text-muted-foreground/80 whitespace-nowrap">
-                               {t('editor3D.sweepTilt')}
-                             </span>
-                             <Slider
-                               min={-90}
-                               max={90}
-                               step={1}
-                               value={[activeSweepNode?.tilt ?? 0]}
-                               onValueChange={([v]) => setSweepNodeTilt(sweepActiveId, v)}
-                               className="flex-1"
-                             />
-                             <span className="font-mono text-[10px] text-green-400 w-8 text-right">
-                               {(activeSweepNode?.tilt ?? 0).toFixed(0)}°
-                             </span>
-                           </div>
-                         </>
-                       )}
-                       <div className="flex items-center gap-2 min-w-[150px]">
-                         <span className="text-[10px] text-muted-foreground/80 whitespace-nowrap">
-                           {t('editor3D.sweepSubdivisions')}
-                         </span>
+
+                       {/* Slider de redimensionamiento uniforme: ocupa el ancho
+                           disponible para que no quede estrangulado junto al
+                           botón de sustrae. */}
+                       <div className="flex items-center gap-2 min-w-0">
+                         <Expand className="w-3 h-3 text-blue-300 shrink-0" />
                          <Slider
-                           min={2}
-                           max={40}
-                           step={1}
-                           value={[sweepSubdivisions]}
-                           onValueChange={([v]) => setSweepSubdivisions(v)}
-                           className="flex-1"
+                           min={0.1}
+                           max={2}
+                           step={0.05}
+                           value={[resizeScale]}
+                           onValueChange={([v]) => {
+                             // La base del redimensionamiento es el polígono
+                             // que se está mostrando en el DrawingCanvas
+                             // principal: el del vértice activo del recorrido
+                             // (si lo tiene) o el contorno Frontal.
+                             if (resizeBaseRef.current === null) {
+                               resizeBaseRef.current = activeSweepNode &&
+                                 activeSweepNode.polygon.length >= 3
+                                 ? [...activeSweepNode.polygon]
+                                 : [...views.front];
+                             }
+                             const scaled = scalePolygonUniformUnbounded(resizeBaseRef.current, v);
+                             if (activeSweepNode && activeSweepNode.polygon.length >= 3) {
+                               updateSweepNodePolygon(activeSweepNode.id, scaled);
+                             } else {
+                               updateView('front')(scaled);
+                             }
+                             setResizeScale(v);
+                           }}
+                           onValueCommit={([v]) => {
+                             resizeBaseRef.current = null;
+                             setResizeScale(1);
+                           }}
+                           className="flex-1 min-w-0"
                          />
-                         <span className="font-mono text-[10px] text-green-400 w-6 text-right">
-                           {sweepSubdivisions}
+                         <span className="font-mono text-[10px] text-green-400 w-10 text-right shrink-0">
+                           {Math.round(resizeScale * 100)}%
                          </span>
                        </div>
-                     </div>
-                     <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
-                       <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
-                       {t('editor3D.sweepHint')}
-                     </p>
-                   </div>
-                   <div className="flex flex-col gap-3">
-                     <div className="flex flex-col gap-1.5">
-                     <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
-                        <span>{t('editor3D.extrusionDepth')}</span>
-                       <span className="font-mono text-[10px] text-green-400">
-                         {extrudeDepth.toFixed(2)}
-                       </span>
-                     </label>
-                     <Slider
-                       min={0.1}
-                       max={3}
-                       step={0.1}
-                       value={[extrudeDepth]}
-                       onValueChange={([v]) => {
-                         setExtrudeDepth(v);
-                         setEditedVertices(null);
-                       }}
-                       className="w-full"
-                     />
-                     <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
-                       <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
-                        {t('editor3D.extrusionHint', { depth: extrudeDepth.toFixed(2) })}
-                     </p>
-                   </div>
-                   
-                   <div className="flex gap-2">
-                      <button
-                        onClick={() => {
-                          const frontPolylines = getPolylines('views:front');
-                          const drawnInside = frontPolylines.filter((line) => {
-                            if (line.points.length < 3) return false;
-                            if (extrudeHoles.includes(line.id)) return false;
-                            // Un contorno dibujado con >= 3 puntos se considera cerrado:
-                            // la herramienta Línea no repite el punto inicial al terminar.
-                            // Comprobar si el centroide está dentro del polígono principal
-                            const cx =
-                              line.points.reduce((s, p) => s + p.x, 0) / line.points.length;
-                            const cy =
-                              line.points.reduce((s, p) => s + p.y, 0) / line.points.length;
-                            return pointInPolygon({ x: cx, y: cy }, views.front);
-                          });
-                          if (drawnInside.length === 0) {
-                            if (extrudeHoles.length > 0) {
-                              setExtrudeHoles([]);
-                              setExtrudeHoleDepths({});
-                            }
-                            return;
-                          }
-                          setExtrudeHoles((prev) =>
-                            Array.from(
-                              new Set([...prev, ...drawnInside.map((l) => l.id)])
-                            )
-                          );
-                        }}
-                        className="flex-1 px-3 py-1.5 text-[10px] font-medium rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/30 transition-colors flex items-center justify-center gap-1"
-                         title={t('editor3D.subtractDrawn')}
-                       >
-                         <Scissors className="w-3 h-3" />
-                         {t('editor3D.subtract')}
-                      </button>
-
-                      {/* Slider de redimensionamiento uniforme */}
-                      <div className="flex items-center gap-2">
-                        <Expand className="w-3 h-3 text-blue-300" />
-                        <Slider
-                          min={0.1}
-                          max={2}
-                          step={0.05}
-                          value={[resizeScale]}
-                          onValueChange={([v]) => {
-                            if (resizeBaseRef.current === null) {
-                              resizeBaseRef.current = [...views.front];
-                            }
-                            const scaled = scalePolygonUniformUnbounded(resizeBaseRef.current, v);
-                            updateView('front')(scaled);
-                            setResizeScale(v);
-                          }}
-                          onValueCommit={([v]) => {
-                            resizeBaseRef.current = null;
-                            setResizeScale(1);
-                          }}
-                          className="w-24"
-                        />
-                        <span className="font-mono text-[10px] text-green-400 w-10 text-right">
-                          {Math.round(resizeScale * 100)}%
-                        </span>
                       </div>
-                     </div>
                       {/* CALADO-MULTI-CIEGO: lista de calados con su profundidad */}
                       {extrudeHoles.length > 0 && (
                         <div className="flex flex-col gap-2 rounded-md border border-red-500/20 bg-red-500/5 p-2">
@@ -9633,9 +9941,9 @@ export default function Home({
                           <p className="text-[10px] text-muted-foreground/60">{t('editor3D.holeDepthLabel')}</p>
                         </div>
                       )}
-                    </div>
-                  </div>
-              ) : (
+                     </div>
+                   </div>
+               ) : (
                 <div className="flex-1 overflow-y-auto grid grid-rows-[320px_320px_320px] gap-2 p-3 min-h-0 custom-scrollbar">
                    <DrawingCanvas
                      label={t('editor3D.panelLabels.front')}
@@ -11861,61 +12169,61 @@ export default function Home({
                   )}
                 </div>
               </div>
-            ) : mode === 'extrude' && editingSweepCanvas ? (
-              <div className="w-full h-full min-h-0">
-                {editingSweepCanvas === 'path' ? (
-                  <PathCanvas
-                    label={t('editor3D.sweepTitle')}
-                    axisLabel="PATH"
-                    points={sweepNodes}
-                    activeId={sweepActiveId}
-                    closed={sweepClosed}
-                    resolution={resolution}
-                    onChange={moveSweepNode}
-                    onAdd={addSweepNode}
-                    onSelect={setSweepActiveId}
-                    onRemove={removeSweepNode}
-                    emptyHint={t('editor3D.sweepEmptyHint')}
-                    helpHint={t('editor3D.sweepHelpHint')}
-                    showEdgeTemplates={sweepEdgeTemplates}
-                    onToggleEdgeTemplates={() => setSweepEdgeTemplates((v) => !v)}
-                    edgeTemplatesLabel={t('editor3D.sweepShowTemplates')}
-                    onClose={() => setEditingSweepCanvas(null)}
-                  />
-                ) : (
-                  <EditorCanvasComponent
-                    label={
-                      activeSweepNode
-                        ? t('editor3D.sweepProfileLabel', { n: sweepNodeNumber })
-                        : t('editor3D.panelLabels.front')
-                    }
-                    axisLabel={t('editor3D.panelLabels.frontAxis')}
-                    polygon={
-                      activeSweepNode ? activeSweepNode.polygon : views.front
-                    }
-                    onChange={
-                      activeSweepNode
-                        ? (poly: Polygon) =>
-                            updateSweepNodePolygon(activeSweepNode.id, poly)
-                        : updateView('front')
-                    }
-                    resolution={editorGridResolution}
-                    onClose={() => setEditingSweepCanvas(null)}
-                    gridResolution={editorGridResolution}
-                    onGridResolutionChange={setEditorGridResolution}
-                    canvasZoom={editorCanvasZoom}
-                    onCanvasZoomChange={setEditorCanvasZoom}
-                    polylines={getPolylines('views:front')}
-                    onPolylinesChange={(lines: Polyline[]) =>
-                      updatePolylines('views:front', lines)
-                    }
-                    templateImage={templateImage}
-                    templateOpacity={templateOpacity}
-                    templateScale={templateScale}
-                  />
-                )}
-              </div>
-            ) : editingPanel !== null ? (
+             ) : mode === 'extrude' && editingSweepCanvas ? (
+                <div className="w-full h-full min-h-0">
+                  {editingSweepCanvas === 'path' ? (
+                    <PathCanvas
+                      label={t('editor3D.sweepTitle')}
+                      axisLabel="PATH"
+                      points={sweepNodes}
+                      activeId={sweepActiveId}
+                      closed={sweepClosed}
+                      resolution={resolution}
+                      onChange={moveSweepNode}
+                      onAdd={addSweepNode}
+                      onSelect={setSweepActiveId}
+                      onRemove={removeSweepNode}
+                      emptyHint={t('editor3D.sweepEmptyHint')}
+                      helpHint={t('editor3D.sweepHelpHint')}
+                      showEdgeTemplates={sweepEdgeTemplates}
+                      onToggleEdgeTemplates={() => setSweepEdgeTemplates((v) => !v)}
+                      edgeTemplatesLabel={t('editor3D.sweepShowTemplates')}
+                      onClose={() => setEditingSweepCanvas(null)}
+                    />
+                  ) : (
+                    <EditorCanvasComponent
+                      label={
+                        activeSweepNode
+                          ? t('editor3D.sweepProfileLabel', { n: sweepNodeNumber })
+                          : t('editor3D.panelLabels.front')
+                      }
+                      axisLabel={t('editor3D.panelLabels.frontAxis')}
+                      polygon={
+                        activeSweepNode ? activeSweepNode.polygon : views.front
+                      }
+                      onChange={
+                        activeSweepNode
+                          ? (poly: Polygon) =>
+                              updateSweepNodePolygon(activeSweepNode.id, poly)
+                          : updateView('front')
+                      }
+                      resolution={editorGridResolution}
+                      onClose={() => setEditingSweepCanvas(null)}
+                      gridResolution={editorGridResolution}
+                      onGridResolutionChange={setEditorGridResolution}
+                      canvasZoom={editorCanvasZoom}
+                      onCanvasZoomChange={setEditorCanvasZoom}
+                      polylines={getPolylines('views:front')}
+                      onPolylinesChange={(lines: Polyline[]) =>
+                        updatePolylines('views:front', lines)
+                      }
+                      templateImage={templateImage}
+                      templateOpacity={templateOpacity}
+                      templateScale={templateScale}
+                    />
+                  )}
+                </div>
+              ) : editingPanel !== null ? (
               renderViewerPanel(editingPanel)
             ) : (
               renderWindowLayout()

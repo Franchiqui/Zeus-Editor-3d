@@ -1,6 +1,7 @@
 'use client';
 
 import { createContext, useContext, useState, useCallback, useRef, type ReactNode } from 'react';
+import type { ZeiaAppliedPlan, ZeiaApplyResult } from '@/lib/zeia';
 
 type WriteToEditorFn = (text: string) => void;
 type GetDocumentContentFn = () => string | null;
@@ -9,6 +10,8 @@ type ExecuteActionFn = (action: string, params: Record<string, unknown>) => Prom
 type CaptureVideoFrameAtFn = (timestampSeconds: number) => Promise<string | null>;
 type GetVideoTimeFn = () => { currentTime: number; duration: number } | null;
 type GetContextHintFn = () => string | null;
+type GetSystemPromptFn = () => string | null;
+type ApplyZeiaPlansFn = (plans: ZeiaAppliedPlan[]) => ZeiaApplyResult | void;
 
 type AIEditorBridgeValue = {
   /** Si está activado, las respuestas de la IA se escriben en el editor de texto registrado */
@@ -51,6 +54,20 @@ type AIEditorBridgeValue = {
   registerContextHint: (fn: GetContextHintFn) => () => void;
   /** Devuelve la pista de contexto del editor activo, o null si no la define. */
   getContextHint: () => string | null;
+  /**
+   * Registrar un generador de system prompt específico del editor activo.
+   * El chat flotante lo usa en lugar del system prompt genérico cuando hay
+   * un executor de acciones registrado, de modo que cada editor (vídeo,
+   * imagen, 3D, texto…) documenta sus propias acciones [ZEUS_ACTION]. */
+  registerEditorSystemPrompt: (fn: GetSystemPromptFn) => () => void;
+  /** Devuelve el system prompt del editor activo, o null si no lo define. */
+  getEditorSystemPrompt: () => string | null;
+  /** Registrar un aplicador de planes ZEIA que refleja la escena REAL del editor 3D. */
+  registerZeiaPlanApplier: (fn: ApplyZeiaPlansFn) => () => void;
+  /** Aplicar planes ZEIA (planificados/ejecutados) a la escena del editor, si hay uno registrado. */
+  applyZeiaPlans: (plans: ZeiaAppliedPlan[]) => ZeiaApplyResult | void;
+  /** Si hay un aplicador de planes ZEIA registrado (editor 3D activo y listo). */
+  hasZeiaPlanApplier: boolean;
 };
 
 const AIEditorBridgeContext = createContext<AIEditorBridgeValue | null>(null);
@@ -67,6 +84,9 @@ export function AIEditorBridgeProvider({ children }: { children: ReactNode }) {
   const captureVideoFrameAtRef = useRef<CaptureVideoFrameAtFn | null>(null);
   const videoTimeGetterRef = useRef<GetVideoTimeFn | null>(null);
   const contextHintRef = useRef<GetContextHintFn | null>(null);
+  const systemPromptGetterRef = useRef<GetSystemPromptFn | null>(null);
+  const [hasZeiaPlanApplier, setHasZeiaPlanApplier] = useState(false);
+  const zeiaPlanApplierRef = useRef<ApplyZeiaPlansFn | null>(null);
 
   const registerEditor = useCallback((write: WriteToEditorFn) => {
     writerRef.current = write;
@@ -192,6 +212,41 @@ export function AIEditorBridgeProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const registerEditorSystemPrompt = useCallback((fn: GetSystemPromptFn) => {
+    systemPromptGetterRef.current = fn;
+    return () => {
+      systemPromptGetterRef.current = null;
+    };
+  }, []);
+
+  const getEditorSystemPrompt = useCallback((): string | null => {
+    if (!systemPromptGetterRef.current) return null;
+    try {
+      return systemPromptGetterRef.current();
+    } catch (e) {
+      console.warn('[AIEditorBridge] Error al leer el system prompt del editor:', e);
+      return null;
+    }
+  }, []);
+
+  const registerZeiaPlanApplier = useCallback((fn: ApplyZeiaPlansFn) => {
+    zeiaPlanApplierRef.current = fn;
+    setHasZeiaPlanApplier(true);
+    return () => {
+      zeiaPlanApplierRef.current = null;
+      setHasZeiaPlanApplier(false);
+    };
+  }, []);
+
+  const applyZeiaPlans = useCallback((plans: ZeiaAppliedPlan[]): ZeiaApplyResult | void => {
+    if (!zeiaPlanApplierRef.current) return;
+    try {
+      return zeiaPlanApplierRef.current(plans);
+    } catch (e) {
+      console.warn('[AIEditorBridge] Error al aplicar planes ZEIA:', e);
+    }
+  }, []);
+
   const value: AIEditorBridgeValue = {
     allowAIToWriteToEditor,
     setAllowAIToWriteToEditor,
@@ -213,6 +268,11 @@ export function AIEditorBridgeProvider({ children }: { children: ReactNode }) {
     getVideoTime,
     registerContextHint,
     getContextHint,
+    registerEditorSystemPrompt,
+    getEditorSystemPrompt,
+    registerZeiaPlanApplier,
+    applyZeiaPlans,
+    hasZeiaPlanApplier,
   };
 
   return (

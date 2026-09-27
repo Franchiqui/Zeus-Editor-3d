@@ -100,8 +100,10 @@ section('2) Código fuente: Editor3D.tsx (botón "Sustraer" sin cierre estricto)
      !src.includes('line.points[0].x - line.points[line.points.length - 1].x'));
   ok('ya NO existe la variable closedInside', !src.includes('closedInside'));
   ok('sigue marcando los ids como agujeros', src.includes('extrudeHoles.includes(line.id)'));
-  ok('sigue comprobando el centroide dentro del Frontal',
-     src.includes('pointInPolygon({ x: cx, y: cy }, views.front)'));
+  ok('comprueba el centroide contra la plantilla visible (baseProfile)',
+     src.includes('pointInPolygon({ x: cx, y: cy }, baseProfile)'));
+  ok('usa el perfil del vértice activo del recorrido como plantilla',
+     src.includes('activeSweepNode && activeSweepNode.polygon.length >= 3'));
   ok('el botón sigue usando el título "subtractDrawn"',
      src.includes("t('editor3D.subtractDrawn')"));
   ok('el mesh añade los ids en extrudeHoles a holes',
@@ -225,6 +227,57 @@ section('5) Triangulación real (three.ShapeUtils) respeta el agujero');
     ok('el área con agujero es menor que sin agujero', areaWithHole < areaNoHole - 1e-6);
     ok('el área con agujero equivale al material restante (~0.32)', Math.abs(areaWithHole - 0.32) < 1e-3);
   }
+}
+
+
+section("4.bis) Botón \"Sustraer\" en un RECORRIDO (plantilla por vértice)");
+{
+  // Réplica del arreglo: la base es la plantilla visible del lienzo
+  // (perfil del vértice activo) o, sin recorrido, el contorno Frontal.
+  function drawnInsideForSubtractSweep(frontPolylines, extrudeHoles, activeSweepNode, viewsFront) {
+    const baseProfile =
+      activeSweepNode && activeSweepNode.polygon.length >= 3
+        ? activeSweepNode.polygon
+        : viewsFront;
+    return frontPolylines.filter((line) => {
+      if (line.points.length < 3) return false;
+      if (extrudeHoles.includes(line.id)) return false;
+      const cx = line.points.reduce((s, p) => s + p.x, 0) / line.points.length;
+      const cy = line.points.reduce((s, p) => s + p.y, 0) / line.points.length;
+      return pointInPolygon({ x: cx, y: cy }, baseProfile);
+    });
+  }
+
+  // Recorrido: perfil del vértice activo en el centro; views.front VACÍO
+  // (caso que antes fallaba: pointInPolygon(pt, []) => false).
+  const nodePolygon = [
+    { x: 0.2, y: 0.2 },
+    { x: 0.8, y: 0.2 },
+    { x: 0.8, y: 0.8 },
+    { x: 0.2, y: 0.8 },
+  ];
+  const holeSweep = { id: "h", points: [{ x: 0.4, y: 0.4 }, { x: 0.6, y: 0.4 }, { x: 0.6, y: 0.6 }, { x: 0.4, y: 0.6 }] };
+
+  const resSweep = drawnInsideForSubtractSweep([holeSweep], [], { id: 1, polygon: nodePolygon }, []);
+  ok("recorrido + views.front vacío: detecta el calado dentro del perfil", resSweep.length === 1 && resSweep[0].id === "h");
+
+  // Mismo caso comprobando la lógica ANTIGUA (contra views.front vacío): fallaba.
+  const oldSweep = [holeSweep].filter((line) => {
+    const cx = line.points.reduce((s, p) => s + p.x, 0) / line.points.length;
+    const cy = line.points.reduce((s, p) => s + p.y, 0) / line.points.length;
+    return pointInPolygon({ x: cx, y: cy }, []);
+  });
+  ok("la lógica antigua (views.front) NO detectaba nada en el recorrido", oldSweep.length === 0);
+
+  // Sin recorrido debe seguir funcionando igual que antes.
+  const front = [
+    { x: 0.2, y: 0.2 },
+    { x: 0.8, y: 0.2 },
+    { x: 0.8, y: 0.8 },
+    { x: 0.2, y: 0.8 },
+  ];
+  const resSimple = drawnInsideForSubtractSweep([holeSweep], [], null, front);
+  ok("extrusión simple: sigue detectando el calado (sin regresión)", resSimple.length === 1);
 }
 
 console.log('\n----------------------------------------');

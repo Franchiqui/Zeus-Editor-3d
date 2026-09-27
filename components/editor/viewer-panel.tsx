@@ -313,6 +313,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
   };
   return (
   <div
+    data-view={viewName}
     onClick={onActiveView}
     className={`relative flex flex-col rounded-lg border-2 overflow-hidden transition-colors ${
       activeView === viewName

@@ -47,6 +47,7 @@ import {
 } from '@/lib/animation';
 import { cloneMesh } from '@/lib/plugins/clone';
 import type { Mesh } from '@/lib/geometry';
+import { Slider } from '@/components/ui/slider';
 import {
   listarPlugins,
   suscribirsePlugins,
@@ -1309,7 +1310,7 @@ key={kf.time}
           <button onClick={stop} className="p-1.5 rounded hover:bg-red-500/20 text-red-300" title={t('editor3D.motion.stop')}>
             <Square className="w-3 h-3" />
           </button>
-          <button
+<button
             onClick={() => setShowMotionPath(!showMotionPath)}
             data-testid="motion-path-toggle"
             className={`p-1.5 rounded ${
@@ -1321,9 +1322,9 @@ key={kf.time}
           >
             {showMotionPath ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
           </button>
-           <span className="px-1.5 py-0.5 rounded bg-black/30 font-mono text-[11px]" data-testid="motion-time-display">
-             {formatTime(currentTime)}
-           </span>
+          <span className="px-1.5 py-0.5 rounded bg-black/30 font-mono text-[11px]" data-testid="motion-time-display">
+            {formatTime(currentTime)}
+          </span>
 
            {effectiveTransform && (
              <div className="flex items-center gap-1 ml-2">
@@ -1480,14 +1481,14 @@ key={kf.time}
 
           <label className="text-muted-foreground ml-auto flex items-center gap-1">
             Zoom
-            <input
-              type="range"
+            <Slider
+              value={[pxPerSecond]}
               min={MIN_PX_PER_SECOND}
               max={MAX_PX_PER_SECOND}
               step={10}
-              value={pxPerSecond}
-              onChange={(e) => setPxPerSecond(parseInt(e.target.value, 10))}
+              onValueChange={([v]) => setPxPerSecond(v)}
               className="w-24"
+              data-testid="motion-zoom-slider"
             />
           </label>
         </div>

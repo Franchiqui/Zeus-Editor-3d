@@ -1,10 +1,10 @@
 import PocketBase from 'pocketbase';
 
-/** URL de PocketBase (desplegada). En otra app: .env con POCKETBASE_URL */
+/** URL de PocketBase (desplegada). En otra app: .env con NEXT_PUBLIC_POCKETBASE_URL */
 export function getPocketBaseUrl(): string {
-  const url = process.env.POCKETBASE_URL;
+  const url = process.env.NEXT_PUBLIC_POCKETBASE_URL;
   if (!url) {
-    console.warn('⚠️ POCKETBASE_URL no está definida en .env.local. Usando localhost por defecto.');
+    console.warn('⚠️ NEXT_PUBLIC_POCKETBASE_URL no está definida en .env.local. Usando localhost por defecto.');
     return 'http://127.0.0.1:8090';
   }
   return url;
