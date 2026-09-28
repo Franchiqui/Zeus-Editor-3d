@@ -216,6 +216,12 @@ import {
    Rotate3D,
    Scale3D,
   Magnet,
+  AlignStartVertical,
+  AlignEndVertical,
+  AlignStartHorizontal,
+  AlignEndHorizontal,
+  AlignCenterVertical,
+  AlignCenterHorizontal,
   MousePointer2,
   Maximize2,
   Minimize2,
@@ -414,7 +420,75 @@ type SceneObject = {
    hidden?: boolean;
    /** Si el objeto está congelado: se muestra en gris y no responde a interacciones */
    frozen?: boolean;
+   /**
+    * Registro del último plugin aplicado (o del generador que lo creó):
+   * permite re-editar sus parámetros en vivo desde la pestaña Escena.
+   * `baseMesh` es la malla previa al efecto (los generadores parten de
+   * malla vacía y no la necesitan). Viaja con el objeto en los .zeus.
+   */
+   pluginEdit?: {
+     pluginId: string;
+     valores: PluginParams;
+     baseMesh?: Mesh;
+     baseVacia?: boolean;
+   };
  };
+
+/**
+ * Caja envolvente de un objeto EN MUNDO: su malla congelada escalada,
+ * girada y trasladada por su transform (mismo orden que el visor:
+ * position + rotación XYZ + escala). Con ella la alineación junta los
+ * BORDES que el usuario ve (tapas, caras laterales), no los orígenes —
+ * imprescindible cuando los objetos alineados son de tamaños distintos.
+ * Sin malla (o vacía) vale su punto de origen como caja de tamaño cero.
+ */
+function objectWorldBounds(object: SceneObject): {
+  minX: number; maxX: number;
+  minY: number; maxY: number;
+  minZ: number; maxZ: number;
+} {
+  const tr = object.transform;
+  const bounds = {
+    minX: tr.px, maxX: tr.px,
+    minY: tr.py, maxY: tr.py,
+    minZ: tr.pz, maxZ: tr.pz,
+  };
+  const mesh = object.mesh;
+  if (!mesh || mesh.vertices.length === 0) return bounds;
+  let lxMin = Infinity, lxMax = -Infinity;
+  let lyMin = Infinity, lyMax = -Infinity;
+  let lzMin = Infinity, lzMax = -Infinity;
+  for (const v of mesh.vertices) {
+    if (v.x < lxMin) lxMin = v.x;
+    if (v.x > lxMax) lxMax = v.x;
+    if (v.y < lyMin) lyMin = v.y;
+    if (v.y > lyMax) lyMax = v.y;
+    if (v.z < lzMin) lzMin = v.z;
+    if (v.z > lzMax) lzMax = v.z;
+  }
+  const matrix = new THREE.Matrix4().compose(
+    new THREE.Vector3(tr.px, tr.py, tr.pz),
+    new THREE.Quaternion().setFromEuler(
+      new THREE.Euler(tr.rx, tr.ry, tr.rz, 'XYZ')
+    ),
+    new THREE.Vector3(tr.sx, tr.sy, tr.sz)
+  );
+  const corner = new THREE.Vector3();
+  for (const lx of [lxMin, lxMax]) {
+    for (const ly of [lyMin, lyMax]) {
+      for (const lz of [lzMin, lzMax]) {
+        corner.set(lx, ly, lz).applyMatrix4(matrix);
+        if (corner.x < bounds.minX) bounds.minX = corner.x;
+        if (corner.x > bounds.maxX) bounds.maxX = corner.x;
+        if (corner.y < bounds.minY) bounds.minY = corner.y;
+        if (corner.y > bounds.maxY) bounds.maxY = corner.y;
+        if (corner.z < bounds.minZ) bounds.minZ = corner.z;
+        if (corner.z > bounds.maxZ) bounds.maxZ = corner.z;
+      }
+    }
+  }
+  return bounds;
+}
 
  /**
  * Figura representativa de un objeto guardado (.zeus): la del dueño de
@@ -879,6 +953,115 @@ function perpDist(
   );
 }
 
+/* ── Utilidades de parseo de las acciones [ZEUS_ACTION] del chat ── */
+
+const CHAT_RAD = Math.PI / 180;
+
+/** Triple numérico desde [x,y,z] o {x,y,z}; devuelve `fallback` si no es válido. */
+function chatTriple(
+  v: unknown,
+  fallback: [number, number, number]
+): [number, number, number] {
+  if (Array.isArray(v) && v.length >= 3) {
+    return [Number(v[0]) || 0, Number(v[1]) || 0, Number(v[2]) || 0];
+  }
+  if (v && typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    if (typeof o.x === 'number' && typeof o.y === 'number' && typeof o.z === 'number') {
+      return [o.x, o.y, o.z];
+    }
+  }
+  return fallback;
+}
+
+/**
+ * ObjectTransform a partir de `params.transform` ({position, rotation en
+ * GRADOS, scale}), el formato que usan los bloques [ZEUS_ACTION].
+ */
+function chatTransformFromParams(params: Record<string, unknown>): ObjectTransform {
+  const t = (params.transform && typeof params.transform === 'object'
+    ? params.transform
+    : {}) as Record<string, unknown>;
+  const [px, py, pz] = chatTriple(t.position, [0, 0, 0]);
+  const [rxd, ryd, rzd] = chatTriple(t.rotation, [0, 0, 0]);
+  const [sx, sy, sz] = chatTriple(t.scale, [1, 1, 1]);
+  return {
+    px: px || 0,
+    py: py || 0,
+    pz: pz || 0,
+    rx: rxd * CHAT_RAD,
+    ry: ryd * CHAT_RAD,
+    rz: rzd * CHAT_RAD,
+    sx: sx || 1,
+    sy: sy || 1,
+    sz: sz || 1,
+  };
+}
+
+/** Polígono 2D desde [[x,y],...] o [{x,y},...]; null con <3 puntos válidos.
+    Acepta números como cadenas ("0.5"): los modelos del chat a veces los
+    mandan entrecomillados. */
+function chatPolygon(v: unknown): Polygon | null {
+  if (!Array.isArray(v)) return null;
+  const pts: Point2D[] = [];
+  const num = (x: unknown): number | null => {
+    if (typeof x === 'number' && Number.isFinite(x)) return x;
+    if (typeof x === 'string') {
+      const n = Number(x.trim());
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  };
+  for (const p of v) {
+    if (Array.isArray(p) && p.length >= 2) {
+      const x = num(p[0]);
+      const y = num(p[1]);
+      if (x !== null && y !== null) pts.push({ x, y });
+    } else if (p && typeof p === 'object') {
+      const po = p as Record<string, unknown>;
+      const x = num(po.x);
+      const y = num(po.y);
+      if (x !== null && y !== null) pts.push({ x, y });
+    }
+  }
+  return pts.length >= 3 ? pts : null;
+}
+
+/** Plantilla circular de `segments` lados centrada en (cx, cy), radio `r`. */
+function chatCirclePolygon(cx: number, cy: number, r: number, segments = 32): Polygon {
+  const pts: Point2D[] = [];
+  for (let i = 0; i < segments; i++) {
+    const a = (i / segments) * Math.PI * 2;
+    pts.push({ x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r });
+  }
+  return pts;
+}
+
+/**
+ * Polígono degenerado: sin área real (puntos colineales o apilados, o
+ * encerrados en una línea). Los barridos/extrusiones no generan nada con
+ * él; se detecta antes para devolver un error útil al modelo del chat.
+ */
+function chatPolygonDegenerada(poly: Polygon): boolean {
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  let area2 = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const p = poly[i];
+    const q = poly[(i + 1) % poly.length];
+    area2 += p.x * q.y - q.x * p.y;
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  return (
+    maxX - minX < 1e-3 || maxY - minY < 1e-3 || Math.abs(area2) < 1e-4
+  );
+}
+
 /**
  * Controles de cada plantilla 2D: escalar sin deformar (mismo factor en
  * X e Y, centrado, sin salirse del lienzo), girar en su propio plano y
@@ -1137,15 +1320,30 @@ async function imageFileToSceneState(
           const i01 = (ry + 1) * targetW + rx;
           const i11 = (ry + 1) * targetW + (rx + 1);
 
-          const avgBrightness =
-            (data[i00 * 4] +
-              data[i10 * 4] +
-              data[i01 * 4] +
-              data[i11 * 4]) /
-            (4 * 255);
-          const color = `hsl(${Math.round(
-            260 + avgBrightness * 40
-          )}, 60%, ${Math.round(25 + avgBrightness * 50)}%)`;
+          // Color REAL de la imagen: media RGB de los 4 píxeles de la
+          // celda (sin contar los transparentes, que saldrían negros).
+          // Cada cara del relieve se pinta con el color de su zona.
+          let sr = 0, sg = 0, sb = 0, valid = 0;
+          for (const si of [i00, i10, i01, i11]) {
+            const p = si * 4;
+            if (hasAlphaChannel && data[p + 3] < ALPHA_THRESHOLD) continue;
+            sr += data[p];
+            sg += data[p + 1];
+            sb += data[p + 2];
+            valid++;
+          }
+          if (valid === 0) {
+            const p = i00 * 4;
+            sr = data[p];
+            sg = data[p + 1];
+            sb = data[p + 2];
+            valid = 1;
+          }
+          const toHex = (n: number) =>
+            Math.min(255, Math.max(0, Math.round(n / valid)))
+              .toString(16)
+              .padStart(2, '0');
+          const color = `#${toHex(sr)}${toHex(sg)}${toHex(sb)}`;
 
           if (
             !vertexIsTransparent[i00] &&
@@ -1225,6 +1423,30 @@ export default function Home({
   const [imageRemoveBackground, setImageRemoveBackground] = useState(true);
   const [isImageLoading, setIsImageLoading] = useState(false);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  /** Imagen original de CADA relieve creado desde imagen en esta sesión:
+   * id del objeto -> su archivo y los parámetros con los que nació. Así
+   * cualquier relieve se retoca después: al seleccionarlo, los mandos de
+   * esta sección cargan sus datos, y moverlos regenera SU malla en vivo,
+   * sin borrarlo ni volver a subir la imagen. */
+  const heightmapSourcesRef = useRef<
+    Map<
+      string,
+      {
+        file: File;
+        heightScale: number;
+        cols: number;
+        rows: number;
+        removeBackground: boolean;
+      }
+    >
+  >(new Map());
+  const heightmapRegenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
+  /** Espejo de la escena para que el temporizador de regeneración sepa si
+   * su objeto sigue vivo sin meter sceneObjects en las dependencias. */
+  const heightmapAliveRef = useRef<SceneObject[]>([]);
+  const heightmapSkipFirstRunRef = useRef(true);
 
   const [meshStyle, setMeshStyle] = useState<'fusionada' | 'suave' | 'voxeles'>(
     'suave'
@@ -1265,6 +1487,10 @@ export default function Home({
   const [textRes, setTextRes] = useState(144);
 
    const [showGizmo, setShowGizmo] = useState(true);
+  // Giro individual (multi-selección): cada objeto seleccionado gira sobre
+  // su propio centro. Desactivado por defecto: la selección entera gira
+  // como una sola pieza alrededor del centro del conjunto.
+  const [giroIndividual, setGiroIndividual] = useState(false);
   // Modos del gizmo activos: qué asas del manipulador están visibles.
   // Por defecto el gizmo completo (mover, rotar, escalar).
   const [gizmoModes, setGizmoModes] = useState<GizmoMode[]>([
@@ -3741,11 +3967,22 @@ export default function Home({
     autoKeyRef.current = autoKey;
     const transformTracksRef = useRef(transformTracks);
     transformTracksRef.current = transformTracks;
+    const effectTracksRef = useRef(effectTracks);
+    effectTracksRef.current = effectTracks;
     const currentTimeRef = useRef(currentTime);
     currentTimeRef.current = currentTime;
 
     const animationStartTimeRef = useRef<number | null>(null);
    const animIdRef = useRef<number | null>(null);
+    // switchTab se actualiza en cada render (ver su definición); el puente
+    // del chat lo lee por ref para no quedarse con la versión capturada al
+    // montar (deps del efecto: solo aiBridge).
+    const switchTabRef = useRef<(next: Mode) => void>(() => {});
+    // Igual con capturePanelConfig: los objetos creados por el chat llevan
+    // su config congelada (plantillas) construida sobre la del panel vivo.
+    const capturePanelConfigRef = useRef<() => ObjectConfig>(() => {
+      throw new Error('capturePanelConfig aún no está listo');
+    });
     // Espejo de sceneObjects para la duración de reproducción: leerlo por
     // ref evita reiniciar la reproducción en cada re-render de la escena.
     const sceneObjectsPlaybackRef = useRef(sceneObjects);
@@ -3761,11 +3998,13 @@ export default function Home({
         const out = applyZeiaPlansToScene(plans, currentObjs, transformTracksRef.current, {
           idMap: zeiaIdMapRef.current,
           lastCreatedId: lastCreatedIdRef.current,
+          effectTracks: effectTracksRef.current,
         });
         zeiaIdMapRef.current = out.idMap;
         lastCreatedIdRef.current = out.lastCreatedId;
         setSceneObjects(out.objects as unknown as SceneObject[]);
         setTransformTracks(out.transformTracks);
+        setEffectTracks(out.effectTracks);
         return out.result;
       });
       return unregister;
@@ -3817,9 +4056,16 @@ export default function Home({
            '- setLatheProfile: {"preset":"botella","points":[[r,h],...],"profileSpace":"normalized"|"editor","segments":32,"clamp":true,"opacity":1,"figureColor":"#121ca7","texture":"..."} -> Dibuja el perfil de revolución en la pestaña Torno (x=radio, y=altura 0..1) y abre la pestaña. "preset" ∈ {botella, jarron, taza, cuenco, copa, cono, cilindro, esfera}; "points"/"profile" aportan [radio, altura] normalizados o, con profileSpace:"editor", coordenadas del lienzo. Ideal para aplicar coordenadas que el modelo de visión extrajo del render del visor.',
            '- createLatheObject: {"preset":"botella"|"profile":[[r,h],...],"name":"Botella","segments":32,"clamp":true,"opacity":1,"figureColor":"#121ca7","transform":{"position":[0,0,0]}} -> Crea un objeto de revolución (botella/jarrón/...) en la escena: construye su malla con buildLatheMesh, la añade, la selecciona y abre la pestaña Torno con su perfil adoptando el panel como dueño.',
            '- createHeightmapFromImage: {"imageUrl":"https://...","heightScale":10,"cols":128,"rows":128","removeBackground":true,"name":"Relieve"} -> Convierte una imagen (accesible vía URL) en un relevado 3D: la luminosidad de cada píxel define la altura (eje Y). La imagen se descarga, rasteriza a cols×rows y genera la malla de relieve que se añade a la escena como objeto de la pestaña Extruir.',
+           '- createTextObject: {"text":"HOLA","font":"\'Anton\', sans-serif","depth":48,"smooth":true,"color":"#e8e8e8","name":"Cartel","transform":{...}} -> Crea un objeto de TEXTO 3D (pestaña Texto). "font" es la CSS de la fuente (p. ej. "\'Bebas Neue\', sans-serif"; Google Fonts cargadas también valen). smooth:false genera vóxeles; hollow:true letras huecas.',
+           '- createViewsObject: {"front":[[0.3,0],[0.7,0],[0.7,1],[0.3,1]],"side":[[...]],"top":[[...]],"style":"suave"|"vóxel"|"fusionada","resolution":48,"color":"#8b5cf6","name":"Vaso"} -> Crea un objeto de la pestaña Vistas por intersección de sus tres plantillas (X·Y, Z·Y y X·Z en 0..1, y=0 ARRIBA en front/side). Si solo das "front", las otras dos la copian (sólido de revolución).',
+           '- createMeshObject: {"silhouette":[[...]],"sections":[{"y":0,"radius":0.15},{"y":0.5,"radius":0.3},{"y":1,"radius":0.1}],"style":"suave","name":"Pieza de ajedrez"} -> Crea un objeto de la pestaña Mallas: silueta frontal + plantillas de secciones (cada una {y, radius|polygon}, y en 0..1 lienzo, 0 arriba). Ideal para piezas orgánicas descritas por su silueta y radios. La silueta debe ser un CONTORNO CERRADO con área (no puntos en línea) y cada radius > 0 (0..0.5).',
+           '- createExtrudeObject: {"polygon":[[...]],"holes":[{"polygon":[[...]]}],"depth":0.5,"name":"Estrella"} -> Crea un objeto de la pestaña Extruir: extruye el polígono frontal a lo largo de Z. "shapes" añade polígonos extra (prismas fusionados) y "holes" calados (opcional "depth" por agujero).',
+           '- applyPlugin: {"plugin":"Bend","objectId":"...","valores":{"angulo":45},"newObject":false} -> Aplica un PLUGIN (modificador) a un objeto: pluginId o plugin (nombre; se busca por id o nombre), objectId destino (si se omite: último creado/seleccionado), "valores" con los parámetros del plugin (los que falten usan su valor por defecto). Los plugins generadores (p. ej. montañas) pueden usar newObject:true para crear un objeto nuevo. El plugin queda registrado en el objeto (pluginEdit) y se puede re-editar en vivo desde la pestaña Escena.',
+           '- applyEffect: {"effectType":"rain","count":320,"speed":2,"duration":5,"loop":true} (o {"effectType":"glow","glowColor":"#5fd4ff","glowIntensity":1.4}) -> Activa un EFECTO VISUAL en la escena: rain/lluvia, smoke/humo, stars/estrellas, fire/fuego, sparks/chispas, glow/brillo. Los parámetros (count, speed, size, intensity, color, riseSpeed, starSize, glowColor, glowIntensity, glowObjects) se aplican como valores del efecto; duration/loop definen la pista (los valores se mantienen tras la duración).',
+           'Animaciones: createAnimation admite type rotate|spin|orbit|translate|move|scale|pulse|bounce (pulse/bounce son de ida y vuelta; translate acepta "to":[x,y,z] o "axis"+"distance"; bounce "height") y también "keyframes":[{"time":0,"position":[0,0,0],"rotation":[0,0,0],"scale":[1,1,1]},...] (time en segundos, rotation en GRADOS, cualquier subconjunto de campos).',
            'El modelo de visión inspecciona el render del visor activo (registerDocumentImages capta el canvas vía toDataURL). Puede pedirle coordenadas de perfil precisas y aplicarlas con setLatheProfile.',
            'Si el usuario pide un objeto que ya existe guardado en OBJ_ZEUS_ACTION (p. ej. "taza", "Taza"), usa loadSavedObject con ese nombre ANTES que recrearlo desde cero. La pista de contexto enumera los objetos guardados disponibles en cada turno.',
-           'Si la acción depende del id de un objeto que no conoces, llama PRIMERO a getScene sin hacer nada más, y usa los ids en el siguiente turno. NO inventes ids.',
+           'Si la acción depende de un objeto existente, usa su id (o su nombre exacto, p. ej. "Cartel-Z"); si no lo conoces, llama PRIMERO a getScene y usa los ids/nombres REALES del resultado. NO inventes ids.',
         ].join('\n')
       );
       return unregister;
@@ -3863,6 +4109,73 @@ export default function Home({
     // ── Executor de acciones [ZEUS_ACTION] del editor 3D ──
     useEffect(() => {
       if (!aiBridge?.registerActionExecutor) return;
+
+      // Congela la config de un objeto creado por el chat: parte de la
+      // foto del panel vivo y sobreescribe las plantillas de SU pestaña.
+      // Así el objeto se re-edita (silueta, vistas, texto…) al entrar el
+      // usuario a la pestaña con el objeto seleccionado.
+      const chatConfig = (
+        overrides: Partial<ObjectConfig>
+      ): ObjectConfig => ({
+        ...capturePanelConfigRef.current(),
+        ...overrides,
+      });
+
+      // Añade un objeto nuevo a partir de una malla ya construida y lo
+      // selecciona. Lo comparten todas las acciones create*Object del chat.
+      // `config` congela las plantillas con el objeto: al entrar el
+      // usuario a su pestaña, estas se recuperan y se pueden re-editar.
+      const addChatObject = (
+        mesh: Mesh,
+        mode: Mode | null,
+        params: Record<string, unknown>,
+        opts: { smooth?: boolean; config?: ObjectConfig } = {}
+      ): Record<string, unknown> => {
+        const currentObjs = sceneObjectsPlaybackRef.current;
+        const id = `object-${Date.now()}-${currentObjs.length}`;
+        const nombre =
+          typeof params.name === 'string' && params.name.trim()
+            ? params.name.trim()
+            : t('editor3D.objectN', { n: currentObjs.length + 1 });
+        const nuevoObjeto: SceneObject = {
+          id,
+          name: nombre,
+          ...(mode ? { mode } : {}),
+          transform: chatTransformFromParams(params),
+          mesh,
+          smooth: opts.smooth ?? false,
+          textureProjection,
+          ...(opts.config ? { config: opts.config } : {}),
+        };
+        setSceneObjects((current) => [...current, nuevoObjeto]);
+        setSelectedObjectId(id);
+        setSelectedObjectIds([id]);
+        const center = computeMeshBoundsCenter(mesh);
+        if (center) {
+          setGizmoOffset({
+            px: center.px,
+            py: center.py,
+            pz: center.pz,
+            rx: 0,
+            ry: 0,
+            rz: 0,
+            sx: 1,
+            sy: 1,
+            sz: 1,
+          });
+        }
+        switchTabRef.current('scene');
+        frameAllWindows();
+        return {
+          ok: true,
+          id,
+          name: nombre,
+          mode,
+          vertices: mesh.vertices.length,
+          faces: mesh.faces.length,
+        };
+      };
+
       const runZeusAction = async (action: string, params: Record<string, unknown>): Promise<unknown> => {
         switch (action) {
           case 'getScene':
@@ -3879,6 +4192,11 @@ export default function Home({
                 objectId: t.objectId,
                 duration: t.duration,
               })),
+              effectTracks: (effectTracksRef.current ?? []).map((t) => ({
+                id: t.id,
+                effectType: t.effectType,
+                duration: t.duration,
+              })),
             };
           case 'applyZeiaPlans': {
             const rawPlans = params.plans;
@@ -3889,11 +4207,13 @@ export default function Home({
             const out = applyZeiaPlansToScene(plans, currentObjs, transformTracksRef.current, {
               idMap: zeiaIdMapRef.current,
               lastCreatedId: lastCreatedIdRef.current,
+              effectTracks: effectTracksRef.current,
             });
             zeiaIdMapRef.current = out.idMap;
             lastCreatedIdRef.current = out.lastCreatedId;
             setSceneObjects(out.objects as unknown as SceneObject[]);
             setTransformTracks(out.transformTracks);
+            setEffectTracks(out.effectTracks);
             return out.result;
           }
 
@@ -3913,11 +4233,13 @@ export default function Home({
             const out = applyZeiaPlansToScene(plans, currentObjs, transformTracksRef.current, {
               idMap: zeiaIdMapRef.current,
               lastCreatedId: lastCreatedIdRef.current,
+              effectTracks: effectTracksRef.current,
             });
             zeiaIdMapRef.current = out.idMap;
             lastCreatedIdRef.current = out.lastCreatedId;
             setSceneObjects(out.objects as unknown as SceneObject[]);
             setTransformTracks(out.transformTracks);
+            setEffectTracks(out.effectTracks);
             return out.result;
           }
           case 'selectObject': {
@@ -4187,7 +4509,7 @@ export default function Home({
                   sz: 1,
                 });
               }
-              switchTab('scene');
+              switchTabRef.current('scene');
               frameAllWindows();
 
               // Informar de los logs de generación al feedback del chat.
@@ -4232,11 +4554,471 @@ export default function Home({
               const result = await runZeusAction(innerAction, innerParams);
               return { loaded: name, action: innerAction, result };
             }
+           case 'createTextObject': {
+             const texto = typeof params.text === 'string' ? params.text : '';
+             if (!texto.trim()) {
+               return { ok: false, error: 'createTextObject: falta el campo "text"' };
+             }
+             const fontCssChat =
+               typeof params.font === 'string' && params.font ? params.font : fontCss;
+             const resolucion = Math.min(
+               200,
+               Math.max(8, typeof params.resolution === 'number' ? params.resolution : textRes)
+             );
+             const profundidad = Math.max(
+               1,
+               typeof params.depth === 'number' ? params.depth : textDepth
+             );
+             const suave = params.smooth !== false;
+             const mesh = suave
+               ? buildSmoothTextMesh({
+                   text: texto,
+                   fontFamily: fontCssChat,
+                   resolution: resolucion,
+                   depth: profundidad,
+                   baseColor: typeof params.color === 'string' && params.color ? params.color : baseColor,
+                   useFontColor: params.useFontColor !== false,
+                   opacity: typeof params.opacity === 'number' ? params.opacity : 1,
+                 })
+               : buildTextMesh({
+                   text: texto,
+                   fontFamily: fontCssChat,
+                   resolution: resolucion,
+                   depth: profundidad,
+                   hollow: params.hollow === true,
+                   greedy: true,
+                 });
+             if (!mesh.vertices.length) {
+               throw new Error('createTextObject: el texto no generó geometría');
+             }
+             const resultado = addChatObject(mesh, 'text', params, {
+               smooth: true,
+               config: chatConfig({
+                 text: texto,
+                 fontCss: fontCssChat,
+                 textDepth: profundidad,
+                 textRes: resolucion,
+                 textMode: suave ? 'smooth' : 'voxel',
+                 hollowText: params.hollow === true,
+                 greedyMesh: true,
+                 useFontColor: params.useFontColor !== false,
+                 baseColor:
+                   typeof params.color === 'string' && params.color ? params.color : baseColor,
+               }),
+             });
+             return resultado;
+           }
+           case 'createViewsObject': {
+             const front = chatPolygon(params.front);
+             if (!front) {
+               return {
+                 ok: false,
+                 error:
+                   'createViewsObject: falta "front" (polígono [[x,y],...] con 3+ puntos, coordenadas 0..1)',
+               };
+             }
+             if (chatPolygonDegenerada(front)) {
+               return {
+                 ok: false,
+                 error:
+                   'createViewsObject: la vista "front" es degenerada (puntos en línea o sin área). Dibuja un contorno cerrado.',
+               };
+             }
+             // Vista única: el modelo puede dar solo el Frente (la Costado
+             // y la Superior iguales generan un sólido de revolución).
+             const side = chatPolygon(params.side) ?? front;
+             const top = chatPolygon(params.top) ?? front;
+             const style =
+               typeof params.style === 'string' ? params.style.toLowerCase() : 'suave';
+             const resolution = Math.min(
+               160,
+               Math.max(16, typeof params.resolution === 'number' ? params.resolution : 48)
+             );
+             let mesh: Mesh;
+             if (style === 'vóxel' || style === 'voxel' || style === 'fusionada') {
+               const solid = reconstructVoxels(
+                 { front, side, top } as Views,
+                 style === 'fusionada' ? Math.max(HIGH_FIDELITY_RES, resolution) : resolution
+               );
+               mesh = voxelsToBoxMesh(solid.voxels, resolution, style === 'fusionada', solid.yModel);
+             } else {
+               mesh = buildViewsMesh({ front, side, top } as Views, {
+                 levels: Math.min(72, Math.max(24, resolution + 8)),
+                 samples: Math.min(128, Math.max(48, resolution * 3)),
+               });
+             }
+             if (!mesh.vertices.length) {
+               throw new Error('createViewsObject: las plantillas no generaron geometría');
+             }
+             const color = typeof params.color === 'string' && params.color ? params.color : null;
+             if (color && mesh.faces) mesh.faceColors = mesh.faces.map(() => color);
+             if (typeof params.opacity === 'number') mesh.opacity = params.opacity;
+             if (typeof params.texture === 'string') {
+               mesh.texture = params.texture;
+               mesh.textureColor = '#ffffff';
+             }
+             const resultado = addChatObject(mesh, 'views', params, {
+               smooth: true,
+               config: chatConfig({
+                 views: { front, side, top },
+                 resolution,
+                 meshStyle:
+                   style === 'fusionada'
+                     ? 'fusionada'
+                     : style === 'vóxel' || style === 'voxel'
+                       ? 'voxeles'
+                       : 'suave',
+                 viewsOpacity:
+                   typeof params.opacity === 'number' ? 1 - params.opacity : 1,
+                 texture:
+                   typeof params.texture === 'string' ? params.texture : null,
+               }),
+             });
+             return resultado;
+           }
+           case 'createMeshObject': {
+             const silhouette = chatPolygon(params.silhouette);
+             if (!silhouette) {
+               return {
+                 ok: false,
+                 error:
+                   'createMeshObject: falta "silhouette" (polígono [[x,y],...], vista frontal X·Y en 0..1, y=0 arriba)',
+               };
+             }
+             // Silueta degenerada (todos los puntos comparten X o Y: es una
+             // línea, no un área) no genera nada: error claro en vez de un
+             // fallo genérico más abajo.
+             const silXs = silhouette.map((p) => p.x);
+             const silYs = silhouette.map((p) => p.y);
+             if (chatPolygonDegenerada(silhouette)) {
+               return {
+                 ok: false,
+                 error:
+                   `createMeshObject: la silhouette es degenerada (x ${Math.min(...silXs).toFixed(2)}..${Math.max(...silXs).toFixed(2)}, y ${Math.min(...silYs).toFixed(2)}..${Math.max(...silYs).toFixed(2)}). Dibuja un contorno cerrado con área.`,
+               };
+             }
+             // Secciones: {y, radius|polygon}; y en lienzo 0..1 (0 arriba),
+             // plantilla X·Z en 0..1. Con radius se usa un círculo centrado.
+             const secsRaw = Array.isArray(params.sections) ? params.sections : [];
+             const radiusDe = (so: Record<string, unknown>): number | null => {
+               const r = typeof so.radius === 'number' ? so.radius : typeof so.radius === 'string' ? Number(so.radius.trim()) : NaN;
+               return Number.isFinite(r) ? r : null;
+             };
+             const sections = secsRaw
+               .map((s) => {
+                 const so = (s && typeof s === 'object' ? s : {}) as Record<string, unknown>;
+                 const yRaw = typeof so.y === 'number' ? so.y : typeof so.y === 'string' ? Number(so.y.trim()) : NaN;
+                 const y = Number.isFinite(yRaw) ? Math.min(1, Math.max(0, yRaw)) : 0.5;
+                 const r = radiusDe(so);
+                 const poly =
+                   chatPolygon(so.polygon) ??
+                   (r !== null ? chatCirclePolygon(0.5, 0.5, r) : null);
+                 return poly ? { y, polygon: poly } : null;
+               })
+               .filter((s): s is { y: number; polygon: Polygon } => s !== null)
+               // Sección degenerada (radio 0, plantilla colapsada en un
+               // punto o línea): la descartamos en vez de bloquear el
+               // barrido de buildViewsMesh.
+               .filter((s) => !chatPolygonDegenerada(s.polygon));
+             if (sections.length === 0 && secsRaw.length >= 2) {
+               return {
+                 ok: false,
+                 error:
+                   'createMeshObject: todas las "sections" eran degeneradas (radius 0 o plantilla colapsada). Usa radius > 0 en 0..0.5.',
+               };
+             }
+             if (secsRaw.length < 2) {
+               return {
+                 ok: false,
+                 error:
+                   'createMeshObject: faltan "sections" (2+ entradas, cada una {y, radius|polygon} con y 0..1)',
+               };
+             }
+             const sideView = chatPolygon(params.sideView);
+             const meshViews = meshInputToViews(silhouette, sections, sideView);
+             const style =
+               typeof params.style === 'string' ? params.style.toLowerCase() : 'suave';
+             const resolution = Math.min(
+               160,
+               Math.max(16, typeof params.resolution === 'number' ? params.resolution : 48)
+             );
+             const sectionsMesh = sections
+               .filter((s) => s.polygon.length >= 3)
+               .map((s) => ({ y: 1 - s.y, polygon: s.polygon }));
+             const construirSuave = () =>
+               buildViewsMesh(meshViews, {
+                 levels: Math.min(120, Math.max(48, resolution + 16)),
+                 samples: Math.min(128, Math.max(48, resolution * 3)),
+                 sections: sectionsMesh.length >= 2 ? sectionsMesh : undefined,
+               });
+             let mesh: Mesh;
+             if (style === 'vóxel' || style === 'voxel' || style === 'fusionada') {
+               const solid = reconstructVoxels(
+                 meshViews,
+                 style === 'fusionada' ? Math.max(HIGH_FIDELITY_RES, resolution) : resolution,
+                 sectionsMesh
+               );
+               mesh = voxelsToBoxMesh(solid.voxels, resolution, style === 'fusionada', solid.yModel);
+               // El vóxel pierde rasgos finos (patas de silla): si no quedó
+               // nada, se reintenta en suave antes de rendirse.
+               if (!mesh.vertices.length) {
+                 mesh = construirSuave();
+               }
+             } else {
+               mesh = construirSuave();
+             }
+             // Último recurso: sin plantillas (sólido de revolución con la
+             // silueta), por si las secciones eran incompatibles.
+             if (!mesh.vertices.length && sectionsMesh.length >= 2) {
+               mesh = buildViewsMesh(meshViews, {
+                 levels: Math.min(120, Math.max(48, resolution + 16)),
+                 samples: Math.min(128, Math.max(48, resolution * 3)),
+               });
+             }
+             if (!mesh.vertices.length) {
+               throw new Error(
+                 `createMeshObject: la silueta y las secciones no generaron geometría ` +
+                   `(silueta: ${silhouette.length} puntos, x ${Math.min(...silXs).toFixed(2)}..${Math.max(...silXs).toFixed(2)}, y ${Math.min(...silYs).toFixed(2)}..${Math.max(...silYs).toFixed(2)}; secciones válidas: ${sections.length} de ${secsRaw.length})`
+               );
+             }
+             const color = typeof params.color === 'string' && params.color ? params.color : null;
+             if (color && mesh.faces) mesh.faceColors = mesh.faces.map(() => color);
+             if (typeof params.opacity === 'number') mesh.opacity = params.opacity;
+             if (typeof params.texture === 'string') {
+               mesh.texture = params.texture;
+               mesh.textureColor = '#ffffff';
+             }
+             const resultado = addChatObject(mesh, 'mesh', params, {
+               smooth: true,
+               config: chatConfig({
+                 meshSilhouette: silhouette,
+                 meshSections: sections.map((s, i) => ({
+                   id: i + 1,
+                   polygon: s.polygon,
+                   y: s.y,
+                 })),
+                 meshSilhouetteView: 'front',
+                 meshSideView:
+                   sideView ??
+                   capturePanelConfigRef.current().meshSideView,
+                 resolution,
+                 meshStyle:
+                   style === 'fusionada'
+                     ? 'fusionada'
+                     : (style === 'vóxel' || style === 'voxel' ? 'voxeles' : 'suave'),
+                 texture:
+                   typeof params.texture === 'string' ? params.texture : null,
+               }),
+             });
+             return resultado;
+           }
+           case 'createExtrudeObject': {
+             const main =
+               chatPolygon(params.polygon) ??
+               chatPolygon(params.front) ??
+               chatPolygon(params.shape);
+             if (!main) {
+               return {
+                 ok: false,
+                 error:
+                   'createExtrudeObject: falta "polygon" (polígono [[x,y],...] con 3+ puntos, coordenadas 0..1)',
+               };
+             }
+             if (chatPolygonDegenerada(main)) {
+               return {
+                 ok: false,
+                 error:
+                   'createExtrudeObject: el "polygon" es degenerado (puntos en línea o sin área). Dibuja un contorno cerrado.',
+               };
+             }
+             const extras: Polygon[] = Array.isArray(params.shapes)
+               ? (params.shapes.map((s) => chatPolygon(s)).filter((s): s is Polygon => s !== null) as Polygon[])
+               : [];
+             const holes = Array.isArray(params.holes)
+               ? (params.holes
+                   .map((h) => {
+                     const ho = (h && typeof h === 'object' ? h : {}) as Record<string, unknown>;
+                     const poly = chatPolygon(ho.polygon ?? h);
+                     return poly
+                       ? { polygon: poly, depth: typeof ho.depth === 'number' ? ho.depth : 0 }
+                       : null;
+                   })
+                   .filter((h): h is { polygon: Polygon; depth: number } => h !== null))
+               : [];
+             const depth = Math.max(
+               0.05,
+               typeof params.depth === 'number' ? params.depth : extrudeDepth
+             );
+             const mesh = buildExtrudeMeshes([main, ...extras], depth, holes);
+             if (!mesh.vertices.length) {
+               throw new Error('createExtrudeObject: el polígono no generó geometría');
+             }
+             const color = typeof params.color === 'string' && params.color ? params.color : null;
+             if (color && mesh.faces) mesh.faceColors = mesh.faces.map(() => color);
+             if (typeof params.opacity === 'number') mesh.opacity = params.opacity;
+             if (typeof params.texture === 'string') {
+               mesh.texture = params.texture;
+               mesh.textureColor = '#ffffff';
+             }
+             const resultado = addChatObject(mesh, 'extrude', params, {
+               smooth: false,
+               // Las plantillas de Extruir viven en views.front; los agujeros
+               // del chat quedan horneados en la malla (no como polilíneas).
+               config: chatConfig({
+                 views: { front: main, side: main, top: main },
+                 extrudeDepth: depth,
+               }),
+             });
+             return resultado;
+           }
+           case 'applyEffect': {
+             // Envoltorio directo del paso ZEIA effects.apply: normaliza
+             // (effectType/effect/...) y construye la pista de efecto visual
+             // (lluvia, humo, fuego, chispas, brillo…).
+             const plans: ZeiaAppliedPlan[] = [
+               { plan: 'addEffect', execute: params } as unknown as ZeiaAppliedPlan,
+             ];
+             const out = applyZeiaPlansToScene(plans, [], transformTracksRef.current, {
+               effectTracks: effectTracksRef.current,
+             });
+             setEffectTracks(out.effectTracks);
+             if (!out.result.effects) {
+               return {
+                 ok: false,
+                 error:
+                   'applyEffect: tipo de efecto no soportado. Usa rain/lluvia, smoke/humo, stars/estrellas, fire/fuego, sparks/chispas o glow/brillo.',
+                 warnings: out.result.warnings,
+               };
+             }
+             return { ok: true, ...out.result, track: out.effectTracks[out.effectTracks.length - 1] };
+           }
+           case 'applyPlugin': {
+             const pluginIdRaw = typeof params.pluginId === 'string' ? params.pluginId.trim() : '';
+             const pluginNameRaw = typeof params.plugin === 'string' ? params.plugin.trim().toLowerCase() : '';
+             const plugin =
+               (pluginIdRaw ? obtenerPlugin(pluginIdRaw) : undefined) ??
+               (pluginNameRaw
+                 ? listarPlugins().find(
+                     (p) => p.id.toLowerCase() === pluginNameRaw || p.nombre.toLowerCase() === pluginNameRaw
+                   )
+                 : undefined);
+             if (!plugin) {
+               return {
+                 ok: false,
+                 error: `applyPlugin: plugin no encontrado ("${pluginIdRaw || pluginNameRaw}"). Usa getScene o la lista de plugins del modal para ver los disponibles.`,
+               };
+             }
+             // Valores: los que mande el modelo + los iniciales del plugin.
+             const rawValores = (params.valores ?? params.vals ?? params.params ?? {}) as Record<string, unknown>;
+             const valores: PluginParams = {};
+             for (const p of plugin.params) {
+               const crudo = rawValores[p.id];
+               if (crudo !== undefined && crudo !== null) {
+                 if (p.tipo === 'slider') valores[p.id] = Number(crudo) || 0;
+                 else if (p.tipo === 'check') valores[p.id] = crudo !== false && crudo !== 'false';
+                 else valores[p.id] = String(crudo);
+               } else {
+                 valores[p.id] = p.valor;
+               }
+             }
+             // Destino: id explícito, último creado o el objeto seleccionado.
+             const destinoId =
+               (typeof params.objectId === 'string' && params.objectId) ||
+               (typeof params.targetObjectId === 'string' && params.targetObjectId) ||
+               (params.newObject === true ? DESTINO_NUEVO_OBJETO : '') ||
+               lastCreatedIdRef.current ||
+               selectedObjectId ||
+               '';
+             try {
+               if (destinoId === DESTINO_NUEVO_OBJETO || (!destinoId && plugin.generador)) {
+                 if (!plugin.generador) {
+                   return { ok: false, error: `applyPlugin: "${plugin.nombre}" no es generador; pasa un objectId.` };
+                 }
+                 const generado = plugin.aplicar({ vertices: [], faces: [] }, valores);
+                 if (!generado || !generado.vertices.length) {
+                   throw new Error('applyPlugin: el generador no devolvió geometría');
+                 }
+                 // Congelar el dueño de la configuración, igual que el modal.
+                 if (configObjectId) {
+                   freezeObjectSnapshot(configObjectId);
+                   setConfigObjectId(null);
+                 }
+                 const res = addChatObject(generado, null, params, { smooth: true });
+                 setSceneObjects((current) =>
+                   current.map((o) =>
+                     o.id === res.id
+                       ? { ...o, pluginEdit: { pluginId: plugin.id, valores: { ...valores }, baseVacia: true } }
+                       : o
+                   )
+                 );
+                 return { ...res, plugin: plugin.nombre, valores };
+               }
+               const target = sceneObjectsPlaybackRef.current.find(
+                 (o) => o.id === destinoId || o.name.toLowerCase() === destinoId.toLowerCase()
+               );
+               if (!target) {
+                 return { ok: false, error: `applyPlugin: objeto destino no encontrado ("${destinoId}")` };
+               }
+               const meshObjetivo = target.mesh;
+               if (!meshObjetivo || !meshObjetivo.vertices.length) {
+                 return { ok: false, error: `applyPlugin: el objeto "${target.name}" no tiene geometría` };
+               }
+               const baseMesh = structuredClone(meshObjetivo);
+               const resultado = plugin.aplicar(meshObjetivo, valores);
+               if (!resultado || !resultado.vertices.length) {
+                 throw new Error('applyPlugin: el plugin no devolvió geometría');
+               }
+               // Si el objeto era dueño de la configuración del panel, se
+               // desvincula (igual que en el modal de plugins).
+               if (configObjectId === target.id) {
+                 setConfigObjectId(null);
+               }
+               setSceneObjects((current) =>
+                 current.map((o) =>
+                   o.id === target.id
+                     ? {
+                         ...o,
+                         mesh: resultado,
+                         smooth: true,
+                         pluginEdit: {
+                           pluginId: plugin.id,
+                           valores: { ...valores },
+                           baseMesh,
+                         },
+                       }
+                     : o
+                 )
+               );
+               setSelectedObjectId(target.id);
+               // El bloque de re-edición del plugin vive en la pestaña
+               // Escena: saltar allí para que se vea (por ref, misma
+               // razón que en addChatObject).
+               switchTabRef.current('scene');
+               return {
+                 ok: true,
+                 id: target.id,
+                 name: target.name,
+                 plugin: plugin.nombre,
+                 valores,
+                 vertices: resultado.vertices.length,
+                 faces: resultado.faces.length,
+               };
+             } catch (e) {
+               console.error('[ZEUS_ACTION] applyPlugin:', e);
+               throw new Error(
+                 e instanceof Error ? e.message : 'applyPlugin: error inesperado'
+               );
+             }
+           }
            default:
              throw new Error(`Acción 3D desconocida: ${action}`);
         }
       };
        const unregister = aiBridge.registerActionExecutor(runZeusAction);
+       // Gancho de depuración/pruebas: ejecuta una acción del chat sin pasar
+       // por el modelo de texto (lo usan las pruebas E2E del editor).
+       (window as unknown as { zeusRunAction?: typeof runZeusAction }).zeusRunAction =
+         (action, params) => runZeusAction(action, params ?? {});
        return unregister;
      }, [aiBridge]);
 
@@ -4693,33 +5475,72 @@ pluginTracks,
     []
   );
 
+  /**
+   * Mueve la ESCENA con los botones ▲▼◀▶ de una ventana: la escena se
+   * desplaza hacia donde apunta la flecha EN PANTALLA, sea cual sea la vista
+   * activa de la ventana (frente, espalda, superior, inferior, costado izq. /
+   * der. o 3D libre). La base de pantalla (h = derecha, v = arriba) se deduce
+   * de la rotación ACTUAL de la cámara de la ventana con las mismas fórmulas
+   * que usan el visor y la alineación. Equivalencias por vista:
+   *   frente:    ▲Y+ ▼Y− ◀X− ▶X+      espalda:  ▲Y+ ▼Y− ◀X+ ▶X−
+   *   superior:  ▲-Z ▼+Z ◀X− ▶X+     inferior: ▲+Z ▼−Z ◀X− ▶X+
+   *   costado der.: ▲Y+ ▼Y− ◀Z+ ▶Z−   costado izq.: ▲Y+ ▼Y− ◀Z− ▶Z+
+   * El objetivo de la cámara se mueve al lado contrario de la escena, y el
+   * desplazamiento se guarda en el offset que cada rama del visor usa para
+   * ese eje (cenital: X/Z; lateral: Z/Y; frente·espalda·3D: X/Y).
+   */
   const pan3D = useCallback(
     (panel: 'front' | 'top' | 'side' | '3d', dx: number, dy: number) => {
       setPanelCameras((prev) => {
-        const newState = { ...prev };
-        const cam = { ...newState[panel] };
-
-        if (panel === 'front') {
-          cam.offsetX -= dx;
-          cam.offsetY += dy;
-        } else if (panel === 'top') {
-          // Top view: camera looks down -Y. Moving target +Z makes object appear UP on screen.
-          // ▼ (Adelante, dy=+5): want object to move DOWN on screen → target must move -Z → offsetY -= dy
-          // ▲ (Atrás, dy=-5): want object to move UP on screen → target must move +Z → offsetY -= dy
-          cam.offsetX -= dx;
-          cam.offsetY += dy;
-        } else if (panel === 'side') {
-          // Side view: invertir dx para que ◀ = adelante, ▶ = atrás
-          cam.offsetX -= dx;
-          cam.offsetY += dy;
-        } else {
-          // 3D free view: invert only dy (up/down reversed)
-          cam.offsetX -= dx;
-          cam.offsetY += dy;
+        const cam = { ...prev[panel] };
+        const rotX = cam.rotationX ?? 0;
+        const rotY = cam.rotationY ?? 0;
+        // Base de pantalla: n apunta del objetivo hacia la cámara (misma
+        // fórmula que applyCamera del visor y applyAlignment).
+        const n = new THREE.Vector3(
+          Math.cos(rotX) * Math.sin(rotY),
+          Math.sin(rotX),
+          Math.cos(rotX) * Math.cos(rotY)
+        );
+        // Vertical de pantalla: (0,1,0) proyectado sobre el plano de la
+        // vista. En cenitales es degenerado: arriba de pantalla = -Z en la
+        // vista superior y +Z en la inferior (como resuelve el visor).
+        const v = new THREE.Vector3(0, 1, 0).sub(
+          n.clone().multiplyScalar(n.y)
+        );
+        if (v.lengthSq() < 1e-8) {
+          v.set(0, 0, rotX >= 0 ? -1 : 1);
         }
-
-        newState[panel] = cam;
-        return newState;
+        v.normalize();
+        // Horizontal de pantalla (hacia la derecha).
+        const h = v.clone().cross(n).normalize();
+        // La escena debe moverse dx a la derecha y dy hacia abajo de la
+        // ventana: contenido = dx·h − dy·v. El objetivo va al revés.
+        const d = h
+          .clone()
+          .multiplyScalar(-dx)
+          .add(v.clone().multiplyScalar(dy));
+        // Rama del visor para la pose ACTUAL (mismas tolerancias que
+        // applyCamera) para guardar cada eje del objetivo en su offset.
+        const eq = (a: number, b: number) => Math.abs(a - b) < 0.01;
+        const cenital =
+          Math.abs(rotY) < 0.01 &&
+          (eq(rotX, Math.PI / 2) || eq(rotX, -Math.PI / 2));
+        const lateral =
+          Math.abs(rotX) < 0.01 &&
+          (eq(rotY, Math.PI / 2) || eq(rotY, -Math.PI / 2));
+        if (cenital) {
+          cam.offsetX += d.x;
+          cam.offsetY += d.z;
+        } else if (lateral) {
+          cam.offsetX += d.z;
+          cam.offsetY += d.y;
+        } else {
+          // frente/espalda/3D: offsetX ↔ X del objetivo, offsetY ↔ Y
+          cam.offsetX += d.x;
+          cam.offsetY += d.y;
+        }
+        return { ...prev, [panel]: cam };
       });
     },
     []
@@ -5639,6 +6460,11 @@ pluginTracks,
   const [booleanModalOpen, setBooleanModalOpen] = useState<boolean>(false);
   // Modal de plugins (deformadores y utilidades registrados en lib/plugins)
   const [pluginsModalOpen, setPluginsModalOpen] = useState<boolean>(false);
+  // Modal de alineación de los objetos seleccionados (menú «Acciones»)
+  const [alignModalOpen, setAlignModalOpen] = useState<boolean>(false);
+  // Temporizador del debounce para la re-edición en vivo de plugins
+  // (el registro del plugin viaja dentro del propio SceneObject).
+  const pluginRegenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [booleanPreview, setBooleanPreview] = useState<boolean>(false);
   const [booleanToolObjectId, setBooleanToolObjectId] = useState<string | null>(null);
   const [booleanPreviewLive, setBooleanPreviewLive] = useState<boolean>(false);
@@ -6011,6 +6837,10 @@ pluginTracks,
       polylines,
     ]
   );
+
+  // Refresco del ref de capturePanelConfig: los objetos del chat congelan
+  // su config con la captura del panel de ESTE render.
+  capturePanelConfigRef.current = capturePanelConfig;
 
   // Aplica al panel la configuración completa de un objeto: al
   // seleccionarlo en la vista 3D, al pegar, al eliminar al dueño, al
@@ -7779,6 +8609,24 @@ pluginTracks,
      [mode, triMesh, smoothShadingValue, textureProjection, capturePanelConfig]
    );
 
+  // "Nuevo objeto": termina el objeto que la pestaña activa está
+  // editando y deja el borrador en blanco. Sin esto, lo que el usuario
+  // dibuje a continuación seguiría mutando al mismo objeto (sigue
+  // siendo el dueño). Con la figura congelada en su objeto y el dueño
+  // desatado, el detector de creación crea un objeto NUEVO con el
+  // próximo dibujo — y el anterior queda intacto como instantánea.
+  const createNewObject = useCallback(() => {
+    if (!configObjectId) return;
+    // Congelar solo si hay figura en el lienzo: con el borrador vacío
+    // no hay nada que instantanear y congelar destruiría la malla que
+    // el objeto ya tiene guardada.
+    if (triMesh && triMesh.vertices.length > 0) {
+      freezeObjectSnapshot(configObjectId);
+    }
+    setConfigObjectId(null);
+    resetModel();
+  }, [configObjectId, triMesh, freezeObjectSnapshot, resetModel]);
+
   // Cambio de pestaña: el único camino para moverse entre pestañas. El
   // usuario entra a cada pestaña manualmente — ningún clic ni acción
   // cambia la pestaña por sí solo. Al salir de una pestaña-herramienta
@@ -7829,6 +8677,9 @@ pluginTracks,
       applyObjectConfig,
     ]
     );
+    // Refresco del ref de switchTab: el puente del chat (registrado una
+    // sola vez) llama siempre a la versión con el estado de ESTE render.
+    switchTabRef.current = switchTab;
 
      // Transparencia centralizada (pestaña Escena): escribe la opacidad
     // directamente en la malla de todos los objetos seleccionados — la
@@ -8823,6 +9674,133 @@ pluginTracks,
     syncTextureStateToSelection,
   ]);
 
+  // Alinea los objetos seleccionados entre sí por sus cajas envolventes
+  // (lo que se VE de cada objeto, no su origen) INTERPRETADO EN LA
+  // VENTANA ACTIVA, igual que el gizmo: "arriba" es la parte de arriba
+  // de lo que se ve — aunque mirando desde arriba eso sea la parte de
+  // atrás del objeto. Los ejes de pantalla se deducen de la cámara de
+  // la ventana activa, con la misma fórmula con la que el visor la
+  // coloca. El desplazamiento se aplica al transform de cada objeto,
+  // que conserva su tamaño y orientación. Es un cambio de escena
+  // normal: el historial de deshacer/rehacer lo captura igual.
+  const applyAlignment = useCallback(
+    (alignMode: 'horizontal' | 'vertical' | 'left' | 'right' | 'top' | 'bottom') => {
+      const ids = selectedObjectIds;
+      if (ids.length < 2) return;
+      // Base de pantalla de la ventana activa: n apunta de la escena
+      // hacia la cámara (misma fórmula que applyCamera del visor).
+      const slot = activeView;
+      const cam = panelCameras[slot];
+      const n = new THREE.Vector3(
+        Math.cos(cam.rotationX) * Math.sin(cam.rotationY),
+        Math.sin(cam.rotationX),
+        Math.cos(cam.rotationX) * Math.cos(cam.rotationY)
+      ).normalize();
+      // Vertical de pantalla: el (0,1,0) proyectado sobre el plano de la
+      // vista. En vistas cenitales (superior/inferior) es degenerado:
+      // como resuelve el propio visor, arriba = -Z en superior y +Z en
+      // inferior.
+      const worldUp = new THREE.Vector3(0, 1, 0);
+      let v = worldUp.clone().sub(n.clone().multiplyScalar(worldUp.dot(n)));
+      if (v.lengthSq() < 1e-8) {
+        v = new THREE.Vector3(0, 0, Math.sin(cam.rotationX) >= 0 ? -1 : 1);
+      }
+      v.normalize();
+      // Horizontal de pantalla (hacia la derecha).
+      const h = v.clone().cross(n).normalize();
+      setSceneObjects((current) => {
+        const sel = current.filter((o) => ids.includes(o.id));
+        if (sel.length < 2) return current;
+        const boxes = sel.map(objectWorldBounds);
+        // Coordenada de pantalla de cada objeto sobre un eje cualquiera:
+        // se proyectan las 8 esquinas de su caja envolvente mundo.
+        const proj = (
+          b: ReturnType<typeof objectWorldBounds>,
+          a: THREE.Vector3
+        ) => {
+          let min = Infinity;
+          let max = -Infinity;
+          for (const x of [b.minX, b.maxX])
+            for (const y of [b.minY, b.maxY])
+              for (const z of [b.minZ, b.maxZ]) {
+                const d = x * a.x + y * a.y + z * a.z;
+                if (d < min) min = d;
+                if (d > max) max = d;
+              }
+          return { min, max, center: (min + max) / 2 };
+        };
+        const hp = boxes.map((b) => proj(b, h));
+        const vp = boxes.map((b) => proj(b, v));
+        const avg = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+        // Objetivo de cada modo: el borde extremo de la selección o la
+        // media de sus centros. El eje y la coordenada de cada objeto
+        // dependen del modo; "top"/"bottom" trabajan sobre el vertical
+        // de pantalla (que en vista superior es el fondo del mundo).
+        let axis: THREE.Vector3;
+        let coordOf: (i: number) => number;
+        let target: number;
+        switch (alignMode) {
+          // Fila horizontal: los centros a la misma altura de pantalla
+          // (el eje VERTICAL de la vista). La profundidad se respeta: uno
+          // puede quedar más adelante y otro más atrás y seguir viéndose
+          // como fila.
+          case 'horizontal':
+            axis = v;
+            coordOf = (i) => vp[i].center;
+            target = avg(vp.map((p) => p.center));
+            break;
+          // Columna vertical: centros en la misma posición horizontal de
+          // pantalla (el eje de columnas de la vista).
+          case 'vertical':
+            axis = h;
+            coordOf = (i) => hp[i].center;
+            target = avg(hp.map((p) => p.center));
+            break;
+          // Juntar el borde extremo de todos al borde extremo de la selección
+          case 'left':
+            axis = h;
+            coordOf = (i) => hp[i].min;
+            target = Math.min(...hp.map((p) => p.min));
+            break;
+          case 'right':
+            axis = h;
+            coordOf = (i) => hp[i].max;
+            target = Math.max(...hp.map((p) => p.max));
+            break;
+          case 'top':
+            axis = v;
+            coordOf = (i) => vp[i].max;
+            target = Math.max(...vp.map((p) => p.max));
+            break;
+          case 'bottom':
+            axis = v;
+            coordOf = (i) => vp[i].min;
+            target = Math.min(...vp.map((p) => p.min));
+            break;
+          default:
+            return current;
+        }
+        return current.map((o) => {
+          if (!ids.includes(o.id)) return o;
+          const i = sel.findIndex((s) => s.id === o.id);
+          const delta = target - coordOf(i);
+          const tr = o.transform;
+          return {
+            ...o,
+            transform: {
+              ...tr,
+              px: tr.px + axis.x * delta,
+              py: tr.py + axis.y * delta,
+              pz: tr.pz + axis.z * delta,
+            },
+          };
+        });
+      });
+      setAlignModalOpen(false);
+    },
+    [selectedObjectIds, activeView, panelCameras]
+  );
+
   // Ejecuta la operación booleana (sustracción, unión o intersección) entre dos objetos
   const handleApplyBoolean = useCallback(
     ({
@@ -8984,6 +9962,10 @@ pluginTracks,
             transform: { ...IDENTITY_TRANSFORM },
             mesh: resultado,
             smooth: true,
+            // Recordar el plugin generador para poder re-editar sus
+            // parámetros en vivo desde la pestaña Escena (los generadores
+            // parten de malla vacía: no hace falta base).
+            pluginEdit: { pluginId, valores: { ...valores }, baseVacia: true },
           };
           setSceneObjects((current) => [...current, nuevoObjeto]);
           setSelectedObjectId(nuevoId);
@@ -9023,6 +10005,13 @@ pluginTracks,
       }
 
       try {
+        // Recordar el plugin y la malla base (previa a la deformación)
+        // DENTRO del objeto, para poder re-editar sus parámetros en vivo
+        // desde la pestaña Escena (y tras guardar/recargar el .zeus).
+        // Aplicar otro plugin al mismo objeto sustituye al anterior (la
+        // nueva base ya lleva el efecto previo).
+        const baseMesh = structuredClone(meshObjetivo);
+
         const resultado = plugin.aplicar(meshObjetivo, valores);
         if (!resultado || !resultado.vertices.length) {
           toast.error(t('editor3D.plugins.errInvalidMesh'));
@@ -9045,6 +10034,11 @@ pluginTracks,
                   // El resultado se muestra con el tipo de malla «Suave»
                   // por defecto (sombreado suave).
                   smooth: true,
+                  pluginEdit: {
+                    pluginId,
+                    valores: { ...valores },
+                    baseMesh,
+                  },
                 }
               : o
           )
@@ -9066,6 +10060,52 @@ pluginTracks,
       }
     },
     [sceneObjects, configObjectId, triMesh, t]
+  );
+
+  /*
+   * Re-aplica en vivo el plugin registrado en el objeto: cada cambio de
+   * parámetro en la pestaña Escena guarda los valores y, con un pequeño
+   * debounce, recalcula la malla a partir de la base guardada (o de la
+   * malla vacía, en los generadores). El registro viaja dentro del
+   * SceneObject, así que funciona también tras guardar/recargar.
+   */
+  const handleLivePluginParam = useCallback(
+    (objectId: string, valores: PluginParams) => {
+      // Guardar los valores nuevos en el objeto.
+      setSceneObjects((current) =>
+        current.map((o) =>
+          o.id === objectId && o.pluginEdit
+            ? { ...o, pluginEdit: { ...o.pluginEdit, valores } }
+            : o
+        )
+      );
+
+      if (pluginRegenTimerRef.current) clearTimeout(pluginRegenTimerRef.current);
+      pluginRegenTimerRef.current = setTimeout(() => {
+        pluginRegenTimerRef.current = null;
+        setSceneObjects((current) => {
+          const rec = current.find((o) => o.id === objectId)?.pluginEdit;
+          if (!rec) return current;
+          const plugin = obtenerPlugin(rec.pluginId);
+          if (!plugin) return current;
+          const base: Mesh | null = rec.baseVacia
+            ? { vertices: [], faces: [] }
+            : rec.baseMesh ?? null;
+          if (!base) return current;
+          try {
+            const resultado = plugin.aplicar(base, valores);
+            if (!resultado || !resultado.vertices.length) return current;
+            return current.map((o) =>
+              o.id === objectId ? { ...o, mesh: resultado, smooth: true } : o
+            );
+          } catch (err) {
+            console.error('[plugins] Error al re-aplicar en vivo:', err);
+            return current;
+          }
+        });
+      }, 300);
+    },
+    []
   );
 
   // Las 4 ventanas (Frente, Superior, Costado y 3D) son las mismas para
@@ -9186,8 +10226,18 @@ pluginTracks,
             sz: 1,
           });
         }
-        switchTab('scene');
+        switchTabRef.current('scene');
         frameAllWindows();
+        // El archivo original queda guardado con SUS parámetros de nacimiento:
+        // al seleccionar este relieve, los mandos cargarán estos datos y
+        // cualquier cambio regenerará su malla en vivo.
+        heightmapSourcesRef.current.set(id, {
+          file,
+          heightScale: imageHeightScale,
+          cols: imageCols,
+          rows: imageRows,
+          removeBackground: imageRemoveBackground,
+        });
 
         toast.success(
           t('editor3D.imageToHeightmap.success', {
@@ -9209,6 +10259,101 @@ pluginTracks,
     },
     [imageHeightScale, imageCols, imageRows, imageRemoveBackground, sceneObjects, configObjectId, freezeObjectSnapshot, textureProjection, switchTab, frameAllWindows, computeMeshBoundsCenter, setGizmoOffset, t]
   );
+
+  // Espejo de la escena para el temporizador de regeneración del relieve.
+  useEffect(() => {
+    heightmapAliveRef.current = sceneObjects;
+  }, [sceneObjects]);
+
+  // Al seleccionar un relieve nacido de una imagen, los mandos de la
+  // sección cargan SUS datos: moverlos después regenera ese objeto, no
+  // el último creado. (Los mandos viven en la pestaña Extruir; la
+  // selección de la escena se mantiene al cambiar de pestaña.)
+  useEffect(() => {
+    const id = configObjectId ?? selectedObjectId;
+    if (!id) return;
+    const source = heightmapSourcesRef.current.get(id);
+    if (!source) return;
+    setImageHeightScale(source.heightScale);
+    setImageCols(source.cols);
+    setImageRows(source.rows);
+    setImageRemoveBackground(source.removeBackground);
+  }, [configObjectId, selectedObjectId]);
+
+  // Relieve desde imagen en vivo: con un relieve seleccionado (o, si no
+  // hay ninguno, el último creado), variar la altura, la resolución o el
+  // fondo regenera su malla al momento — sin borrarlo ni crear otro nuevo.
+  useEffect(() => {
+    if (heightmapSkipFirstRunRef.current) {
+      heightmapSkipFirstRunRef.current = false;
+      return;
+    }
+    if (heightmapRegenTimerRef.current)
+      clearTimeout(heightmapRegenTimerRef.current);
+    // Pequeña espera para no rasterizar en cada muesca del deslizador.
+    heightmapRegenTimerRef.current = setTimeout(async () => {
+      heightmapRegenTimerRef.current = null;
+      const sources = heightmapSourcesRef.current;
+      // Objetivo: el relieve seleccionado; si lo seleccionado no es un
+      // relieve, el último que se creó en la sesión.
+      const preferred = configObjectId ?? selectedObjectId;
+      let targetId: string | null =
+        preferred && sources.has(preferred) ? preferred : null;
+      if (!targetId) {
+        const keys = Array.from(sources.keys());
+        targetId = keys[keys.length - 1] ?? null;
+      }
+      if (!targetId) return;
+      // Su objeto se borró: fuera de la lista, nada que actualizar.
+      if (!heightmapAliveRef.current.some((o) => o.id === targetId)) {
+        sources.delete(targetId);
+        return;
+      }
+      // Si sus datos guardados ya son los de los mandos, no hay cambio
+      // real que regenerar (p. ej. la carga al seleccionarlo).
+      const stored = sources.get(targetId)!;
+      if (
+        stored.heightScale === imageHeightScale &&
+        stored.cols === imageCols &&
+        stored.rows === imageRows &&
+        stored.removeBackground === imageRemoveBackground
+      ) {
+        return;
+      }
+      try {
+        const { mesh, logs } = await imageFileToSceneState(
+          stored.file,
+          imageHeightScale,
+          imageCols,
+          imageRows,
+          imageRemoveBackground
+        );
+        if (!mesh.vertices.length) return;
+        // Solo se reemplaza su malla: id, nombre, posición y el resto de
+        // ajustes del objeto quedan tal como el usuario los dejó.
+        setSceneObjects((current) =>
+          current.map((object) =>
+            object.id === targetId ? { ...object, mesh } : object
+          )
+        );
+        sources.set(targetId, {
+          file: stored.file,
+          heightScale: imageHeightScale,
+          cols: imageCols,
+          rows: imageRows,
+          removeBackground: imageRemoveBackground,
+        });
+        logs.forEach((log) => console.log('[imageToHeightmap]', log));
+      } catch {
+        // Sin imagen cargable ahora mismo: se deja el relieve como estaba.
+      }
+    }, 350);
+    return () => {
+      if (heightmapRegenTimerRef.current)
+        clearTimeout(heightmapRegenTimerRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageHeightScale, imageCols, imageRows, imageRemoveBackground]);
 
   const handleCenterGizmoOnObject = useCallback(() => {
     if (!selectedObjectId) {
@@ -9440,6 +10585,7 @@ pluginTracks,
       objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
       onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
       selectedObjectIds={selectedObjectIds}
+      giroIndividual={giroIndividual}
       onSelectionChange={setSelectedObjectIds}
       selectionMode={selectionMode}
       onSelectionModeChange={setSelectionMode}
@@ -9611,6 +10757,25 @@ pluginTracks,
               <DropdownMenuItem
                 onSelect={(e) => {
                   e.preventDefault();
+                  createNewObject();
+                }}
+                disabled={!configObjectId || mode === 'scene'}
+                data-testid="new-object-btn"
+                className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5 disabled:opacity-40"
+                title={
+                  configObjectId
+                    ? t('editor3D.newObjectDesc')
+                    : t('editor3D.newObjectIdle')
+                }
+              >
+                <span className="text-sm font-bold flex items-center gap-1.5">
+                  <Box className="w-3.5 h-3.5 text-sky-400" />
+                  {t('editor3D.newObject')}
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={(e) => {
+                  e.preventDefault();
                   selectedObjectId && setObjectToDelete(selectedObjectId);
                 }}
                 disabled={!selectedObjectId || sceneObjects.length <= 1}
@@ -9619,6 +10784,25 @@ pluginTracks,
                 <span className="text-sm font-bold flex items-center gap-1.5">
                    <Trash2 className="w-3.5 h-3.5 text-red-400" />
                    {t('editor3D.deleteObject')}
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={(e) => {
+                  e.preventDefault();
+                  setAlignModalOpen(true);
+                }}
+                disabled={selectedObjectIds.length < 2}
+                data-testid="open-align-modal"
+                className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5 disabled:opacity-40"
+                title={
+                  selectedObjectIds.length < 2
+                    ? t('editor3D.alignNeedTwo')
+                    : t('editor3D.alignDesc')
+                }
+              >
+                <span className="text-sm font-bold flex items-center gap-1.5">
+                  <Magnet className="w-3.5 h-3.5 text-emerald-400" />
+                  {t('editor3D.align')}
                 </span>
               </DropdownMenuItem>
               <DropdownMenuItem
@@ -10411,7 +11595,10 @@ pluginTracks,
               </div>
 
 {mode === 'extrude' ? (
-                   <div className="flex-1 overflow-y-auto grid grid-rows-[320px_320px_auto] gap-3 p-3 min-h-0 custom-scrollbar">
+                   /* Columna única minmax(0,1fr): sin ella la pista implícita
+                      se dimensiona al contenido y los mandos desbordan la
+                      columna fija de 380px. */
+                   <div className="flex-1 overflow-y-auto grid grid-cols-[minmax(0,1fr)] grid-rows-[320px_320px_auto] gap-3 p-3 min-h-0 min-w-0 custom-scrollbar">
                      <DrawingCanvas
                      label={activeSweepNode ? t('editor3D.sweepProfileLabel', { n: sweepNodeNumber }) : t('editor3D.panelLabels.front')}
                      axisLabel={t('editor3D.panelLabels.frontAxis')}
@@ -10422,7 +11609,7 @@ pluginTracks,
                      onMaximize={() => setEditingSweepCanvas('profile')}
                      polylines={getPolylines('views:front')}
                    />
-                   <div className="flex flex-col gap-2 min-h-0">
+                   <div className="flex flex-col gap-2 min-h-0 min-w-0">
                      <PathCanvas
                        label={t('editor3D.sweepTitle')}
                        axisLabel="PATH"
@@ -10586,7 +11773,7 @@ pluginTracks,
                      </div>
                    </div>
                ) : (
-                <div className="flex-1 overflow-y-auto grid grid-rows-[320px_320px_320px] gap-2 p-3 min-h-0 custom-scrollbar">
+                   <div className="flex-1 overflow-y-auto grid grid-cols-[minmax(0,1fr)] grid-rows-[320px_320px_320px] gap-2 p-3 min-h-0 min-w-0 custom-scrollbar">
                    <DrawingCanvas
                      label={t('editor3D.panelLabels.front')}
                      axisLabel={t('editor3D.panelLabels.frontAxis')}
@@ -10640,97 +11827,102 @@ pluginTracks,
                  </div>
 
                  {mode === 'extrude' && (
-                   <div className="border-t border-white/5 pt-3 mt-1">
-                     <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2 mb-2">
-                       <ImageIcon className="w-3 h-3 text-purple-400" />
-                       {t('editor3D.imageToHeightmap.title')}
+                   <div className="border-t border-white/5 pt-3 mt-1 pb-2 px-3 min-w-0">
+                     <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2 mb-1.5">
+                       <ImageIcon className="w-3 h-3 text-purple-400 shrink-0" />
+                       <span className="truncate">{t('editor3D.imageToHeightmap.title')}</span>
                      </h3>
-                     <p className="text-[10px] text-muted-foreground/60 mb-2 flex items-start gap-1">
+                     <p className="text-[10px] text-muted-foreground/60 mb-2 flex items-start gap-1 min-w-0 break-words">
                        <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
                        {t('editor3D.imageToHeightmap.hint')}
                      </p>
 
-                     <div className="flex items-center gap-2 mb-2">
-                       <input
-                         type="file"
-                         accept="image/*"
-                         ref={imageInputRef}
-                         onChange={(e) => {
-                           const file = e.target.files?.[0];
-                           if (file) handleImageToHeightmap(file);
-                           e.target.value = '';
-                         }}
-                         className="hidden"
-                       />
-                       <button
-                         onClick={() => imageInputRef.current?.click()}
-                         disabled={isImageLoading}
-                         className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border border-purple-500/30 disabled:opacity-40 transition-colors"
-                       >
-                         {isImageLoading ? (
-                           <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                         ) : (
-                           <Upload className="w-3.5 h-3.5" />
-                         )}
-                         {t('editor3D.imageToHeightmap.uploadBtn')}
-                       </button>
-                     </div>
+                     {/* Mandos a ancho completo de la columna: la pista de
+                         la rejilla ya es minmax(0,1fr), así que no desbordan
+                         ni dejan huecos libres a la derecha. */}
+                     <div className="flex flex-col gap-1.5 mb-1 min-w-0">
+                       <div className="flex items-center gap-2 min-w-0">
+                         <input
+                           type="file"
+                           accept="image/*"
+                           ref={imageInputRef}
+                           onChange={(e) => {
+                             const file = e.target.files?.[0];
+                             if (file) handleImageToHeightmap(file);
+                             e.target.value = '';
+                           }}
+                           className="hidden"
+                         />
+                         <button
+                           onClick={() => imageInputRef.current?.click()}
+                           disabled={isImageLoading}
+                           className="flex-1 min-w-0 flex items-center justify-center gap-1 px-1.5 py-1 rounded-md text-[10px] font-medium bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border border-purple-500/30 disabled:opacity-40 transition-colors"
+                         >
+                           {isImageLoading ? (
+                             <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                           ) : (
+                             <Upload className="w-3 h-3 shrink-0" />
+                           )}
+                           <span className="truncate">{t('editor3D.imageToHeightmap.uploadBtn')}</span>
+                         </button>
+                       </div>
 
-                     <div className="flex flex-col gap-1.5 mb-2">
-                       <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
-                         <span>{t('editor3D.imageToHeightmap.heightScale')}</span>
-                         <span className="font-mono text-[10px] text-green-400">
-                           {imageHeightScale.toFixed(1)}
-                         </span>
+                       <div className="flex flex-col gap-1 min-w-0">
+                         <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between gap-2 min-w-0">
+                           <span className="truncate">{t('editor3D.imageToHeightmap.heightScale')}</span>
+                           <span className="font-mono text-[10px] text-green-400 shrink-0">
+                             {imageHeightScale.toFixed(1)}
+                           </span>
+                         </label>
+                         <Slider
+                           min={0.5}
+                           max={20}
+                           step={0.5}
+                           value={[imageHeightScale]}
+                           onValueChange={([v]) => setImageHeightScale(v)}
+                           className="w-full h-3"
+                         />
+                       </div>
+
+                       <div className="grid grid-cols-2 gap-1.5 min-w-0">
+                         <div className="min-w-0">
+                           <label className="text-[10px] text-muted-foreground/80 truncate block">
+                             {t('editor3D.imageToHeightmap.cols')}
+                           </label>
+                           <input
+                             type="number"
+                             min={8}
+                             max={256}
+                             value={imageCols}
+                             onChange={(e) => setImageCols(Math.max(8, Math.min(256, parseInt(e.target.value) || 128)))}
+                             className="w-full min-w-0 px-1.5 py-0.5 text-[11px] bg-black/40 border border-white/10 rounded text-foreground"
+                           />
+                         </div>
+                         <div className="min-w-0">
+                           <label className="text-[10px] text-muted-foreground/80 truncate block">
+                             {t('editor3D.imageToHeightmap.rows')}
+                           </label>
+                           <input
+                             type="number"
+                             min={8}
+                             max={256}
+                             value={imageRows}
+                             onChange={(e) => setImageRows(Math.max(8, Math.min(256, parseInt(e.target.value) || 128)))}
+                             className="w-full min-w-0 px-1.5 py-0.5 text-[11px] bg-black/40 border border-white/10 rounded text-foreground"
+                           />
+                         </div>
+                       </div>
+
+                       <label className="flex items-center gap-2 cursor-pointer text-xs text-muted-foreground/80 min-w-0 pb-1">
+                         <input
+                           type="checkbox"
+                           checked={imageRemoveBackground}
+                           onChange={(e) => setImageRemoveBackground(e.target.checked)}
+                           className="w-3 h-3 shrink-0"
+                         />
+                         <span className="truncate">{t('editor3D.imageToHeightmap.removeBackground')}</span>
                        </label>
-                       <Slider
-                         min={0.5}
-                         max={20}
-                         step={0.5}
-                         value={[imageHeightScale]}
-                         onValueChange={([v]) => setImageHeightScale(v)}
-                         className="w-full"
-                       />
                      </div>
-
-                     <div className="grid grid-cols-2 gap-2 mb-2">
-                       <div>
-                         <label className="text-[10px] text-muted-foreground/80">
-                           {t('editor3D.imageToHeightmap.cols')}
-                         </label>
-                         <input
-                           type="number"
-                           min={8}
-                           max={256}
-                           value={imageCols}
-                           onChange={(e) => setImageCols(Math.max(8, Math.min(256, parseInt(e.target.value) || 128)))}
-                           className="w-full px-2 py-1 text-xs bg-black/40 border border-white/10 rounded text-foreground"
-                         />
-                       </div>
-                       <div>
-                         <label className="text-[10px] text-muted-foreground/80">
-                           {t('editor3D.imageToHeightmap.rows')}
-                         </label>
-                         <input
-                           type="number"
-                           min={8}
-                           max={256}
-                           value={imageRows}
-                           onChange={(e) => setImageRows(Math.max(8, Math.min(256, parseInt(e.target.value) || 128)))}
-                           className="w-full px-2 py-1 text-xs bg-black/40 border border-white/10 rounded text-foreground"
-                         />
-                       </div>
-                     </div>
-
-                     <label className="flex items-center gap-2 cursor-pointer text-xs text-muted-foreground/80">
-                       <input
-                         type="checkbox"
-                         checked={imageRemoveBackground}
-                         onChange={(e) => setImageRemoveBackground(e.target.checked)}
-                         className="w-3 h-3"
-                       />
-                       <span>{t('editor3D.imageToHeightmap.removeBackground')}</span>
-                     </label>
                    </div>
                  )}
              </Fragment>
@@ -11443,20 +12635,23 @@ pluginTracks,
                    activar/desactivar el manipulador y, en modo configuración,
                    ajustar qué asas están disponibles (mover, rotar, escalar)
                    antes de reactivarlo. */}
-               <div className="mt-2 border-t border-white/5 pt-2 space-y-1.5">
-                 <div className="flex items-center justify-between">
+               <div className="mt-2 border-t border-white/5 pt-2 space-y-1.5 px-3 pb-2 min-w-0">
+                 {/* gap + shrink-0 en los botones pequeños: sin ellos el
+                     botón Gizmo (flex-1) se estiraba de borde a borde y
+                     los pequeños quedaban cortados en el borde derecho. */}
+                 <div className="flex items-center gap-1.5 min-w-0">
                    <button
                      onClick={() => setShowGizmo(!showGizmo)}
                      data-testid="toggle-gizmo-btn"
                      title={showGizmo ? t('editor3D.gizmoHide') : t('editor3D.gizmoShow')}
-                     className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1 rounded-md text-[10px] font-medium transition-colors ${
+                     className={`flex-1 min-w-0 flex items-center justify-center gap-1.5 px-2 py-1 rounded-md text-[10px] font-medium transition-colors ${
                        showGizmo
                          ? 'bg-green-500/20 text-green-300 border border-green-500/30'
                          : 'bg-black/40 text-foreground/60 hover:text-foreground border border-white/10'
                      }`}
                    >
-                     <Settings className="w-3 h-3" />
-                     {t('editor3D.gizmoTool')}
+                     <Settings className="w-3 h-3 shrink-0" />
+                     <span className="truncate">{t('editor3D.gizmoTool')}</span>
                    </button>
                     <button
                       onClick={() => {
@@ -11480,7 +12675,7 @@ pluginTracks,
                       data-testid="gizmo-config-btn"
                       title={gizmoConfigMode ? t('editor3D.gizmoApply') : t('editor3D.gizmoConfigure')}
                       disabled={!selectedObjectId}
-                      className={`px-1.5 py-1 rounded-md text-[10px] font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${
+                      className={`px-1.5 py-1 shrink-0 rounded-md text-[10px] font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${
                         gizmoConfigMode
                           ? 'bg-green-500/20 text-green-300 border border-green-500/30'
                           : 'bg-black/40 text-foreground/60 hover:text-foreground border border-white/10'
@@ -11493,7 +12688,7 @@ pluginTracks,
                        data-testid="gizmo-center-btn"
                        title={t('editor3D.gizmoCenterOnObject')}
                        disabled={!selectedObjectId}
-                       className="px-1.5 py-1 rounded-md text-[10px] font-medium bg-black/40 text-foreground/60 hover:text-foreground border border-white/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                       className="px-1.5 py-1 shrink-0 rounded-md text-[10px] font-medium bg-black/40 text-foreground/60 hover:text-foreground border border-white/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                      >
                        <Target className="w-3 h-3" />
                     </button>
@@ -11536,6 +12731,140 @@ pluginTracks,
                     </div>
                   )}
                </div>
+               {/* Giro de la multi-selección: por defecto la selección
+                   entera gira como una sola pieza alrededor del centro del
+                   conjunto; activado, cada objeto gira sobre su propio
+                   centro. La alineación no se ve afectada. */}
+               <div className="mt-2 border-t border-white/5 pt-2 px-3 pb-2">
+                 <label
+                   data-testid="toggle-giro-individual"
+                   title={t('editor3D.individualRotationHint')}
+                   className="flex items-center gap-2 cursor-pointer select-none"
+                 >
+                   <input
+                     type="checkbox"
+                     checked={giroIndividual}
+                     onChange={(e) => setGiroIndividual(e.target.checked)}
+                     className="w-4 h-4 accent-green-500 cursor-pointer"
+                   />
+                   <span className="text-[11px] font-medium text-foreground/80">
+                     {t('editor3D.individualRotation')}
+                   </span>
+                 </label>
+               </div>
+              {/* ▼ Re-edición en vivo de plugins: si el objeto seleccionado
+                  (selección simple) tiene un plugin aplicado (o lo generó
+                  uno), se muestran aquí sus parámetros editables. ▼ */}
+              {selectedObjectIds.length <= 1 && selectedObjectId && (() => {
+                const liveRec = sceneObjects.find((o) => o.id === selectedObjectId)?.pluginEdit;
+                if (!liveRec) return null;
+                const livePlugin = obtenerPlugin(liveRec.pluginId);
+                return (
+                  <div className="border-t border-white/5 px-3 py-3 space-y-2 bg-[hsl(224_50%_6%)] shrink-0 min-w-0">
+                    <h3 className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center gap-2 min-w-0">
+                      <Puzzle className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                      <span className="truncate">{t('editor3D.plugins.liveTitle')}</span>
+                      {livePlugin && (
+                        <span className="shrink-0 text-[9px] font-mono text-violet-300 bg-violet-500/10 border border-violet-500/30 rounded px-1.5 py-0.5 truncate">
+                          {livePlugin.nombre}
+                        </span>
+                      )}
+                    </h3>
+                    {!livePlugin ? (
+                      <p className="text-[10px] text-amber-300/80 break-words">
+                        {t('editor3D.plugins.liveMissing')}
+                      </p>
+                    ) : (
+                      <div className="flex flex-col gap-1.5 min-w-0">
+                        {livePlugin.params.map((param) => {
+                          if (param.tipo === 'slider') {
+                            const valor = typeof liveRec.valores[param.id] === 'number'
+                              ? (liveRec.valores[param.id] as number)
+                              : param.valor;
+                            return (
+                              <div key={param.id} className="flex flex-col gap-1 min-w-0">
+                                <div className="flex items-center justify-between gap-1.5 min-w-0">
+                                  <span className="text-[10px] text-foreground/90 truncate">{param.etiqueta}</span>
+                                  <span className="shrink-0 text-[9px] text-violet-300 font-mono bg-violet-500/10 border border-violet-500/30 rounded px-1 py-0.5">
+                                    {valor}{param.unidad ?? ''}
+                                  </span>
+                                </div>
+                                <Slider
+                                  value={[valor]}
+                                  min={param.min}
+                                  max={param.max}
+                                  step={param.paso ?? 1}
+                                  onValueChange={(vals: number[]) =>
+                                    handleLivePluginParam(selectedObjectId, {
+                                      ...liveRec.valores,
+                                      [param.id]: vals[0],
+                                    })
+                                  }
+                                />
+                                {param.descripcion && (
+                                  <span className="text-[9px] text-muted-foreground/70 break-words">
+                                    {param.descripcion}
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          }
+                          if (param.tipo === 'select') {
+                            return (
+                              <div key={param.id} className="flex flex-col gap-1 min-w-0">
+                                <span className="text-[10px] text-foreground/90 truncate">{param.etiqueta}</span>
+                                <select
+                                  value={
+                                    typeof liveRec.valores[param.id] === 'string'
+                                      ? (liveRec.valores[param.id] as string)
+                                      : param.valor
+                                  }
+                                  onChange={(e) =>
+                                    handleLivePluginParam(selectedObjectId, {
+                                      ...liveRec.valores,
+                                      [param.id]: e.target.value,
+                                    })
+                                  }
+                                  className="w-full min-w-0 bg-black/40 border border-white/10 rounded px-1.5 py-1 text-[11px] text-foreground focus:outline-none focus:border-violet-500"
+                                >
+                                  {param.opciones.map((op) => (
+                                    <option key={op.valor} value={op.valor}>
+                                      {op.etiqueta}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                            );
+                          }
+                          // check
+                          return (
+                            <label
+                              key={param.id}
+                              className="flex items-center justify-between gap-2 cursor-pointer min-w-0"
+                            >
+                              <span className="text-[10px] text-foreground/90 truncate">{param.etiqueta}</span>
+                              <input
+                                type="checkbox"
+                                checked={liveRec.valores[param.id] !== false}
+                                onChange={(e) =>
+                                  handleLivePluginParam(selectedObjectId, {
+                                    ...liveRec.valores,
+                                    [param.id]: e.target.checked,
+                                  })
+                                }
+                                className="shrink-0 accent-violet-500"
+                              />
+                            </label>
+                          );
+                        })}
+                        <p className="text-[9px] text-muted-foreground/70 break-words">
+                          {t('editor3D.plugins.liveHint')}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
               {/* ▼ Apariencia centralizada: un solo juego de color y
                   textura, aquí en Escena, que se aplica a los objetos
                   seleccionados (y queda como base de lo que se
@@ -11692,18 +13021,86 @@ pluginTracks,
                     />
                     {t('editor3D.textureHelper')}
                     {(textureHelper || textureHelperDirty) && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setTextureHelperTransform(IDENTITY_TRANSFORM)
-                        }
-                        className="ml-auto px-1.5 py-0.5 rounded border border-white/10 bg-black/40 hover:bg-white/10"
-                        title={t('editor3D.restore')}
-                      >
-                        ↺
-                      </button>
+                      <span className="ml-auto flex items-center gap-1">
+                        {/* Cuadrar el proyector con los ejes: posición y
+                            rotación a cero, conservando el tamaño de la
+                            pieza (la escala queda como esté). */}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setTextureHelperTransform((prev) => ({
+                              ...prev,
+                              px: 0,
+                              py: 0,
+                              pz: 0,
+                              rx: 0,
+                              ry: 0,
+                              rz: 0,
+                            }))
+                          }
+                          className="px-1.5 py-0.5 rounded border border-white/10 bg-black/40 hover:bg-white/10"
+                          title={t('editor3D.textureHelperAxes')}
+                          data-testid="texture-helper-axes"
+                        >
+                          ⌖
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setTextureHelperTransform(IDENTITY_TRANSFORM)
+                          }
+                          className="px-1.5 py-0.5 rounded border border-white/10 bg-black/40 hover:bg-white/10"
+                          title={t('editor3D.restore')}
+                        >
+                          ↺
+                        </button>
+                      </span>
                     )}
                   </label>
+                  {/* Campos numéricos de la ayuda de textura: posición,
+                      rotación (en grados) y escala del transform de la
+                      guía. Solo con la ayuda activada. */}
+                  {textureHelper && (
+                    <div className="mt-1 flex flex-col gap-1 min-w-0" data-testid="texture-helper-fields">
+                      {([
+                        { grupo: `${t('editor3D.motion.position')}`, campo: 'p', paso: 0.1, esRot: false },
+                        { grupo: `${t('editor3D.motion.rotation')} (°)`, campo: 'r', paso: 5, esRot: true },
+                        { grupo: t('editor3D.motion.scale'), campo: 's', paso: 0.1, esRot: false },
+                      ] as const).map(({ grupo, campo, paso, esRot }) => (
+                        <div key={campo} className="flex flex-col gap-0.5 min-w-0">
+                          <span className="text-[10px] text-muted-foreground/80">{grupo}</span>
+                          <div className="grid grid-cols-3 gap-1 min-w-0">
+                            {(['x', 'y', 'z'] as const).map((eje) => {
+                              const clave = `${campo}${eje}` as 'px' | 'py' | 'pz' | 'rx' | 'ry' | 'rz' | 'sx' | 'sy' | 'sz';
+                              const rad = Math.PI / 180;
+                              const valor = esRot
+                                ? Math.round((textureHelperTransform[clave] / rad) * 10) / 10
+                                : Math.round(textureHelperTransform[clave] * 100) / 100;
+                              return (
+                                <div key={eje} className="flex items-center gap-0.5 min-w-0">
+                                  <span className="text-[9px] text-muted-foreground/70 shrink-0">{eje.toUpperCase()}</span>
+                                  <input
+                                    type="number"
+                                    step={paso}
+                                    value={valor}
+                                    onChange={(e) => {
+                                      const n = parseFloat(e.target.value);
+                                      if (Number.isNaN(n)) return;
+                                      setTextureHelperTransform((prev) => ({
+                                        ...prev,
+                                        [clave]: esRot ? n * rad : campo === 's' ? Math.max(0.01, n) : n,
+                                      }));
+                                    }}
+                                    className="w-full min-w-0 px-1 py-0.5 text-[10px] bg-black/40 border border-white/10 rounded text-foreground focus:outline-none focus:border-green-500"
+                                  />
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   <label className="text-[10px] text-muted-foreground/80 mt-1">
                     {t('editor3D.textureFinish')}
                   </label>
@@ -13852,6 +15249,64 @@ pluginTracks,
                 className="px-4 py-2 rounded-md text-sm font-bold bg-red-500 hover:bg-red-600 text-white transition-colors"
               >
                 {t('editor3D.delete')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {alignModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+          onClick={() => setAlignModalOpen(false)}
+          data-testid="align-modal"
+        >
+          <div
+            className="bg-[hsl(224_50%_10%)] border border-emerald-500/30 rounded-xl p-6 max-w-md w-full shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-3 mb-2">
+              <div className="w-9 h-9 rounded-lg bg-emerald-500/15 flex items-center justify-center border border-emerald-500/30">
+                <Magnet className="w-4 h-4 text-emerald-400" />
+              </div>
+              <h3 className="text-base font-bold text-foreground">
+                {t('editor3D.align')}
+              </h3>
+            </div>
+            <p className="text-sm text-muted-foreground mb-4">
+              {t('editor3D.alignDesc')}
+            </p>
+            <div className="grid grid-cols-2 gap-2">
+              {([
+                { mode: 'horizontal', icon: AlignCenterHorizontal, label: t('editor3D.alignHorizontal'), desc: t('editor3D.alignHorizontalDesc') },
+                { mode: 'vertical', icon: AlignCenterVertical, label: t('editor3D.alignVertical'), desc: t('editor3D.alignVerticalDesc') },
+                { mode: 'left', icon: AlignStartVertical, label: t('editor3D.alignLeft'), desc: t('editor3D.alignLeftDesc') },
+                { mode: 'right', icon: AlignEndVertical, label: t('editor3D.alignRight'), desc: t('editor3D.alignRightDesc') },
+                { mode: 'top', icon: AlignStartHorizontal, label: t('editor3D.alignTop'), desc: t('editor3D.alignTopDesc') },
+                { mode: 'bottom', icon: AlignEndHorizontal, label: t('editor3D.alignBottom'), desc: t('editor3D.alignBottomDesc') },
+              ] as const).map((opt) => {
+                const Icon = opt.icon;
+                return (
+                  <button
+                    key={opt.mode}
+                    onClick={() => applyAlignment(opt.mode)}
+                    data-testid={`align-${opt.mode}`}
+                    className="text-left px-3 py-2.5 rounded-md bg-white/5 hover:bg-emerald-500/15 border border-white/10 hover:border-emerald-500/40 transition-colors"
+                  >
+                    <div className="flex items-center gap-2">
+                      <Icon className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <div className="text-sm font-bold text-foreground">{opt.label}</div>
+                    </div>
+                    <div className="text-[10px] text-muted-foreground leading-tight mt-1">{opt.desc}</div>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="flex justify-end mt-4">
+              <button
+                onClick={() => setAlignModalOpen(false)}
+                className="px-4 py-2 rounded-md text-sm font-medium bg-white/5 hover:bg-white/10 text-muted-foreground border border-white/10 transition-colors"
+              >
+                {t('editor3D.cancel')}
               </button>
             </div>
           </div>

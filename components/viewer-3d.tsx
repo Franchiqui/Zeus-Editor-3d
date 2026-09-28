@@ -267,6 +267,9 @@ interface Viewer3DProps {
    onObjectSelect?: (id: string) => void;
    /** IDs de objetos seleccionados en modo multi-selección */
    selectedObjectIds?: string[];
+   /** Giro individual: cada objeto seleccionado gira sobre su propio centro
+    *  (desactivado = la selección entera gira como una sola pieza) */
+   giroIndividual?: boolean;
    /** Notifica al padre del cambio en la selección múltiple */
    onSelectionChange?: (ids: string[]) => void;
     /** Activar modo de selección por rectángulo (rubber-band) */
@@ -1052,6 +1055,13 @@ type GizmoDrag = {
     /** Posición MUNDIAL del objeto al empezar el arrastre: base fija para
      *  la órbita, evita acumular la posición por frame (dq es ángulo total). */
     startObjectPos?: THREE.Vector3;
+    /** Multi-selección: centro del CONJUNTO seleccionado al empezar el
+     *  arrastre; el gizmo se queda anclado a él durante el gesto. */
+    multiCenter?: THREE.Vector3;
+    /** Vista previa del giro multi-selección: rotación total desde el inicio
+     *  (dq) y de la órbita del conjunto (dqOrbit), actualizada por frame. */
+    lastDq?: THREE.Quaternion;
+    lastDqOrbit?: THREE.Quaternion;
   };
 
 /** Colores del manipulador por eje (rojo X, verde Y, azul Z) */
@@ -1940,6 +1950,7 @@ export default function Viewer3D({
     configRelief,
   onObjectSelect,
   selectedObjectIds,
+  giroIndividual,
   onSelectionChange,
     selectionMode,
     onSelectionModeChange,
@@ -2180,6 +2191,8 @@ export default function Viewer3D({
     const selectionStartRef = useRef<{ x: number; y: number; rect: DOMRect } | null>(null);
     const selectionRectRef = useRef<HTMLDivElement | null>(null);
     const multiTransformStartRef = useRef<Record<string, ObjectTransform>>({});
+    const giroIndividualRef = useRef(giroIndividual);
+    giroIndividualRef.current = giroIndividual ?? false;
     const lightConfigRef = useRef(lightConfig);
     lightConfigRef.current = lightConfig;
 
@@ -2509,6 +2522,31 @@ export default function Viewer3D({
    const onMultiObjectTransformRef = useRef(onMultiObjectTransform);
    onMultiObjectTransformRef.current = onMultiObjectTransform;
 
+  // Centro del CONJUNTO multi-seleccionado: centro de la caja que envuelve
+  // a todos los objetos seleccionados (el activo va en la figura principal,
+  // el resto como duplicados). Sirve de pivote del gizmo y del giro de
+  // conjunto. Devuelve null si no hay selección múltiple o geometría.
+  const computeSelectionCenter = useCallback((): THREE.Vector3 | null => {
+    const meshGroup = meshGroupRef.current;
+    const selIds = selectedObjectIdsRef.current ?? [];
+    if (!meshGroup || selIds.length < 2) return null;
+    meshGroup.updateMatrixWorld();
+    const box = new THREE.Box3();
+    const activoId = meshGroup.userData.sceneObjectId as string | undefined;
+    const principal = meshGroup.children.find(
+      (c) => !c.userData.sceneObjectDuplicate
+    );
+    if (principal && activoId && selIds.includes(activoId)) {
+      box.expandByObject(principal);
+    }
+    for (const child of meshGroup.children) {
+      if (!child.userData.sceneObjectDuplicate) continue;
+      if (!selIds.includes(child.userData.sceneObjectId)) continue;
+      box.expandByObject(child);
+    }
+    if (box.isEmpty()) return null;
+    return box.getCenter(new THREE.Vector3());
+  }, []);
 
   // Aplica el transform a la malla y a sus acompañantes. El gizmo y las
   // partículas solo toman posición y rotación: las flechas mantienen su
@@ -2552,6 +2590,58 @@ export default function Viewer3D({
         child.matrix.copy(inverseSelected).multiply(objectMatrix);
         child.matrixAutoUpdate = false;
       }
+      // Vista previa EN VIVO del giro multi-selección: durante un arrastre
+      // de rotación, los demás objetos seleccionados giran al tiempo con el
+      // activo (los duplicados no seleccionados permanecen quietos).
+      const dragGiro = gizmoDragRef.current;
+      if (
+        dragGiro &&
+        dragGiro.target === 'object' &&
+        dragGiro.mode === 'rotate' &&
+        dragGiro.lastDq &&
+        dragGiro.lastDqOrbit
+      ) {
+        const selIds = selectedObjectIdsRef.current ?? [];
+        if (selIds.length > 1 && selIds.includes(selectedId)) {
+          const startTransforms = multiTransformStartRef.current;
+          for (const child of meshGroup.children) {
+            if (!child.userData.sceneObjectDuplicate) continue;
+            const objId = child.userData.sceneObjectId as string | undefined;
+            if (!objId || objId === selectedId || !selIds.includes(objId)) continue;
+            const startObj = startTransforms[objId];
+            if (!startObj) continue;
+            const startQuatHijo = new THREE.Quaternion().setFromEuler(
+              new THREE.Euler(startObj.rx, startObj.ry, startObj.rz)
+            );
+            let posHijo: THREE.Vector3;
+            let quatHijo: THREE.Quaternion;
+            if (giroIndividualRef.current) {
+              // Giro individual: cada objeto gira sobre su propio centro,
+              // con la misma rotación de mundo que el activo; posición fija.
+              posHijo = new THREE.Vector3(startObj.px, startObj.py, startObj.pz);
+              quatHijo = startQuatHijo.clone().premultiply(dragGiro.lastDq);
+            } else {
+              // Giro de conjunto: todos órbitan alrededor del centro del
+              // conjunto con la misma rotación: giran como una sola pieza.
+              posHijo = new THREE.Vector3(startObj.px, startObj.py, startObj.pz)
+                .sub(dragGiro.startPos)
+                .applyQuaternion(dragGiro.lastDqOrbit)
+                .add(dragGiro.startPos);
+              quatHijo = startQuatHijo.clone().premultiply(dragGiro.lastDqOrbit);
+            }
+            child.matrix
+              .copy(inverseSelected)
+              .multiply(
+                new THREE.Matrix4().compose(
+                  posHijo,
+                  quatHijo,
+                  new THREE.Vector3(startObj.sx, startObj.sy, startObj.sz)
+                )
+              );
+            child.matrixAutoUpdate = false;
+          }
+        }
+      }
     }
     full(glowGroupRef.current, true);
     full(vertexHelpersRef.current, true);
@@ -2578,6 +2668,35 @@ export default function Viewer3D({
       const baseScale = gizmoBaseScaleRef.current || 1;
       giz.scale.set(baseScale * off.sx, baseScale * off.sy, baseScale * off.sz);
       }
+     // Multi-selección: el manipulador se centra en el CONJUNTO de los
+     // objetos seleccionados (caja que los envuelve), no en el objeto
+     // activo. Durante un arrastre se queda anclado al pivote del gesto.
+     const gizMulti = gizmoGroupRef.current;
+     if (gizMulti) {
+       const selIdsMulti = selectedObjectIdsRef.current ?? [];
+       if (!selectionModeRef.current && selIdsMulti.length > 1) {
+         const dragMulti = gizmoDragRef.current;
+         if (dragMulti && dragMulti.target === 'object' && dragMulti.multiCenter) {
+           if (dragMulti.mode === 'rotate') {
+             gizMulti.position.copy(dragMulti.multiCenter);
+           } else {
+             const startActive = multiTransformStartRef.current[
+               selectedObjectIdRef.current ?? ''
+             ];
+             if (startActive) {
+               gizMulti.position.set(
+                 dragMulti.multiCenter.x + (t.px - startActive.px),
+                 dragMulti.multiCenter.y + (t.py - startActive.py),
+                 dragMulti.multiCenter.z + (t.pz - startActive.pz)
+               );
+             }
+           }
+         } else if (!dragMulti) {
+           const centro = computeSelectionCenter();
+           if (centro) gizMulti.position.copy(centro);
+         }
+       }
+     }
     if (lightGizmoGroupRef.current) {
       lightGizmoGroupRef.current.visible = false;
     }
@@ -2721,15 +2840,43 @@ export default function Viewer3D({
       const zoom = Math.max(0.1, Math.min(5, dist > 0 ? baseDistance / dist : 1));
       // Calcular rotaciones desde la dirección cámara→target
       const dir = pos.clone().sub(tgt).normalize();
-       const rotX = Math.asin(Math.max(-1, Math.min(1, dir.y)));
-       const rotY = Math.atan2(dir.x, dir.z);
-       const camState = {
-         zoom,
-         offsetX: tgt.x,
-         offsetY: tgt.y,
-         rotationX: Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, rotX)),
-         rotationY: rotY,
-       };
+      // Vistas cenitales (superior/inferior mirando justo al polo): el
+      // recorte a ±(π/2−0.01) dejaba rotX justo fuera de la tolerancia
+      // isTopView/isBottomView del visor (la vista dejaba de reconocerse) y
+      // el offset vertical real va por Z del objetivo (tgt.y es siempre 0).
+      // Sin esto, cada eco de OrbitControls corrompía el estado y los
+      // botones ▲▼◀▶ de la ventana superior se movían por ejes equivocados.
+      // El umbral es cos(0.01) para que el camino normal nunca pierda
+      // precisión al recortar.
+      const cenital = Math.abs(dir.y) > Math.cos(0.01);
+      const rotX = Math.asin(Math.max(-1, Math.min(1, dir.y)));
+      const rotY = Math.atan2(dir.x, dir.z);
+      const camState = cenital
+        ? {
+            zoom,
+            offsetX: tgt.x,
+            offsetY: tgt.z,
+            rotationX: dir.y > 0 ? Math.PI / 2 : -Math.PI / 2,
+            rotationY: 0,
+          }
+        : // Vistas laterales (costado izq./der.): el eje horizontal real va
+          // por Z del objetivo (tgt.x es siempre 0); sin esto cada eco
+          // perdía el desplazamiento de ◀▶ en las ventanas laterales.
+          Math.abs(dir.x) > Math.cos(0.01)
+        ? {
+            zoom,
+            offsetX: tgt.z,
+            offsetY: tgt.y,
+            rotationX: rotX,
+            rotationY: dir.x > 0 ? Math.PI / 2 : -Math.PI / 2,
+          }
+        : {
+            zoom,
+            offsetX: tgt.x,
+            offsetY: tgt.y,
+            rotationX: Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, rotX)),
+            rotationY: rotY,
+          };
       // Solo emitir al padre si el estado CAMBIÓ de verdad: con
       // auto-rotar 'change' vuela por cada frame, y re-emitir el mismo
       // estado solo provocaría renders y ecos inútiles.
@@ -4759,6 +4906,13 @@ export default function Viewer3D({
           drag.axisWorld,
           swept
         );
+        // Vista previa del giro multi-selección: el activo y el resto de
+        // seleccionados comparten estas rotaciones (dq: giro individual;
+        // dqOrbit: órbita del conjunto alrededor del centro).
+        if (drag.target === 'object') {
+          drag.lastDq = dq;
+          drag.lastDqOrbit = dqOrbit;
+        }
         if (drag.rotatePivot) {
           // Gizmo desplazado (offset activo) sobre un único objeto: el objeto
           // rota ORBITANDO alrededor del pivote (posición de mundo del gizmo).
@@ -5462,19 +5616,34 @@ export default function Viewer3D({
       // mismo punto de mundo (se re-deriva al render).
       let gizmoPivot: THREE.Vector3 | undefined;
       if (target === 'object' && ud.mode === 'rotate') {
-        const off = gizmoOffsetRef.current;
-        if (off.px || off.py || off.pz) {
-          const isSingle =
-            !selectionModeRef.current &&
-            (selectedObjectIdsRef.current?.length ?? 0) <= 1;
-          if (isSingle) {
-            const objQuat = new THREE.Quaternion().setFromEuler(
-              new THREE.Euler(t.rx, t.ry, t.rz)
-            );
-            const objPos = new THREE.Vector3(t.px, t.py, t.pz);
-            gizmoPivot = new THREE.Vector3(off.px, off.py, off.pz)
-              .applyQuaternion(objQuat)
-              .add(objPos);
+        const selIdsMulti = selectedObjectIdsRef.current ?? [];
+        const esMulti =
+          !selectionModeRef.current && selIdsMulti.length > 1;
+        if (esMulti) {
+          // Multi-selección: el giro se mide desde el centro del CONJUNTO.
+          // Sin giro individual el conjunto rota como UNA pieza: el activo
+          // órbita alrededor de ese centro (rotatePivot) y el resto de
+          // seleccionados los arrastra la misma rotación (release).
+          const centro =
+            startPosOverride ?? computeSelectionCenter();
+          if (centro && !giroIndividualRef.current) {
+            gizmoPivot = centro;
+          }
+        } else {
+          const off = gizmoOffsetRef.current;
+          if (off.px || off.py || off.pz) {
+            const isSingle =
+              !selectionModeRef.current &&
+              (selectedObjectIdsRef.current?.length ?? 0) <= 1;
+            if (isSingle) {
+              const objQuat = new THREE.Quaternion().setFromEuler(
+                new THREE.Euler(t.rx, t.ry, t.rz)
+              );
+              const objPos = new THREE.Vector3(t.px, t.py, t.pz);
+              gizmoPivot = new THREE.Vector3(off.px, off.py, off.pz)
+                .applyQuaternion(objQuat)
+                .add(objPos);
+            }
           }
         }
       }
@@ -6076,6 +6245,13 @@ export default function Viewer3D({
           const objectAxisOverride = GIZMO_AXIS_DIR[ud.axis]
             .clone()
             .applyQuaternion(gizmoWorldQuatForDrag);
+          // Multi-selección: centro del CONJUNTO seleccionado. En rotación
+          // es el pivote del giro (plano del anillo); en mover/escalar solo
+          // ancla el gizmo durante el gesto.
+          const selIdsMulti = selectedObjectIdsRef.current ?? [];
+          const esMulti =
+            !selectionModeRef.current && selIdsMulti.length > 1;
+          const centroMulti = esMulti ? computeSelectionCenter() : undefined;
           const drag = makeGizmoDrag(
             ud,
             transformRef.current,
@@ -6086,9 +6262,11 @@ export default function Viewer3D({
             undefined,
             undefined,
             undefined,
-            objectAxisOverride
+            objectAxisOverride,
+            ud.mode === 'rotate' ? (centroMulti ?? undefined) : undefined
           );
           if (!drag) return;
+          if (centroMulti) drag.multiCenter = centroMulti;
           // Store initial transforms of all selected objects for multi-transform
           const selIds = selectedObjectIdsRef.current ?? [];
           multiTransformStartRef.current = {};
@@ -6823,6 +7001,7 @@ export default function Viewer3D({
       if (gizmoDragRef.current) {
         const wasHelper = gizmoDragRef.current.target === 'texture';
         const wasGizmo = gizmoDragRef.current.target === 'gizmo';
+        const dragFinal = gizmoDragRef.current;
         gizmoDragRef.current = null;
         controls.enabled = true;
         renderer.domElement.style.cursor = '';
@@ -6880,12 +7059,6 @@ export default function Viewer3D({
             const updatedTransforms: { id: string; transform: ObjectTransform }[] = [];
             const startActive = startTransforms[activeId ?? ''];
             if (startActive) {
-              const deltaPos = {
-                x: t.px - startActive.px,
-                y: t.py - startActive.py,
-                z: t.pz - startActive.pz,
-              };
-              // Quaternion delta for rotation
               const startQuat = new THREE.Quaternion().setFromEuler(
                 new THREE.Euler(startActive.rx, startActive.ry, startActive.rz)
               );
@@ -6893,6 +7066,50 @@ export default function Viewer3D({
                 new THREE.Euler(t.rx, t.ry, t.rz)
               );
               const deltaQuat = endQuat.clone().multiply(startQuat.invert());
+              if (
+                dragFinal &&
+                dragFinal.target === 'object' &&
+                dragFinal.mode === 'rotate' &&
+                !giroIndividualRef.current
+              ) {
+                // Giro de CONJUNTO (multi-selección, giro individual
+                // apagado): cada seleccionado órbita alrededor del centro
+                // del conjunto con la misma rotación total que el activo,
+                // de modo que la composición gira como una sola pieza.
+                const pivot = dragFinal.startPos;
+                for (const id of selIds) {
+                  if (id === activeId) continue;
+                  const startObj = startTransforms[id];
+                  if (!startObj) continue;
+                  const quat = new THREE.Quaternion().setFromEuler(
+                    new THREE.Euler(startObj.rx, startObj.ry, startObj.rz)
+                  );
+                  const pos = new THREE.Vector3(
+                    startObj.px, startObj.py, startObj.pz
+                  ).sub(pivot).applyQuaternion(deltaQuat).add(pivot);
+                  const newQuat = deltaQuat.clone().multiply(quat);
+                  const newEuler = new THREE.Euler().setFromQuaternion(newQuat, 'XYZ');
+                  updatedTransforms.push({
+                    id,
+                    transform: {
+                      px: pos.x,
+                      py: pos.y,
+                      pz: pos.z,
+                      rx: newEuler.x,
+                      ry: newEuler.y,
+                      rz: newEuler.z,
+                      sx: startObj.sx,
+                      sy: startObj.sy,
+                      sz: startObj.sz,
+                    },
+                  });
+                }
+              } else {
+              const deltaPos = {
+                x: t.px - startActive.px,
+                y: t.py - startActive.py,
+                z: t.pz - startActive.pz,
+              };
               // Scale delta (factor)
               const deltaScale = {
                 x: startActive.sx !== 0 ? t.sx / startActive.sx : 1,
@@ -6922,6 +7139,7 @@ export default function Viewer3D({
                     sz: startObj.sz * deltaScale.z,
                   },
                 });
+              }
               }
             }
             if (updatedTransforms.length > 0) {
@@ -8100,13 +8318,34 @@ export default function Viewer3D({
       highlightGroup.clear();
       const selectedIds = selectedObjectIdsRef.current ?? [];
        if (selectedIds.length === 0) return;
+      const cajaUnion = new THREE.Box3();
+      const activoId = meshGroup.userData.sceneObjectId as string | undefined;
+      const principal = meshGroup.children.find(
+        (c) => !c.userData.sceneObjectDuplicate
+      );
+      if (principal && activoId && selectedIds.includes(activoId)) {
+        cajaUnion.expandByObject(principal);
+      }
        for (const child of meshGroup.children) {
         if (!child.userData.sceneObjectDuplicate) continue;
         if (!selectedIds.includes(child.userData.sceneObjectId)) continue;
         const box = new THREE.Box3().setFromObject(child);
         if (box.isEmpty()) continue;
+        cajaUnion.union(box);
         const helper = new THREE.Box3Helper(box, 0x38bdf8);
         highlightGroup.add(helper);
+      }
+      // El gizmo multi-selección se centra en el conjunto al cambiar la
+      // selección (el gizmo solo se re-deriva con el transform del activo).
+      const giz = gizmoGroupRef.current;
+      if (
+        giz &&
+        selectedIds.length > 1 &&
+        !cajaUnion.isEmpty() &&
+        !gizmoDragRef.current &&
+        !selectionModeRef.current
+      ) {
+        giz.position.copy(cajaUnion.getCenter(new THREE.Vector3()));
       }
      }, [selectedObjectIds, objects?.length, forceObjectsUpdate]);
     // --- (toolId) tanto si es un duplicate como si es el mesh principal

@@ -48,6 +48,8 @@ interface ViewerPanelProps {
     sceneObjects: any[];
     handleObjectSelect: (id: string | null) => void;
     selectedObjectIds?: string[];
+    /** Giro individual: cada objeto seleccionado gira sobre su propio centro */
+    giroIndividual?: boolean;
     onSelectionChange?: (ids: string[]) => void;
     selectionMode?: boolean;
     onSelectionModeChange?: (active: boolean) => void;
@@ -184,6 +186,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
     sceneObjects,
     handleObjectSelect,
     selectedObjectIds,
+    giroIndividual,
     onSelectionChange,
     selectionMode,
     onSelectionModeChange,
@@ -461,6 +464,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
           selectedObjectId={selectedObjectId ?? undefined}
           onObjectSelect={handleObjectSelect}
           selectedObjectIds={selectedObjectIds}
+          giroIndividual={giroIndividual}
           onSelectionChange={onSelectionChange}
            selectionMode={selectionMode}
            onSelectionModeChange={onSelectionModeChange}

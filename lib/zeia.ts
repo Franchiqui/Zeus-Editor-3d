@@ -104,6 +104,8 @@ export type ZeiaApplyResult = {
   updated: number;
   removed: number;
   motions: number;
+  /** Pistas de efecto visual creadas por `effects.apply` (opcional). */
+  effects?: number;
   warnings: string[];
 };
 

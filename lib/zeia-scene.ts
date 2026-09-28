@@ -1,5 +1,5 @@
 import type { Mesh, ObjectTransform, Vertex3D } from './geometry';
-import type { TransformProperty, TransformTrack } from './animation';
+import type { EffectKeyframe, EffectProperty, EffectTrack, TransformProperty, TransformTrack } from './animation';
 import type { ZeiaApplyResult, ZeiaAppliedPlan, ZeiaPlanStep } from './zeia';
 import { buildPrimitiveMesh, fallbackMesh, normalizePrimitiveName, primitiveIsSmooth, type ZeiaPrimitiveName } from './zeia-primitives';
 
@@ -33,11 +33,14 @@ export type ApplyZeiaOptions = {
   idMap?: Record<string, string>;
   /** ID del último objeto creado (para resolver referencias entre llamadas individuales). */
   lastCreatedId?: string | null;
+  /** Pistas de efectos visuales actuales (in/out: se devuelven ampliadas). */
+  effectTracks?: EffectTrack[];
 };
 
 export type ApplyZeiaOutput<T extends ZeiaSceneObject> = {
   objects: T[];
   transformTracks: TransformTrack[];
+  effectTracks: EffectTrack[];
   result: ZeiaApplyResult;
   idMap: Record<string, string>;
   lastCreatedId: string | null;
@@ -160,6 +163,41 @@ function valuesOf(t: ObjectTransform): Partial<Record<TransformProperty, number>
   return { px: t.px, py: t.py, pz: t.pz, rx: t.rx, ry: t.ry, rz: t.rz, sx: t.sx, sy: t.sy, sz: t.sz };
 }
 
+/**
+ * Fotograma flexible de una animación por keyframes: `time` en segundos y
+ * parches parciales de transformada (position/rotation en GRADOS/scale).
+ * También acepta `t` como alias de `time`.
+ */
+function keyframeTransform(
+  base: ObjectTransform,
+  kf: unknown,
+  fallbackTime: number
+): { time: number; values: Partial<Record<TransformProperty, number>> } | null {
+  if (!kf || typeof kf !== 'object') return null;
+  const k = kf as Record<string, unknown>;
+  const time = Math.max(0, num(k.time ?? k.t, fallbackTime));
+  let out = { ...base };
+  if ('position' in k) {
+    const [x, y, z] = triple(k.position, [out.px, out.py, out.pz]);
+    out = { ...out, px: x, py: y, pz: z };
+  }
+  if ('rotation' in k) {
+    // Puede venir un solo número (grados en Y) o un triple [rx, ry, rz].
+    if (typeof k.rotation === 'number') {
+      out = { ...out, ry: k.rotation * RAD };
+    } else {
+      const [rx, ry, rz] = triple(k.rotation, [out.rx / RAD, out.ry / RAD, out.rz / RAD]);
+      out = { ...out, rx: rx * RAD, ry: ry * RAD, rz: rz * RAD };
+    }
+  }
+  if ('scale' in k) {
+    const raw = typeof k.scale === 'number' ? [k.scale, k.scale, k.scale] : k.scale;
+    const [sx, sy, sz] = triple(raw, [out.sx, out.sy, out.sz]);
+    out = { ...out, sx, sy, sz };
+  }
+  return { time, values: valuesOf(out) };
+}
+
 function buildMotionTrack<T extends ZeiaSceneObject>(
   target: T,
   params: Record<string, unknown>,
@@ -170,9 +208,36 @@ function buildMotionTrack<T extends ZeiaSceneObject>(
   const loop = params.loop === true;
   const degrees = num(params.degrees, 360);
   const base = { ...target.transform };
-  let end: ObjectTransform;
+  let end: ObjectTransform = { ...base };
+  let keyframeTimes: Array<{ time: number; values: Partial<Record<TransformProperty, number>> }> | null = null;
+
+  // Animación por keyframes explícitos: cada uno parchea la transformada
+  // sobre el estado del objeto y manda sobre el tipo declarado.
+  const kfRaw = params.keyframes;
+  if (Array.isArray(kfRaw) && kfRaw.length >= 2) {
+    const paso = duration / (kfRaw.length - 1);
+    const parsed = kfRaw
+      .map((kf, i) => keyframeTransform(base, kf, i * paso))
+      .filter((k): k is NonNullable<ReturnType<typeof keyframeTransform>> => k !== null)
+      .sort((a, b) => a.time - b.time);
+    if (parsed.length >= 2) {
+      // El último fotograma se recoloca a `duration` para que la duración
+      // de la pista (y el bucle) respeten el parámetro declarado.
+      parsed[parsed.length - 1] = { ...parsed[parsed.length - 1], time: duration };
+      return {
+        id: makeId('ttrack'),
+        objectId: target.id,
+        name: `Animación ZEIA (keyframes)`,
+        duration,
+        looping: loop,
+        keyframes: parsed.map((k) => ({ ...k, easing: 'ease-in-out' as const })),
+      };
+    }
+  }
+
   switch (type) {
-    case 'rotate': {
+    case 'rotate':
+    case 'spin': {
       const axis = String(params.axis || 'y').toLowerCase();
       end = { ...base };
       if (axis === 'x') end.rx = base.rx + degrees * RAD;
@@ -190,8 +255,53 @@ function buildMotionTrack<T extends ZeiaSceneObject>(
       break;
     }
     case 'translate':
-      end = { ...base, px: base.px + 1 };
+    case 'move': {
+      // Destino explícito (`to`/`position`), desplazamiento por eje
+      // (`axis` + `distance`/`amount`) o el clásico +1 en X.
+      const to = params.to ?? params.position;
+      if (to !== undefined) {
+        const [px, py, pz] = triple(to, [base.px, base.py, base.pz]);
+        end = { ...base, px, py, pz };
+      } else {
+        const axis = String(params.axis || 'x').toLowerCase();
+        const dist = num(params.distance ?? params.amount ?? params.degrees, 1);
+        end = { ...base };
+        if (axis === 'y') end.py = base.py + dist;
+        else if (axis === 'z') end.pz = base.pz + dist;
+        else end.px = base.px + dist;
+      }
       break;
+    }
+    case 'bounce': {
+      // Sube `height` (def. 1) y vuelve a su sitio en 3 fotogramas.
+      const height = num(params.height ?? params.distance ?? params.amount, 1);
+      const up = { ...base, py: base.py + height };
+      keyframeTimes = [
+        { time: 0, values: valuesOf(base) },
+        { time: duration / 2, values: valuesOf(up) },
+        { time: duration, values: valuesOf(base) },
+      ];
+      break;
+    }
+    case 'pulse': {
+      // Escala hasta `maxScale` y vuelve (latido).
+      const minS = params.min_scale ?? params.minScale;
+      if (minS) {
+        const [sx, sy, sz] = triple(minS, [base.sx, base.sy, base.sz]);
+        base.sx = sx; base.sy = sy; base.sz = sz;
+      }
+      const maxRaw = params.max_scale ?? params.maxScale ?? params.scale;
+      const [mx, my, mz] = maxRaw !== undefined
+        ? triple(typeof maxRaw === 'number' ? [maxRaw, maxRaw, maxRaw] : maxRaw, [base.sx * 2, base.sy * 2, base.sz * 2])
+        : [base.sx * 2, base.sy * 2, base.sz * 2] as [number, number, number];
+      const peak = { ...base, sx: mx, sy: my, sz: mz };
+      keyframeTimes = [
+        { time: 0, values: valuesOf(base) },
+        { time: duration / 2, values: valuesOf(peak) },
+        { time: duration, values: valuesOf(base) },
+      ];
+      break;
+    }
     case 'scale': {
       const minS = params.min_scale ?? params.minScale;
       const maxS = params.max_scale ?? params.maxScale ?? params.scale;
@@ -209,6 +319,17 @@ function buildMotionTrack<T extends ZeiaSceneObject>(
     }
     default:
       return null;
+  }
+
+  if (keyframeTimes) {
+    return {
+      id: makeId('ttrack'),
+      objectId: target.id,
+      name: `Animación ZEIA (${type})`,
+      duration,
+      looping: loop,
+      keyframes: keyframeTimes.map((k) => ({ ...k, easing: 'ease-in-out' as const })),
+    };
   }
   return {
     id: makeId('ttrack'),
@@ -392,8 +513,80 @@ function normalizeAnimateParams(execute: Record<string, unknown>): Record<string
   if (anim.max_scale) params.max_scale = anim.max_scale;
   if (anim.minScale) params.min_scale = anim.minScale;
   if (anim.maxScale) params.max_scale = anim.maxScale;
+  // Animaciones por keyframes y desplazamientos explícitos.
+  if (Array.isArray(anim.keyframes)) params.keyframes = anim.keyframes;
+  if (anim.to !== undefined) params.to = anim.to;
+  if (anim.position !== undefined && !anim.objectId) params.to = anim.position;
+  if (anim.distance !== undefined) params.distance = anim.distance;
+  if (anim.amount !== undefined) params.amount = anim.amount;
+  if (anim.height !== undefined) params.height = anim.height;
 
   return params;
+}
+
+/** Propiedades válidas de un efecto visual (las que entiende EffectTrack). */
+const EFFECT_PARAM_KEYS = [
+  'enabled', 'count', 'speed', 'size', 'intensity', 'color', 'riseSpeed',
+  'starSize', 'glowColor', 'glowIntensity', 'glowObjects',
+] as const satisfies ReadonlyArray<EffectProperty>;
+
+/** Alias ES/EN de los tipos de efecto que el modelo puede usar. */
+export function normalizeEffectType(raw: unknown): EffectTrack['effectType'] | null {
+  const n = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (!n) return null;
+  if (n === 'rain' || n === 'lluvia' || n === 'rainfall') return 'rain';
+  if (n === 'smoke' || n === 'humo' || n === 'fog' || n === 'niebla') return 'smoke';
+  if (n === 'stars' || n === 'star' || n === 'estrellas' || n === 'estrella') return 'stars';
+  if (n === 'fire' || n === 'fuego' || n === 'flames' || n === 'llamas') return 'fire';
+  if (n === 'sparks' || n === 'spark' || n === 'chispas' || n === 'chispa') return 'sparks';
+  if (n === 'glow' || n === 'brillo' || n === 'bloom') return 'glow';
+  return null;
+}
+
+/**
+ * Construye una pista de efecto visual a partir de los params normalizados
+ * de `effects.apply`. Un solo fotograma en t=0 con `enabled` y los
+ * parámetros del efecto (el visor los aplica como override por frame).
+ */
+function buildEffectTrack(
+  params: Record<string, unknown>,
+  makeId: (prefix: string) => string
+): EffectTrack | null {
+  const effectType = normalizeEffectType(params.name ?? params.type);
+  if (!effectType) return null;
+  const duration = Math.max(0.5, num(params.duration, 5));
+  const looping = params.loop === true || params.looping === true;
+
+  const raw = (params.params && typeof params.params === 'object'
+    ? params.params
+    : params) as Record<string, unknown>;
+  const values: Partial<Record<EffectProperty, number | string | boolean>> = { enabled: true };
+  const camel = (s: string): string => s.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+  for (const key of EFFECT_PARAM_KEYS) {
+    const candidates = [key, camel(key), key.toLowerCase()];
+    for (const c of candidates) {
+      const v = raw[c];
+      if (v === undefined || v === null) continue;
+      if (key === 'enabled' || key === 'glowObjects') values[key] = v !== false;
+      else if (key === 'color' || key === 'glowColor') {
+        if (typeof v === 'string') values[key] = v;
+      } else {
+        const n = num(v, NaN);
+        if (Number.isFinite(n)) values[key] = n;
+      }
+      break;
+    }
+  }
+  // `type` del execute no es una propiedad: no entra en values (arriba solo
+  // se leen claves de EFFECT_PARAM_KEYS), así que no hace falta limpiarlo.
+
+  return {
+    id: makeId('etrack'),
+    effectType,
+    duration,
+    looping,
+    keyframes: [{ time: 0, values, easing: 'linear' }] as EffectKeyframe[],
+  };
 }
 
 /** Normaliza params de efecto: `objectId`/`effect.*` → `object_id`/`name/...`. */
@@ -407,10 +600,30 @@ function normalizeEffectParams(execute: Record<string, unknown>): Record<string,
 
   if (effect.name) params.name = effect.name;
   else if (effect.type) params.name = String(effect.type);
+  else if (effect.effectType) params.name = String(effect.effectType);
+
+  // Duración/bucle pueden venir dentro del efecto o en el execute.
+  if (effect.duration !== undefined) params.duration = effect.duration;
+  else if (execute.duration !== undefined) params.duration = execute.duration;
+  if (effect.loop !== undefined) params.loop = effect.loop;
+  else if (execute.loop !== undefined) params.loop = execute.loop;
+  else if (effect.looping !== undefined) params.loop = effect.looping;
+  else if (execute.looping !== undefined) params.looping = execute.looping;
+
+  // Parámetros del efecto (count/speed/size/color/...): se recogen de
+  // effect.params (idempotente si ya venía normalizado), del propio objeto
+  // del efecto y, si `effect` era el execute, también de sus claves.
+  const nested = effect.params && typeof effect.params === 'object'
+    ? (effect.params as Record<string, unknown>)
+    : {};
   const effectParams: Record<string, unknown> = {};
-  if (effect.position) effectParams.position = effect.position;
-  if (effect.scale) effectParams.scale = effect.scale;
-  if (effect.color) effectParams.color = effect.color;
+  for (const key of EFFECT_PARAM_KEYS) {
+    if (nested[key] !== undefined && nested[key] !== null) effectParams[key] = nested[key];
+    else if (effect[key] !== undefined && effect[key] !== null) effectParams[key] = effect[key];
+    else if (execute[key] !== undefined && execute[key] !== null && effect !== execute) {
+      effectParams[key] = execute[key];
+    }
+  }
   if (Object.keys(effectParams).length) params.params = effectParams;
 
   return params;
@@ -457,6 +670,19 @@ function planStepsFromIntent(planType: string, execute: Record<string, unknown>)
     (t.startsWith('add') && (execute.geometry || execute.material)) ||
     (!t.startsWith('animate') && execute.geometry && !execute.effect);
 
+  // Un plan tipo "createRain"/"addEffect"/"applyFx" con tipo de efecto
+  // manda sobre la creación: si el execute declara un tipo de efecto
+  // reconocido (o trae un objeto `effect`) y no trae geometría, es un
+  // efecto, no un objeto.
+  const effectTypeName =
+    normalizeEffectType(execute.effectType) ??
+    normalizeEffectType(execute.type) ??
+    (t.includes('effect') ? normalizeEffectType(execute.name) : null);
+  const isEffectLike =
+    !execute.geometry &&
+    !execute.primitive &&
+    (Boolean(execute.effect) || effectTypeName !== null);
+
   if (t.startsWith('update') || t.startsWith('modify') || t.startsWith('move') || t.startsWith('transform')) {
     const params = normalizeObjectRefParams(execute);
     if (execute.patch) params.patch = execute.patch;
@@ -468,9 +694,14 @@ function planStepsFromIntent(planType: string, execute: Record<string, unknown>)
     steps.push({ action: 'objects.delete', params: normalizeObjectRefParams(execute) });
   } else if (t.startsWith('duplicate') || t.startsWith('clone') || t.startsWith('copy')) {
     steps.push({ action: 'objects.duplicate', params: normalizeObjectRefParams(execute) });
+  } else if (isEffectLike) {
+    steps.push({ action: 'effects.apply', params: normalizeEffectParams(execute) });
   } else if (isCreateLike) {
     steps.push({ action: 'objects.create', params: normalizeCreateParams(execute) });
-  } else if (t.includes('effect') && execute.effect) {
+  } else if (
+    (t.includes('effect') || t.includes('fx')) &&
+    (execute.effect || execute.type || execute.name)
+  ) {
     steps.push({ action: 'effects.apply', params: normalizeEffectParams(execute) });
   }
 
@@ -511,9 +742,17 @@ export function applyZeiaPlansToScene<T extends ZeiaSceneObject>(
   let updated = 0;
   let removed = 0;
   let motions = 0;
+  let effects = 0;
   let lastCreatedId: string | null = opts.lastCreatedId ?? null;
+  let effectTracks: EffectTrack[] = (opts.effectTracks ?? []).slice();
 
   const byId = (id?: string | null): T | undefined => (id ? objs.find((o) => o.id === id) : undefined);
+  const byName = (name?: string | null): T | undefined => {
+    if (!name) return undefined;
+    const lower = name.trim().toLowerCase();
+    if (!lower) return undefined;
+    return objs.find((o) => o.name.toLowerCase() === lower);
+  };
   const resolve = (raw?: string | null): T | undefined => {
     if (!raw) return undefined;
     const mapped = idMap[raw];
@@ -521,7 +760,7 @@ export function applyZeiaPlansToScene<T extends ZeiaSceneObject>(
       const o = byId(mapped);
       if (o) return o;
     }
-    return byId(raw);
+    return byId(raw) ?? byName(raw);
   };
 
   for (const plan of plans) {
@@ -625,6 +864,20 @@ export function applyZeiaPlansToScene<T extends ZeiaSceneObject>(
           break;
         }
 
+        case 'effects.apply': {
+          // Los params pueden venir ya normalizados (plan {plan, execute}) o
+          // crudos del modelo (pasos directos): se normalizan siempre.
+          const track = buildEffectTrack(normalizeEffectParams(params), makeId);
+          if (!track) {
+            warnOnce(`${action}: tipo de efecto no soportado ("${String(params.name ?? params.type)}").`);
+            break;
+          }
+          effectTracks = [...effectTracks, track];
+          effects++;
+          applied++;
+          break;
+        }
+
         default: {
           warnOnce(`${action}: se aplicó en ZEIA pero no tiene representación directa en la escena del editor.`);
           break;
@@ -636,8 +889,9 @@ export function applyZeiaPlansToScene<T extends ZeiaSceneObject>(
   return {
     objects: objs,
     transformTracks: tracks,
+    effectTracks,
     idMap,
     lastCreatedId,
-    result: { applied, created, updated, removed, motions, warnings },
+    result: { applied, created, updated, removed, motions, effects, warnings },
   };
 }
