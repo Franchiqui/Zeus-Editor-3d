@@ -44,8 +44,6 @@
     "PB_Datos",
     "dist",
     "components/ui/calendar.tsx",
-    "components/ui/chart.tsx",
-    "debug-brush.tsx",
-    "OBJ 3D-Zeus"
+    "components/ui/chart.tsx"
   ]
 }

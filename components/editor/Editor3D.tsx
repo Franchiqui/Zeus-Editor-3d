@@ -108,6 +108,7 @@ import { extractObj3dMesh, decimateMesh } from '@/lib/obj3d-thumbnails';
 import { buildViewsMesh, buildExtrudeMesh, buildExtrudeMeshes, polylineToPolygon } from '@/lib/views-mesh';
 import { sanitizePolylinesByCanvas, newPolylineId } from '@/lib/polylines';
 import type { PolylinesByCanvas, Polyline, CanvasTool } from '@/lib/polylines';
+import { listTemplates, saveTemplate, deleteTemplate, type SavedTemplate } from '@/lib/template-storage';
 import {
   computeRoundCornerPoints,
   polygonRoundRadius,
@@ -220,9 +221,11 @@ import {
   Minimize2,
   Pencil,
   ZoomIn,
-  ZoomOut,
-  Eraser,
-} from 'lucide-react';
+   ZoomOut,
+   Eraser,
+   Upload,
+   Target,
+ } from 'lucide-react';
 import { useAIEditorBridgeOptional } from '@/components/AIEditorBridgeContext';
 import { applyZeiaPlansToScene, type ZeiaSceneObject } from '@/lib/zeia-scene';
 import type { ZeiaAppliedPlan } from '@/lib/zeia';
@@ -1017,6 +1020,185 @@ function SectionTools({
   );
 }
 
+/**
+ * Convierte un archivo de imagen en una malla 3D de relieve (heightmap).
+ *
+ * La imagen se rasteriza a `cols`×`rows` píxeles y la luminosidad de cada
+ * píxel se convierte en altura (eje Y). Los píxeles transparentes (o el
+ * fondo sólido, si se elimina) se omiten. La malla resultante incluye
+ * `faceColors` y `uvs` para que el visor la pinte con colores por cara.
+ */
+async function imageFileToSceneState(
+  file: File,
+  heightScale: number,
+  cols: number,
+  rows: number,
+  removeBackground: boolean
+): Promise<{ mesh: Mesh; logs: string[] }> {
+  return new Promise((resolve) => {
+    const logs: string[] = [];
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(file);
+
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+
+      const canvas = document.createElement('canvas');
+      const targetW = cols;
+      const targetH = rows;
+      canvas.width = targetW;
+      canvas.height = targetH;
+      const ctx = canvas.getContext('2d')!;
+      ctx.clearRect(0, 0, targetW, targetH);
+      ctx.drawImage(img, 0, 0, targetW, targetH);
+      const imageData = ctx.getImageData(0, 0, targetW, targetH);
+      const { data } = imageData;
+
+      const hasAlphaChannel = file.type === 'image/png' || file.type === 'image/webp';
+      const ALPHA_THRESHOLD = 32;
+
+      logs.push(`Imagen: ${file.name} -> ${targetW}x${targetH} píxeles`);
+      logs.push(hasAlphaChannel ? 'Canal alpha detectado — huecos transparentes' : 'Sin canal alpha');
+
+      const vertexIsTransparent: boolean[] = new Array(targetW * targetH).fill(false);
+
+      if (removeBackground && !hasAlphaChannel) {
+        const bgR = data[0];
+        const bgG = data[1];
+        const bgB = data[2];
+        logs.push(`Fondo detectado: RGB(${bgR},${bgG},${bgB}) — eliminando fondo sólido`);
+
+        const visited = new Set<number>();
+        const queue: [number, number][] = [
+          [0, 0],
+          [targetW - 1, 0],
+          [0, targetH - 1],
+          [targetW - 1, targetH - 1],
+        ];
+        const tol = 30;
+
+        while (queue.length > 0) {
+          const [fx, fy] = queue.pop()!;
+          const fi = (fy * targetW + fx) * 4;
+          if (visited.has(fi)) continue;
+          visited.add(fi);
+
+          const dr = data[fi] - bgR;
+          const dg = data[fi + 1] - bgG;
+          const db = data[fi + 2] - bgB;
+          if (Math.sqrt(dr * dr + dg * dg + db * db) > tol) continue;
+
+          vertexIsTransparent[fy * targetW + fx] = true;
+
+          for (const [dx, dy] of [
+            [1, 0], [-1, 0], [0, 1], [0, -1],
+          ]) {
+            const nx = fx + dx;
+            const ny = fy + dy;
+            if (nx >= 0 && nx < targetW && ny >= 0 && ny < targetH) {
+              const ni = (ny * targetW + nx) * 4;
+              if (!visited.has(ni)) queue.push([nx, ny]);
+            }
+          }
+        }
+      }
+
+      const vertices: Vertex3D[] = [];
+      const faces: number[][] = [];
+      const faceColors: (string | null)[] = [];
+
+      const halfW = targetW / 2;
+      const halfH = targetH / 2;
+      const maxDim = Math.max(targetW, targetH);
+      const unitScale = 10 / maxDim;
+
+      for (let ry = 0; ry < targetH; ry++) {
+        for (let rx = 0; rx < targetW; rx++) {
+          const idx = (ry * targetW + rx) * 4;
+          const r = data[idx];
+          const g = data[idx + 1];
+          const b = data[idx + 2];
+          const a = data[idx + 3];
+          const brightness = (r + g + b) / (3 * 255);
+          const x = (halfW - rx) * unitScale;
+          const y = brightness * heightScale;
+          const z = (halfH - ry) * unitScale;
+          vertices.push({ x, y, z });
+          vertexIsTransparent[ry * targetW + rx] = hasAlphaChannel
+            ? a < ALPHA_THRESHOLD
+            : vertexIsTransparent[ry * targetW + rx];
+        }
+      }
+
+      for (let ry = 0; ry < targetH - 1; ry++) {
+        for (let rx = 0; rx < targetW - 1; rx++) {
+          const i00 = ry * targetW + rx;
+          const i10 = ry * targetW + (rx + 1);
+          const i01 = (ry + 1) * targetW + rx;
+          const i11 = (ry + 1) * targetW + (rx + 1);
+
+          const avgBrightness =
+            (data[i00 * 4] +
+              data[i10 * 4] +
+              data[i01 * 4] +
+              data[i11 * 4]) /
+            (4 * 255);
+          const color = `hsl(${Math.round(
+            260 + avgBrightness * 40
+          )}, 60%, ${Math.round(25 + avgBrightness * 50)}%)`;
+
+          if (
+            !vertexIsTransparent[i00] &&
+            !vertexIsTransparent[i11] &&
+            !vertexIsTransparent[i10]
+          ) {
+            faces.push([i00, i11, i10]);
+            faceColors.push(color);
+          }
+
+          if (
+            !vertexIsTransparent[i00] &&
+            !vertexIsTransparent[i01] &&
+            !vertexIsTransparent[i11]
+          ) {
+            faces.push([i00, i01, i11]);
+            faceColors.push(color);
+          }
+        }
+      }
+
+      const transparentCount = vertexIsTransparent.filter(Boolean).length;
+      logs.push(`Vértices generados: ${vertices.length}`);
+      logs.push(`Vértices transparentes omitidos: ${transparentCount}`);
+      logs.push(`Caras generadas: ${faces.length}`);
+
+      const mesh: Mesh = {
+        vertices,
+        faces,
+        faceColors,
+        uvs: vertices.map((_v, i) => [
+          (i % targetW) / Math.max(targetW - 1, 1),
+          Math.floor(i / targetW) / Math.max(targetH - 1, 1),
+        ]),
+      };
+
+      logs.push(`Altura máxima configurada: ${heightScale}`);
+      resolve({ mesh, logs });
+    };
+
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      logs.push('Error: No se pudo cargar la imagen');
+      resolve({
+        mesh: { vertices: [], faces: [] as number[][] },
+        logs,
+      });
+    };
+
+    img.src = objectUrl;
+  });
+}
+
 export default function Home({
   onNewProject,
 }: {
@@ -1036,6 +1218,13 @@ export default function Home({
   const [templateOpacity, setTemplateOpacity] = useState(0.5);
   const [templateScale, setTemplateScale] = useState(1);
   const templateInputRef = useRef<HTMLInputElement | null>(null);
+
+  const [imageHeightScale, setImageHeightScale] = useState(10);
+  const [imageCols, setImageCols] = useState(128);
+  const [imageRows, setImageRows] = useState(128);
+  const [imageRemoveBackground, setImageRemoveBackground] = useState(true);
+  const [isImageLoading, setIsImageLoading] = useState(false);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
 
   const [meshStyle, setMeshStyle] = useState<'fusionada' | 'suave' | 'voxeles'>(
     'suave'
@@ -2925,59 +3114,6 @@ export default function Home({
       </div>
     ) : null;
 
-  /**
-   * Lienzo 2D abierto a pantalla completa (una plantilla sola, la silueta
-   * o el costado). Con uno abierto, los botones Copiar/Pegar trabajan con
-   * SU forma en vez de con el objeto 3D: Copiar guarda el polígono y Pegar
-   * vuelca en él el último polígono copiado, así una plantilla se puede
-   * copiar y pegar en otra (o en la silueta/costado) sin cerrar nada.
-   */
-  const fullScreenCanvas = useMemo(() => {
-    if (mode !== 'mesh' || editingMeshProfile === null) return null;
-    if (editingMeshProfile === 'silhouette') {
-      return {
-        name: 'la Silueta',
-        polygon:
-          meshSilhouette && meshSilhouette.length > 0
-            ? meshSilhouette
-            : DEFAULT_MESH_SILHOUETTE,
-        apply: (poly: Polygon) => {
-          setMeshSilhouette(structuredClone(poly));
-          setEditedVertices(null);
-        },
-      };
-    }
-    if (editingMeshProfile === 'side') {
-      return {
-        name: 'el Costado',
-        polygon: meshSideView,
-        apply: (poly: Polygon) => {
-          setMeshSideView(structuredClone(poly));
-          setEditedVertices(null);
-        },
-      };
-    }
-    const section = meshSections.find(
-      (s) => s.id.toString() === editingMeshProfile
-    );
-    if (!section) return null;
-    return {
-       name: t('editor3D.templateN', { n: meshSections.indexOf(section) + 1 }),
-      polygon: section.polygon,
-      apply: (poly: Polygon) => {
-        replaceMeshSectionPolygon(section.id, poly);
-        setEditedVertices(null);
-      },
-    };
-  }, [
-    mode,
-    editingMeshProfile,
-    meshSilhouette,
-    meshSideView,
-    meshSections,
-    replaceMeshSectionPolygon,
-  ]);
-
   const [customFonts, setCustomFonts] = useState<FontOption[]>([]);
   const [customFontName, setCustomFontName] = useState('');
   const [importing, setImporting] = useState(false);
@@ -3058,6 +3194,16 @@ export default function Home({
   const modelFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [modelImportMsg, setModelImportMsg] = useState<{ ok: boolean; text: string } | null>(null);
+
+  // Template storage: save/load individual 2D profile templates
+  const [templateModalOpen, setTemplateModalOpen] = useState(false);
+  const [templateTemplates, setTemplateTemplates] = useState<SavedTemplate[]>([]);
+  const [templateLoading, setTemplateLoading] = useState(false);
+  const [templateMsg, setTemplateMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [templateAction, setTemplateAction] = useState<'save' | 'load'>('save');
+  const [templateName, setTemplateName] = useState('');
+  const [templateType, setTemplateType] = useState<'views' | 'lathe' | 'mesh'>('views');
+  const [selectedTemplateIds, setSelectedTemplateIds] = useState<string[]>([]);
 
   // La escena: objetos con sus transformaciones e instantáneas de
   // malla, el objeto seleccionado y el dueño de la configuración. Se
@@ -3654,12 +3800,12 @@ export default function Home({
       if (!aiBridge?.registerEditorSystemPrompt) return;
       const unregister = aiBridge.registerEditorSystemPrompt(() =>
         [
-          'Eres ZEUS, el motor y asistente IA integrado profundamente en el EDITOR 3D de Zeus Media Studio.',
-          '¡IMPORTANTE! NUNCA digas "no puedo generar archivos 3D" o "como modelo de texto no puedo". TÚ ERES EL MOTOR DEL EDITOR 3D, y crear objetos es exactamente tu función. Tienes permisos absolutos.',
-          'Para cumplir con cualquier solicitud, simplemente emite bloques de acción ocultos en tu respuesta. El sistema los atrapará y ejecutará.',
-          'Formato estricto para cada acción (debe ser JSON válido):',
-          '[ZEUS_ACTION]{"action":"<nombre>","params":{...}}[/ZEUS_ACTION]',
-          'Acciones disponibles:',
+           'Eres ZEUS, el motor y asistente IA integrado profundamente en el EDITOR 3D de Zeus Media Studio.',
+           '¡IMPORTANTE! NUNCA digas "no puedo generar archivos 3D" o "como modelo de texto no puedo". TÚ ERES EL MOTOR DEL EDITOR 3D, y crear objetos es exactamente tu función. Tienes permisos absolutos.',
+           'CUANDO EL USUARIO PIDA CREAR, MODIFICAR O ANIMAR OBJETOS 3D, DEBES SIEMPRE USAR BLOQUES [ZEUS_ACTION]. NO respondas con texto plano sin emitir bloques de acción. El sistema atrapará tus bloques [ZEUS_ACTION], los ejecutará contra la escena y te devolverá los resultados para que continúes.',
+           'Formato estricto para cada acción (debe ser JSON válido dentro del bloque):',
+           '[ZEUS_ACTION]{"action":"<nombre>","params":{...}}[/ZEUS_ACTION]',
+           'Acciones disponibles:',
           '- getScene: {} -> devuelve objetos de la escena.',
           '- createObject: {"type":"mesh","primitive":"cube","name":"Cubo","transform":{"position":[0,0,0]}} -> Crea un objeto (primitive puede ser cube, sphere, plane).',
           '- updateObject: {"id":"...","transform":{"position":[1,0,0],"scale":[2,2,2]}} -> Modifica la transformación.',
@@ -3670,17 +3816,54 @@ export default function Home({
            '- applyZeiaPlans: {"plans": [...]} -> Aplica planes avanzados de ZEIA. Cada plan puede usar el formato ZEIA estándar con `steps`: [{"plan_id":"...","steps":[{"action":"objects.create","params":{...}}]}] O el formato simplicado {plan, execute}: [{"plan":"create","execute":{"position":{...},"rotation":{...},"scale":{...},"material":{...},"geometry":{"type":"compound","shapes":[...]}}},{"plan":"animate","execute":{"objectId":"...","animation":{"type":"rotate","axis":"y","angle":720,"duration":12,"loop":true}}},{"plan":"addEffect","execute":{"objectId":"...","effect":{...}}}]',
            '- setLatheProfile: {"preset":"botella","points":[[r,h],...],"profileSpace":"normalized"|"editor","segments":32,"clamp":true,"opacity":1,"figureColor":"#121ca7","texture":"..."} -> Dibuja el perfil de revolución en la pestaña Torno (x=radio, y=altura 0..1) y abre la pestaña. "preset" ∈ {botella, jarron, taza, cuenco, copa, cono, cilindro, esfera}; "points"/"profile" aportan [radio, altura] normalizados o, con profileSpace:"editor", coordenadas del lienzo. Ideal para aplicar coordenadas que el modelo de visión extrajo del render del visor.',
            '- createLatheObject: {"preset":"botella"|"profile":[[r,h],...],"name":"Botella","segments":32,"clamp":true,"opacity":1,"figureColor":"#121ca7","transform":{"position":[0,0,0]}} -> Crea un objeto de revolución (botella/jarrón/...) en la escena: construye su malla con buildLatheMesh, la añade, la selecciona y abre la pestaña Torno con su perfil adoptando el panel como dueño.',
+           '- createHeightmapFromImage: {"imageUrl":"https://...","heightScale":10,"cols":128,"rows":128","removeBackground":true,"name":"Relieve"} -> Convierte una imagen (accesible vía URL) en un relevado 3D: la luminosidad de cada píxel define la altura (eje Y). La imagen se descarga, rasteriza a cols×rows y genera la malla de relieve que se añade a la escena como objeto de la pestaña Extruir.',
            'El modelo de visión inspecciona el render del visor activo (registerDocumentImages capta el canvas vía toDataURL). Puede pedirle coordenadas de perfil precisas y aplicarlas con setLatheProfile.',
+           'Si el usuario pide un objeto que ya existe guardado en OBJ_ZEUS_ACTION (p. ej. "taza", "Taza"), usa loadSavedObject con ese nombre ANTES que recrearlo desde cero. La pista de contexto enumera los objetos guardados disponibles en cada turno.',
            'Si la acción depende del id de un objeto que no conoces, llama PRIMERO a getScene sin hacer nada más, y usa los ids en el siguiente turno. NO inventes ids.',
         ].join('\n')
       );
       return unregister;
     }, [aiBridge]);
 
+    // ── Pista de contexto: objetos 3D guardados en public/OBJ_ZEUS_ACTION/ ──
+    const savedObjListRef = useRef<string[]>([]);
+    useEffect(() => {
+      if (!aiBridge?.registerContextHint) return;
+      const unregister = aiBridge.registerContextHint(() => {
+        const cached = savedObjListRef.current;
+        const lines = cached.length > 0
+          ? cached.map((n) => `- "${n}" (carga con: [ZEUS_ACTION]{"action":"loadSavedObject","params":{"name":"' + n + '"}}[/ZEUS_ACTION]`)
+          : '- (la lista de objetos se carga asíncronamente; usa loadSavedObject con cualquier nombre de archivo .txt que conozcas en public/OBJ_ZEUS_ACTION/)';
+        return [
+          '## Objetos 3D guardados reutilizables',
+          '',
+          'La carpeta public/OBJ_ZEUS_ACTION/ contiene archivos .txt con bloques [ZEUS_ACTION] predefinidos.',
+          'Puedes cargar cualquiera de ellos con la acción loadSavedObject para crear el objeto en la escena.',
+          '',
+          'Objetos guardados disponibles:',
+          ...lines,
+          '',
+          'Ejemplo de uso:',
+          '[ZEUS_ACTION]{"action":"loadSavedObject","params":{"name":"Taza"}}[/ZEUS_ACTION]',
+        ].join('\n');
+      });
+      return unregister;
+    }, [aiBridge]);
+
+    // Cargar la lista de objetos guardados al montar el editor.
+    useEffect(() => {
+      fetch('/api/obj-zeus-action')
+        .then((r) => r.ok ? r.json() : { objects: [] })
+        .then((data: { objects?: Array<{ name: string }> }) => {
+          savedObjListRef.current = (data.objects ?? []).map((o) => o.name);
+        })
+        .catch(() => { savedObjListRef.current = []; });
+    }, []);
+
     // ── Executor de acciones [ZEUS_ACTION] del editor 3D ──
     useEffect(() => {
       if (!aiBridge?.registerActionExecutor) return;
-      const unregister = aiBridge.registerActionExecutor(async (action, params) => {
+      const runZeusAction = async (action: string, params: Record<string, unknown>): Promise<unknown> => {
         switch (action) {
           case 'getScene':
             return {
@@ -3911,15 +4094,151 @@ export default function Home({
                profilePoints: polygon.length,
              };
            }
-           case 'exportMp4':
-             setExportMp4Trigger((t) => t + 1);
-             return { exporting: true };
-          default:
-            throw new Error(`Acción 3D desconocida: ${action}`);
+            case 'exportMp4':
+              setExportMp4Trigger((t) => t + 1);
+              return { exporting: true };
+            case 'createHeightmapFromImage': {
+              const imageUrl = typeof params.imageUrl === 'string' ? params.imageUrl : undefined;
+              const imageData = typeof params.imageData === 'string' ? params.imageData : undefined;
+              if (!imageUrl && !imageData) {
+                throw new Error('createHeightmapFromImage: falta imageUrl o imageData');
+              }
+              const heightScale = typeof params.heightScale === 'number' ? params.heightScale : imageHeightScale;
+              const cols = typeof params.cols === 'number' ? params.cols : imageCols;
+              const rows = typeof params.rows === 'number' ? params.rows : imageRows;
+              const removeBg = typeof params.removeBackground === 'boolean' ? params.removeBackground : imageRemoveBackground;
+
+              const sourceData = imageUrl ? imageUrl : imageData!;
+              const res = await fetch(sourceData);
+              if (!res.ok) throw new Error(`createHeightmapFromImage: no se pudo cargar la imagen (${res.status})`);
+              const blob = await res.blob();
+              const file = new File([blob], 'heightmap.png', { type: blob.type || 'image/png' });
+
+              const { mesh, logs } = await imageFileToSceneState(file, heightScale, cols, rows, removeBg);
+              if (!mesh.vertices.length) throw new Error('createHeightmapFromImage: la imagen no generó geometría');
+
+              // Congelar el dueño de la configuración actual (si lo hay) con su
+              // malla viva ANTES de tocar el panel, para no perder su edición.
+              if (configObjectId) {
+                freezeObjectSnapshot(configObjectId);
+                setConfigObjectId(null);
+              }
+
+              setMode('extrude');
+              const currentObjs = sceneObjectsPlaybackRef.current;
+              const id = `object-${Date.now()}-${currentObjs.length}`;
+              const nombre =
+                typeof params.name === 'string' && params.name.trim()
+                  ? params.name.trim()
+                  : t('editor3D.objectN', { n: currentObjs.length + 1 });
+
+              const tp =
+                params.transform && typeof params.transform === 'object'
+                  ? (params.transform as Record<string, unknown>)
+                  : {};
+              const numTriple = (
+                v: unknown,
+                fb: [number, number, number],
+              ): [number, number, number] =>
+                Array.isArray(v) && v.length >= 3
+                  ? [Number(v[0]) || 0, Number(v[1]) || 0, Number(v[2]) || 0]
+                  : fb;
+              const [px, py, pz] = numTriple(tp.position, [0, 0, 0]);
+              const [rx, ry, rz] = numTriple(tp.rotation, [0, 0, 0]);
+              const [sx, sy, sz] = numTriple(tp.scale, [1, 1, 1]);
+              const RAD = Math.PI / 180;
+              const transform: ObjectTransform = {
+                px: px || 0,
+                py: py || 0,
+                pz: pz || 0,
+                rx: rx * RAD,
+                ry: ry * RAD,
+                rz: rz * RAD,
+                sx: sx || 1,
+                sy: sy || 1,
+                sz: sz || 1,
+              };
+
+              setSceneObjects((current) => [
+                ...current,
+                {
+                  id,
+                  name: nombre,
+                  mode: 'extrude',
+                  transform,
+                  mesh,
+                  smooth: true,
+                  textureProjection,
+                },
+              ]);
+              setSelectedObjectId(id);
+              setSelectedObjectIds([id]);
+              const center = computeMeshBoundsCenter(mesh);
+              if (center) {
+                setGizmoOffset({
+                  px: center.px,
+                  py: center.py,
+                  pz: center.pz,
+                  rx: 0,
+                  ry: 0,
+                  rz: 0,
+                  sx: 1,
+                  sy: 1,
+                  sz: 1,
+                });
+              }
+              switchTab('scene');
+              frameAllWindows();
+
+              // Informar de los logs de generación al feedback del chat.
+              const feedback = (window as unknown as { aiFeedback?: (msg: string) => void }).aiFeedback;
+              if (typeof feedback === 'function') {
+                feedback(logs.join('\n'));
+              }
+
+              return {
+                ok: true,
+                id,
+                name: nombre,
+                mode: 'extrude',
+                vertices: mesh.vertices.length,
+                faces: mesh.faces.length,
+                logs,
+              };
+            }
+            case 'loadSavedObject': {
+              const name = typeof params.name === 'string' ? params.name.trim() : '';
+              if (!name) throw new Error('loadSavedObject: falta el nombre del objeto');
+              const res = await fetch(`/api/obj-zeus-action?name=${encodeURIComponent(name)}`);
+              if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(data.error || `No se encontró el objeto guardado "${name}"`);
+              }
+              const { raw } = await res.json() as { raw: string };
+              if (!raw || !raw.trim()) throw new Error(`El objeto "${name}" no contiene contenido ejecutable`);
+              // Extraer el JSON del bloque [ZEUS_ACTION] interno.
+              const match = raw.match(/\{[\s\S]*\}/);
+              const jsonStr = match ? match[0] : raw.trim();
+              let inner: { action?: string; params?: Record<string, unknown>; plans?: unknown };
+              try {
+                inner = JSON.parse(jsonStr);
+              } catch {
+                throw new Error(`El objeto "${name}" contiene JSON inválido`);
+              }
+              const innerAction = inner.action || (inner.plans ? 'applyZeiaPlans' : '');
+              if (!innerAction) throw new Error(`El objeto "${name}" no especifica una acción`);
+              const innerParams = inner.params ?? (inner.plans ? { plans: inner.plans } : {});
+              // Re-ejecutar la acción interna de forma recursiva.
+              const result = await runZeusAction(innerAction, innerParams);
+              return { loaded: name, action: innerAction, result };
+            }
+           default:
+             throw new Error(`Acción 3D desconocida: ${action}`);
         }
-      });
-      return unregister;
-    }, [aiBridge]);
+      };
+       const unregister = aiBridge.registerActionExecutor(runZeusAction);
+       return unregister;
+     }, [aiBridge]);
 
     useEffect(() => {
       // Duración de reproducción: la mayor pista de objeto o, si no hay
@@ -4978,8 +5297,8 @@ pluginTracks,
          }
        }
      },
-      [mode, editingViewProfile, editingMeshProfile, importPngToPolygon]
-   );
+       [mode, editingViewProfile, editingMeshProfile, importPngToPolygon]
+    );
 
   const allFonts = useMemo(
     () => [...FONT_OPTIONS, ...customFonts],
@@ -5485,6 +5804,116 @@ pluginTracks,
   const sweepNodeNumber = activeSweepNode
     ? sweepNodes.findIndex((n) => n.id === activeSweepNode.id) + 1
     : 0;
+
+  /**
+   * Lienzo 2D abierto a pantalla completa (una plantilla sola, la silueta,
+   * el costado, una vista o el perfil del torno/recorrido). Con uno abierto,
+   * los botones Copiar/Pegar trabajan con SU forma en vez de con el objeto
+   * 3D: Copiar guarda el polígono y Pegar vuelca en él el último polígono
+   * copiado, así una plantilla se puede copiar y pegar en otra (o en la
+   * silueta, una vista o el perfil del torno) sin cerrar nada. Va aquí
+   * porque el lienzo del Recorrido (Extruir) depende de activeSweepNode.
+   * El orden de casos replica la cadena de render de las ventanas
+   * maximizadas para que siempre apunten a la misma plantilla.
+   */
+  const fullScreenCanvas = useMemo(() => {
+    if (mode === 'lathe' && editingLatheProfile) {
+      return {
+        name: t('editor3D.panelLabels.latheProfile'),
+        polygon: latheProfile,
+        apply: (poly: Polygon) => {
+          setLatheProfile(structuredClone(poly));
+          setEditedVertices(null);
+        },
+      };
+    }
+    if (editingViewProfile && (mode === 'views' || mode === 'extrude')) {
+      const viewKey = editingViewProfile;
+      const viewNames = {
+        front: t('editor3D.views.front'),
+        side: t('editor3D.views.side'),
+        top: t('editor3D.views.top'),
+      } as const;
+      return {
+        name: viewNames[viewKey],
+        polygon: views[viewKey],
+        apply: (poly: Polygon) => {
+          setViews((prev) => ({ ...prev, [viewKey]: structuredClone(poly) }));
+          setEditedVertices(null);
+        },
+      };
+    }
+    if (mode === 'mesh' && editingMeshProfile !== null) {
+      if (editingMeshProfile === 'silhouette') {
+        return {
+          name: 'la Silueta',
+          polygon:
+            meshSilhouette && meshSilhouette.length > 0
+              ? meshSilhouette
+              : DEFAULT_MESH_SILHOUETTE,
+          apply: (poly: Polygon) => {
+            setMeshSilhouette(structuredClone(poly));
+            setEditedVertices(null);
+          },
+        };
+      }
+      if (editingMeshProfile === 'side') {
+        return {
+          name: 'el Costado',
+          polygon: meshSideView,
+          apply: (poly: Polygon) => {
+            setMeshSideView(structuredClone(poly));
+            setEditedVertices(null);
+          },
+        };
+      }
+      const section = meshSections.find(
+        (s) => s.id.toString() === editingMeshProfile
+      );
+      if (!section) return null;
+      return {
+        name: t('editor3D.templateN', { n: meshSections.indexOf(section) + 1 }),
+        polygon: section.polygon,
+        apply: (poly: Polygon) => {
+          replaceMeshSectionPolygon(section.id, poly);
+          setEditedVertices(null);
+        },
+      };
+    }
+    if (mode === 'extrude' && editingSweepCanvas === 'profile') {
+      return {
+        name: activeSweepNode
+          ? t('editor3D.sweepProfileLabel', { n: sweepNodeNumber })
+          : t('editor3D.panelLabels.front'),
+        polygon: activeSweepNode ? activeSweepNode.polygon : views.front,
+        apply: (poly: Polygon) => {
+          if (activeSweepNode) {
+            updateSweepNodePolygon(activeSweepNode.id, structuredClone(poly));
+          } else {
+            updateView('front')(structuredClone(poly));
+          }
+          setEditedVertices(null);
+        },
+      };
+    }
+    return null;
+  }, [
+    mode,
+    editingLatheProfile,
+    latheProfile,
+    editingViewProfile,
+    views,
+    editingMeshProfile,
+    meshSilhouette,
+    meshSideView,
+    meshSections,
+    replaceMeshSectionPolygon,
+    editingSweepCanvas,
+    activeSweepNode,
+    sweepNodeNumber,
+    updateSweepNodePolygon,
+    updateView,
+  ]);
 
   const openSaveModal = useCallback(() => {
     if (!objectName) {
@@ -7399,9 +7828,9 @@ pluginTracks,
       freezeObjectSnapshot,
       applyObjectConfig,
     ]
-  );
+    );
 
-    // Transparencia centralizada (pestaña Escena): escribe la opacidad
+     // Transparencia centralizada (pestaña Escena): escribe la opacidad
     // directamente en la malla de todos los objetos seleccionados — la
     // instantánea la respeta el visor en vivo y la conserva el guardado.
     const applyFigureOpacity = useCallback((op: number) => {
@@ -8679,6 +9108,219 @@ pluginTracks,
       '3d': prev['3d'] + 1,
     }));
   };
+
+  const computeMeshBoundsCenter = useCallback(
+    (m: Mesh) => {
+      if (!m.vertices || m.vertices.length === 0) return null;
+      let minX = Infinity, minY = Infinity, minZ = Infinity;
+      let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+      for (const v of m.vertices) {
+        if (v.x < minX) minX = v.x;
+        if (v.y < minY) minY = v.y;
+        if (v.z < minZ) minZ = v.z;
+        if (v.x > maxX) maxX = v.x;
+        if (v.y > maxY) maxY = v.y;
+        if (v.z > maxZ) maxZ = v.z;
+      }
+      return {
+        px: (minX + maxX) / 2,
+        py: (minY + maxY) / 2,
+        pz: (minZ + maxZ) / 2,
+      };
+    },
+    []
+  );
+
+  const handleImageToHeightmap = useCallback(
+    async (file: File) => {
+      if (!file || !file.type.startsWith('image/')) return;
+      setIsImageLoading(true);
+      try {
+        const { mesh, logs } = await imageFileToSceneState(
+          file,
+          imageHeightScale,
+          imageCols,
+          imageRows,
+          imageRemoveBackground
+        );
+
+        if (!mesh.vertices.length) {
+          toast.error(t('editor3D.imageToHeightmap.error'));
+          return;
+        }
+
+        if (configObjectId) {
+          freezeObjectSnapshot(configObjectId);
+          setConfigObjectId(null);
+        }
+
+        const currentObjs = sceneObjects;
+        const id = `object-${Date.now()}-${currentObjs.length}`;
+        const nombre = t('editor3D.objectN', { n: currentObjs.length + 1 });
+
+        setSceneObjects((current) => [
+          ...current,
+          {
+            id,
+            name: nombre,
+            mode: 'extrude',
+            transform: { ...IDENTITY_TRANSFORM },
+            mesh,
+            smooth: true,
+            textureProjection,
+          },
+        ]);
+        setSelectedObjectId(id);
+        setSelectedObjectIds([id]);
+        const center = computeMeshBoundsCenter(mesh);
+        if (center) {
+          setGizmoOffset({
+            px: center.px,
+            py: center.py,
+            pz: center.pz,
+            rx: 0,
+            ry: 0,
+            rz: 0,
+            sx: 1,
+            sy: 1,
+            sz: 1,
+          });
+        }
+        switchTab('scene');
+        frameAllWindows();
+
+        toast.success(
+          t('editor3D.imageToHeightmap.success', {
+            vertices: mesh.vertices.length,
+            faces: mesh.faces.length,
+          })
+        );
+        logs.forEach((log) => console.log('[imageToHeightmap]', log));
+      } catch (err) {
+        toast.error(
+          err instanceof Error
+            ? err.message
+            : t('editor3D.imageToHeightmap.error')
+        );
+      } finally {
+        setIsImageLoading(false);
+        if (imageInputRef.current) imageInputRef.current.value = '';
+      }
+    },
+    [imageHeightScale, imageCols, imageRows, imageRemoveBackground, sceneObjects, configObjectId, freezeObjectSnapshot, textureProjection, switchTab, frameAllWindows, computeMeshBoundsCenter, setGizmoOffset, t]
+  );
+
+  const handleCenterGizmoOnObject = useCallback(() => {
+    if (!selectedObjectId) {
+      toast.error(t('editor3D.selectObjectFirst'));
+      return;
+    }
+    const obj = sceneObjects.find((o) => o.id === selectedObjectId);
+    if (!obj?.mesh?.vertices || obj.mesh.vertices.length === 0) {
+      toast.error(t('editor3D.noGeometry'));
+      return;
+    }
+    const verts = obj.mesh.vertices;
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (const v of verts) {
+      if (v.x < minX) minX = v.x;
+      if (v.y < minY) minY = v.y;
+      if (v.z < minZ) minZ = v.z;
+      if (v.x > maxX) maxX = v.x;
+      if (v.y > maxY) maxY = v.y;
+      if (v.z > maxZ) maxZ = v.z;
+    }
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    const cz = (minZ + maxZ) / 2;
+    setGizmoOffset({
+      px: cx,
+      py: cy,
+      pz: cz,
+      rx: 0,
+      ry: 0,
+      rz: 0,
+      sx: 1,
+      sy: 1,
+      sz: 1,
+    });
+    toast.success(t('editor3D.gizmoCentered'));
+  }, [selectedObjectId, sceneObjects, t]);
+
+  // Template save/load handlers
+  const openTemplateModal = useCallback(async (action: 'save' | 'load') => {
+    setTemplateAction(action);
+    setTemplateMsg(null);
+    setTemplateName('');
+    setSelectedTemplateIds([]);
+    if (action === 'save') {
+      setTemplateType(mode === 'lathe' ? 'lathe' : mode === 'mesh' ? 'mesh' : 'views');
+    }
+    setTemplateLoading(true);
+    try {
+      const result = await listTemplates();
+      setTemplateTemplates(result);
+    } catch (e) {
+      setTemplateMsg({ ok: false, text: t('editor3D.templateLoadError') });
+    } finally {
+      setTemplateLoading(false);
+    }
+    setTemplateModalOpen(true);
+  }, [mode, t]);
+
+  const handleSaveTemplate = useCallback(async () => {
+    if (!templateName.trim()) {
+      setTemplateMsg({ ok: false, text: t('editor3D.templateNameRequired') });
+      return;
+    }
+    try {
+      let data: Record<string, unknown> = {};
+      if (templateType === 'views') {
+        data = { views: { front: structuredClone(views.front), side: structuredClone(views.side), top: structuredClone(views.top) } };
+      } else if (templateType === 'lathe') {
+        data = { latheProfile: structuredClone(latheProfile) };
+      } else if (templateType === 'mesh') {
+        data = { meshSilhouette: structuredClone(meshSilhouette), meshSections: structuredClone(meshSections) };
+      }
+      await saveTemplate({ name: templateName.trim(), type: templateType, data });
+      setTemplateMsg({ ok: true, text: t('editor3D.templateSaveSuccess', { name: templateName.trim() }) });
+      const result = await listTemplates();
+      setTemplateTemplates(result);
+    } catch (e) {
+      setTemplateMsg({ ok: false, text: t('editor3D.templateSaveError') });
+    }
+  }, [templateName, templateType, views, latheProfile, meshSilhouette, meshSections, t]);
+
+  const handleApplyTemplate = useCallback(async (tpl: SavedTemplate) => {
+    try {
+      const data = tpl.data;
+      if (tpl.type === 'views' && data.views) {
+        const v = data.views as { front: unknown; side: unknown; top: unknown };
+        if (v.front) setViews((prev) => ({ ...prev, front: structuredClone(v.front as Point2D[]) }));
+        if (v.side) setViews((prev) => ({ ...prev, side: structuredClone(v.side as Point2D[]) }));
+        if (v.top) setViews((prev) => ({ ...prev, top: structuredClone(v.top as Point2D[]) }));
+      } else if (tpl.type === 'lathe' && data.latheProfile) {
+        setLatheProfile(structuredClone(data.latheProfile as Point2D[]));
+      } else if (tpl.type === 'mesh') {
+        if (data.meshSilhouette) setMeshSilhouette(structuredClone(data.meshSilhouette as Point2D[]));
+        if (data.meshSections) setMeshSections(structuredClone(data.meshSections as Array<{ id: number; polygon: Polygon; y: number }>));
+      }
+      setTemplateMsg({ ok: true, text: t('editor3D.templateApplySuccess', { name: tpl.name }) });
+    } catch (e) {
+      setTemplateMsg({ ok: false, text: t('editor3D.templateApplyError') });
+    }
+  }, [t]);
+
+  const handleDeleteTemplate = useCallback(async (id: string) => {
+    try {
+      await deleteTemplate(id);
+      setTemplateTemplates((prev) => prev.filter((t) => t.id !== id));
+      setSelectedTemplateIds((prev) => prev.filter((tid) => tid !== id));
+    } catch {
+      setTemplateMsg({ ok: false, text: t('editor3D.templateDeleteError') });
+    }
+  }, [t]);
 
   /**
    * Pinta las ventanas del área de trabajo según la composición elegida
@@ -9992,11 +10634,106 @@ pluginTracks,
                     value={[Math.round((1 - viewsOpacity) * 100)]}
                     onValueChange={([v]) => setViewsOpacity(1 - v / 100)}
                   />
-                  <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
-                    <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />{t('editor3D.opacityHint')}
-                  </p>
-                </div>
-            </Fragment>
+                   <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
+                     <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />{t('editor3D.opacityHint')}
+                   </p>
+                 </div>
+
+                 {mode === 'extrude' && (
+                   <div className="border-t border-white/5 pt-3 mt-1">
+                     <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2 mb-2">
+                       <ImageIcon className="w-3 h-3 text-purple-400" />
+                       {t('editor3D.imageToHeightmap.title')}
+                     </h3>
+                     <p className="text-[10px] text-muted-foreground/60 mb-2 flex items-start gap-1">
+                       <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
+                       {t('editor3D.imageToHeightmap.hint')}
+                     </p>
+
+                     <div className="flex items-center gap-2 mb-2">
+                       <input
+                         type="file"
+                         accept="image/*"
+                         ref={imageInputRef}
+                         onChange={(e) => {
+                           const file = e.target.files?.[0];
+                           if (file) handleImageToHeightmap(file);
+                           e.target.value = '';
+                         }}
+                         className="hidden"
+                       />
+                       <button
+                         onClick={() => imageInputRef.current?.click()}
+                         disabled={isImageLoading}
+                         className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border border-purple-500/30 disabled:opacity-40 transition-colors"
+                       >
+                         {isImageLoading ? (
+                           <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                         ) : (
+                           <Upload className="w-3.5 h-3.5" />
+                         )}
+                         {t('editor3D.imageToHeightmap.uploadBtn')}
+                       </button>
+                     </div>
+
+                     <div className="flex flex-col gap-1.5 mb-2">
+                       <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
+                         <span>{t('editor3D.imageToHeightmap.heightScale')}</span>
+                         <span className="font-mono text-[10px] text-green-400">
+                           {imageHeightScale.toFixed(1)}
+                         </span>
+                       </label>
+                       <Slider
+                         min={0.5}
+                         max={20}
+                         step={0.5}
+                         value={[imageHeightScale]}
+                         onValueChange={([v]) => setImageHeightScale(v)}
+                         className="w-full"
+                       />
+                     </div>
+
+                     <div className="grid grid-cols-2 gap-2 mb-2">
+                       <div>
+                         <label className="text-[10px] text-muted-foreground/80">
+                           {t('editor3D.imageToHeightmap.cols')}
+                         </label>
+                         <input
+                           type="number"
+                           min={8}
+                           max={256}
+                           value={imageCols}
+                           onChange={(e) => setImageCols(Math.max(8, Math.min(256, parseInt(e.target.value) || 128)))}
+                           className="w-full px-2 py-1 text-xs bg-black/40 border border-white/10 rounded text-foreground"
+                         />
+                       </div>
+                       <div>
+                         <label className="text-[10px] text-muted-foreground/80">
+                           {t('editor3D.imageToHeightmap.rows')}
+                         </label>
+                         <input
+                           type="number"
+                           min={8}
+                           max={256}
+                           value={imageRows}
+                           onChange={(e) => setImageRows(Math.max(8, Math.min(256, parseInt(e.target.value) || 128)))}
+                           className="w-full px-2 py-1 text-xs bg-black/40 border border-white/10 rounded text-foreground"
+                         />
+                       </div>
+                     </div>
+
+                     <label className="flex items-center gap-2 cursor-pointer text-xs text-muted-foreground/80">
+                       <input
+                         type="checkbox"
+                         checked={imageRemoveBackground}
+                         onChange={(e) => setImageRemoveBackground(e.target.checked)}
+                         className="w-3 h-3"
+                       />
+                       <span>{t('editor3D.imageToHeightmap.removeBackground')}</span>
+                     </label>
+                   </div>
+                 )}
+             </Fragment>
           ) : mode === 'text' ? (
             <div key="text" className="flex-1 flex flex-col min-h-0">
               <div className="px-3 py-2 border-b border-white/5">
@@ -10751,10 +11488,19 @@ pluginTracks,
                     >
                       {gizmoConfigMode ? <Check className="w-3 h-3" /> : '⚙'}
                     </button>
-                  </div>
+                     <button
+                       onClick={handleCenterGizmoOnObject}
+                       data-testid="gizmo-center-btn"
+                       title={t('editor3D.gizmoCenterOnObject')}
+                       disabled={!selectedObjectId}
+                       className="px-1.5 py-1 rounded-md text-[10px] font-medium bg-black/40 text-foreground/60 hover:text-foreground border border-white/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                     >
+                       <Target className="w-3 h-3" />
+                    </button>
+                   </div>
 
-                  {gizmoConfigMode && (
-                    <div className="space-y-1">
+                   {gizmoConfigMode && (
+                     <div className="space-y-1">
                       {[
                         { key: 'move' as const, icon: Move3D, label: t('editor3D.gizmoMove') },
                         { key: 'rotate' as const, icon: Rotate3D, label: t('editor3D.gizmoRotate') },
@@ -12459,19 +13205,37 @@ pluginTracks,
                       {Math.round(templateScale * 100)}%
                     </span>
                   </div>
-                  <button
-                    onClick={() => {
-                      setTemplateImage(null);
-                      setTemplateOpacity(0.5);
-                      setTemplateScale(1);
-                    }}
-                    className="px-2 py-1 rounded-md text-xs font-medium bg-red-500/10 hover:bg-red-500/20 text-red-300 border border-red-500/30 transition-colors"
-                    title={t('editor3D.removeTemplate')}
-                  >
-                    Quitar
-                  </button>
-                </>
+                   <button
+                      onClick={() => {
+                        setTemplateImage(null);
+                        setTemplateOpacity(0.5);
+                        setTemplateScale(1);
+                      }}
+                      className="px-2 py-1 rounded-md text-xs font-medium bg-red-500/10 hover:bg-red-500/20 text-red-300 border border-red-500/30 transition-colors"
+                      title={t('editor3D.removeTemplate')}
+                    >
+                      Quitar
+                    </button>
+                  </>
               )}
+              {/* Plantillas guardadas/cargadas */}
+              <div className="w-px h-5 bg-white/10"></div>
+              <button
+                onClick={() => openTemplateModal('save')}
+                className="flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium bg-purple-500/15 hover:bg-purple-500/25 text-purple-200 border border-purple-500/30 transition-colors"
+                title={t('editor3D.templateSaveTitle')}
+              >
+                <Save className="w-3 h-3" />
+                {t('editor3D.templateSaveBtn')}
+              </button>
+              <button
+                onClick={() => openTemplateModal('load')}
+                className="flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium bg-blue-500/15 hover:bg-blue-500/25 text-blue-200 border border-blue-500/30 transition-colors"
+                title={t('editor3D.templateLoadTitle')}
+              >
+                <FolderOpen className="w-3 h-3" />
+                {t('editor3D.templateLoadBtn')}
+              </button>
             </div>
           )}
         </div>
@@ -12868,6 +13632,163 @@ pluginTracks,
           </div>
         </div>
       </Modal>
+      <Modal
+        isOpen={templateModalOpen}
+        onClose={() => setTemplateModalOpen(false)}
+        title={t(templateAction === 'save' ? 'editor3D.templateSaveTitle' : 'editor3D.templateLoadTitle')}
+        size="md"
+      >
+        <div className="space-y-4 py-4">
+          {templateMsg && (
+            <div
+              className={`rounded-lg px-4 py-2 text-sm border ${
+                templateMsg.ok
+                  ? 'bg-green-500/20 border-green-500/50 text-green-300'
+                  : 'bg-red-500/20 border-red-500/50 text-red-300'
+              }`}
+            >
+              {templateMsg.text}
+            </div>
+          )}
+
+          {templateAction === 'save' ? (
+            <>
+              <div className="space-y-2">
+                <label className="flex items-center gap-2 text-sm font-medium text-gray-300">
+                  <Save className="w-4 h-4 text-green-400" />
+                  {t('editor3D.templateNameLabel')}
+                </label>
+                <input
+                  type="text"
+                  value={templateName}
+                  data-testid="template-name-input"
+                  onChange={(e) => setTemplateName(e.target.value)}
+                  placeholder={t('editor3D.templateNamePlaceholder')}
+                  className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-green-500"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <span className="text-xs text-muted-foreground">{t('editor3D.templateTypeLabel')}</span>
+                <div className="flex gap-1">
+                  <button
+                    onClick={() => setTemplateType('views')}
+                    className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                      templateType === 'views'
+                        ? 'bg-purple-600 text-white'
+                        : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                    }`}
+                  >
+                    {t('editor3D.templateTypeViews')}
+                  </button>
+                  <button
+                    onClick={() => setTemplateType('lathe')}
+                    className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                      templateType === 'lathe'
+                        ? 'bg-purple-600 text-white'
+                        : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                    }`}
+                    disabled={mode !== 'lathe'}
+                  >
+                    {t('editor3D.templateTypeLathe')}
+                  </button>
+                  <button
+                    onClick={() => setTemplateType('mesh')}
+                    className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                      templateType === 'mesh'
+                        ? 'bg-purple-600 text-white'
+                        : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                    }`}
+                    disabled={mode !== 'mesh'}
+                  >
+                    {t('editor3D.templateTypeMesh')}
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-3">
+                <button
+                  onClick={() => setTemplateModalOpen(false)}
+                  className="px-6 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-gray-300 text-sm font-bold transition-colors"
+                >
+                  {t('editor3D.cancel')}
+                </button>
+                <button
+                  onClick={handleSaveTemplate}
+                  data-testid="template-save-confirm"
+                  disabled={!templateName.trim()}
+                  className="px-6 py-2 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 rounded-lg text-white text-sm font-bold transition-colors flex items-center gap-2"
+                >
+                  <Save className="w-4 h-4" />
+                  {t('editor3D.templateSaveConfirmBtn')}
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              {templateLoading ? (
+                <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
+                  <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                  {t('editor3D.templateLoading')}
+                </div>
+              ) : templateTemplates.length === 0 ? (
+                <p className="text-sm text-muted-foreground py-4 text-center">
+                  {t('editor3D.templateEmpty')}
+                </p>
+              ) : (
+                <div className="max-h-80 overflow-y-auto space-y-2">
+                  {templateTemplates.map((tpl) => (
+                    <div
+                      key={tpl.id}
+                      className="flex items-center justify-between p-2 rounded-md bg-gray-800/50 border border-white/5 group"
+                    >
+                      <div className="flex-1 truncate">
+                        <div className="text-sm font-medium text-foreground truncate">
+                          {tpl.name}
+                        </div>
+                        <div className="text-[10px] text-muted-foreground/60">
+                          {tpl.type === 'views'
+                            ? t('editor3D.templateTypeViews')
+                            : tpl.type === 'lathe'
+                              ? t('editor3D.templateTypeLathe')
+                              : t('editor3D.templateTypeMesh')}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1 opacity-60 group-hover:opacity-100 transition-opacity">
+                        <button
+                          onClick={() => handleApplyTemplate(tpl)}
+                          data-testid={`template-apply-${tpl.id}`}
+                          className="px-2 py-1 rounded text-xs font-medium bg-blue-500/20 hover:bg-blue-500/30 text-blue-200 border border-blue-500/30 transition-colors"
+                          title={t('editor3D.templateApplyTooltip', { name: tpl.name })}
+                        >
+                          {t('editor3D.templateApplyBtn')}
+                        </button>
+                        <button
+                          onClick={() => handleDeleteTemplate(tpl.id)}
+                          data-testid={`template-delete-${tpl.id}`}
+                          className="px-2 py-1 rounded text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/30 transition-colors"
+                          title={t('editor3D.templateDeleteTooltip', { name: tpl.name })}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="flex justify-end">
+                <button
+                  onClick={() => setTemplateModalOpen(false)}
+                  className="px-6 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-gray-300 text-sm font-bold transition-colors"
+                >
+                  {t('editor3D.cancel')}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </Modal>
       <TextureBrowserModal
         isOpen={textureBrowserOpen}
         onClose={() => setTextureBrowserOpen(false)}
@@ -12981,10 +13902,10 @@ pluginTracks,
              setSkyboxImage(dataUrl);
              setSkyboxImageFileName(fileName);
            }
-         }}
-        mode={mode}
-      />
-    </div>
+          }}
+          mode={mode}
+        />
+      </div>
   );
 }
 export function PanelButtons({

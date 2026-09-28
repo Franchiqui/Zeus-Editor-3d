@@ -1,4 +1,4 @@
-import type { Mesh, ObjectTransform } from './geometry';
+import type { Mesh, ObjectTransform, Vertex3D } from './geometry';
 import type { TransformProperty, TransformTrack } from './animation';
 import type { ZeiaApplyResult, ZeiaAppliedPlan, ZeiaPlanStep } from './zeia';
 import { buildPrimitiveMesh, fallbackMesh, normalizePrimitiveName, primitiveIsSmooth, type ZeiaPrimitiveName } from './zeia-primitives';
@@ -97,7 +97,14 @@ function objectName(params: Record<string, unknown>): string {
 function buildObject<T extends ZeiaSceneObject>(id: string, params: Record<string, unknown>): T {
   const prim = resolvePrimitiveName(params);
   const primName = prim?.toString() ?? params.primitive ?? primitiveFromGeometry(params.geometry) ?? null;
-  const mesh = buildPrimitiveMesh(primName) ?? fallbackMesh();
+  const primitiveMesh = buildPrimitiveMesh(primName) ?? fallbackMesh();
+  // Si se proporcionó una malla explícita (execute.mesh), usarla en lugar
+  // de generar una primitiva: así los objetos guardados con geometría real
+  // (p. ej. Taza.txt) se crean con su malla original, no con un cubo de reserva.
+  const mesh: Mesh =
+    params.mesh && typeof params.mesh === 'object' && !Array.isArray(params.mesh)
+      ? (params.mesh as Mesh)
+      : primitiveMesh;
   // Luces/cámaras: usamos una esfera (marcador) si no son una primitiva conocida.
   const meshFinal = params.type === 'light' || params.type === 'camera' ? buildPrimitiveMesh('sphere') ?? mesh : mesh;
   const smooth = primitiveIsSmooth(prim);
@@ -107,8 +114,20 @@ function buildObject<T extends ZeiaSceneObject>(id: string, params: Record<strin
     transform: transformFromParams(params),
     mesh: meshFinal,
     smooth,
+    // Propiedades de textura/acabado/opacity pasadas desde execute.
+    ...extractTextureProps(params),
   };
   return obj as unknown as T;
+}
+
+/** Extrae las propiedades de textura/acabado/opacity de params al objeto. */
+function extractTextureProps(params: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const keys = ['texture', 'textureColor', 'textureRelief', 'textureRepeat', 'textureFinish', 'texturePanela', 'textureHelper', 'textureHelperTransform', 'opacity'];
+  for (const key of keys) {
+    if (key in params && params[key] !== undefined) out[key] = params[key];
+  }
+  return out;
 }
 
 function applyTransformPatch(base: ObjectTransform, patch: Record<string, unknown>): ObjectTransform {
@@ -307,12 +326,43 @@ function normalizeCreateParams(execute: Record<string, unknown>): Record<string,
     }
   }
 
-  if (Object.keys(transform).length) params.transform = transform;
+   if (Object.keys(transform).length) params.transform = transform;
 
-  if (execute.material) params.material = execute.material;
-  if (execute.color) params.material = { ...(typeof execute.material === 'object' ? execute.material : {}), color: execute.color };
+   if (execute.material) params.material = execute.material;
+   if (execute.color) params.material = { ...(typeof execute.material === 'object' ? execute.material : {}), color: execute.color };
 
-  return params;
+   // Malla explícita (execute.mesh o execute.geometry con vertices/faces).
+   // Cuando se provee, buildObject la usa directamente en lugar de generar
+   // una primitiva: esto permite cargar objetos guardados con geometría real
+   // (p. ej. Taza.txt) en vez de caer en el cubo de reserva.
+   const explicitMesh = extractExplicitMesh(execute);
+   if (explicitMesh) params.mesh = explicitMesh;
+
+   // Pasar propiedades de textura/acabado/opacity para que lleguen al objeto.
+   for (const key of ['texture', 'textureColor', 'textureRelief', 'textureRepeat', 'textureFinish', 'texturePanela', 'textureHelper', 'textureHelperTransform', 'opacity']) {
+     if (key in execute && execute[key] !== undefined) (params as Record<string, unknown>)[key] = execute[key];
+   }
+
+   return params;
+}
+
+/** Extrae una malla {vertices, faces} de execute.mesh o execute.geometry.{mesh|vertices|faces}. */
+function extractExplicitMesh(execute: Record<string, unknown>): Mesh | null {
+  if (execute.mesh && typeof execute.mesh === 'object' && !Array.isArray(execute.mesh)) {
+    const m = execute.mesh as Record<string, unknown>;
+    if (Array.isArray(m.vertices) && Array.isArray(m.faces)) return m as unknown as Mesh;
+  }
+  if (execute.geometry && typeof execute.geometry === 'object') {
+    const g = execute.geometry as Record<string, unknown>;
+    if (g.mesh && typeof g.mesh === 'object' && !Array.isArray(g.mesh)) {
+      const m = g.mesh as Record<string, unknown>;
+      if (Array.isArray(m.vertices) && Array.isArray(m.faces)) return m as unknown as Mesh;
+    }
+    if (Array.isArray(g.vertices) && Array.isArray(g.faces)) {
+      return { vertices: g.vertices as Vertex3D[], faces: g.faces as number[][] };
+    }
+  }
+  return null;
 }
 
 function capitalize(s: string): string {
