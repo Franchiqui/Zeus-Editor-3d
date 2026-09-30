@@ -310,8 +310,8 @@ interface Viewer3DProps {
     onSelectionModeChange?: (active: boolean) => void;
     /** Activar modo de selección de caras de la figura activa */
     faceSelectMode?: boolean;
-    /** Herramienta de selección: rectángulo, círculo o línea (segmento en pantalla) */
-    faceSelectionTool?: 'rectangle' | 'circle' | 'line';
+    /** Herramienta de selección: rectángulo, círculo, línea o polígono (clics sucesivos) */
+    faceSelectionTool?: 'rectangle' | 'circle' | 'line' | 'poligono';
     /** Qué se selecciona: caras, vértices o segmentos (aristas) */
     faceSelectionTarget?: 'cara' | 'vertice' | 'segmento';
     /** Solo capturar lo visible (caras frontales, no lo que está detrás) */
@@ -333,10 +333,14 @@ interface Viewer3DProps {
     /** Notifica al padre del cambio en el modo de selección de caras */
     onFaceSelectionModeChange?: (active: boolean) => void;
     /** Notifica al padre del cambio en la herramienta de selección */
-    onFaceSelectionToolChange?: (tool: 'rectangle' | 'circle' | 'line') => void;
+    onFaceSelectionToolChange?: (tool: 'rectangle' | 'circle' | 'line' | 'poligono') => void;
     /** Notifica al padre del cambio en el objetivo de selección */
     onFaceSelectionTargetChange?: (target: 'cara' | 'vertice' | 'segmento') => void;
   onVerticesChange?: (vertices: Vertex3D[]) => void;
+  /** Registra la función que desplaza la selección actual (vértices/
+   *  segmentos/caras): los campos numéricos de la barra del editor la
+   *  guardan y la llaman con el desplazamiento X·Y·Z. */
+  onRegisterSelectionMove?: (fn: (dx: number, dy: number, dz: number) => void) => void;
   showVerticesDefault?: boolean;
   camera3D?: Camera3D;
   /** Al incrementarse, encuadra (ajusta el zoom/centro) la figura y los
@@ -1582,24 +1586,50 @@ function isPointInPolygon(px: number, py: number, polygon: Array<{ x: number; y:
  */
 function findMainMesh(meshGroup: THREE.Group | null): THREE.Mesh | undefined {
   if (!meshGroup) return undefined;
+  // Una malla es de la figura ACTIVA si ni ella ni ninguno de sus padres
+  // lleva la marca de duplicado de otro objeto ni el cuerpo de una
+  // cámara-objeto.
+  const esElegible = (o: THREE.Mesh): boolean => {
+    if (o.userData?.sceneObjectDuplicate || o.userData?.cameraBodyActive) {
+      return false;
+    }
+    let p: THREE.Object3D | null = o.parent;
+    while (p && p !== meshGroup) {
+      if (p.userData?.sceneObjectDuplicate || p.userData?.cameraBodyActive) {
+        return false;
+      }
+      p = p.parent;
+    }
+    return true;
+  };
   const named = meshGroup.getObjectByName('mesh');
-  if (
-    named instanceof THREE.Mesh &&
-    !named.userData.sceneObjectDuplicate &&
-    !named.userData.cameraBodyActive
-  ) {
+  if (named instanceof THREE.Mesh && esElegible(named)) {
     return named;
   }
   for (const child of meshGroup.children) {
-    if (
-      child instanceof THREE.Mesh &&
-      !child.userData.sceneObjectDuplicate &&
-      !child.userData.cameraBodyActive
-    ) {
+    if (child instanceof THREE.Mesh && esElegible(child)) {
       return child;
     }
   }
-  return undefined;
+  // Visuales compuestos (texto con malla por letra, instantáneas por
+  // pestañas): la malla principal puede estar ANIDADA. Gana la de
+  // más triángulos — las flechas del gizmo y las guías quedan fuera por
+  // tamaño y porque no hay malla rival con volumen real.
+  let mejor: THREE.Mesh | undefined;
+  let mejorTri = 0;
+  meshGroup.traverse((o) => {
+    if (!(o instanceof THREE.Mesh) || !esElegible(o)) return;
+    const geo = o.geometry;
+    if (!geo) return;
+    const tri = geo.index
+      ? geo.index.count / 3
+      : (geo.getAttribute('position')?.count ?? 0);
+    if (tri > mejorTri) {
+      mejorTri = tri;
+      mejor = o;
+    }
+  });
+  return mejor;
 }
 
 /**
@@ -1645,21 +1675,25 @@ function buildFaceSelectionOverlay(
   geometry.setIndex(indices);
 
   // Tinte sólido y contrastado para que el cambio de color se note claro
-  // AUNQUE el objeto tenga textura: magenta casi opaco.
+  // AUNQUE el objeto tenga textura: magenta casi opaco. depthTest:true:
+  // la superficie del objeto (empujada con polygonOffset en modo
+  // selección) oculta los resaltes de atrÁS — pero el delantero gana el
+  // test de profundidad coplanar sin z-fight.
   const material = new THREE.MeshBasicMaterial({
     color: 0xff00ff,
+    toneMapped: false, // magenta puro, sin lavado del tonemapping
     transparent: true,
     opacity: 0.9,
     depthWrite: false,
     depthTest: true,
     side: THREE.DoubleSide,
-    // Coplanar con la malla original: ganar el test de profundidad.
     polygonOffset: true,
     polygonOffsetFactor: -4,
     polygonOffsetUnits: -4,
   });
 
   const overlay = new THREE.Mesh(geometry, material);
+  overlay.renderOrder = 997;
 
   // Contorno amarillo sólido del borde de cada cara seleccionada: visible
   // sobre cualquier textura, con el mismo empuje de profundidad.
@@ -1683,6 +1717,7 @@ function buildFaceSelectionOverlay(
     lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(linePos, 3));
     const lineMat = new THREE.LineBasicMaterial({
       color: 0xffff00,
+      toneMapped: false, // amarillo puro, sin lavado del tonemapping
       transparent: true,
       opacity: 1,
       depthWrite: false,
@@ -1736,6 +1771,9 @@ function distanceToSegment(
 /** Umbral en píxeles para la herramienta Línea (y para agarrar la selección). */
 const FACE_LINE_TOLERANCE = 12;
 
+/** Píxeles alrededor del primer vértice para CERRAR el polígono con clic. */
+const POLIGONO_CIERRE_PX = 10;
+
 /**
  * Overlay de vértices seleccionados: una esfera pequeña por vértice, en el
  * espacio LOCAL de la malla (el grupo ya sigue la transform del objeto).
@@ -1745,10 +1783,29 @@ function buildVertexSelectionOverlay(
   vertexIds: Set<number>
 ): THREE.Group | null {
   if (vertexIds.size === 0) return null;
-  const geometry = new THREE.SphereGeometry(0.06, 10, 8);
+  // Radio en función del tamaño de la malla: la mitad del tamaño anterior
+  // (el usuario lo pidió: las esferas de vértice salían muy grandes).
+  let maxDim = 1;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const v of mesh.vertices) {
+    minX = Math.min(minX, v.x); maxX = Math.max(maxX, v.x);
+    minY = Math.min(minY, v.y); maxY = Math.max(maxY, v.y);
+    minZ = Math.min(minZ, v.z); maxZ = Math.max(maxZ, v.z);
+  }
+  if (mesh.vertices.length > 0) {
+    maxDim = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
+  }
+  const radio = Math.max(0.02, Math.min(0.15, maxDim * 0.01));
+  const geometry = new THREE.SphereGeometry(radio, 10, 8);
   const material = new THREE.MeshBasicMaterial({
-    color: 0x00ffff,
+    // Amarillo: el MISMO color de «seleccionado» que las caras; la guía
+    // (todos los vértices) sigue en verde-azulado para que se distinga.
+    // depthTest:true — la superficie empujada con polygonOffset deja
+    // ganar la esfera coplanar, y el objeto OCULTA los vértices de atrás.
+    color: 0xffff00,
+    toneMapped: false, // amarillo puro, sin lavado del tonemapping
     depthWrite: false,
+    depthTest: true,
     transparent: true,
     opacity: 0.95,
   });
@@ -1780,26 +1837,59 @@ function buildEdgeSelectionOverlay(
   edgeKeys: Set<string>
 ): THREE.LineSegments | null {
   if (edgeKeys.size === 0) return null;
-  const positions: number[] = [];
-  for (const edge of deriveMeshEdges(mesh)) {
+  const edges = deriveMeshEdges(mesh);
+  let maxDim = 1;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const v of mesh.vertices) {
+    minX = Math.min(minX, v.x); maxX = Math.max(maxX, v.x);
+    minY = Math.min(minY, v.y); maxY = Math.max(maxY, v.y);
+    minZ = Math.min(minZ, v.z); maxZ = Math.max(maxZ, v.z);
+  }
+  if (mesh.vertices.length > 0) {
+    maxDim = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
+  }
+  // La línea de 1 px coplanar pierde el test de profundidad (y con el
+  // antialiasing ni un píxel puro sale): se usa una CAJA fina alargada
+  // por cada arista seleccionada — un Mesh sí gana y se ve gruesa.
+  const grosor = Math.max(0.03, maxDim * 0.006);
+  const material = new THREE.MeshBasicMaterial({
+    // Amarillo: mismo color de «seleccionado» que caras y vértices.
+    // depthTest:true — oculto tras la superficie (polygonOffset del mesh).
+    color: 0xffff00,
+    toneMapped: false, // amarillo puro, sin lavado del tonemapping
+    depthWrite: false,
+    depthTest: true,
+    transparent: true,
+    opacity: 1,
+    // Empuje NEGATIVO propio para ganar el coplanar contra la superficie.
+    polygonOffset: true,
+    polygonOffsetFactor: -4,
+    polygonOffsetUnits: -4,
+    side: THREE.DoubleSide,
+  });
+  const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+  const ejeZ = new THREE.Vector3(0, 0, 1);
+  const grupo = new THREE.Group();
+  for (const edge of edges) {
     if (!edgeKeys.has(edge.key)) continue;
     const va = mesh.vertices[edge.a];
     const vb = mesh.vertices[edge.b];
     if (!va || !vb) continue;
-    positions.push(va.x, va.y, va.z, vb.x, vb.y, vb.z);
+    const a = new THREE.Vector3(va.x, va.y, va.z);
+    const b = new THREE.Vector3(vb.x, vb.y, vb.z);
+    const dir = b.clone().sub(a);
+    const len = dir.length();
+    if (len < 1e-6) continue;
+    const box = new THREE.Mesh(boxGeo, material);
+    box.position.copy(a.add(b).multiplyScalar(0.5));
+    box.quaternion.setFromUnitVectors(ejeZ, dir.normalize());
+    box.scale.set(grosor, grosor, len);
+    box.renderOrder = 997;
+    grupo.add(box);
   }
-  if (positions.length === 0) return null;
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  const material = new THREE.LineBasicMaterial({
-    color: 0x00ffff,
-    depthWrite: false,
-    transparent: true,
-    opacity: 1,
-  });
-  const overlay = new THREE.LineSegments(geometry, material);
-  overlay.renderOrder = 997;
-  return overlay;
+  if (grupo.children.length === 0) return null;
+  grupo.renderOrder = 997;
+  return grupo as unknown as THREE.LineSegments;
 }
 
 /**
@@ -1820,12 +1910,20 @@ function buildVertexGuideOverlay(mesh: Mesh): THREE.Points | null {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   const material = new THREE.PointsMaterial({
-    color: 0x06b7a3,
-    size: 5,
+    // AZUL puro (el usuario lo pidió: el turquesa se lavaba a blanco sobre
+    // las texturas claras y destrozaba la vista). toneMapped:false — sin
+    // lavado del tonemapping, se ve el mismo azul sobre cualquier fondo.
+    // AZUL OSCURO (el usuario lo pidió: el turquesa viejo quedaba «de un
+    // azul muy flojo» sobre las texturas claras). toneMapped:false — se ve
+    // el mismo azul sobre cualquier fondo, sin lavado.
+    color: 0x1d4ed8,
+    toneMapped: false,
+    size: 4,
     sizeAttenuation: false,
     depthWrite: false,
+    depthTest: true,
     transparent: true,
-    opacity: 0.65,
+    opacity: 0.8,
   });
   const points = new THREE.Points(geometry, material);
   points.renderOrder = 996;
@@ -1850,8 +1948,12 @@ function buildEdgeGuideOverlay(mesh: Mesh): THREE.LineSegments | null {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   const material = new THREE.LineBasicMaterial({
-    color: 0x06b7a3,
+    color: 0x1d4ed8, // mismo AZUL OSCURO de la guía de vértices
+    toneMapped: false,
+    // depthTest:true — el objeto oculta la guía de atrÁS (el mesh se
+    // empuja con polygonOffset durante el modo selección).
     depthWrite: false,
+    depthTest: true,
     transparent: true,
     opacity: 0.5,
   });
@@ -1874,10 +1976,13 @@ function buildFaceGuideOverlay(mesh: Mesh): THREE.Points | null {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   const material = new THREE.PointsMaterial({
+    // Celeste CLARO: el usuario lo dejó tal cual («deja los blancos») —
+    // es el celeste que sobre las texturas se ve blanco y a él le vale.
     color: 0x8be9e0,
     size: 4,
     sizeAttenuation: false,
     depthWrite: false,
+    depthTest: true,
     transparent: true,
     opacity: 0.8,
   });
@@ -2011,6 +2116,7 @@ export default function Viewer3D({
     onFaceSelectionToolChange,
     onFaceSelectionTargetChange,
     onVerticesChange,
+    onRegisterSelectionMove,
    showVerticesDefault = true,
   smoothShading = false,
   showLatheAxis = false,
@@ -2270,6 +2376,9 @@ export default function Viewer3D({
     const faceSelectionOverlayRef = useRef<THREE.Group | null>(null);
     const faceSelectionStartRef = useRef<{ x: number; y: number; rect: DOMRect } | null>(null);
     const faceSelectionPointsRef = useRef<Array<{ x: number; y: number }>>([]);
+    // Polígono cerrado esperando a que el pointerup aplique la selección:
+    // se rellena en el clic de cierre y se vacía al usarse.
+    const poligonoCerradaRef = useRef<Array<{ x: number; y: number }> | null>(null);
     const faceSelectionPolyDivRef = useRef<SVGPolygonElement | null>(null);
     const faceSelectionRectDivRef = useRef<HTMLDivElement | null>(null);
     const faceSelectionCircleDivRef = useRef<HTMLDivElement | null>(null);
@@ -2587,6 +2696,49 @@ export default function Viewer3D({
 
   const onVerticesChangeRef = useRef(onVerticesChange);
   onVerticesChangeRef.current = onVerticesChange;
+  const onRegisterSelectionMoveRef = useRef(onRegisterSelectionMove);
+  onRegisterSelectionMoveRef.current = onRegisterSelectionMove;
+
+  // Mover la selección con los campos numéricos de la barra del editor:
+  // desplaza los vértices afectados (según el objetivo actual: caras →
+  // sus vértices, vértices → ellos mismos, segmentos → sus extremos) en
+  // el espacio LOCAL de la malla y emite la malla completa por
+  // onVerticesChange, igual que el arrastre de mover.
+  const moverSeleccion = useCallback((dx: number, dy: number, dz: number) => {
+    const m = meshRef.current;
+    const meshObj = findMainMesh(meshGroupRef.current);
+    if (!m || !meshObj || !faceSelectModeRef.current) return;
+    const vertIdxSet = new Set<number>();
+    const target = faceSelectionTargetRef.current;
+    if (target === 'cara') {
+      for (const f of selectedFaceIdsRef.current) {
+        const face = m.faces[f];
+        if (face) for (const vi of face) vertIdxSet.add(vi);
+      }
+    } else if (target === 'vertice') {
+      for (const vi of selectedVertexIdsRef.current) vertIdxSet.add(vi);
+    } else {
+      for (const edge of deriveMeshEdges(m)) {
+        if (!selectedEdgeIdsRef.current.includes(edge.key)) continue;
+        vertIdxSet.add(edge.a);
+        vertIdxSet.add(edge.b);
+      }
+    }
+    if (vertIdxSet.size === 0) return;
+    const verts = m.vertices.map((v) => ({ ...v }));
+    for (const idx of vertIdxSet) {
+      const v = verts[idx];
+      if (!v) continue;
+      v.x += dx;
+      v.y += dy;
+      v.z += dz;
+    }
+    onVerticesChangeRef.current?.(verts);
+  }, []);
+
+  useEffect(() => {
+    onRegisterSelectionMoveRef.current?.(moverSeleccion);
+  }, [moverSeleccion]);
 
   const onLightConfigChangeRef = useRef(onLightConfigChange);
   onLightConfigChangeRef.current = onLightConfigChange;
@@ -4263,7 +4415,16 @@ export default function Viewer3D({
           updateSparks(rt.sparks, dt, emisorDeFoco(rt, 'sparks'));
         }
         if (rt.fire?.points.visible) {
-          updateFire(rt.fire, dt, emisorDeFoco(rt, 'fire'));
+          // El estilo viene del fireEstilo del objeto. Con focos el emisor
+          // ya es un punto (no se converge); sin focos la pluma converge
+          // hacia el promedio vivo de los nacimientos.
+          updateFire(
+            rt.fire,
+            dt,
+            emisorDeFoco(rt, 'fire'),
+            rt.estatico.fire?.fireEstilo ?? 0,
+            rt.focos.fire.length === 0
+          );
         }
         if (rt.stars?.group.visible) {
           updateStars(rt.stars, dt, rt.sampler, rt.starSize);
@@ -4411,8 +4572,50 @@ export default function Viewer3D({
         // cualquier hijo llamado 'mesh' que no lo sea de verdad.
         const meshObj = findMainMesh(meshGroupRef.current);
         if (faceSelectModeRef.current && m && meshObj) {
+          // Empujar la superficie una pizca hacia atrás para que la guía y
+          // los resaltes coplanares ganen el test de profundidad (el truco
+          // canónico del overlay de wireframe). Además COLOR LISO: sin la
+          // textura de fondo la malla de puntos no despista (el usuario lo
+          // pidió: con la textura no se ve bien por dónde recortar). Al
+          // salir se restaura lo guardado.
+          const matsPO = Array.isArray(meshObj.material) ? meshObj.material : [meshObj.material];
+          for (const mat of matsPO) {
+            const matU = mat as THREE.Material & { userData: Record<string, unknown>; polygonOffset: boolean };
+            if (!matU) continue;
+            if (!matU.userData || matU.userData.__ovPO !== true) {
+              // Primera vez en modo selección: guardar la apariencia.
+              const comoMat = matU as THREE.MeshStandardMaterial & { userData: Record<string, unknown> };
+              if (matU.userData) {
+                matU.userData.__ovApariencia = {
+                  map: 'map' in comoMat ? comoMat.map : undefined,
+                  color: comoMat.color ? comoMat.color.getHex() : null,
+                };
+              }
+              if ('map' in comoMat && comoMat.map) {
+                comoMat.map = null;
+                comoMat.needsUpdate = true;
+              }
+              if ('color' in comoMat && comoMat.color) comoMat.color.setHex(0xf2f4f7);
+            }
+            matU.polygonOffset = true;
+            // Con segmentos la Línea de 1 px coplanar pierde el test de
+            // profundidad con empuje mínimo: más empuje para la arista.
+            const objetivo = faceSelectionTargetRef.current;
+            matU.polygonOffsetFactor = objetivo === 'segmento' ? 3 : 1;
+            matU.polygonOffsetUnits = objetivo === 'segmento' ? 4 : 1;
+            matU.userData.__ovPO = true;
+          }
           const worldMatrix = meshObj.matrixWorld;
           const target = faceSelectionTargetRef.current;
+
+          // Los grupos de guía y de resalte deben vivir DENTRO de la malla
+          // viva: un remontaje (HMR/StrictMode) puede dejarlos en la escena
+          // de un montaje anterior — invisibles para siempre. Si el padre no
+          // es la malla actual, se re-adosan aquí (add re-parenta).
+          const overlayGr = faceSelectionOverlayRef.current;
+          if (overlayGr && overlayGr.parent !== meshObj) meshObj.add(overlayGr);
+          const guiaGr = faceGuideRef.current;
+          if (guiaGr && guiaGr.parent !== meshObj) meshObj.add(guiaGr);
 
           // Guía del objetivo activo: todos los vértices/segmentos/
           // centroides de caras (no solo los seleccionados). Se reconstruye
@@ -4483,12 +4686,30 @@ export default function Viewer3D({
             }
           }
 
-          // El polígono libre ya no existe (la herramienta es «línea», que
-          // se dibuja con su propio SVG en pointermove): mantenerlo oculto.
-          if (faceSelectionPolyDivRef.current) {
+          // El polígono se dibuja ahora con clics sucesivos: mantener el
+          // SVG oculto salvo mientras hay una forma en curso.
+          if (faceSelectionPolyDivRef.current && faceSelectionPointsRef.current.length === 0) {
             faceSelectionPolyDivRef.current.style.display = 'none';
           }
         } else if (!faceSelectModeRef.current) {
+          // Restaurar la apariencia (color liso + polygonOffset del modo
+          // selección).
+          const meshObjOff = findMainMesh(meshGroupRef.current);
+          if (meshObjOff) {
+            const matsPO = Array.isArray(meshObjOff.material) ? meshObjOff.material : [meshObjOff.material];
+            for (const mat of matsPO) {
+              const matU = mat as THREE.MeshStandardMaterial & { userData: Record<string, unknown>; polygonOffset: boolean };
+              if (!matU || !matU.userData || matU.userData.__ovPO !== true) continue;
+              const guardado = matU.userData.__ovApariencia as { map?: THREE.Texture | null; color?: number | null } | undefined;
+              if (guardado) {
+                if (matU.map !== guardado.map) { matU.map = guardado.map ?? null; matU.needsUpdate = true; }
+                if (matU.color && typeof guardado.color === 'number') matU.color.setHex(guardado.color);
+              }
+              matU.polygonOffset = false;
+              delete matU.userData.__ovPO;
+              delete matU.userData.__ovApariencia;
+            }
+          }
           // Only hide 3D overlay when NOT in face select mode
           if (faceSelectionOverlayRef.current) {
             faceSelectionOverlayRef.current.traverse((child) => {
@@ -4516,6 +4737,9 @@ export default function Viewer3D({
           if (faceSelectionLineRef.current) faceSelectionLineRef.current.style.display = 'none';
           if (faceSelectionRectDivRef.current) faceSelectionRectDivRef.current.style.display = 'none';
           if (faceSelectionCircleDivRef.current) faceSelectionCircleDivRef.current.style.display = 'none';
+          // Un polígono a medias no sobrevive a salir del modo.
+          faceSelectionPointsRef.current.length = 0;
+          poligonoCerradaRef.current = null;
         }
        renderer.render(scene, camera);
 
@@ -5039,6 +5263,38 @@ export default function Viewer3D({
                 onVerticesChangeRef.current?.(verts);
               }
             }
+          }
+          return;
+        }
+
+        // --- Polígono: previsualización (clics sucesivos, no arrastra) ---
+        if (
+          faceSelectModeRef.current &&
+          faceSelectionToolRef.current === 'poligono' &&
+          faceSelectionPointsRef.current.length > 0
+        ) {
+          const canvasRect = renderer.domElement.getBoundingClientRect();
+          const pts = faceSelectionPointsRef.current;
+          const poly = faceSelectionPolyDivRef.current;
+          const lineEl = faceSelectionLineRef.current;
+          if (poly && poly.parentElement && lineEl) {
+            poly.parentElement.style.display = 'block';
+            poly.style.display = 'block';
+            // Relleno de la forma con el punto vivo siguiendo al cursor.
+            poly.setAttribute(
+              'points',
+              pts
+                .map((p) => `${p.x - canvasRect.left},${p.y - canvasRect.top}`)
+                .join(' ') +
+                ` ${e.clientX - canvasRect.left},${e.clientY - canvasRect.top}`
+            );
+            // Goma viva: del último vértice al cursor.
+            const ultimo = pts[pts.length - 1];
+            lineEl.style.display = 'block';
+            lineEl.setAttribute('x1', String(ultimo.x - canvasRect.left));
+            lineEl.setAttribute('y1', String(ultimo.y - canvasRect.top));
+            lineEl.setAttribute('x2', String(e.clientX - canvasRect.left));
+            lineEl.setAttribute('y2', String(e.clientY - canvasRect.top));
           }
           return;
         }
@@ -5759,6 +6015,102 @@ export default function Viewer3D({
          if (faceSelectModeRef.current && !gizmoDragRef.current) {
           const rect = renderer.domElement.getBoundingClientRect();
 
+          // --- Polígono: añadir vértices con clics, cerrar/cancelar ---
+          if (faceSelectionToolRef.current === 'poligono') {
+            const polig = faceSelectionPointsRef.current;
+            if (e.button !== 0 && e.button !== 2) return;
+            // Clic derecho: cancela la forma en curso (sin seleccionar).
+            if (e.button === 2) {
+              if (polig.length > 0) {
+                polig.length = 0;
+                if (faceSelectionPolyDivRef.current) faceSelectionPolyDivRef.current.style.display = 'none';
+                if (faceSelectionLineRef.current) faceSelectionLineRef.current.style.display = 'none';
+              }
+              return;
+            }
+            // Cierre: clic dentro del radio del PRIMER vértice con ≥3 lados.
+            if (polig.length >= 3 && Math.hypot(e.clientX - polig[0].x, e.clientY - polig[0].y) <= POLIGONO_CIERRE_PX) {
+              poligonoCerradaRef.current = polig.slice();
+              polig.length = 0;
+              // El pointerup es quien aplica la selección (y devuelve aquí
+              // sin filtrar al resto de la lógica de clics).
+              faceSelectionStartRef.current = { x: e.clientX, y: e.clientY, rect };
+              controls.enabled = false;
+              renderer.domElement.style.cursor = 'crosshair';
+              if (faceSelectionPolyDivRef.current) faceSelectionPolyDivRef.current.style.display = 'none';
+              if (faceSelectionLineRef.current) faceSelectionLineRef.current.style.display = 'none';
+              return;
+            }
+            // Punto nuevo: aseguramos el SVG del polígono y crece la forma.
+            polig.push({ x: e.clientX, y: e.clientY });
+            poligonoCerradaRef.current = null;
+            const mountElP = mountRef.current;
+            if (mountElP && !faceSelectionPolyDivRef.current) {
+              const svgNS = 'http://www.w3.org/2000/svg';
+              const svg = document.createElementNS(svgNS, 'svg');
+              svg.style.position = 'absolute';
+              svg.style.top = '0';
+              svg.style.left = '0';
+              svg.style.width = '100%';
+              svg.style.height = '100%';
+              svg.style.pointerEvents = 'none';
+              svg.style.zIndex = '10';
+              const poly = document.createElementNS(svgNS, 'polygon');
+              poly.setAttribute('fill', 'rgba(6, 183, 163, 0.15)');
+              poly.setAttribute('stroke', '#06b7a3');
+              poly.setAttribute('stroke-width', '1');
+              svg.appendChild(poly);
+              mountElP.appendChild(svg);
+              faceSelectionPolyDivRef.current = poly;
+            }
+            if (mountElP && !faceSelectionLineRef.current) {
+              const svgNS = 'http://www.w3.org/2000/svg';
+              const svg = document.createElementNS(svgNS, 'svg');
+              svg.style.position = 'absolute';
+              svg.style.top = '0';
+              svg.style.left = '0';
+              svg.style.width = '100%';
+              svg.style.height = '100%';
+              svg.style.pointerEvents = 'none';
+              svg.style.zIndex = '10';
+              const line = document.createElementNS(svgNS, 'line');
+              line.setAttribute('stroke', '#06b7a3');
+              line.setAttribute('stroke-width', '1.5');
+              line.setAttribute('stroke-dasharray', '4 3');
+              svg.appendChild(line);
+              mountElP.appendChild(svg);
+              faceSelectionLineRef.current = line;
+            }
+            // Dibuja ya la forma (sin esperar al move) para que el punto
+            // nuevo se vea con su segmento hacia el cursor.
+            const canvasRectP = renderer.domElement.getBoundingClientRect();
+            const poly = faceSelectionPolyDivRef.current;
+            const lineEl = faceSelectionLineRef.current;
+            if (poly && poly.parentElement && lineEl) {
+              poly.parentElement.style.display = 'block';
+              poly.style.display = 'block';
+              poly.setAttribute(
+                'points',
+                polig
+                  .map((p) => `${p.x - canvasRectP.left},${p.y - canvasRectP.top}`)
+                  .join(' ')
+              );
+              const ultimo = polig[polig.length - 1];
+              lineEl.style.display = 'block';
+              lineEl.setAttribute('x1', String(ultimo.x - canvasRectP.left));
+              lineEl.setAttribute('y1', String(ultimo.y - canvasRectP.top));
+              lineEl.setAttribute('x2', String(e.clientX - canvasRectP.left));
+              lineEl.setAttribute('y2', String(e.clientY - canvasRectP.top));
+            }
+            return;
+          }
+          // Cambio de herramienta desde polígono: limpiar la forma en curso.
+          if (faceSelectionPointsRef.current.length > 0) {
+            faceSelectionPointsRef.current.length = 0;
+            poligonoCerradaRef.current = null;
+            if (faceSelectionPolyDivRef.current) faceSelectionPolyDivRef.current.style.display = 'none';
+          }
+
           // ¿El pointer está sobre un elemento ya seleccionado? Entonces
           // el gesto es MOVER la selección (y no dibujar una figura):
           // arrastre en el plano frontal a la cámara, emitiendo los
@@ -5818,6 +6170,8 @@ export default function Viewer3D({
             }
 
             // Ancla más cercano en pantalla; si está a <14 px, agarrar.
+            // Con MAYÚS no se agarra: Mayús+clic es DESELECCIONAR (el
+            // usuario lo pidió), y el mouseup de selección se encarga.
             let grabbed: { world: THREE.Vector3 } | null = null;
             let bestDist = Infinity;
             for (const anchor of anchors) {
@@ -5829,7 +6183,7 @@ export default function Viewer3D({
                 grabbed = anchor;
               }
             }
-            if (grabbed && bestDist < 14 && vertIdxSet.size > 0) {
+            if (grabbed && bestDist < 14 && vertIdxSet.size > 0 && !e.shiftKey) {
               const camDir = new THREE.Vector3();
               camera.getWorldDirection(camDir);
               const plane = new THREE.Plane();
@@ -6589,9 +6943,19 @@ export default function Viewer3D({
           const tool = faceSelectionToolRef.current;
           const target = faceSelectionTargetRef.current;
 
+          // Polígono cerrado en este gesto (se vacía para el siguiente): el
+          // clic de cierre casi no se mueve, así que NO cuenta como «clic
+          // simple» — el área de la forma manda.
+          const poligonoCerrada =
+            tool === 'poligono' && poligonoCerradaRef.current
+              ? poligonoCerradaRef.current
+              : null;
+          poligonoCerradaRef.current = null;
+
           // La prueba de la herramienta sobre un punto de pantalla,
-          // unificada para los tres objetivos (el polígono dejó paso a la
-          // línea: puntos a <12 px del segmento dibujado).
+          // unificada para los cuatro objetivos (el polígono: ray-casting
+          // sobre los vértices de la forma; la línea: puntos a <12 px del
+          // segmento dibujado).
           const insideShape = (screenPt: { x: number; y: number }): boolean => {
             if (tool === 'rectangle') {
               const x1 = Math.min(start.x, e.clientX);
@@ -6606,19 +6970,33 @@ export default function Viewer3D({
               );
               return isPointInCircle(screenPt.x, screenPt.y, start.x, start.y, radius);
             }
+            if (tool === 'poligono') {
+              if (!poligonoCerrada || poligonoCerrada.length < 3) return false;
+              return isPointInPolygon(screenPt.x, screenPt.y, poligonoCerrada);
+            }
             // line
             return distanceToSegment(
               screenPt.x, screenPt.y,
               start.x, start.y, e.clientX, e.clientY
             ) <= FACE_LINE_TOLERANCE;
           };
+          // Las herramientas de ÁREA (rectángulo/círculo/polígono) piden
+          // contención COMPLETA: el usuario no quiere caras cogidas «por la
+          // mitad». La línea se queda con su regla de cercanía al segmento.
+          const pruebaArea = tool !== 'line';
 
           // Clic casi sin arrastre: elegir el elemento más cercano al
-          // puntero (un rectángulo de tamaño cero no atraparía nada).
+          // puntero (un rectángulo de tamaño cero no atraparía nada). En el
+          // polígono NO hay clic simple: el clic de cierre aplica el área.
           const clicSimple =
+            !poligonoCerrada &&
             Math.hypot(e.clientX - start.x, e.clientY - start.y) < 4;
-          // Teclas acumuladoras: Ctrl o Mayús añaden/quitan sin perder la selección.
-          const modificada = e.ctrlKey || e.shiftKey;
+          // Teclas acumuladoras: Ctrl AÑADE la nueva selección y Mayús la
+          // QUITA de la existente (el usuario lo pidió: ctrl selecciona,
+          // mayús deselecciona).
+          const esCtrl = e.ctrlKey;
+          const esMayus = e.shiftKey;
+          const modificada = esCtrl || esMayus;
 
           // Visibilidad: solo caras FRONTALES (mirando a la cámara) y los
           // vértices/segmentos que pertenecen a alguna de ellas. Sin esto
@@ -6689,12 +7067,21 @@ export default function Viewer3D({
             const prev = selectedVertexIdsRef.current ?? [];
             let newIds: number[];
             if (selected.length === 0 && !modificada) {
-              // Clic o rectángulo en el vacío: deselecciona todo.
+              // Clic o área en el vacío sin teclas: deselecciona todo.
               newIds = [];
-            } else if (selected.length > 0 && selected.every((f) => prev.includes(f))) {
-              newIds = prev.filter((f) => !selected.includes(f));
+            } else if (esMayus) {
+              // Mayús+clic o Mayús+área: QUITA los vértices del área.
+              newIds = selected.length
+                ? prev.filter((f) => !selected.includes(f))
+                : prev;
+            } else if (esCtrl) {
+              // Ctrl+clic o Ctrl+área: AÑADE los vértices del área.
+              newIds = selected.length
+                ? [...new Set([...prev, ...selected])]
+                : prev;
             } else {
-              newIds = [...new Set([...prev, ...selected])];
+              // Nueva área sin teclas: reemplaza la selección.
+              newIds = selected;
             }
             onVertexSelectionChangeRef.current?.(newIds);
             selectedVertexIdsRef.current = newIds;
@@ -6739,6 +7126,27 @@ export default function Viewer3D({
                 if (dist < mejorDist) { mejorDist = dist; mejorKey = edge.key; }
               }
               if (mejorKey) selectedKeys.push(mejorKey);
+            } else if (pruebaArea) {
+              // Área: solo segmentos con AMBOS extremos dentro de la figura
+              // (el punto medio admitía aristas cogidas «por la mitad»).
+              for (const edge of edges) {
+                if (edgeVisible && !edgeVisible.has(edge.key)) continue;
+                const va = m.vertices[edge.a];
+                const vb = m.vertices[edge.b];
+                if (!va || !vb) continue;
+                const pA = projectToScreen(
+                  new THREE.Vector3(va.x, va.y, va.z).applyMatrix4(worldMatrix),
+                  camera,
+                  rect
+                );
+                const pB = projectToScreen(
+                  new THREE.Vector3(vb.x, vb.y, vb.z).applyMatrix4(worldMatrix),
+                  camera,
+                  rect
+                );
+                if (!pA || !pB) continue;
+                if (insideShape(pA) && insideShape(pB)) selectedKeys.push(edge.key);
+              }
             } else {
               for (const edge of edges) {
                 if (edgeVisible && !edgeVisible.has(edge.key)) continue;
@@ -6758,15 +7166,21 @@ export default function Viewer3D({
             const prev = selectedEdgeIdsRef.current ?? [];
             let newIds: string[];
             if (selectedKeys.length === 0 && !modificada) {
-              // Clic o rectángulo en el vacío: deselecciona todo.
+              // Clic o área en el vacío sin teclas: deselecciona todo.
               newIds = [];
-            } else if (
-              selectedKeys.length > 0 &&
-              selectedKeys.every((k) => prev.includes(k))
-            ) {
-              newIds = prev.filter((k) => !selectedKeys.includes(k));
+            } else if (esMayus) {
+              // Mayús+clic o Mayús+área: QUITA los segmentos del área.
+              newIds = selectedKeys.length
+                ? prev.filter((k) => !selectedKeys.includes(k))
+                : prev;
+            } else if (esCtrl) {
+              // Ctrl+clic o Ctrl+área: AÑADE los segmentos del área.
+              newIds = selectedKeys.length
+                ? [...new Set([...prev, ...selectedKeys])]
+                : prev;
             } else {
-              newIds = [...new Set([...prev, ...selectedKeys])];
+              // Nueva área sin teclas: reemplaza la selección.
+              newIds = selectedKeys;
             }
             onEdgeSelectionChangeRef.current?.(newIds);
             selectedEdgeIdsRef.current = newIds;
@@ -6811,6 +7225,38 @@ export default function Viewer3D({
                 if (dist < mejorDist) { mejorDist = dist; mejorIdx = i; }
               }
             }
+          } else if (pruebaArea) {
+            // Área (rectángulo/círculo/polígono): solo caras COMPLETAMENTE
+            // dentro — TODAS sus esquinas proyectadas caen dentro de la
+            // figura. La prueba por centroide admitía caras cogidas «por la
+            // mitad»; las proyecciones se cachean por vértice.
+            const enPantalla = new Map<number, { x: number; y: number } | null>();
+            const proyectaVertice = (vi: number) => {
+              let pt = enPantalla.get(vi);
+              if (pt === undefined) {
+                const v = m.vertices[vi];
+                pt = v
+                  ? projectToScreen(
+                      new THREE.Vector3(v.x, v.y, v.z).applyMatrix4(worldMatrix),
+                      camera,
+                      rect
+                    )
+                  : null;
+                enPantalla.set(vi, pt);
+              }
+              return pt ?? null;
+            };
+            for (let i = 0; i < m.faces.length; i++) {
+              if (frenteCaras && !frenteCaras[i]) continue;
+              const face = m.faces[i];
+              if (!face || face.length < 3) continue;
+              let completa = true;
+              for (const vi of face) {
+                const pt = proyectaVertice(vi);
+                if (!pt || !insideShape(pt)) { completa = false; break; }
+              }
+              if (completa) selected.push(i);
+            }
           } else {
             for (let i = 0; i < centroids.length; i++) {
               if (frenteCaras && !frenteCaras[i]) continue;
@@ -6825,18 +7271,28 @@ export default function Viewer3D({
 
           // Clic simple sin teclas: la selección pasa a ser SOLO esa cara.
           // Ctrl/Mayús+clic: añade (o quita, si ya estaba) esa cara una a
-          // una, sin perder el resto. El rectángulo/círculo/línea mantiene
-          // su conmutación por lotes de siempre.
+          // una, sin perder el resto.
+          // Nueva área SIN teclas: REEMPLAZA — las caras del área anterior
+          // que no vuelven a estar dentro salen de la selección sola.
           let newFaceIds: number[];
           if (clicSimple && !modificada) {
             newFaceIds = mejorIdx >= 0 ? [mejorIdx] : [];
+          } else if (esMayus) {
+            // Mayús+clic: QUITA las caras nuevas de la selección (los que
+            // ya no vuelven a estar dentro salen; el resto se conserva).
+            newFaceIds = selected.length
+              ? selectedFaceIds.filter((f) => !selected.includes(f))
+              : selectedFaceIds;
+          } else if (esCtrl) {
+            // Ctrl+clic: AÑADE las caras nuevas a la selección.
+            newFaceIds = selected.length
+              ? [...new Set([...selectedFaceIds, ...selected])]
+              : selectedFaceIds;
           } else if (!clicSimple && selected.length === 0) {
-            // Rectángulo/círculo/línea en el vacío: deselecciona todo.
+            // Área en el vacío: deselecciona todo.
             newFaceIds = [];
-          } else if (selected.length > 0 && selected.every((f) => selectedFaceIds.includes(f))) {
-            newFaceIds = selectedFaceIds.filter((f) => !selected.includes(f));
           } else {
-            newFaceIds = [...new Set([...selectedFaceIds, ...selected])];
+            newFaceIds = selected;
           }
           onFaceSelectionChangeRef.current?.(newFaceIds);
           selectedFaceIdsRef.current = newFaceIds;
@@ -7345,21 +7801,97 @@ export default function Viewer3D({
         const p = mapToHelper(v);
         const angle = Math.atan2(p.z, p.x);
         const u = (angle / (Math.PI * 2) + 1) % 1;
+        // MISMA convención que lib/geometry.ts: V crece hacia ARRIBA
+        // (v=1 arriba del objeto). flipY=true hace que V=1 muestre la
+        // PARTE ALTA de la imagen — así la textura sale derecha. El
+        // viejo «1 - …» la ponía boca abajo.
         if (textureProjection === 'planar') {
-          return [(p.x - minX) / rangeX, 1 - (p.y - minY) / rangeY];
+          return [(p.x - minX) / rangeX, (p.y - minY) / rangeY];
         }
         if (textureProjection === 'spherical') {
           const length = Math.max(1e-6, Math.hypot(p.x, p.y, p.z));
           return [u, 1 - Math.acos(p.y / length) / Math.PI];
         }
-        return [u, 1 - (p.y - minY) / rangeY];
+        return [u, (p.y - minY) / rangeY];
       };
+
+      // Textura SOBRE LA SELECCIÓN: UNA imagen global estirada sobre las
+      // caras de la asignación. Caja de la unión de los vértices del
+      // grupo; los DOS ejes de mayor extensión de esa caja reciben U·V,
+      // con Y como «arriba» cuando participa, para que la imagen salga
+      // derecha. Las caras sin grupo (caras de antes) comparten todas
+      // una caja global.
+      const faceTexturesList = mesh.faceTextures ?? null;
+      const gruposTextura = mesh.faceTextureGroups ?? null;
+      const uvDeCara = new Map<number, number[]>();
+      {
+        const lista: Array<{ face: number[]; faceIdx: number }> = [];
+        mesh.faces.forEach((face, faceIdx) => {
+          const tex = faceTexturesList?.[faceIdx] ?? null;
+          if (!tex || face.length < 3) return;
+          lista.push({ face, faceIdx });
+        });
+        const gruposList = lista.map((item) => gruposTextura?.[item.faceIdx] ?? null);
+        // Agrupar: cada asignación es un grupo propio (cada una con su
+        // caja de UV, así una segunda selección NO reescala la primera);
+        // las sin grupo van todas juntas en la caja de siempre.
+        const porGrupo = new Map<string, Array<{ face: number[]; faceIdx: number }>>();
+        for (let i = 0; i < lista.length; i++) {
+          const clave = gruposList[i] ? `g${gruposList[i]}` : 'global';
+          let arr = porGrupo.get(clave);
+          if (!arr) { arr = []; porGrupo.set(clave, arr); }
+          arr.push(lista[i]);
+        }
+        const encajeCaja = (
+          miembros: Array<{ face: number[]; faceIdx: number }>,
+        ) => {
+          let ax = Infinity, axx = -Infinity, ay = Infinity, ayy = -Infinity, az = Infinity, azz = -Infinity;
+          for (const { face } of miembros) {
+            for (const idx of face) {
+              const v = mesh.vertices[idx];
+              if (!v) continue;
+              if (v.x < ax) ax = v.x; if (v.x > axx) axx = v.x;
+              if (v.y < ay) ay = v.y; if (v.y > ayy) ayy = v.y;
+              if (v.z < az) az = v.z; if (v.z > azz) azz = v.z;
+            }
+          }
+          const rangos: Array<[number, number, number]> = [
+            [axx - ax, ax, axx], [ayy - ay, ay, ayy], [azz - az, az, azz],
+          ];
+          // «Arriba» = Y si es uno de los dos ejes dominantes de la caja
+          // de la selección; si no, los dos mayores en su orden.
+          const ordenados = [...rangos].sort((a, b) => b[0] - a[0]);
+          let ejeU = ordenados[0];
+          let ejeV = ordenados[1];
+          if (rangos[1] === ordenados[0] || rangos[1] === ordenados[1]) {
+            ejeV = rangos[1];
+            ejeU = ejeV === ordenados[0] ? ordenados[1] : ordenados[0];
+          }
+          const dimU = ejeU === rangos[0] ? 0 : ejeU === rangos[1] ? 1 : 2;
+          const dimV = ejeV === rangos[0] ? 0 : ejeV === rangos[1] ? 1 : 2;
+          const rangoU = Math.max(1e-6, ejeU[0]);
+          const rangoV = Math.max(1e-6, ejeV[0]);
+          const baseU = dimU === 0 ? ax : dimU === 1 ? ay : az;
+          const baseV = dimV === 0 ? ax : dimV === 1 ? ay : az;
+          for (const { face, faceIdx } of miembros) {
+            const uv: number[] = [];
+            for (const idx of face) {
+              const v = mesh.vertices[idx];
+              if (!v) { uv.push(0.5, 0.5); continue; }
+              const cu = dimU === 0 ? v.x : dimU === 1 ? v.y : v.z;
+              const cv = dimV === 0 ? v.x : dimV === 1 ? v.y : v.z;
+              uv.push((cu - baseU) / rangoU, (cv - baseV) / rangoV);
+            }
+            uvDeCara.set(faceIdx, uv);
+          }
+        };
+        for (const miembros of porGrupo.values()) encajeCaja(miembros);
+      }
 
       // Construir geometría con UVs
       // Por cara apilada: cuántos triángulos aporta y qué textura lleva,
       // para montar los grupos de material de las texturas por cara.
       const faceEntries: Array<{ triCount: number; tex: string | null }> = [];
-      const faceTexturesList = mesh.faceTextures ?? null;
       for (let faceIdx = 0; faceIdx < mesh.faces.length; faceIdx++) {
         const face = mesh.faces[faceIdx];
         if (face.length < 3) continue;
@@ -7373,12 +7905,22 @@ export default function Viewer3D({
         const n = e1.cross(e2).normalize();
 
         const baseIdx = positions.length / 3;
+        // UVs prefabricadas por cara (imagen encajada) para las caras con
+        // textura propia; el resto lleva su UV de siempre.
+        const uvPropia = uvDeCara.get(faceIdx);
+        let posEnCara = 0;
         for (const idx of face) {
           const v = mesh.vertices[idx];
-          if (!v) continue;
+          if (!v) {
+            posEnCara++;
+            continue;
+          }
           positions.push(v.x, v.y, v.z);
           normals.push(n.x, n.y, n.z);
 
+          if (uvPropia) {
+            uvs.push(uvPropia[posEnCara * 2], uvPropia[posEnCara * 2 + 1]);
+          } else
           // UVs: si existen, usarlos; si no, generar coordenadas básicas.
           // En cuanto la pieza se ha movido del reposo, ella manda (se
           // juega con la textura a mano, no con las UV precalculadas).
@@ -7392,6 +7934,7 @@ export default function Viewer3D({
           } else {
             uvs.push(...projectionUv(v));
           }
+          posEnCara++;
         }
         // Triangulación
         for (let i = 1; i < face.length - 1; i++) {
@@ -7604,14 +8147,14 @@ export default function Viewer3D({
         const angle = Math.atan2(p.z, p.x);
         const u = (angle / (Math.PI * 2) + 1) % 1;
         if (textureProjection === 'planar') {
-          uvs.push((p.x - minX) / rangeX, 1 - (p.y - minY) / rangeY);
+          uvs.push((p.x - minX) / rangeX, (p.y - minY) / rangeY);
           return;
         }
         if (textureProjection === 'spherical') {
           const length = Math.max(1e-6, Math.hypot(p.x, p.y, p.z));
           uvs.push(u, 1 - Math.acos(p.y / length) / Math.PI);
         } else {
-          uvs.push(u, 1 - (p.y - minY) / rangeY);
+          uvs.push(u, (p.y - minY) / rangeY);
         }
       });
       for (const face of mesh.faces) {
@@ -7620,7 +8163,9 @@ export default function Viewer3D({
           index.push(face[0], face[j], face[j + 1]);
         }
       }
-      if (index.length === 0) return;
+      if (index.length === 0) {
+        return;
+      }
 
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute(
@@ -7696,6 +8241,21 @@ export default function Viewer3D({
           opacity: 0.9,
         });
         meshGroup.add(new THREE.LineSegments(edgeGeometry, edgeMat));
+
+        // Malla fantasma bajo las aristas (como en la malla plana): sin
+        // ella no hay MESH que raycastear en las vistas de alambre — la
+        // selección de caras/vértices/segmentos moría en silencio.
+        const ghostMatSuave = new THREE.MeshStandardMaterial({
+          color: 0x9db4c8,
+          metalness: 0.1,
+          roughness: 0.6,
+          transparent: true,
+          opacity: 0.12,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+          envMapIntensity: 0,
+        });
+        meshGroup.add(new THREE.Mesh(geometry, ghostMatSuave));
       } else {
         const uniformFaceColor = useFaceColors
           ? faceColors!.find((color): color is string => !!color) ?? null
@@ -9568,11 +10128,13 @@ uniform vec3 sombraFocoPos[8];`
                     <select
                       value={faceSelectionTool}
                       onChange={(e) => onFaceSelectionToolChangeRef.current?.(e.target.value as any)}
+                      title="Rectángulo, círculo y polígono solo tocan lo COMPLETAMENTE dentro. Polígono: clic por cada vértice, ciérralo con un clic cerca del primer punto (clic derecho cancela)"
                       className="px-1.5 py-0.5 text-xs bg-white/10 rounded border border-white/20 text-white"
                     >
                       <option value="rectangle">Rectángulo</option>
                       <option value="circle">Círculo</option>
                       <option value="line">Línea</option>
+                      <option value="poligono">Polígono</option>
                     </select>
                   </>
                 )}
@@ -9893,6 +10455,12 @@ type ParticleSystem = {
   velocities: Float32Array;
   life: Float32Array;
   maxLife: Float32Array;
+  /** Solo fuego: fracción de vida por partícula (afina el tamaño en shader). */
+  vidaA?: Float32Array;
+  /** Solo fuego: uniforme del estilo (0 partículas ↔ 1 llama real). */
+  uniformesEstilo?: { uEstilo: { value: number } };
+  /** Solo fuego: centro de la malla (convergencia de la pluma). */
+  origen?: THREE.Vector3;
 };
 
 type RainSystem = {
@@ -10148,6 +10716,39 @@ function createParticleSystem(count: number, size: number): ParticleSystem {
   };
 }
 
+/**
+ * Sistema de fuego: como createParticleSystem pero con el parche de
+ * material que morfa la partícula con el estilo (0 = punto suelto de
+ * tamaño fijo, 1 = pluma de llama que se afina con la edad). Cada
+ * sistema lleva su propio uniforme para que cada objeto tenga su valor.
+ */
+function crearSistemaFuego(count: number, size: number): ParticleSystem {
+  const sys = createParticleSystem(count, size);
+  const vidaA = new Float32Array(count);
+  sys.points.geometry.setAttribute('aVida', new THREE.BufferAttribute(vidaA, 1));
+  const uniformesEstilo = { uEstilo: { value: 0 } };
+  const mat = sys.points.material as THREE.PointsMaterial;
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uEstilo = uniformesEstilo.uEstilo;
+    // El attribute/uniform entran por <common>; el tamaño del punto pasa a
+    // depender de la vida: al nacer grande, afina conforme sube (punta).
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        '#include <common>\nattribute float aVida;\nuniform float uEstilo;'
+      )
+      .replace(
+        'gl_PointSize = size;',
+        'gl_PointSize = size * mix(1.0, 0.4 + 0.8 * aVida, uEstilo);'
+      );
+  };
+  return {
+    ...sys,
+    vidaA,
+    uniformesEstilo,
+  };
+}
+
 /** Chispas: saltan hacia fuera desde el texto y caen desvaneciéndose. */
 function updateSparks(
   sys: ParticleSystem,
@@ -10334,13 +10935,24 @@ function updateSmoke(
   (sys.points.geometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
 }
 
-/** Fuego: llamas que nacen en el texto y suben temblando. Color amarillo→naranja→rojo. */
+/** Fuego: llamas que nacen en el texto y suben temblando. Color amarillo→naranja→rojo.
+ *  `estilo` (0..1, fireEstilo del objeto) morfe la llama: 0 = partículas sueltas
+ *  que deambulan con bruma larga; 1 = pluma coherente que converge, sube rápido,
+ *  vive poco y se afina (punta) con color más caliente. Con `converge` (sin
+ *  focos) el centro de la pluma es el promedio vivo de los puntos de nacimiento
+ *  (EMA): no dependemos de la caja de la malla, cuyas coords no siempre son
+ *  las del grupo de partículas. */
 function updateFire(
   sys: ParticleSystem,
   dt: number,
-  randomPoint: () => THREE.Vector3 | null
+  randomPoint: () => THREE.Vector3 | null,
+  estilo = 0,
+  converge = false
 ): void {
   const count = sys.life.length;
+  const s = Math.min(Math.max(estilo, 0), 1);
+  const cohesion = 1 - 0.85 * s; // menos dispersión lateral al subir el estilo
+  const vidaA = sys.vidaA;
   for (let i = 0; i < count; i++) {
     const o = i * 3;
     if (sys.life[i] <= 0) {
@@ -10349,26 +10961,51 @@ function updateFire(
       sys.positions[o] = p.x;
       sys.positions[o + 1] = p.y - 0.04;
       sys.positions[o + 2] = p.z;
-      sys.velocities[o] = (Math.random() - 0.5) * 0.12;
-      sys.velocities[o + 1] = 0.5 + Math.random() * 0.6;
-      sys.velocities[o + 2] = (Math.random() - 0.5) * 0.12;
-      sys.maxLife[i] = 0.7 + Math.random() * 1.1;
+      if (converge && s > 0) {
+        if (!sys.origen) {
+          sys.origen = new THREE.Vector3(p.x, p.y, p.z);
+        } else {
+          // EMA del centro de nacimiento (señal estable, sin salto por
+          // muestras raras): corrige el centro en ~20 nacimientos.
+          sys.origen.x += (p.x - sys.origen.x) * 0.05;
+          sys.origen.z += (p.z - sys.origen.z) * 0.05;
+        }
+        // El nacimiento se concentra hacia el eje de la pluma.
+        sys.positions[o] += (sys.origen.x - sys.positions[o]) * s * 0.55;
+        sys.positions[o + 2] += (sys.origen.z - sys.positions[o + 2]) * s * 0.55;
+      }
+      sys.velocities[o] = (Math.random() - 0.5) * 0.12 * cohesion;
+      sys.velocities[o + 1] = 0.5 + Math.random() * 0.6 + s * (0.45 + Math.random() * 0.35);
+      sys.velocities[o + 2] = (Math.random() - 0.5) * 0.12 * cohesion;
+      sys.maxLife[i] = Math.max(0.3, 0.7 + Math.random() * 1.1 - s * (0.2 + Math.random() * 0.55));
       sys.life[i] = sys.maxLife[i];
+      if (vidaA) vidaA[i] = 1;
     } else {
       sys.life[i] -= dt;
       sys.positions[o] += sys.velocities[o] * dt;
       sys.positions[o + 1] += sys.velocities[o + 1] * dt;
       sys.positions[o + 2] += sys.velocities[o + 2] * dt;
-      sys.velocities[o] += (Math.random() - 0.5) * 0.5 * dt;
+      sys.velocities[o] += (Math.random() - 0.5) * 0.5 * dt * cohesion;
+      if (converge && s > 0 && sys.origen) {
+        // La pluma se cierra hacia su eje mientras sube.
+        sys.velocities[o] += (sys.origen.x - sys.positions[o]) * 1.6 * s * dt;
+        sys.velocities[o + 2] += (sys.origen.z - sys.positions[o + 2]) * 1.6 * s * dt;
+      }
     }
     const t = Math.max(sys.life[i], 0) / (sys.maxLife[i] || 1);
-    // Amarillo al nacer → naranja → rojo apagado
-    sys.colors[o] = t;
-    sys.colors[o + 1] = t * t * 0.55;
-    sys.colors[o + 2] = t * t * t * 0.06;
+    // Amarillo al nacer → naranja → rojo apagado; con la pluma el núcleo
+    // nace más caliente (más blanco-amarillo) y las puntas van a rojo.
+    sys.colors[o] = t + s * 0.12 * t;
+    sys.colors[o + 1] = t * t * (0.55 + s * 0.3);
+    sys.colors[o + 2] = t * t * t * (0.06 + s * 0.24);
+    if (vidaA) vidaA[i] = t;
   }
   (sys.points.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
   (sys.points.geometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+  if (vidaA) {
+    const attr = sys.points.geometry.attributes.aVida as THREE.BufferAttribute | undefined;
+    if (attr) attr.needsUpdate = true;
+  }
 }
 
 function createStarSystem(): StarSystem {
@@ -10808,6 +11445,7 @@ function asegurarSistemaFx(
     case 'fire': {
       const count = valores.fireCount ?? DEFAULT_FX_CONFIG.fireCount;
       const size = valores.fireSize ?? DEFAULT_FX_CONFIG.fireSize;
+      const estilo = valores.fireEstilo ?? DEFAULT_FX_CONFIG.fireEstilo;
       if (rt.fire && rt.fire.life.length !== count) {
         grupo.remove(rt.fire.points);
         rt.fire.points.geometry.dispose();
@@ -10815,7 +11453,7 @@ function asegurarSistemaFx(
         rt.fire = null;
       }
       if (!rt.fire) {
-        rt.fire = createParticleSystem(count, size);
+        rt.fire = crearSistemaFuego(count, size);
         grupo.add(rt.fire.points);
       } else {
         const mat = rt.fire.points.material as THREE.PointsMaterial;
@@ -10823,6 +11461,9 @@ function asegurarSistemaFx(
           mat.size = size;
           mat.needsUpdate = true;
         }
+      }
+      if (rt.fire.uniformesEstilo) {
+        rt.fire.uniformesEstilo.uEstilo.value = Math.min(Math.max(estilo, 0), 1);
       }
       rt.fire.points.visible = activo;
       rt.counts.fire = count;
@@ -11066,7 +11707,13 @@ function aplicarOverrideEfectoObjeto(
         ) {
           const anterior = rt.fire;
           const size = (anterior.points.material as THREE.PointsMaterial).size;
-          rt.fire = createParticleSystem(values.count, size);
+          rt.fire = crearSistemaFuego(values.count, size);
+          // Conserva el estilo y el centro de convergencia del anterior.
+          if (anterior.uniformesEstilo && rt.fire.uniformesEstilo) {
+            rt.fire.uniformesEstilo.uEstilo.value =
+              anterior.uniformesEstilo.uEstilo.value;
+          }
+          if (anterior.origen) rt.fire.origen = anterior.origen.clone();
           rt.grupo.remove(anterior.points);
           anterior.points.geometry.dispose();
           (anterior.points.material as THREE.Material)?.dispose();

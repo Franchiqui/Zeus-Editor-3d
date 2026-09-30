@@ -55,7 +55,7 @@ interface ViewerPanelProps {
     selectionMode?: boolean;
     onSelectionModeChange?: (active: boolean) => void;
     faceSelectMode?: boolean;
-    faceSelectionTool?: 'rectangle' | 'circle' | 'line';
+    faceSelectionTool?: 'rectangle' | 'circle' | 'line' | 'poligono';
     faceSelectionTarget?: 'cara' | 'vertice' | 'segmento';
     faceSelectVisibleOnly?: boolean;
     wireframeOffSignal?: number;
@@ -66,8 +66,10 @@ interface ViewerPanelProps {
     selectedEdgeIds?: string[];
     onEdgeSelectionChange?: (edgeIds: string[]) => void;
     onFaceSelectionModeChange?: (active: boolean) => void;
-    onFaceSelectionToolChange?: (tool: 'rectangle' | 'circle' | 'line') => void;
+    onFaceSelectionToolChange?: (tool: 'rectangle' | 'circle' | 'line' | 'poligono') => void;
     onFaceSelectionTargetChange?: (target: 'cara' | 'vertice' | 'segmento') => void;
+    /** Registra la función de mover la selección del visor (campos numéricos). */
+    onRegisterSelectionMove?: (fn: (dx: number, dy: number, dz: number) => void) => void;
     onMultiObjectTransform?: (transforms: { id: string; transform: ObjectTransform }[]) => void;
     /** Efectos por objeto cambiados desde el visor (aplicar/retirar, params, focos). */
     onEfectosObjetos?: (cambios: Record<string, EfectoObjeto[] | undefined>) => void;
@@ -207,6 +209,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
     onFaceSelectionModeChange,
     onFaceSelectionToolChange,
     onFaceSelectionTargetChange,
+    onRegisterSelectionMove,
     onMultiObjectTransform,
     onEfectosObjetos,
     objectName,
@@ -486,6 +489,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
            onFaceSelectionModeChange={onFaceSelectionModeChange}
            onFaceSelectionToolChange={onFaceSelectionToolChange}
            onFaceSelectionTargetChange={onFaceSelectionTargetChange}
+          onRegisterSelectionMove={onRegisterSelectionMove}
           onMultiObjectTransform={onMultiObjectTransform}
           onEfectosObjetos={onEfectosObjetos}
            objectName={objectName}

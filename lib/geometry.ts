@@ -89,11 +89,41 @@ export type Mesh = {
    */
   uvs?: [number, number][];
   /**
+   * Identificador de GRUPO de asignación por cara, alineado con `faces`.
+   * Cada «Asignar textura» estampa un id nuevo: las caras del mismo grupo
+   * comparten UNA caja de UV (la imagen completa estirada en esa
+   * selección) y dos asignaciones distintas —incluso con la misma
+   * imagen— no se reescalan entre sí. Ausente o null = las caras se
+   * reparten la caja global de siempre (mallas y caras de antes).
+   */
+  faceTextureGroups?: (string | null)[];
+  /**
    * Opacidad global del material (0..1, 1 = sólido). Solo la usa el
    * visor cuando la malla lleva textura.
    */
   opacity?: number;
 };
+
+/** Contador de asignaciones de textura: cada «Asignar» lleva id nuevo. */
+let contadorGruposTextura = 0;
+export function nuevoGrupoTextura(): string {
+  contadorGruposTextura += 1;
+  return `tg${contadorGruposTextura.toString(36)}${Date.now().toString(36)}`;
+}
+
+/** Estampa el id de esta asignación solo en las caras indicadas. */
+export function estamparGrupoTextura(
+  grupos: (string | null)[],
+  caras: number[],
+  id: string,
+): (string | null)[] {
+  const resultado = [...grupos];
+  for (const cara of caras) {
+    if (cara < 0 || cara >= resultado.length) continue;
+    resultado[cara] = id;
+  }
+  return resultado;
+}
 
 export type LatheTextureProjection = 'planar' | 'cylindrical' | 'spherical';
 export type TextureFinish = 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';

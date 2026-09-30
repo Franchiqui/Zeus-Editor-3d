@@ -45,6 +45,7 @@ const SECCIONES: Array<{ tipo: EffectType; titulo: string; campos: CampoFx[] }> 
       { key: 'fireCount', label: 'Partículas', kind: 'int', min: 50, max: 500, step: 10 },
       { key: 'fireSize', label: 'Tamaño', kind: 'float', min: 0.05, max: 0.3, step: 0.005 },
       { key: 'fireIntensity', label: 'Intensidad', kind: 'float', min: 0, max: 3, step: 0.1 },
+      { key: 'fireEstilo', label: 'Tipo de llama', kind: 'float', min: 0, max: 1, step: 0.01 },
     ],
   },
   {

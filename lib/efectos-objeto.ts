@@ -37,6 +37,7 @@ export type EfectoValores = Partial<{
   fireCount: number;
   fireSize: number;
   fireIntensity: number;
+  fireEstilo: number;
   rainCount: number;
   rainSpeed: number;
   smokeCount: number;
@@ -74,6 +75,7 @@ export interface FxConfig {
   fireCount: number;      // 50..500
   fireSize: number;       // 0.05..0.3
   fireIntensity: number;  // 0..3 (multiplica color + luz)
+  fireEstilo: number;     // 0..1 (0 = partículas sueltas, 1 = llama real)
   rain: boolean;
   rainCount: number;      // 100..1000
   rainSpeed: number;      // 1..10
@@ -98,6 +100,7 @@ export const DEFAULT_FX_CONFIG: FxConfig = {
   fireCount: 160,
   fireSize: 0.11,
   fireIntensity: 1,
+  fireEstilo: 0.35,
   rain: false,
   rainCount: 320,
   rainSpeed: 2,
@@ -117,6 +120,7 @@ export const VALORES_DEFECTO_EFECTO: Record<EffectType, EfectoValores> = {
     fireCount: DEFAULT_FX_CONFIG.fireCount,
     fireSize: DEFAULT_FX_CONFIG.fireSize,
     fireIntensity: DEFAULT_FX_CONFIG.fireIntensity,
+    fireEstilo: DEFAULT_FX_CONFIG.fireEstilo,
   },
   rain: { rainCount: DEFAULT_FX_CONFIG.rainCount, rainSpeed: DEFAULT_FX_CONFIG.rainSpeed },
   smoke: {
@@ -241,6 +245,7 @@ function paramsDe(fx: Partial<FxConfig>, tipo: EffectType): EfectoValores {
         fireCount: fx.fireCount,
         fireSize: fx.fireSize,
         fireIntensity: fx.fireIntensity,
+        fireEstilo: fx.fireEstilo,
       };
     case 'rain':
       return { rainCount: fx.rainCount, rainSpeed: fx.rainSpeed };

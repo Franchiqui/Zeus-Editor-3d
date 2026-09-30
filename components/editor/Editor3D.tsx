@@ -108,7 +108,14 @@ type LatheTextureProjection,
   type Point2D,
   type Handle2D,
   type HoleSpec,
+  nuevoGrupoTextura,
 } from '@/lib/geometry';
+import {
+  regionSegunObjetivo,
+  extrudeRegionMesh,
+  aristasDeMalla,
+  type ObjetivoSeleccion,
+} from '@/lib/extrusion-seleccion';
 import { resolveLatheProfile, LATHE_PRESET_NAMES } from '@/lib/lathe-profiles';
 import { extractObj3dMesh, decimateMesh } from '@/lib/obj3d-thumbnails';
 import { buildViewsMesh, buildExtrudeMesh, buildExtrudeMeshes, polylineToPolygon } from '@/lib/views-mesh';
@@ -1560,27 +1567,7 @@ export default function Home({
   // Muestra/oculta la rejilla del suelo
   const [showGrid, setShowGrid] = useState(true);
   // Estado de efectos visuales (brillo, chispas, fuego)
-  const [fxConfig, setFxConfig] = useState<FxConfig>({
-    glow: false,
-    glowColor: '#5fd4ff',
-    glowIntensity: 1.4,
-    sparks: false,
-    sparksCount: 140,
-    sparksSize: 0.035,
-    fire: false,
-    fireCount: 160,
-    fireSize: 0.11,
-    fireIntensity: 1,
-    rain: false,
-    rainCount: 320,
-    rainSpeed: 2,
-    smoke: false,
-    smokeCount: 120,
-    smokeSize: 0.11,
-    smokeColor: '#444a52',
-    smokeRiseSpeed: 1,
-    glowObjects: false,
-  });
+  const [fxConfig, setFxConfig] = useState<FxConfig>({ ...DEFAULT_FX_CONFIG });
 
   const [texture, setTexture] = useState<string | null>(null);
   const textureInputRef = useRef<HTMLInputElement | null>(null);
@@ -3461,7 +3448,7 @@ export default function Home({
   const [renameDraft, setRenameDraft] = useState('');
    const [selectionMode, setSelectionMode] = useState(false);
    const [faceSelectMode, setFaceSelectMode] = useState(false);
-   const [faceSelectionTool, setFaceSelectionTool] = useState<'rectangle' | 'circle' | 'line'>('rectangle');
+   const [faceSelectionTool, setFaceSelectionTool] = useState<'rectangle' | 'circle' | 'line' | 'poligono'>('rectangle');
    const [faceSelectionTarget, setFaceSelectionTarget] = useState<'cara' | 'vertice' | 'segmento'>('cara');
    // Solo capturar lo visible (caras de frente, no lo que está detrás).
    const [faceSelectVisibleOnly, setFaceSelectVisibleOnly] = useState(true);
@@ -3470,6 +3457,10 @@ export default function Home({
    const [selectedFaceIds, setSelectedFaceIds] = useState<number[]>([]);
    const [selectedVertexIds, setSelectedVertexIds] = useState<number[]>([]);
    const [selectedEdgeIds, setSelectedEdgeIds] = useState<string[]>([]);
+   // Campos numéricos para mover la selección (desplazamiento por eje).
+   const [moveSelDelta, setMoveSelDelta] = useState({ x: 0, y: 0, z: 0 });
+   // Función de mover la selección registrada por el visor.
+   const moveSelectionFnRef = useRef<((dx: number, dy: number, dz: number) => void) | null>(null);
    // Cómo se MUESTRA la figura del objeto seleccionado en la pestaña
    // Escena: fusionada (tal cual), suave (sombreado suave) o voxeles
    // (voxelización de la superficie en vivo; no cambia la figura real).
@@ -6587,9 +6578,30 @@ pluginTracks,
     []
   );
 
+  /**
+   * Cambio de vértices desde el visor. En modo escena con un objeto
+   * seleccionado el visor muestra LA MALLA DEL OBJETO — el cambio se
+   * escribe en ella en el acto (el campo numérico «Mover» y los arrastres
+   * de vértices editan el objeto). Fuera (figura de la pestaña), va al
+   * estado de edición setEditedVertices, que la figura viva consume.
+   */
   const handleVerticesChange = useCallback((verts: Vertex3D[]) => {
+    if (mode === 'scene' && selectedObjectId) {
+      setSceneObjects((current) => {
+        const object = current.find((o) => o.id === selectedObjectId);
+        if (!object?.mesh || object.mesh.vertices.length === 0) return current;
+        const viewedMesh = selectedObjectId === configObjectId ? triMesh : object.mesh;
+        if (viewedMesh.vertices.length !== verts.length) return current;
+        const newMesh = structuredClone(object.mesh);
+        newMesh.vertices = verts;
+        return current.map((o) =>
+          o.id === selectedObjectId ? { ...o, mesh: newMesh } : o
+        );
+      });
+      return;
+    }
     setEditedVertices(verts);
-  }, []);
+  }, [mode, selectedObjectId, configObjectId, triMesh]);
 
   // --- Recorrido (Extruir) ---
   const defaultSweepProfile = useCallback((): Polygon => {
@@ -7325,17 +7337,81 @@ pluginTracks,
         const newMesh = structuredClone(object.mesh);
         const textures = [...(newMesh.faceTextures ?? [])];
         while (textures.length < newMesh.faces.length) textures.push(null);
+        // GRUPO por asignación: cada «Asignar textura» estampa un id
+        // nuevo; las caras del grupo comparten su caja de UV y no se
+        // reescalan si luego se texturiza otra selección.
+        const grupo = textureUrl ? nuevoGrupoTextura() : null;
+        const grupos = [...(newMesh.faceTextureGroups ?? [])];
+        while (grupos.length < newMesh.faces.length) grupos.push(null);
         for (const f of faceIds) {
-          if (f >= 0 && f < textures.length) textures[f] = textureUrl;
+          if (f >= 0 && f < textures.length) {
+            textures[f] = textureUrl;
+            grupos[f] = grupo;
+          }
         }
         if (textures.every((tx) => tx === null)) {
           delete newMesh.faceTextures;
+          if (grupos.every((g) => g === null)) delete newMesh.faceTextureGroups;
         } else {
           newMesh.faceTextures = textures;
+          newMesh.faceTextureGroups = grupos;
         }
         return current.map((o) => (o.id === id ? { ...o, mesh: newMesh } : o));
       });
     }, [selectedObjectId, configObjectId, selectedFaceIds, triMesh, triangleToFaceMap]);
+
+    // ---- Extrusión exacta de la selección ------------------------------
+    // El usuario lo pidió: al sacar lo seleccionado hacia fuera, las
+    // paredes salen rectas de lo seleccionado — no se estiran las caras
+    // vecinas ni quedan esquinas en cuña. Usa el mismo desplazamiento
+    // X·Y·Z que «Mover»; tras extrudir, la selección pasa a la copia
+    // movida (como en Blender) para seguir trabajándola.
+    const handleExtrudir = useCallback(() => {
+      const id = selectedObjectId ?? configObjectId;
+      if (!id) return;
+      const object = sceneObjects.find((o) => o.id === id);
+      if (!object?.mesh || object.mesh.vertices.length === 0) return;
+      if (object.mesh.faces.length !== (id === configObjectId ? triMesh : object.mesh).faces.length) {
+        return; // Solo con la malla vista = malla del objeto (modo escena).
+      }
+      const dx = moveSelDelta.x, dy = moveSelDelta.y, dz = moveSelDelta.z;
+      if (dx === 0 && dy === 0 && dz === 0) return;
+      const objetivo: ObjetivoSeleccion = faceSelectionTarget;
+      // Con la malla vista = malla del objeto los índices coinciden tal cual.
+      const region = regionSegunObjetivo(
+        object.mesh,
+        objetivo,
+        selectedFaceIds,
+        selectedVertexIds,
+        selectedEdgeIds,
+      );
+      if (region.length === 0) return;
+      const res = extrudeRegionMesh(object.mesh, region, { x: dx, y: dy, z: dz });
+      if (!res) return;
+      setSceneObjects((current) =>
+        current.map((o) => (o.id === id ? { ...o, mesh: res.mesh } : o)),
+      );
+      // La selección sigue a la parte movida (los duplicados).
+      if (objetivo === 'cara') {
+        setSelectedFaceIds(res.carasNuevas);
+        if (selectedVertexIds.length > 0) setSelectedVertexIds([]);
+        if (selectedEdgeIds.length > 0) setSelectedEdgeIds([]);
+      } else if (objetivo === 'vertice') {
+        setSelectedVertexIds(selectedVertexIds.map((v) => res.vmap.get(v) ?? v));
+      } else {
+        setSelectedEdgeIds(selectedEdgeIds.map((k) => res.mapaAristas.get(k) ?? k));
+      }
+    }, [
+      selectedObjectId,
+      configObjectId,
+      sceneObjects,
+      triMesh,
+      faceSelectionTarget,
+      selectedFaceIds,
+      selectedVertexIds,
+      selectedEdgeIds,
+      moveSelDelta,
+    ]);
 
     // ---- Resalte por textura automática -------------------------------
     // El usuario lo pidió así: las caras seleccionadas se pintan con una
@@ -7360,8 +7436,10 @@ pluginTracks,
         const actuales = object.mesh.faceTextures ?? [];
         const cambios = new Map<number, string | null>();
         // Caras que dejaron de estar seleccionadas: quitar SOLO el color
-        // automático que puso este sistema (las demás no se tocan).
-        for (const f of autoPintadasRef.current) {
+        // automático que puso este sistema (las demás no se tocan). Se
+        // barre TODA la lista — así también se limpia el resalte de una
+        // cara seleccionada que ya no lo está tras una extrusión.
+        for (let f = 0; f < actuales.length; f++) {
           if (selSet.has(f)) continue;
           if (actuales[f] === colorAuto) cambios.set(f, null);
         }
@@ -7384,13 +7462,23 @@ pluginTracks,
         const newMesh = structuredClone(object.mesh);
         const textures = [...(newMesh.faceTextures ?? [])];
         while (textures.length < newMesh.faces.length) textures.push(null);
+        // El resalte automático también va por grupo: cada lote pintado
+        // se apoya en un id propio (al limpiar queda null y se libera).
+        const grupoAuto = nuevoGrupoTextura();
+        const grupos = [...(newMesh.faceTextureGroups ?? [])];
+        while (grupos.length < newMesh.faces.length) grupos.push(null);
         for (const [f, color] of cambios) {
-          if (f >= 0 && f < textures.length) textures[f] = color;
+          if (f >= 0 && f < textures.length) {
+            textures[f] = color;
+            grupos[f] = grupoAuto;
+          }
         }
         if (textures.every((tx) => tx === null)) {
           delete newMesh.faceTextures;
+          if (grupos.every((g) => g === null)) delete newMesh.faceTextureGroups;
         } else {
           newMesh.faceTextures = textures;
+          newMesh.faceTextureGroups = grupos;
         }
         autoPintadasRef.current = pintadas;
         return current.map((o) => (o.id === id ? { ...o, mesh: newMesh } : o));
@@ -10699,6 +10787,9 @@ pluginTracks,
         setSelectedFaceIds([]);
         setSelectedVertexIds([]);
         setSelectedEdgeIds([]);
+      }}
+      onRegisterSelectionMove={(fn) => {
+        moveSelectionFnRef.current = fn;
       }}
       showGizmo={showGizmo}
       gizmoModes={gizmoConfigMode ? gizmoModesDraft : gizmoModes}
@@ -14500,7 +14591,7 @@ pluginTracks,
           {faceSelectMode && (
             <div
               data-testid="face-select-bar"
-              className="absolute bottom-4 left-14 z-50 flex items-center gap-2 bg-gray-900/90 rounded-lg border border-cyan-500/30 px-3 py-2 shadow-lg max-w-[calc(100%-4rem)] flex-wrap"
+              className="absolute bottom-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 bg-gray-900/90 rounded-lg border border-cyan-500/30 px-3 py-2 shadow-lg max-w-[calc(100%-4rem)] flex-wrap"
             >
               <span className="text-xs text-cyan-300 shrink-0">
                 {faceSelectionTarget === 'cara'
@@ -14509,6 +14600,60 @@ pluginTracks,
                     ? t('editor3D.faceSelVertices', { n: selectedVertexIds.length })
                     : t('editor3D.faceSelEdges', { n: selectedEdgeIds.length })}
               </span>
+              {/* Campos numéricos: desplazar la selección por eje */}
+              {(faceSelectionTarget === 'cara'
+                ? selectedFaceIds.length
+                : faceSelectionTarget === 'vertice'
+                  ? selectedVertexIds.length
+                  : selectedEdgeIds.length) > 0 && (
+                <div
+                  className="flex items-center gap-1 shrink-0"
+                  title={t('editor3D.moveSelTitle')}
+                  data-testid="face-move-fields"
+                >
+                  {(['x', 'y', 'z'] as const).map((ax) => (
+                    <label key={ax} className="flex items-center gap-0.5 text-[10px] text-muted-foreground shrink-0">
+                      <span className="text-cyan-300/80">{t(`editor3D.axis${ax.toUpperCase()}`)}</span>
+                      <input
+                        type="number"
+                        step={0.1}
+                        value={moveSelDelta[ax]}
+                        data-testid={`face-move-${ax}`}
+                        onChange={(e) =>
+                          setMoveSelDelta((p) => ({ ...p, [ax]: parseFloat(e.target.value) || 0 }))
+                        }
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.stopPropagation();
+                            moveSelectionFnRef.current?.(moveSelDelta.x, moveSelDelta.y, moveSelDelta.z);
+                            setMoveSelDelta({ x: 0, y: 0, z: 0 });
+                          }
+                        }}
+                        className="w-16 px-1 py-0.5 text-xs bg-gray-950 border border-white/15 rounded text-white focus:border-cyan-500/50 outline-none"
+                      />
+                    </label>
+                  ))}
+                  <button
+                    data-testid="face-move-apply"
+                    onClick={() => {
+                      moveSelectionFnRef.current?.(moveSelDelta.x, moveSelDelta.y, moveSelDelta.z);
+                      setMoveSelDelta({ x: 0, y: 0, z: 0 });
+                    }}
+                    className="px-2.5 py-1 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/40 transition-colors shrink-0"
+                    title={t('editor3D.moveSelTitle')}
+                  >
+                    {t('editor3D.moveSelApply')}
+                  </button>
+                  <button
+                    data-testid="face-extrude-apply"
+                    onClick={handleExtrudir}
+                    className="px-2.5 py-1 rounded-md text-xs font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 transition-colors shrink-0"
+                    title={t('editor3D.faceExtrudeTitle')}
+                  >
+                    {t('editor3D.faceExtrude')}
+                  </button>
+                </div>
+              )}
               <input
                 ref={faceTextureInputRef}
                 type="file"
