@@ -1,5 +1,23 @@
 'use client';
 
+/**
+ * Compone la matriz THREE de una transformada de objeto (misma regla que
+ * en el resto del visor: euler XYZ en radianes, escala por eje).
+ */
+function componerMatrizTransforma(t: {
+  px?: number; py?: number; pz?: number;
+  rx?: number; ry?: number; rz?: number;
+  sx?: number; sy?: number; sz?: number;
+}): THREE.Matrix4 {
+  return new THREE.Matrix4().compose(
+    new THREE.Vector3(t.px ?? 0, t.py ?? 0, t.pz ?? 0),
+    new THREE.Quaternion().setFromEuler(
+      new THREE.Euler(t.rx ?? 0, t.ry ?? 0, t.rz ?? 0)
+    ),
+    new THREE.Vector3(t.sx ?? 1, t.sy ?? 1, t.sz ?? 1)
+  );
+}
+
 let mp4ExportActive = false;
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -59,56 +77,21 @@ import {
      Menu,
   } from 'lucide-react';
 
-/** Configuración completa de efectos visuales con parámetros ajustables. */
-export interface FxConfig {
-  /** Halo de neón alrededor del texto */
-  glow: boolean;
-  glowColor: string;      // hex #RRGGBB
-  glowIntensity: number;  // 0..3
-  /** Chispas que salen disparadas del texto */
-  sparks: boolean;
-  sparksCount: number;    // 50..500
-  sparksSize: number;     // 0.01..0.2
-  /** Llamas que suben por el texto */
-  fire: boolean;
-  fireCount: number;      // 50..500
-  fireSize: number;       // 0.05..0.3
-  fireIntensity: number;  // 0..3 (multiplica color + luz)
-  /** Lluvia cayendo sobre el texto */
-  rain: boolean;
-  rainCount: number;      // 100..1000
-  rainSpeed: number;      // 1..10
-   /** Estrellas que brillan sobre el texto */
-   glowObjects: boolean;  // apply glow effect to scene objects too
-  smoke: boolean;
-  smokeCount: number;     // 50..500
-  smokeSize: number;      // 0.05..0.5
-  smokeColor: string;     // hex #RRGGBB
-  smokeRiseSpeed: number; // 0.1..5
-}
-
-/** Configuración de efectos visuales por defecto (modo no controlado). */
-export const DEFAULT_FX_CONFIG: FxConfig = {
-  glow: false,
-  glowColor: '#5fd4ff',
-  glowIntensity: 1.4,
-  sparks: false,
-  sparksCount: 140,
-  sparksSize: 0.035,
-  fire: false,
-  fireCount: 160,
-  fireSize: 0.11,
-  fireIntensity: 1,
-  rain: false,
-  rainCount: 320,
-  rainSpeed: 2,
-  smoke: false,
-  smokeCount: 120,
-  smokeSize: 0.11,
-  smokeColor: '#444a52',
-  smokeRiseSpeed: 1,
-  glowObjects: false,
-};
+/** Configuración FX global (legacy v3): vive en lib/efectos-objeto.ts. */
+export type { FxConfig } from '@/lib/efectos-objeto';
+export { DEFAULT_FX_CONFIG } from '@/lib/efectos-objeto';
+import {
+  DEFAULT_FX_CONFIG,
+  VALORES_DEFECTO_EFECTO,
+  aplicarAEfectos,
+  crearEfectoObjeto,
+  validarEfectos,
+  valoresEfecto,
+  type EfectoObjeto,
+  type EfectoValores,
+  type FxConfig,
+  type EstrellaColocada,
+} from '@/lib/efectos-objeto';
 
 // Presets de iluminación: "Natural" (blanca neutra) es el predeterminado.
 const LIGHT_PRESETS = [
@@ -150,6 +133,42 @@ export type Camera3D = {
   rotationY: number;
 };
 
+/** Contador de programas de shader con exclusión de luces (clave única
+ *  por material parcheado: así compila SUS uniformes y no comparte
+ *  programa con otro material). */
+let contadorExclusiones = 0;
+
+/** lights_fragment_begin (three r186) con el filtro de exclusión
+ *  inyectado: la irradiance ambiente va según excluirAmbiente y cada
+ *  foco excluido se anula comparando su posición — la del uniforme
+ *  spotLights está en espacio de VISTA, así que la lista (mundo) se
+ *  proyecta a vista con viewMatrix. Va REEMPLAZANDO al tag
+ *  `#include <lights_fragment_begin>` porque onBeforeCompile corre
+ *  ANTES de que three expanda los includes: los .replace contra código
+ *  interno del chunk (spotLight/irradiance) serían no-ops con el
+ *  fragmento sin resolver. */
+const LUCES_FRAG_INICIO = ((trozo: string) =>
+  trozo
+    .replace(
+      'vec3 irradiance = getAmbientLightIrradiance( ambientLightColor );',
+      'vec3 irradiance = getAmbientLightIrradiance( ambientLightColor ) * ( 1.0 - excluirAmbiente );'
+    )
+    .replace(
+      '\t\tspotLight = spotLights[ i ];',
+      `\t\tspotLight = spotLights[ i ];
+		for ( int s = 0; s < excluirFocos; s ++ ) {
+			if ( distance( spotLight.position, ( viewMatrix * vec4( excluirFocoPos[ s ], 1.0 ) ).xyz ) < 0.001 ) {
+				spotLight.color = vec3( 0.0 );
+			}
+		}`
+    ))(
+      (THREE as unknown as { ShaderChunk?: Record<string, string> })
+        .ShaderChunk?.['lights_fragment_begin'] ??
+        // Si el chunk no estuviera a mano, dejar el tag intacto:
+        // el replace entero se vuelve no-op y nada revienta.
+        '#include <lights_fragment_begin>'
+    );
+
 export interface SpotlightConfig {
   id: string;
   enabled: boolean;
@@ -171,6 +190,12 @@ export interface SpotlightConfig {
   /** Si los ayudantes visuales del foco (cono, aros, esfera de posición)
    *  se muestran en la escena. El foco sigue iluminando aunque esté a false. */
   helperVisible?: boolean;
+  /**
+   * Objetos de la escena que ESTE foco NO ilumina: se quita la
+   * contribución de la luz de los materiales de esos objetos (por
+   * objeto, sin tocar a los demás).
+   */
+  excluyeObjetos?: string[];
 }
 
 export interface LightConfig {
@@ -178,6 +203,11 @@ export interface LightConfig {
     enabled: boolean;
     color: number;
     intensity: number;
+    /**
+     * Objetos de la escena que la luz ambiente NO ilumina (se resta su
+     * contribución ambiental de los materiales de esos objetos).
+     */
+    excluyeObjetos?: string[];
   };
   spotlights: SpotlightConfig[];
   /** Opcional: si está activo, el fondo (cielo) también sigue a las luces.
@@ -242,6 +272,8 @@ interface Viewer3DProps {
     kind?: 'figure' | 'camera';
     /** Datos de la cámara-objeto (FOV + fotogramas del recorrido) */
     camera?: CameraData;
+    /** Efectos visuales del objeto (con parámetros y focos persistidos). */
+    efectos?: EfectoObjeto[];
   }>;
   /**
    * Objeto dueño de la configuración actual: su figura es la malla que
@@ -389,6 +421,9 @@ interface Viewer3DProps {
     fxConfig?: FxConfig;
     /** Notifica al padre cuando un efecto visual cambió */
     onFxChange?: (fx: Partial<FxConfig>) => void;
+    /** Efectos por objeto cambiados desde el visor (aplicar/retirar en lote,
+     *  parámetros, focos colocados con clic). Solo llegan los que cambian. */
+    onEfectosObjetos?: (cambios: Record<string, EfectoObjeto[] | undefined>) => void;
     /** Abrir el modal de configuración de efectos visuales */
     onOpenFxConfig?: () => void;
     /** Mostrar u ocultar la rejilla del suelo */
@@ -561,11 +596,18 @@ function applyCamera(
 }
 
 function disposeMaterial(material: THREE.Material | THREE.Material[]): void {
+  const liberar = (mat: THREE.Material) => {
+    // El material de profundidad acompaña a su pintura (userData.
+    // matSombra): muere con ella, sin tocar cada punto de dispose.
+    const sombra = mat.userData?.matSombra as THREE.Material | undefined;
+    if (sombra) sombra.dispose();
+    mat.dispose();
+  };
   if (Array.isArray(material)) {
-    material.forEach((item) => item.dispose());
+    material.forEach(liberar);
     return;
   }
-  material.dispose();
+  liberar(material);
 }
 
 /**
@@ -2000,8 +2042,7 @@ export default function Viewer3D({
       groundTextureFinish = 'semi-matte',
      objectTextureFinish = 'semi-matte',
      skyboxImage = null,
-    fxConfig,
-    onFxChange,
+    onEfectosObjetos,
     onOpenFxConfig,
     showGrid: showGridProp,
      onShowGridChange,
@@ -2261,45 +2302,182 @@ export default function Viewer3D({
 
     const [showVertices, setShowVertices] = useState(showVerticesDefault);
     const [smoothCapture, setSmoothCapture] = useState(true);
-    // Estado local sólo se usa cuando el componente es no controlado
-    // (fxConfig === undefined). Mantiene una copia editable del FX.
-    const [fxConfigLocal, setFxConfigLocal] = useState<FxConfig | undefined>(undefined);
-
-    // Valores efectivos: fxConfig (controlado) si existe, else local state
-    const fx = fxConfig ?? fxConfigLocal ?? DEFAULT_FX_CONFIG;
-   const glowValue = fx.glow;
-   const sparksValue = fx.sparks;
-   const fireValue = fx.fire;
-    const rainValue = fx.rain;
-    const smokeValue = fx.smoke;
 
     const [showFxConfigModal, setShowFxConfigModal] = useState(false);
 
+    // --- Efectos por objeto -------------------------------------------------
+    // Los efectos viven en cada objeto (obj.efectos); los toggles del menú
+    // FX se aplican a la selección múltiple (o al objeto activo con uno solo).
+    const onEfectosObjetosRef = useRef(onEfectosObjetos);
+    onEfectosObjetosRef.current = onEfectosObjetos;
+    const objectsRefFx = useRef(objects);
+    objectsRefFx.current = objects;
 
-    const toggleGlow = useCallback(() => {
-      if (fxConfig !== undefined) onFxChange?.({ glow: !fxConfig.glow });
-      else setFxConfigLocal((prev) => ({ ...DEFAULT_FX_CONFIG, ...prev, glow: !(prev?.glow ?? false) }));
-     }, [fxConfig, onFxChange, fxConfigLocal]);
-     const toggleSparks = useCallback(() => {
-       if (fxConfig !== undefined) onFxChange?.({ sparks: !fxConfig.sparks });
-       else setFxConfigLocal((prev) => ({ ...DEFAULT_FX_CONFIG, ...prev, sparks: !(prev?.sparks ?? false) }));
-     }, [fxConfig, onFxChange, fxConfigLocal]);
-     const toggleFire = useCallback(() => {
-       if (fxConfig !== undefined) onFxChange?.({ fire: !fxConfig.fire });
-       else setFxConfigLocal((prev) => ({ ...DEFAULT_FX_CONFIG, ...prev, fire: !(prev?.fire ?? false) }));
-     }, [fxConfig, onFxChange, fxConfigLocal]);
-     const toggleRain = useCallback(() => {
-       if (fxConfig !== undefined) onFxChange?.({ rain: !fxConfig.rain });
-       else setFxConfigLocal((prev) => ({ ...DEFAULT_FX_CONFIG, ...prev, rain: !(prev?.rain ?? false) }));
-     }, [fxConfig, onFxChange, fxConfigLocal]);
-     const toggleSmoke = useCallback(() => {
-       if (fxConfig !== undefined) onFxChange?.({ smoke: !fxConfig.smoke });
-       else setFxConfigLocal((prev) => ({ ...DEFAULT_FX_CONFIG, ...prev, smoke: !(prev?.smoke ?? false) }));
-     }, [fxConfig, onFxChange, fxConfigLocal]);
-    const [fxStars, setFxStars] = useState(false);
-  const [placeTarget, setPlaceTarget] = useState<'fire' | 'smoke' | 'sparks' | 'stars' | null>(null);
-   const [starSize, setStarSize] = useState(1);
-   const [showGridInternal, setShowGridInternal] = useState(true);
+    /** Ids a los que se aplica un efecto: la selección múltiple, o el
+     *  objeto activo si no hay selección (comportamiento de siempre). */
+    const idsFx = useCallback((): string[] => {
+      const sel = selectedObjectIdsRef.current ?? [];
+      if (sel.length > 0) return sel;
+      const activo = selectedObjectIdRef.current;
+      return activo ? [activo] : [];
+    }, []);
+
+    /** Efectos actuales de los ids dados (mapa id -> lista). */
+    const efectosDe = useCallback(
+      (ids: string[]): Record<string, EfectoObjeto[] | undefined> => {
+        const out: Record<string, EfectoObjeto[] | undefined> = {};
+        for (const id of ids) {
+          out[id] = objectsRefFx.current?.find((o) => o.id === id)?.efectos;
+        }
+        return out;
+      },
+      []
+    );
+
+    /** Estado de un tipo de efecto sobre la selección: true (todos),
+     *  false (ninguno) o 'indeterminate' (algunos). */
+    const estadoEfectoSel = useCallback(
+      (tipo: EffectType): boolean | 'indeterminate' => {
+        const ids = idsFx();
+        if (ids.length === 0) return false;
+        let activos = 0;
+        for (const id of ids) {
+          const e = objectsRefFx.current
+            ?.find((o) => o.id === id)
+            ?.efectos?.find((e) => e.tipo === tipo && e.activo);
+          if (e) activos++;
+        }
+        if (activos === 0) return false;
+        return activos === ids.length ? true : 'indeterminate';
+      },
+      [idsFx, objects]
+    );
+
+    /** Aplica o retira un tipo de efecto a la selección (lote). */
+    const toggleEfectoObjetos = useCallback(
+      (tipo: EffectType) => {
+        const ids = idsFx();
+        if (ids.length === 0 || !onEfectosObjetosRef.current) return;
+        const estado = estadoEfectoSel(tipo);
+        const activar = estado !== true;
+        const cambios = aplicarAEfectos(efectosDe(ids), ids, tipo, activar);
+        if (Object.keys(cambios).length > 0) onEfectosObjetosRef.current(cambios);
+      },
+      [idsFx, estadoEfectoSel, efectosDe]
+    );
+
+    /** Edita los valores de un tipo de efecto en TODOS los objetos de la
+     *  selección que lo tengan (el modal de configuración). */
+    const editarValoresEfectoSel = useCallback(
+      (tipo: EffectType, valores: EfectoValores) => {
+        const ids = idsFx();
+        if (ids.length === 0 || !onEfectosObjetosRef.current) return;
+        const cambios: Record<string, EfectoObjeto[]> = {};
+        for (const id of ids) {
+          const lista = objectsRefFx.current?.find((o) => o.id === id)?.efectos;
+          const efecto = lista?.find((e) => e.tipo === tipo && e.activo);
+          if (!efecto || !lista) continue;
+          cambios[id] = lista.map((e) =>
+            e.id === efecto.id ? { ...e, params: { ...valoresEfecto(e), ...valores } } : e
+          );
+        }
+        if (Object.keys(cambios).length > 0) onEfectosObjetosRef.current(cambios);
+      },
+      [idsFx]
+    );
+
+    /** Persiste los focos runtime de un tipo en el objeto (auto-creando el
+     *  efecto, inactivo, si el objeto no lo tenía: los focos viven aunque
+     *  el efecto esté apagado). Devuelve la lista escrita. */
+    const guardarFocosObjeto = (
+      rt: RuntimeFxObjeto,
+      tipo: 'fire' | 'smoke' | 'sparks'
+    ): EfectoObjeto[] | null => {
+      const obj = objectsRefFx.current?.find((o) => o.id === rt.objectId);
+      if (!obj || !onEfectosObjetosRef.current) return null;
+      let lista = [...(obj.efectos ?? [])];
+      const efecto = lista.find((e) => e.tipo === tipo);
+      const focos = rt.focos[tipo].map((v) => ({ x: v.x, y: v.y, z: v.z }));
+      if (!efecto) {
+        lista.push({
+          ...crearEfectoObjeto(tipo, false),
+          params: { ...VALORES_DEFECTO_EFECTO[tipo] },
+          focos,
+        });
+      } else {
+        lista = lista.map((e) =>
+          e.id === efecto.id
+            ? { ...e, focos: focos.length > 0 ? focos : undefined }
+            : e
+        );
+      }
+      onEfectosObjetosRef.current({ [rt.objectId]: lista });
+      return lista;
+    };
+
+    /** Igual que guardarFocosObjeto pero para las estrellas colocadas. */
+    const guardarEstrellasObjeto = (rt: RuntimeFxObjeto): EfectoObjeto[] | null => {
+      const obj = objectsRefFx.current?.find((o) => o.id === rt.objectId);
+      if (!obj || !onEfectosObjetosRef.current) return null;
+      let lista = [...(obj.efectos ?? [])];
+      const efecto = lista.find((e) => e.tipo === 'stars');
+      const estrellas = rt.estrellas.map((p) => ({
+        x: p.x,
+        y: p.y,
+        z: p.z,
+        ...(p.tamaño !== undefined ? { tamaño: p.tamaño } : {}),
+      }));
+      if (!efecto) {
+        lista.push({
+          ...crearEfectoObjeto('stars', false),
+          params: { ...VALORES_DEFECTO_EFECTO.stars },
+          estrellas,
+        });
+      } else {
+        lista = lista.map((e) =>
+          e.id === efecto.id
+            ? { ...e, estrellas: estrellas.length > 0 ? estrellas : undefined }
+            : e
+        );
+      }
+      onEfectosObjetosRef.current({ [rt.objectId]: lista });
+      return lista;
+    };
+
+    /** Quita TODOS los focos y estrellas colocados de los objetos dados
+     *  (botón «Borrar todos los puntos»). */
+    const limpiarPuntosObjetos = useCallback((ids: string[]) => {
+      const cambios: Record<string, EfectoObjeto[]> = {};
+      for (const id of ids) {
+        const lista = objectsRefFx.current?.find((o) => o.id === id)?.efectos;
+        if (!lista || lista.length === 0) continue;
+        cambios[id] = lista.map((e) => ({ ...e, focos: [], estrellas: [] }));
+      }
+      if (Object.keys(cambios).length > 0) onEfectosObjetosRef.current?.(cambios);
+    }, []);
+
+    /** Limpia los focos/estrellas del objeto con el efecto dado (sin
+     *  tocar el resto: quitar el campo vacío del todo). */
+    const limpiarPuntosDeTipo = (
+      id: string,
+      tipo: EffectType
+    ): EfectoObjeto[] | null => {
+      const obj = objectsRefFx.current?.find((o) => o.id === id);
+      const lista = obj?.efectos;
+      if (!lista || lista.length === 0) return null;
+      const efecto = lista.find((e) => e.tipo === tipo);
+      if (!efecto) return null;
+      const nueva = lista.map((e) =>
+        e.id === efecto.id ? { ...e, focos: [], estrellas: [] } : e
+      );
+      onEfectosObjetosRef.current?.({ [id]: nueva });
+      return nueva;
+    };
+
+    const [placeTarget, setPlaceTarget] = useState<'fire' | 'smoke' | 'sparks' | 'stars' | null>(null);
+    /** Tamaño de estrella mostrado en el slider (se escribe en el efecto). */
+    const [starSize, setStarSize] = useState(1);
+    const [showGridInternal, setShowGridInternal] = useState(true);
    const gridValue = showGridProp !== undefined ? showGridProp : showGridInternal;
    const toggleGrid = useCallback(() => {
      if (showGridProp !== undefined) {
@@ -2443,35 +2621,22 @@ export default function Viewer3D({
     startDir?: THREE.Vector3;
   } | null>(null);
 
-  // --- Efectos de iluminación (chispas, fuego, estrellas, neón) ---
-  const effectsGroupRef = useRef<THREE.Group | null>(null);
-  const glowGroupRef = useRef<THREE.Group | null>(null);
-  const sparksRef = useRef<ParticleSystem | null>(null);
-  const fireRef = useRef<ParticleSystem | null>(null);
-  const starsRef = useRef<StarSystem | null>(null);
-  const fireLightRef = useRef<THREE.PointLight | null>(null);
-  const rainRef = useRef<RainSystem | null>(null);
-  const rainEnabledRef = useRef(false);
-  const smokeRef = useRef<SmokeSystem | null>(null);
-   const smokeEnabledRef = useRef(false);
-    const fxFireRef = useRef(fireValue);
-    fxFireRef.current = fireValue;
-   const fxStarsRef = useRef(fxStars);
-   fxStarsRef.current = fxStars;
-   const rainCountRef = useRef<number | null>(null);
-   const fireCountRef = useRef<number | null>(null);
-   const sparksCountRef = useRef<number | null>(null);
+  // --- Efectos por objeto (chispas, fuego, lluvia, humo, estrellas, brillo) ---
+  // Runtime de FX por objeto: sistemas de partículas + focos + shells de
+  // brillo. El grupo vive DENTRO del grupo visual del objeto (duplicado o
+  // malla principal), así viaja con su transform sin matemática extra.
+  const fxObjetosRef = useRef<Map<string, RuntimeFxObjeto>>(new Map());
+  /** API de efectos para los cierres del bucle de animación (que viven en
+   *  el efecto de setup y no ven las funciones del cuerpo del componente). */
+  const fxApiRef = useRef<{
+    runtimeDe: (id: string, crear?: boolean) => RuntimeFxObjeto | null;
+    sincronizar: () => void;
+  }>({
+    runtimeDe: () => null,
+    sincronizar: () => {},
+  });
   const placeTargetRef = useRef<'fire' | 'smoke' | 'sparks' | 'stars' | null>(placeTarget);
   placeTargetRef.current = placeTarget;
-  // Focos de efecto (fuego/humo/chispas) colocados con el ratón. Viven en el
-  // espacio local del grupo de efectos, que sigue al objeto.
-  const fxAnchorsRef = useRef<{
-    fire: THREE.Vector3[];
-    smoke: THREE.Vector3[];
-    sparks: THREE.Vector3[];
-  }>({ fire: [], smoke: [], sparks: [] });
-  const fxAnchorGroupRef = useRef<THREE.Group | null>(null);
-  const placedStarsRef = useRef<PlacedStarSystem | null>(null);
   const placeDownRef = useRef<{ x: number; y: number } | null>(null);
   const starSizeRef = useRef(starSize);
   starSizeRef.current = starSize;
@@ -2643,10 +2808,7 @@ export default function Viewer3D({
         }
       }
     }
-    full(glowGroupRef.current, true);
     full(vertexHelpersRef.current, true);
-    full(placedStarsRef.current?.group ?? null, true);
-    full(effectsGroupRef.current, false);
      full(gizmoGroupRef.current, false);
      // Si hay un offset del gizmo, aplicarlo SOBRE la pose del objeto:
      // el gizmo se desplaza/gira respecto al centro del objeto sin
@@ -3328,31 +3490,6 @@ export default function Viewer3D({
     const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
     planeRef.current = plane;
 
-    // Grupos de efectos (partículas, halo de neón) y luz de fuego
-    const effectsGroup = new THREE.Group();
-    scene.add(effectsGroup);
-    effectsGroupRef.current = effectsGroup;
-
-    const glowGroup = new THREE.Group();
-    scene.add(glowGroup);
-    glowGroupRef.current = glowGroup;
-
-    const fireLight = new THREE.PointLight(0xff8040, 0, 6, 1.6);
-    fireLight.position.set(0, 0.2, 1.4);
-    scene.add(fireLight);
-    fireLightRef.current = fireLight;
-
-    // Estrellas colocadas a mano (clic en el texto)
-    const placedGroup = new THREE.Group();
-    scene.add(placedGroup);
-    placedStarsRef.current = { group: placedGroup, stars: [] };
-
-    // Marcadores de los focos de efecto colocados con el ratón. Cuelgan del
-    // grupo de efectos (que sigue al objeto) para viajar con él.
-    const fxAnchorGroup = new THREE.Group();
-    effectsGroup.add(fxAnchorGroup);
-    fxAnchorGroupRef.current = fxAnchorGroup;
-
     // Manipulador: flechas de ejes X/Y/Z (mover/estirar/rotar). Solo se
     // ve si el usuario lo activa con la casilla de la barra.
     const gizmoGroup = new THREE.Group();
@@ -3368,89 +3505,41 @@ export default function Viewer3D({
     lightGizmoGroupRef.current = lightGizmoGroup;
     lightGizmoHandlesRef.current = buildLightGizmoHandles(lightGizmoGroup);
 
-    // Punto aleatorio de la superficie del texto: emisor de partículas
-    const randomSurfacePoint = (): THREE.Vector3 | null => {
-      const m = meshRef.current;
-      if (!m || m.vertices.length === 0) return null;
-      if (m.texture) {
-        // Modo "vista plana": muestrea el rectángulo del panel
-        const v = m.vertices;
-        const x = v[0].x + Math.random() * (v[1].x - v[0].x);
-        const y = v[0].y + Math.random() * (v[3].y - v[0].y);
-        return new THREE.Vector3(x, y, 0);
-      }
-      const v = m.vertices[(Math.random() * m.vertices.length) | 0];
-      return new THREE.Vector3(v.x, v.y, v.z);
-    };
-
-    // Función de emisión por efecto: si el usuario ha colocado focos con el
-    // ratón, cada partícula nace en uno de ellos (elegido al azar -> varios
-    // clics dan varios focos); si no, se reparte por la superficie como antes.
-    const emitPointFor = (
-      kind: 'fire' | 'smoke' | 'sparks'
-    ): (() => THREE.Vector3 | null) => {
-      const list = fxAnchorsRef.current[kind];
-      if (list.length > 0) {
-        return () => list[(Math.random() * list.length) | 0];
-      }
-      return randomSurfacePoint;
-    };
-
-    // Primera intersección del rayo actual con la superficie del objeto
-    // (recorriendo el grupo entero, no sólo sus hijos directos).
-    const raycastObjectSurface = (): THREE.Intersection | null => {
+    // Primera intersección del rayo actual con la superficie de CUALQUIER
+    // objeto de la escena (recorriendo el grupo entero). Devuelve también
+    // el id del objeto golpeado (subiendo por los padres hasta el
+    // duplicado/meshGroup que lleva sceneObjectId). Los shells del halo y
+    // los helpers de FX quedan fuera del raycast.
+    const raycastObjectSurface = (): {
+      hit: THREE.Intersection;
+      objectId: string | null;
+    } | null => {
       const group = meshGroupRef.current;
       if (!group) return null;
       group.updateMatrixWorld(true);
       const targets: THREE.Object3D[] = [];
       group.traverse((o) => {
-        if ((o as THREE.Mesh).isMesh) targets.push(o);
+        if (!(o as THREE.Mesh).isMesh) return;
+        if ((o as THREE.Mesh).userData?.isGlowShell) return;
+        targets.push(o);
       });
       if (targets.length === 0) return null;
       const hits = raycasterRef.current.intersectObjects(targets, false);
-      return hits.length > 0 ? hits[0] : null;
-    };
-
-    // Añade un foco de efecto (fuego/humo/chispas) con su marcador visible.
-    const addFxAnchor = (
-      kind: 'fire' | 'smoke' | 'sparks',
-      local: THREE.Vector3
-    ) => {
-      const group = fxAnchorGroupRef.current;
-      if (!group) return;
-      const marker = makeAnchorMarker(kind);
-      marker.position.copy(local);
-      group.add(marker);
-      fxAnchorsRef.current[kind].push(local);
-    };
-
-    // Quita el foco del efecto dado más cercano al rayo (en espacio local).
-    const removeFxAnchorAt = (
-      kind: 'fire' | 'smoke' | 'sparks',
-      localRay: THREE.Ray
-    ): boolean => {
-      const group = fxAnchorGroupRef.current;
-      if (!group) return false;
-      const list = fxAnchorsRef.current[kind];
-      let best = -1;
-      let bestDist = 0.09;
-      for (let i = 0; i < list.length; i++) {
-        const d = localRay.distanceToPoint(list[i]);
-        if (d < bestDist) {
-          bestDist = d;
-          best = i;
+      if (hits.length === 0) return null;
+      // Dueño del punto golpeado: sube hasta el nodo que lleva el id.
+      let dueño: string | null = null;
+      let node: THREE.Object3D | null = hits[0].object;
+      while (node) {
+        const oid = node.userData?.sceneObjectId as string | undefined;
+        if (oid) {
+          dueño = oid;
+          break;
         }
+        node = node.parent;
       }
-      if (best < 0) return false;
-      list.splice(best, 1);
-      const marker = group.children[best];
-      if (marker) {
-        group.remove(marker);
-        const sp = marker as THREE.Sprite;
-        sp.material?.dispose?.();
-      }
-      return true;
+      return { hit: hits[0], objectId: dueño };
     };
+    // Colocación de focos: helpers de runtime (focos por objeto).
 
     // Reconstruye el recorrido de la cámara-objeto: curva sobre las
     // posiciones de los fotogramas + UN asa esfera por fotograma (cian;
@@ -3634,241 +3723,11 @@ export default function Viewer3D({
        motionOrigChildren.clear();
        motionParamsCache.clear();
        motionWarnedMissingBase.clear();
-       // Restore effect systems to fx config state (in case effect tracks
-       // had activated effects independently of the fx config).
-       rainEnabledRef.current = !!rainValue;
-       smokeEnabledRef.current = !!smokeValue;
-       fxFireRef.current = !!fireValue;
-       fxStarsRef.current = fxStars;
-       if (!rainValue && rainRef.current) rainRef.current.points.visible = false;
-       if (!smokeValue && smokeRef.current) smokeRef.current.points.visible = false;
-       if (!sparksValue && sparksRef.current) sparksRef.current.points.visible = false;
-       if (!fireValue && fireRef.current) {
-         fireRef.current.points.visible = false;
-         fxFireRef.current = false;
-       }
-       if (!fxStars && starsRef.current) starsRef.current.group.visible = false;
-       if (!glowValue && glowMaterialCache) {
-         glowMaterialCache.uniforms.uIntensity.value = 0;
-       }
-       const glowGroupRestore = glowGroupRef.current;
-       if (glowGroupRestore) glowGroupRestore.visible = !!glowValue;
+       // Restore effect systems to the objects' static state (effect
+       // tracks may have activated effects independently of the objects).
+       fxApiRef.current.sincronizar();
      };
 
-    const applyEffectOverrides = (
-      effectType: EffectType,
-      values: Partial<Record<EffectProperty, number | string | boolean>>
-    ): void => {
-      if (values.enabled === false) {
-        switch (effectType) {
-          case 'rain':
-            if (rainRef.current) {
-              rainRef.current.points.visible = false;
-              rainEnabledRef.current = false;
-            }
-            break;
-          case 'smoke':
-            if (smokeRef.current) {
-              smokeRef.current.points.visible = false;
-              smokeEnabledRef.current = false;
-            }
-            break;
-          case 'stars':
-            if (starsRef.current) {
-              starsRef.current.group.visible = false;
-              fxStarsRef.current = false;
-            }
-            break;
-          case 'fire':
-            if (fireRef.current) fireRef.current.points.visible = false;
-            break;
-          case 'sparks':
-            if (sparksRef.current) sparksRef.current.points.visible = false;
-            break;
-          case 'glow':
-            if (glowMaterialCache) {
-              glowMaterialCache.uniforms.uIntensity.value = 0;
-            }
-            const glowGroupOff = glowGroupRef.current;
-            if (glowGroupOff) glowGroupOff.visible = false;
-            break;
-        }
-        return;
-      }
-
-      // Ensure the effect system exists when enabled is true or not specified.
-      // This allows effect tracks to activate effects independently of the fx config.
-      {
-        const group = effectsGroupRef.current;
-        if (group) {
-          switch (effectType) {
-            case 'rain':
-              if (!rainRef.current && meshRef.current?.vertices?.length > 0) {
-                const m = meshRef.current;
-                const box = new THREE.Box3();
-                for (const v of m.vertices) box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
-                const pad = box.getSize(new THREE.Vector3()).multiplyScalar(0.15);
-                box.min.sub(pad);
-                box.max.add(pad);
-                box.max.y += 0.3;
-                const sys = createRainSystem(box, fx.rainCount, fx.rainSpeed);
-                group.add(sys.points);
-                rainRef.current = sys;
-              }
-              break;
-            case 'smoke':
-              if (!smokeRef.current && meshRef.current?.vertices?.length > 0) {
-                const m = meshRef.current;
-                const box = new THREE.Box3();
-                for (const v of m.vertices) box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
-                const min = box.min.clone();
-                const center = new THREE.Vector3();
-                box.getCenter(center);
-                const origin = new THREE.Vector3(center.x, min.y, center.z);
-                const sys = createSmokeSystem(origin, fx.smokeCount, fx.smokeSize, fx.smokeColor, fx.smokeRiseSpeed, fx.fireIntensity);
-                group.add(sys.points);
-                smokeRef.current = sys;
-              }
-              break;
-            case 'fire':
-              if (!fireRef.current) {
-                const sys = createParticleSystem(fx.fireCount, fx.fireSize);
-                group.add(sys.points);
-                fireRef.current = sys;
-              }
-              break;
-            case 'sparks':
-              if (!sparksRef.current) {
-                const sys = createParticleSystem(fx.sparksCount, fx.sparksSize);
-                group.add(sys.points);
-                sparksRef.current = sys;
-              }
-              break;
-            case 'stars':
-              if (!starsRef.current) {
-                const sys = createStarSystem();
-                group.add(sys.group);
-                starsRef.current = sys;
-              }
-              break;
-            case 'glow':
-              if (!glowMaterialCache) getGlowMaterial();
-              const glowGroupCreate = glowGroupRef.current;
-              const mg = meshGroupRef.current;
-              if (glowGroupCreate && mg && glowMaterialCache) {
-                while (glowGroupCreate.children.length > 0) {
-                  const child = glowGroupCreate.children[glowGroupCreate.children.length - 1];
-                  if (child.userData?.isGlowShell) glowGroupCreate.remove(child);
-                  else break;
-                }
-                for (const child of mg.children) {
-                  if (!(child instanceof THREE.Mesh)) continue;
-                  const shell = new THREE.Mesh(child.geometry, glowMaterialCache);
-                  shell.scale.setScalar(1.1);
-                  if (child.userData.sceneObjectDuplicate && !fx.glowObjects) continue;
-                  (shell as any).userData = { isGlowShell: true };
-                  if (child.userData.sceneObjectDuplicate) {
-                    child.add(shell);
-                  } else {
-                    glowGroupCreate.add(shell);
-                  }
-                }
-                glowGroupCreate.visible = true;
-              }
-              break;
-          }
-        }
-      }
-
-      switch (effectType) {
-        case 'rain':
-          if (rainRef.current) {
-            rainRef.current.points.visible = true;
-            rainEnabledRef.current = true;
-            if (typeof values.speed === 'number') rainRef.current.speed = values.speed;
-            if (typeof values.count === 'number' && values.count !== rainCountRef.current) {
-              effectsGroupRef.current?.remove(rainRef.current.points);
-              rainRef.current.points.geometry.dispose();
-              (rainRef.current.points.material as THREE.Material)?.dispose();
-              rainCountRef.current = values.count;
-              const sys = createRainSystem(rainRef.current.box, values.count, rainRef.current.speed);
-              effectsGroupRef.current?.add(sys.points);
-              rainRef.current = sys;
-            }
-          }
-          break;
-        case 'smoke':
-          if (smokeRef.current) {
-            smokeRef.current.points.visible = true;
-            smokeEnabledRef.current = true;
-            if (typeof values.riseSpeed === 'number') smokeRef.current.riseSpeed = values.riseSpeed;
-            if (typeof values.size === 'number') {
-              (smokeRef.current.points.material as THREE.PointsMaterial).size = values.size;
-              (smokeRef.current.points.material as THREE.PointsMaterial).needsUpdate = true;
-            }
-            if (typeof values.color === 'string') {
-              smokeRef.current.color.set(values.color);
-            }
-          }
-          break;
-        case 'stars':
-          if (starsRef.current) {
-            starsRef.current.group.visible = true;
-            fxStarsRef.current = true;
-            if (typeof values.starSize === 'number') starSizeRef.current = values.starSize;
-          }
-          break;
-        case 'fire':
-          if (fireRef.current) {
-            fireRef.current.points.visible = true;
-            fxFireRef.current = true;
-            if (typeof values.intensity === 'number') fxFireRef.current = values.intensity > 0;
-            if (typeof values.size === 'number') {
-              (fireRef.current.points.material as THREE.PointsMaterial).size = values.size;
-              (fireRef.current.points.material as THREE.PointsMaterial).needsUpdate = true;
-            }
-            if (typeof values.count === 'number' && values.count !== fireCountRef.current) {
-              effectsGroupRef.current?.remove(fireRef.current.points);
-              fireRef.current.points.geometry.dispose();
-              (fireRef.current.points.material as THREE.Material)?.dispose();
-              fireCountRef.current = values.count;
-              const sys = createParticleSystem(values.count, fx.fireSize);
-              effectsGroupRef.current?.add(sys.points);
-              fireRef.current = sys;
-            }
-          }
-          break;
-        case 'sparks':
-          if (sparksRef.current) {
-            sparksRef.current.points.visible = true;
-            if (typeof values.size === 'number') {
-              (sparksRef.current.points.material as THREE.PointsMaterial).size = values.size;
-              (sparksRef.current.points.material as THREE.PointsMaterial).needsUpdate = true;
-            }
-            if (typeof values.count === 'number' && values.count !== sparksCountRef.current) {
-              effectsGroupRef.current?.remove(sparksRef.current.points);
-              sparksRef.current.points.geometry.dispose();
-              (sparksRef.current.points.material as THREE.Material)?.dispose();
-              sparksCountRef.current = values.count;
-              const sys = createParticleSystem(values.count, fx.sparksSize);
-              effectsGroupRef.current?.add(sys.points);
-              sparksRef.current = sys;
-            }
-          }
-          break;
-        case 'glow':
-          if (glowMaterialCache) {
-            if (typeof values.glowColor === 'string') {
-              glowMaterialCache.uniforms.uColor.value = new THREE.Color(values.glowColor);
-            }
-            if (typeof values.glowIntensity === 'number') {
-              glowMaterialCache.uniforms.uIntensity.value = values.glowIntensity;
-            }
-            glowMaterialCache.uniformsNeedUpdate = true;
-          }
-          break;
-      }
-    };
 
     const applyMotionOverride = (time: number) => {
       const meshGroup = meshGroupRef.current;
@@ -3885,32 +3744,94 @@ export default function Viewer3D({
       const evaluadoSel = selTrack && !dragObjeto
         ? evaluateTransformTrack(selTrack, time)
         : null;
-      const selMerged: ObjectTransform = evaluadoSel
+      // Miembro secundario de un grupo (sin pista propia): sigue la pista
+      // de grupo a la que pertenece. La pista guarda la pose del objeto
+      // principal, así que se compone la misma DELTA rígida que aplican
+      // los duplicados y se descompone para dar la nueva transformada.
+      const selGroupTrack = selId && !selTrack
+        ? transformTracksRef.current?.find((tr) => tr.objectIds?.includes(selId))
+        : undefined;
+      const selEvaluadoGrupo =
+        !evaluadoSel && selGroupTrack && !dragObjeto
+          ? evaluateTransformTrack(selGroupTrack, time)
+          : null;
+      let selMerged: ObjectTransform = evaluadoSel
         ? ({ ...transformRef.current, ...evaluadoSel } as ObjectTransform)
         : { ...transformRef.current };
-       if (evaluadoSel) {
+      if (selEvaluadoGrupo) {
+        const principal = objectsRef.current?.find(
+          (o) => o.id === (selGroupTrack as TransformTrack).objectId
+        );
+        if (principal) {
+          const delta = componerMatrizTransforma({
+            ...principal.transform,
+            ...selEvaluadoGrupo,
+          }).multiply(
+            componerMatrizTransforma(principal.transform).invert()
+          );
+          const matriz = delta.multiply(componerMatrizTransforma(transformRef.current));
+          const pos = new THREE.Vector3();
+          const quat = new THREE.Quaternion();
+          const scl = new THREE.Vector3();
+          matriz.decompose(pos, quat, scl);
+          const euler = new THREE.Euler().setFromQuaternion(quat, 'XYZ');
+          selMerged = {
+            ...transformRef.current,
+            px: pos.x, py: pos.y, pz: pos.z,
+            rx: euler.x, ry: euler.y, rz: euler.z,
+            sx: scl.x, sy: scl.y, sz: scl.z,
+          };
+        }
+      }
+       if (evaluadoSel || selEvaluadoGrupo) {
          applyObjectTransformRef.current(selMerged);
        }
 
        // 1b) Opacidad animada del objeto seleccionado: si el fotograma
-       // incluye 'o', aplica esa opacidad a los materiales del mesh group.
-       // Se guarda la original la primera vez para restaurar al parar.
-       if (evaluadoSel?.o !== undefined) {
+       // incluye 'o', aplica esa opacidad a los materiales del SELECCIONADO.
+       // La malla del objeto activo vive en el meshGroup PROPIO (sin la
+       // etiqueta de duplicado; su duplicado se retira al convertirlo en
+       // el activo, viewer-3d ~8036), mientras que los demás objetos cuelgan
+       // como duplicados de userData.sceneObjectDuplicate. Antes se
+       // recorría TODO el meshGroup y la opacidad bajaba a TODA la escena.
+       if (evaluadoSel?.o !== undefined && selId) {
          const targetOpacity = Math.max(0, Math.min(1, evaluadoSel.o));
-         meshGroup.traverse((item) => {
-           const m = item as THREE.Mesh;
-           if (!m.isMesh || !m.material) return;
-           const materials = Array.isArray(m.material) ? m.material : [m.material];
-           for (const mat of materials) {
-             if (!motionOrigOpacity.has(mat)) {
-               motionOrigOpacity.set(mat, mat.opacity);
+         const aplicar = (nodo: THREE.Object3D) => {
+           nodo.traverse((item) => {
+             const m = item as THREE.Mesh;
+             if (!m.isMesh || !m.material) return;
+             const materials = Array.isArray(m.material) ? m.material : [m.material];
+             for (const mat of materials) {
+               if (!motionOrigOpacity.has(mat)) {
+                 motionOrigOpacity.set(mat, mat.opacity);
+               }
+               mat.opacity = targetOpacity;
+               mat.transparent = targetOpacity < 1;
+               mat.needsUpdate = true;
              }
-             mat.opacity = targetOpacity;
-             mat.transparent = targetOpacity < 1;
-             mat.needsUpdate = true;
-           }
-         });
+           });
+         };
+         for (const child of meshGroup.children) {
+           if (child.userData.sceneObjectDuplicate) continue;
+           aplicar(child);
+         }
        }
+
+      // 1c) La sombra sigue la opacidad (plana o animada): el pase de
+      // profundidad NO lee el `opacity` del material de pintura (three
+      // solo le pasa alphaMap/alphaTest), así que el uniforme va al
+      // día por fotograma.
+      for (const hijo of meshGroup.children) {
+        hijo.traverse((item) => {
+          const m = item as THREE.Mesh;
+          if (!m.isMesh) return;
+          const ya = (m.customDepthMaterial?.userData?.sombraLuces ??
+            undefined) as { opac: { value: number } } | undefined;
+          if (!ya) return;
+          const mats = Array.isArray(m.material) ? m.material : [m.material];
+          ya.opac.value = Math.max(0, Math.min(1, mats[0]?.opacity ?? 1));
+        });
+      }
 
       // 2) Duplicados con pista de transformada: su matriz es relativa al
       // seleccionado (animado), igual que en el efecto de duplicados.
@@ -3924,32 +3845,59 @@ export default function Viewer3D({
             new THREE.Vector3(selMerged.sx, selMerged.sy, selMerged.sz)
           )
           .invert();
+        // Deltas rígidos de las pistas de GRUPO: una pista de grupo guarda
+        // la pose absoluta del objeto principal, NO la de cada miembro.
+        // Volcar esos valores sobre cada miembro aplanaba el grupo entero
+        // a la pose del principal (el grupo «se deformaba» al crear
+        // fotogramas). En su lugar se deriva una delta rígida por pista:
+        // Delta = pose animada del principal ∘ pose estática del principal⁻¹,
+        // y cada miembro la aplica sobre SU propia pose estática, así el
+        // grupo entero se mueve como un cuerpo rígido conservando offsets.
+        const deltasGrupo = new Map<string, THREE.Matrix4>();
+        for (const tr of transformTracksRef.current) {
+          if (!tr.objectIds || tr.objectIds.length === 0) continue;
+          const evaluado = evaluateTransformTrack(tr, time);
+          const principal = objectsRef.current?.find((o) => o.id === tr.objectId);
+          if (!evaluado || !principal) continue;
+          deltasGrupo.set(
+            tr.id,
+            componerMatrizTransforma({ ...principal.transform, ...evaluado })
+              .multiply(componerMatrizTransforma(principal.transform).invert())
+          );
+        }
          for (const child of meshGroup.children) {
            if (!child.userData.sceneObjectDuplicate) continue;
            const oid = child.userData.sceneObjectId as string;
            let tr = transformTracksRef.current?.find(
              (tk) => tk.objectId === oid
            );
+           let esGrupo = false;
            if (!tr) {
              // Miembro de un grupo: usa la pista de grupo si existe.
              tr = transformTracksRef.current?.find(
                (tk) => tk.objectIds && tk.objectIds.includes(oid)
              );
+             esGrupo = true;
            }
            if (!tr) continue;
-          const evaluadoDup = evaluateTransformTrack(tr, time);
-          if (!evaluadoDup) continue;
           const obj = objectsRef.current?.find((o) => o.id === oid);
           if (!obj) continue;
-          const merged = { ...obj.transform, ...evaluadoDup } as ObjectTransform;
-          const objectMatrix = new THREE.Matrix4().compose(
-            new THREE.Vector3(merged.px, merged.py, merged.pz),
-            new THREE.Quaternion().setFromEuler(
-              new THREE.Euler(merged.rx, merged.ry, merged.rz)
-            ),
-            new THREE.Vector3(merged.sx, merged.sy, merged.sz)
-          );
-          child.matrix.copy(inverseSel).multiply(objectMatrix);
+          const objectMatrix = componerMatrizTransforma(obj.transform);
+          if (esGrupo) {
+            const delta = deltasGrupo.get(tr.id);
+            if (!delta) continue;
+            child.matrix
+              .copy(inverseSel)
+              .multiply(delta)
+              .multiply(objectMatrix);
+          } else {
+            const evaluadoDup = evaluateTransformTrack(tr, time);
+            if (!evaluadoDup) continue;
+            const merged = { ...obj.transform, ...evaluadoDup } as ObjectTransform;
+            child.matrix
+              .copy(inverseSel)
+              .multiply(componerMatrizTransforma(merged));
+          }
           child.matrixAutoUpdate = false;
         }
       }
@@ -4063,13 +4011,26 @@ export default function Viewer3D({
         }
       }
 
-      // 4) Efectos visuales: aplicar overrides de efectos (lluvia, humo, estrellas)
+      // 4) Efectos visuales: overrides de efectos (lluvia, humo, estrellas)
+      // por objeto: cada pista apunta a SU objeto (objectId); las pistas
+      // viejas sin objectId van al objeto activo.
       const efTracks = effectTracksRef.current;
       if (efTracks && efTracks.length > 0) {
+        const activoId = meshGroup.userData.sceneObjectId as string | undefined;
         for (const tr of efTracks) {
           const evaluated = evaluateEffectTrack(tr, time);
           if (!evaluated) continue;
-          applyEffectOverrides(tr.effectType, evaluated);
+          const objetivos = tr.objectId
+            ? [tr.objectId]
+            : tr.objectIds && tr.objectIds.length > 0
+              ? tr.objectIds
+              : activoId
+                ? [activoId]
+                : [];
+          for (const oid of objetivos) {
+            const rt = fxApiRef.current.runtimeDe(oid, true);
+            if (rt) aplicarOverrideEfectoObjeto(rt, tr.effectType, evaluated);
+          }
         }
       }
     };
@@ -4295,56 +4256,53 @@ export default function Viewer3D({
             ((meshRef.current?.vertices?.length ?? 0) > 0 || esCamara);
         }
       }
-      if (sparksRef.current?.points.visible) {
-        updateSparks(sparksRef.current, dt, emitPointFor('sparks'));
-      }
-      if (fireRef.current?.points.visible) {
-        updateFire(fireRef.current, dt, emitPointFor('fire'));
-      }
-      if (starsRef.current?.group.visible) {
-        updateStars(starsRef.current, dt, randomSurfacePoint, starSizeRef.current);
-      }
-      if (rainRef.current) {
-        rainRef.current.points.visible = rainEnabledRef.current;
-        if (rainEnabledRef.current) updateRain(rainRef.current, dt);
-      }
-      if (smokeRef.current) {
-        smokeRef.current.points.visible = smokeEnabledRef.current;
-        if (smokeEnabledRef.current) updateSmoke(smokeRef.current, dt, emitPointFor('smoke'));
-      }
-      // Humo intensifica la luz cálida del fuego cuando ambos activos
-      // Estrellas colocadas: latido suave + giro lento. Las aleatorias
-      // se pausan mientras se está colocando para editar sin ruido.
-      const placed = placedStarsRef.current;
-      if (placed) {
-        const tNow = clock.elapsedTime;
-        const starSize = starSizeRef.current;
-        placed.group.visible = placed.stars.length > 0;
-        for (const star of placed.stars) {
-          const pulse = 0.8 + 0.2 * Math.sin(tNow * 2.2 + star.phase);
-          star.sprite.scale.setScalar(star.rawScale * starSize * pulse);
-          star.sprite.material.rotation += dt * 0.35;
+      // Efectos por objeto: actualizar cada runtime con partículas vivas.
+      const colocandoAhora = placeTargetRef.current;
+      for (const rt of fxObjetosRef.current.values()) {
+        if (rt.sparks?.points.visible) {
+          updateSparks(rt.sparks, dt, emisorDeFoco(rt, 'sparks'));
         }
-      }
-      if (starsRef.current) {
-        starsRef.current.group.visible =
-          fxStarsRef.current && !placeTargetRef.current;
-      }
-      if (fxAnchorGroupRef.current) {
-        const anchorGroup = fxAnchorGroupRef.current;
-        // Los marcadores de foco (guías) no deben salir en el vídeo ni en la
-        // vista de cámara.
-        anchorGroup.visible = !ayudasOcultas;
+        if (rt.fire?.points.visible) {
+          updateFire(rt.fire, dt, emisorDeFoco(rt, 'fire'));
+        }
+        if (rt.stars?.group.visible) {
+          updateStars(rt.stars, dt, rt.sampler, rt.starSize);
+        }
+        if (rt.rain) {
+          rt.rain.points.visible = rt.rainActivo;
+          if (rt.rainActivo) updateRain(rt.rain, dt);
+        }
+        if (rt.smoke) {
+          rt.smoke.points.visible = rt.smokeActivo;
+          if (rt.smokeActivo) updateSmoke(rt.smoke, dt, emisorDeFoco(rt, 'smoke'));
+        }
+        // Estrellas colocadas: latido suave + giro lento. Las aleatorias
+        // se pausan mientras se está colocando para editar sin ruido.
+        const placed = rt.colocadas;
+        if (placed) {
+          const tNow = clock.elapsedTime;
+          placed.group.visible = placed.stars.length > 0;
+          for (const star of placed.stars) {
+            const pulse = 0.8 + 0.2 * Math.sin(tNow * 2.2 + star.phase);
+            star.sprite.scale.setScalar(star.rawScale * star.tamaño * pulse);
+            star.sprite.material.rotation += dt * 0.35;
+          }
+        }
+        if (rt.stars) {
+          rt.stars.group.visible = rt.starsOn && !colocandoAhora;
+        }
+        // Los marcadores de foco (guías) no deben salir en el vídeo ni en
+        // la vista de cámara.
+        rt.anchorGroup.visible = !ayudasOcultas;
         // Cada guía se oculta cuando su efecto ya está emitiendo (así los
-        // círculos desaparecen al activar Llamas/Humo/Chispas), salvo que se
-        // esté colocando justo ese efecto, para poder seguir editándolo.
+        // círculos desaparecen al activar Llamas/Humo/Chispas), salvo que
+        // se esté colocando justo ese efecto, para seguir editándolo.
         const emitiendo: Record<string, boolean> = {
-          fire: !!(fireRef.current && fireRef.current.points.visible),
-          smoke: !!(smokeRef.current && smokeRef.current.points.visible),
-          sparks: !!(sparksRef.current && sparksRef.current.points.visible),
+          fire: !!(rt.fire && rt.fire.points.visible),
+          smoke: !!(rt.smoke && rt.smoke.points.visible),
+          sparks: !!(rt.sparks && rt.sparks.points.visible),
         };
-        const colocandoAhora = placeTargetRef.current;
-        for (const child of anchorGroup.children) {
+        for (const child of rt.anchorGroup.children) {
           const kind = child.userData.kind as
             | 'fire'
             | 'smoke'
@@ -4352,15 +4310,15 @@ export default function Viewer3D({
             | undefined;
           child.visible = !kind || !emitiendo[kind] || colocandoAhora === kind;
         }
-      }
-      if (fireLightRef.current) {
         // Fuego: luz cálida que parpadea; si hay humo, la luz se atenúa
         // (el humo oscurece el brillo del fuego).
-        const t = clock.elapsedTime;
-        const base = fxFireRef.current
-          ? 0.9 + Math.sin(t * 11.3) * 0.28 + Math.sin(t * 27.1) * 0.2
-          : 0;
-        fireLightRef.current.intensity = smokeEnabledRef.current ? base * 0.35 : base;
+        if (rt.luz) {
+          const t = clock.elapsedTime;
+          const base = rt.fire?.points.visible
+            ? 0.9 + Math.sin(t * 11.3) * 0.28 + Math.sin(t * 27.1) * 0.2
+            : 0;
+          rt.luz.intensity = rt.smokeActivo ? base * 0.35 : base;
+        }
       }
 
        // Update light helper visuals each frame so cones follow lights
@@ -4659,7 +4617,9 @@ export default function Viewer3D({
         if (faceSelectionOverlayRef.current)
           faceSelectionOverlayRef.current.visible = false;
         if (faceGuideRef.current) faceGuideRef.current.visible = false;
-        if (fxAnchorGroupRef.current) fxAnchorGroupRef.current.visible = false;
+        for (const rt of fxObjetosRef.current.values()) {
+          rt.anchorGroup.visible = false;
+        }
         renderer.render(scene, camera);
         const fps = 30;
         const stream = canvas.captureStream(fps);
@@ -5539,8 +5499,10 @@ export default function Viewer3D({
       }
     };
 
-    // Colocación de estrellas: clic (sin arrastre) sobre el texto añade
-    // una estrella; clic cerca de una colocada la quita.
+    // Colocación de focos/estrellas: clic (sin arrastre) sobre CUALQUIER
+    // objeto añade un punto; clic cerca de uno colocado lo quita. El punto
+    // queda en coordenadas locales del objeto y se persiste en sus efectos
+    // (vive con el proyecto y sus deshacer/rehacer).
     const handleFxPlacementClick = (clientX: number, clientY: number) => {
       const target = placeTargetRef.current;
       if (!target) return;
@@ -5549,42 +5511,60 @@ export default function Viewer3D({
       pointerRef.current.y = -((clientY - rect.top) / rect.height) * 2 + 1;
       raycasterRef.current.setFromCamera(pointerRef.current, camera);
 
-      // 1) Clic sobre un punto ya colocado del MISMO efecto -> lo quita.
-      if (target === 'stars') {
-        const placed = placedStarsRef.current;
-        if (placed) {
-          placed.group.updateMatrixWorld(true);
-          const inv = new THREE.Matrix4().copy(placed.group.matrixWorld).invert();
-          const localRay = raycasterRef.current.ray.clone().applyMatrix4(inv);
-          if (removePlacedStarAt(placed, localRay)) return;
+      // 1) Clic sobre un punto ya colocado -> lo quita (busca en todos los
+      // objetos: el punto puede vivir en otro objeto del escenario).
+      for (const rt of fxObjetosRef.current.values()) {
+        if (target === 'stars') {
+          if (!rt.colocadas || rt.estrellas.length === 0) continue;
+        } else if (rt.focos[target].length === 0) {
+          continue;
         }
-      } else {
-        const group = effectsGroupRef.current;
-        if (group && fxAnchorsRef.current[target].length > 0) {
-          group.updateMatrixWorld(true);
-          const inv = new THREE.Matrix4().copy(group.matrixWorld).invert();
-          const localRay = raycasterRef.current.ray.clone().applyMatrix4(inv);
-          if (removeFxAnchorAt(target, localRay)) return;
+        rt.grupo.updateMatrixWorld(true);
+        const inv = new THREE.Matrix4().copy(rt.grupo.matrixWorld).invert();
+        const localRay = raycasterRef.current.ray.clone().applyMatrix4(inv);
+        if (target === 'stars') {
+          if (rt.colocadas && removePlacedStarAt(rt.colocadas, localRay)) {
+            // Sincroniza la copia serializada con la lista de sprites.
+            rt.estrellas = rt.colocadas.stars.map((s) => ({
+              x: s.sprite.position.x,
+              y: s.sprite.position.y,
+              z: s.sprite.position.z,
+              tamaño: s.tamaño,
+            }));
+            rt.firmaEstrellas = firmaPuntos(rt.estrellas);
+            guardarEstrellasObjeto(rt);
+            return;
+          }
+        } else if (quitarFocoObjeto(rt, target, localRay)) {
+          rt.firmaFocos = firmaDeFocos(rt.focos);
+          guardarFocosObjeto(rt, target);
+          return;
         }
       }
 
-      // 2) Si no se quitó nada, coloca un punto en la superficie del objeto.
-      const hit = raycastObjectSurface();
-      if (!hit) return;
+      // 2) Si no se quitó nada, coloca un punto en la superficie del objeto
+      // golpeado (el foco viaja con ESE objeto, no con el activo).
+      const superficie = raycastObjectSurface();
+      if (!superficie) return;
+      const { hit, objectId } = superficie;
+      if (!objectId) return;
+      const rt = fxApiRef.current.runtimeDe(objectId, true);
+      if (!rt) return;
+      const local = rt.grupo.worldToLocal(hit.point.clone());
       if (target === 'stars') {
-        const placed = placedStarsRef.current;
-        if (placed) {
-          addPlacedStar(
-            placed,
-            placed.group.worldToLocal(hit.point.clone()),
-            starSizeRef.current
-          );
-        }
+        addPlacedStar(rt.colocadas, local, starSizeRef.current);
+        rt.estrellas.push({
+          x: local.x,
+          y: local.y,
+          z: local.z,
+          tamaño: starSizeRef.current,
+        });
+        rt.firmaEstrellas = firmaPuntos(rt.estrellas);
+        guardarEstrellasObjeto(rt);
       } else {
-        const group = effectsGroupRef.current;
-        if (group) {
-          addFxAnchor(target, group.worldToLocal(hit.point.clone()));
-        }
+        anadirFocoObjeto(rt, target, local);
+        rt.firmaFocos = firmaDeFocos(rt.focos);
+        guardarFocosObjeto(rt, target);
       }
     };
 
@@ -6433,13 +6413,20 @@ export default function Viewer3D({
           true
         );
         if (objectHits.length > 0) {
-          let selectedObject: THREE.Object3D | null = objectHits[0].object;
-          while (selectedObject && !selectedObject.userData.sceneObjectId) {
-            selectedObject = selectedObject.parent;
-          }
-          if (selectedObject?.userData.sceneObjectId) {
-            onObjectSelectRef.current?.(selectedObject.userData.sceneObjectId);
-            if (selectedObject.userData.sceneObjectId !== selectedObjectIdRef.current) return;
+          // Los objetos CONGELADOS no se pueden seleccionar: el clic pasa
+          // de largo hasta la figura no congelada que quede detrás.
+          const esCongelado = (id: string) =>
+            (objectsRef.current ?? []).find((o) => o.id === id)?.frozen === true;
+          for (const objectHit of objectHits) {
+            let seleccionado: THREE.Object3D | null = objectHit.object;
+            while (seleccionado && !seleccionado.userData.sceneObjectId) {
+              seleccionado = seleccionado.parent;
+            }
+            const id = seleccionado?.userData.sceneObjectId;
+            if (!id || esCongelado(id)) continue;
+            onObjectSelectRef.current?.(id);
+            if (id !== selectedObjectIdRef.current) return;
+            break;
           }
         }
       }
@@ -6461,7 +6448,13 @@ export default function Viewer3D({
           selectedObject = selectedObject.parent;
         }
         if (selectedObject?.userData.sceneObjectId) {
-          onObjectSelectRef.current?.(selectedObject.userData.sceneObjectId);
+          // Los objetos congelados no admiten edición de vértices.
+          const pid = selectedObject.userData.sceneObjectId;
+          const congelado = (objectsRef.current ?? []).find(
+            (o) => o.id === pid
+          )?.frozen;
+          if (congelado) return;
+          onObjectSelectRef.current?.(pid);
           if (!showVertices) return;
         }
         const obj = hit.object as THREE.Mesh;
@@ -6925,7 +6918,17 @@ export default function Viewer3D({
               );
               const cajaPrincipal =
                 activoId && principal ? enPantalla(principal) : null;
-              if (activoId && cajaPrincipal && toca(cajaPrincipal)) {
+              // Los objetos CONGELADOS no participan en la selección por
+              // rectángulo (no se pueden seleccionar ni manipular).
+              const esCongelado = (id: string) =>
+                (objectsRef.current ?? []).find((o) => o.id === id)?.frozen ===
+                true;
+              if (
+                activoId &&
+                cajaPrincipal &&
+                toca(cajaPrincipal) &&
+                !esCongelado(activoId)
+              ) {
                 selectedIds.push(activoId);
               }
               for (const dup of meshGroup.children) {
@@ -6933,7 +6936,7 @@ export default function Viewer3D({
                 const caja = enPantalla(dup);
                 if (!caja || !toca(caja)) continue;
                 const objId = dup.userData.sceneObjectId;
-                if (objId) selectedIds.push(objId);
+                if (objId && !esCongelado(objId)) selectedIds.push(objId);
               }
               // If the rectangle selected nothing, clear all selections
               if (selectedIds.length === 0) {
@@ -7221,41 +7224,12 @@ export default function Viewer3D({
       axisGizmoGroupRef.current = null;
       axisGizmoCameraRef.current = null;
       renderer.dispose();
-      for (const sys of [sparksRef.current, fireRef.current]) {
-         if (sys) {
-           sys.points.geometry.dispose();
-           (sys.points.material as THREE.Material)?.dispose();
-         }
-       }
-       sparksRef.current = null;
-       fireRef.current = null;
-       if (rainRef.current) {
-         rainRef.current.points.geometry.dispose();
-         (rainRef.current.points.material as THREE.Material)?.dispose();
-         rainRef.current = null;
-       }
-       if (smokeRef.current) {
-         smokeRef.current.points.geometry.dispose();
-         (smokeRef.current.points.material as THREE.Material)?.dispose();
-         smokeRef.current = null;
-       }
-       if (starsRef.current) {
-         for (const star of starsRef.current.stars) {
-           star.sprite.material.dispose();
-         }
+      // Libera los runtimes de efectos por objeto.
+      for (const rt of fxObjetosRef.current.values()) {
+        disponerSistemasFx(rt);
+        rt.grupo.parent?.remove(rt.grupo);
       }
-      starsRef.current = null;
-      if (placedStarsRef.current) {
-        for (const star of placedStarsRef.current.stars) {
-          star.sprite.material.dispose();
-        }
-        placedStarsRef.current.stars = [];
-        placedStarsRef.current = null;
-      }
-      if (fxAnchorGroupRef.current) {
-        clearFxAnchors(fxAnchorGroupRef.current, fxAnchorsRef.current);
-        fxAnchorGroupRef.current = null;
-      }
+      fxObjetosRef.current.clear();
        if (mount.contains(renderer.domElement)) {
          mount.removeChild(renderer.domElement);
        }
@@ -8120,15 +8094,16 @@ export default function Viewer3D({
     if (!objects?.length) return;
 
     const selected = objects.find((object) => object.id === selectedObjectId);
-    if (!selected) return;
-    const previouslyDisplayedId = displayedObjectIdRef.current;
+    // Sin objeto activo, la malla principal no representa a nadie: cada
+    // objeto se muestra con su duplicado y sus efectos siguen enganchados
+    // a SU visual aunque no haya nada seleccionado.
 
-    // La malla principal representa siempre el objeto activo: al cambiar
-    // la selección se reconstruye con la figura del recién elegido (es
-    // la malla que llega como prop). La copia que tenía en la escena ya
-    // no hace falta —su figura es ahora la principal— y la figura del
-    // que se deja la crea el bucle de abajo con sus propios datos.
-    if (previouslyDisplayedId && previouslyDisplayedId !== selected.id) {
+    if (selected) {
+      // La malla principal representa siempre el objeto activo: al cambiar
+      // la selección se reconstruye con la figura del recién elegido (es
+      // la malla que llega como prop). La copia que tenía en la escena ya
+      // no hace falta —su figura es ahora la principal— y la figura del
+      // que se deja la crea el bucle de abajo con sus propios datos.
       const staleDuplicate = meshGroup.children.find(
         (child) => child.userData.sceneObjectDuplicate && child.userData.sceneObjectId === selected.id
       );
@@ -8140,21 +8115,28 @@ export default function Viewer3D({
           if (childMesh.material) disposeMaterial(childMesh.material);
         });
       }
+      meshGroup.userData.sceneObjectId = selected.id;
+    } else {
+      meshGroup.userData.sceneObjectId = undefined;
     }
-
-    meshGroup.userData.sceneObjectId = selected.id;
-    displayedObjectIdRef.current = selected.id;
-    const selectedMatrix = new THREE.Matrix4().compose(
-      new THREE.Vector3(selected.transform.px, selected.transform.py, selected.transform.pz),
-      new THREE.Quaternion().setFromEuler(
-        new THREE.Euler(selected.transform.rx, selected.transform.ry, selected.transform.rz)
-      ),
-      new THREE.Vector3(selected.transform.sx, selected.transform.sy, selected.transform.sz)
-    );
-    const inverseSelected = selectedMatrix.clone().invert();
+    displayedObjectIdRef.current = selected?.id;
+    const selectedMatrix = selected
+      ? new THREE.Matrix4().compose(
+          new THREE.Vector3(selected.transform.px, selected.transform.py, selected.transform.pz),
+          new THREE.Quaternion().setFromEuler(
+            new THREE.Euler(selected.transform.rx, selected.transform.ry, selected.transform.rz)
+          ),
+          new THREE.Vector3(selected.transform.sx, selected.transform.sy, selected.transform.sz)
+        )
+      : new THREE.Matrix4();
+    // Sin activo, el grupo principal conserva la transformación del último
+    // activo: los duplicados se expresan relativos a ESE marco.
+    const inverseSelected = selected
+      ? selectedMatrix.clone().invert()
+      : meshGroup.matrix.clone().invert();
 
      for (const object of objects) {
-       if (object.id === selected.id) continue;
+       if (selected && object.id === selected.id) continue;
        // Find or create the duplicate for this object
        let duplicate = meshGroup.children.find(
          (child) => child.userData.sceneObjectDuplicate && child.userData.sceneObjectId === object.id
@@ -8304,6 +8286,387 @@ export default function Viewer3D({
     textureProjection,
     ]);
 
+  // --- Exclusión de luces por objeto (luz ambiente y focos) ----------
+  // Excluir un objeto de una luz NO puede hacerse con capas de three:
+  // las luces se recogen por CÁMARA (todas las luces de la pasada
+  // entran en el shader de todos los materiales), así que se quita la
+  // contribución del PROGRAMA del material: parcheo con
+  // onBeforeCompile + uniformes por material. Cada objeto tiene sus
+  // propios materiales (los build*Visual los crean frescos), así que
+  // el parche queda contenido y se actualiza SIN recompilar al
+  // cambiar la lista de excluidos. Límite: hasta 8 focos exluidos
+  // por objeto (la lista de posiciones del uniforme va fija a 8).
+  useEffect(() => {
+    const meshGroup = meshGroupRef.current;
+    if (!meshGroup) return;
+    const aplicar = (
+      mat: THREE.Material & { userData: Record<string, unknown> },
+      amb: boolean,
+      focos: THREE.Vector3[]
+    ) => {
+      let ya = mat.userData.excluyeLuces as
+        | {
+            amb: { value: number };
+            n: { value: number };
+            pos: { value: THREE.Vector3[] };
+          }
+        | undefined;
+      if (!ya) {
+        const uAmb = { value: amb ? 1 : 0 };
+        const uN = { value: focos.length };
+        const uPos = {
+          value: [0, 1, 2, 3, 4, 5, 6, 7].map(
+            (i) => focos[i] ?? new THREE.Vector3()
+          ),
+        };
+        ya = { amb: uAmb, n: uN, pos: uPos };
+        mat.userData.excluyeLuces = ya;
+        const clave = `excluye-luces-${++contadorExclusiones}`;
+        mat.onBeforeCompile = (shader) => {
+          shader.uniforms.excluirAmbiente = uAmb;
+          shader.uniforms.excluirFocos = uN;
+          shader.uniforms.excluirFocoPos = uPos;
+          shader.fragmentShader = shader.fragmentShader
+            .replace(
+              '#include <common>',
+              `#include <common>
+uniform float excluirAmbiente;
+uniform int excluirFocos;
+uniform vec3 excluirFocoPos[8];`
+            )
+            // El fragmento llega con los #include SIN resolver: ni la
+            // línea del `irradiance` ambiente ni `spotLight = ...`
+            // existen todavía como texto — el reemplazo va anclado al
+            // TAG del bloque de luces, con el trozo ya preparado
+            // (LUCES_FRAG_INICIO, a nivel de módulo) en la mano.
+            .replace('#include <lights_fragment_begin>', LUCES_FRAG_INICIO);
+        };
+        mat.customProgramCacheKey = () => clave;
+      }
+      // La máscara llega por posición MUNDIAL del foco: es lo que el
+      // shader ve en spotLights[].position (el foco cuelga de la raíz).
+      ya.amb.value = amb ? 1 : 0;
+      ya.n.value = focos.length;
+      ya.pos.value = [0, 1, 2, 3, 4, 5, 6, 7].map(
+        (i) => focos[i] ?? new THREE.Vector3()
+      );
+    };
+    // Material de PROFUNDIDAD por malla: three lo genera para el mapa
+    // de sombras ignorando el `opacity` del material de pintura, así
+    // que se cuelga uno propio (userData.matSombra) con uniformes
+    // propios: el peso de la sombra según opacidad (con tramado) y
+    // las posiciones de los focos que excluyen al objeto — en ese
+    // pase cameraPosition ES la cámara-de-sombra del foco, así que
+    // descartar por posición lo saca de SU mapa de sombras (una capa
+    // por foco no existe: las capas se prueban contra la cámara del
+    // visor, WebGLShadowMap.js ~522).
+    const aplicarSombra = (
+      malla: THREE.Mesh,
+      mats: THREE.Material[],
+      focos: THREE.Vector3[]
+    ) => {
+      let dmat = malla.customDepthMaterial as THREE.MeshDepthMaterial | null;
+      if (!dmat) {
+        const nueva = new THREE.MeshDepthMaterial({
+          depthPacking: THREE.RGBADepthPacking,
+        });
+        const uOpac = { value: 1 };
+        const uN = { value: 0 };
+        const uPos = {
+          value: [0, 1, 2, 3, 4, 5, 6, 7].map(() => new THREE.Vector3()),
+        };
+        nueva.userData.sombraLuces = { opac: uOpac, n: uN, pos: uPos };
+        nueva.onBeforeCompile = (shader) => {
+          shader.uniforms.sombraOpac = uOpac;
+          shader.uniforms.sombraFocos = uN;
+          shader.uniforms.sombraFocoPos = uPos;
+          shader.fragmentShader = shader.fragmentShader
+            .replace(
+              '#include <common>',
+              `#include <common>
+uniform float sombraOpac;
+uniform int sombraFocos;
+uniform vec3 sombraFocoPos[8];`
+            )
+            .replace(
+              '#include <clipping_planes_fragment>',
+              `#include <clipping_planes_fragment>
+	if ( sombraFocos > 0 ) {
+		for ( int s = 0; s < sombraFocos; s ++ ) {
+			if ( cameraPosition == sombraFocoPos[ s ] ) discard;
+		}
+	}
+	if ( fract( sin( dot( gl_FragCoord.xy, vec2( 12.9898, 78.233 ) ) ) * 43758.5453 ) > sombraOpac ) discard;`
+            );
+        };
+        nueva.customProgramCacheKey = () =>
+          `sombra-luces-${++contadorExclusiones}`;
+        malla.customDepthMaterial = nueva;
+        dmat = nueva;
+      }
+      const yaSombra = dmat.userData.sombraLuces as {
+        opac: { value: number };
+        n: { value: number };
+        pos: { value: THREE.Vector3[] };
+      };
+      yaSombra.opac.value = Math.max(0, Math.min(1, mats[0]?.opacity ?? 1));
+      yaSombra.n.value = focos.length;
+      yaSombra.pos.value = [0, 1, 2, 3, 4, 5, 6, 7].map(
+        (i) => focos[i] ?? new THREE.Vector3()
+      );
+      // Muere con su pintura: colgado del userData del material
+      // principal, disposeMaterial lo libera sin editar cada sitio.
+      if (mats[0] && mats[0].userData.matSombra !== dmat) {
+        (mats[0].userData as Record<string, unknown>).matSombra = dmat;
+      }
+    };
+    for (const child of meshGroup.children) {
+      const oid = child.userData.sceneObjectDuplicate
+        ? (child.userData.sceneObjectId as string | undefined)
+        : (meshGroup.userData.sceneObjectId as string | undefined);
+      if (!oid) continue;
+      const amb = !!lightConfig?.ambient.excluyeObjetos?.includes(oid);
+      const focos: THREE.Vector3[] = [];
+      for (const sp of lightConfig?.spotlights ?? []) {
+        if (sp.excluyeObjetos?.includes(oid)) {
+          focos.push(new THREE.Vector3(sp.position.x, sp.position.y, sp.position.z));
+        }
+      }
+      child.traverse((item) => {
+        const m = item as THREE.Mesh;
+        if (!m.isMesh || !m.material) return;
+        const mats = Array.isArray(m.material) ? m.material : [m.material];
+        // Sombra: peso según opacidad y focos que lo excluyen.
+        aplicarSombra(m, mats, focos);
+        if (!amb && focos.length === 0) {
+          // Sin exclusiones: si el material quedó parcheado antes, dejarlo
+          // neutro (la malla se reconstruye a menudo; al dejar el parche
+          // con uniformes a cero no hace falta recompilar).
+          for (const mat of mats) {
+            const ya = (mat.userData?.excluyeLuces ?? undefined) as
+              | { amb: { value: number }; focos: { value: THREE.Vector3[] } }
+              | undefined;
+            if (ya) aplicar(mat, false, []);
+          }
+          return;
+        }
+        const vistos = new Set<THREE.Material>();
+        for (const mat of mats) {
+          if (vistos.has(mat)) continue;
+          vistos.add(mat);
+          aplicar(mat as THREE.Material & { userData: Record<string, unknown> }, amb, focos);
+        }
+      });
+    }
+  }, [objects, lightConfig, mesh, configMesh, selectedObjectId]);
+
+  // --- Sincronización de efectos por objeto ------------------------------
+  // Crea, ajusta y libera un runtime de FX por objeto que tenga efectos
+  // propios o una pista de efecto que lo apunte. El grupo del runtime se
+  // engancha al grupo visual del objeto (duplicado, o la malla principal
+  // si es el activo) para seguir su transform.
+  const sincronizarFx = useCallback(() => {
+    const meshGroup = meshGroupRef.current;
+    if (!meshGroup) return;
+    const activoId = meshGroup.userData.sceneObjectId as string | undefined;
+    const objetos = objectsRefFx.current ?? [];
+    const pistas = effectTracksRef.current ?? [];
+    const objetivos = new Set<string>();
+    for (const obj of objetos) if (obj.efectos?.length) objetivos.add(obj.id);
+    for (const tr of pistas) {
+      if (tr.objectId) objetivos.add(tr.objectId);
+      else if (activoId) objetivos.add(activoId);
+      for (const id of tr.objectIds ?? []) objetivos.add(id);
+    }
+    // Runtimes que ya no hacen falta: fuera.
+    for (const [id, rt] of [...fxObjetosRef.current.entries()]) {
+      if (objetivos.has(id)) continue;
+      fxObjetosRef.current.delete(id);
+      disponerSistemasFx(rt);
+      rt.grupo.parent?.remove(rt.grupo);
+    }
+    if (objetivos.size === 0) return;
+    const hayPistaDe = (id: string, tipo: EffectType): boolean =>
+      pistas.some(
+        (tr) =>
+          tr.effectType === tipo &&
+          (tr.objectId === id ||
+            tr.objectIds?.includes(id) ||
+            (!tr.objectId && !tr.objectIds?.length && id === activoId))
+      );
+    for (const obj of objetos) {
+      if (!objetivos.has(obj.id)) continue;
+      const visual =
+        obj.id === activoId
+          ? meshGroup
+          : meshGroup.children.find(
+              (c) =>
+                c.userData.sceneObjectDuplicate &&
+                c.userData.sceneObjectId === obj.id
+            ) ?? null;
+      if (!visual) continue;
+      let rt = fxObjetosRef.current.get(obj.id);
+      if (!rt) {
+        rt = crearRuntimeFxObjeto(obj.id, obj.mesh ?? null);
+        fxObjetosRef.current.set(obj.id, rt);
+      }
+      if (rt.grupo.parent !== visual) {
+        rt.grupo.parent?.remove(rt.grupo);
+        visual.add(rt.grupo);
+      }
+      // Malla nueva: las cajas de lluvia/humo y el muestreo cambian.
+      const malla = obj.mesh ?? null;
+      if (rt.malla !== malla) {
+        rt.malla = malla;
+        rt.sampler = muestreadorDeMalla(malla);
+        for (const tipo of ['rain', 'smoke'] as const) {
+          if (!rt.estatico[tipo]) continue;
+          const sys = tipo === 'rain' ? rt.rain : rt.smoke;
+          if (sys) {
+            rt.grupo.remove(sys.points);
+            sys.points.geometry.dispose();
+            (sys.points.material as THREE.Material)?.dispose();
+            if (tipo === 'rain') rt.rain = null;
+            else rt.smoke = null;
+          }
+        }
+      }
+      // Focos/estrellas serializados → runtime (reconstruye al deshacer).
+      const listaEfectos = validarEfectos(obj.efectos) ?? [];
+      const estatico: Partial<Record<EffectType, EfectoValores>> = {};
+      const focosSer: RuntimeFxObjeto['focos'] = { fire: [], smoke: [], sparks: [] };
+      const estrellasSer: { x: number; y: number; z: number; tamaño?: number }[] = [];
+      for (const efecto of listaEfectos) {
+        for (const f of efecto.focos ?? []) {
+          const destino = focosSer[efecto.tipo as 'fire' | 'smoke' | 'sparks'];
+          if (destino) destino.push(new THREE.Vector3(f.x, f.y, f.z));
+        }
+        if (efecto.tipo === 'stars') {
+          for (const p of efecto.estrellas ?? []) {
+            estrellasSer.push({ x: p.x, y: p.y, z: p.z, tamaño: p.tamaño });
+          }
+        }
+        if (efecto.activo) estatico[efecto.tipo] = valoresEfecto(efecto);
+      }
+      rt.estatico = estatico;
+      const firmaF = firmaDeFocos(focosSer);
+      if (firmaF !== rt.firmaFocos) {
+        rt.focos = focosSer;
+        clearFxAnchors(rt.anchorGroup, rt.focos);
+        for (const kind of ['fire', 'smoke', 'sparks'] as const) {
+          for (const punto of rt.focos[kind]) {
+            const marker = makeAnchorMarker(kind);
+            marker.position.copy(punto);
+            rt.anchorGroup.add(marker);
+          }
+        }
+        rt.firmaFocos = firmaF;
+      }
+      const firmaE = firmaPuntos(estrellasSer);
+      if (firmaE !== rt.firmaEstrellas) {
+        rt.estrellas = estrellasSer;
+        clearPlacedStars(rt.colocadas);
+        for (const p of estrellasSer) {
+          addPlacedStar(rt.colocadas, new THREE.Vector3(p.x, p.y, p.z), p.tamaño ?? 1);
+        }
+        rt.firmaEstrellas = firmaE;
+      }
+      // Sistemas estáticos: crear/ajustar los encendidos, quitar los que
+      // ya ni están estáticos ni los anima una pista.
+      for (const tipo of TIPOS_FX) {
+        if (tipo === 'glow') continue;
+        const valores = estatico[tipo];
+        if (valores) {
+          asegurarSistemaFx(rt, tipo, valores, true);
+        } else if (!hayPistaDe(obj.id, tipo)) {
+          const sys =
+            tipo === 'rain'
+              ? rt.rain
+              : tipo === 'smoke'
+                ? rt.smoke
+                : tipo === 'fire'
+                  ? rt.fire
+                  : tipo === 'sparks'
+                    ? rt.sparks
+                    : rt.stars;
+          if (sys) {
+            const points = tipo === 'stars' ? null : (sys as { points: THREE.Points }).points;
+            if (points) {
+              rt.grupo.remove(points);
+              points.geometry.dispose();
+              (points.material as THREE.Material)?.dispose();
+            }
+            if (tipo === 'stars') {
+              for (const s of (sys as { stars: { sprite: THREE.Sprite }[] }).stars) {
+                s.sprite.material.dispose();
+              }
+              rt.grupo.remove((sys as { group: THREE.Group }).group);
+            }
+            if (tipo === 'rain') rt.rain = null;
+            else if (tipo === 'smoke') rt.smoke = null;
+            else if (tipo === 'fire') rt.fire = null;
+            else if (tipo === 'sparks') rt.sparks = null;
+            else rt.stars = null;
+          }
+        } else {
+          // Solo pista: al parar la reproducción queda en silencio.
+          silenciarSistemaFx(rt, tipo);
+        }
+      }
+      // Glow estático o por pista.
+      const valoresGlow = estatico.glow;
+      if (valoresGlow) {
+        asegurarGlowFx(rt, valoresGlow, true);
+      } else if (!hayPistaDe(obj.id, 'glow')) {
+        for (const shell of rt.glowShells) rt.grupo.remove(shell);
+        rt.glowShells = [];
+        rt.glowShellsFirma = '';
+        rt.glowMaterial?.dispose();
+        rt.glowMaterial = null;
+      } else {
+        for (const shell of rt.glowShells) shell.visible = false;
+      }
+      // Flags estáticos (las pistas los pisan durante la reproducción).
+      rt.rainActivo = !!estatico.rain;
+      rt.smokeActivo = !!estatico.smoke;
+      rt.starsOn = !!estatico.stars;
+      rt.starSize = estatico.stars?.starSize ?? 1;
+    }
+  }, [objects, selectedObjectId, mesh, effectTracks]);
+  const sincronizarFxRef = useRef(sincronizarFx);
+  sincronizarFxRef.current = sincronizarFx;
+  useEffect(() => {
+    sincronizarFx();
+  }, [sincronizarFx]);
+  // El bucle de animación y el editor de movimiento usan esta API.
+  fxApiRef.current.runtimeDe = (id: string, crear = false): RuntimeFxObjeto | null => {
+    const meshGroup = meshGroupRef.current;
+    if (!meshGroup) return null;
+    const activoId = meshGroup.userData.sceneObjectId as string | undefined;
+    const visual =
+      id === activoId
+        ? meshGroup
+        : meshGroup.children.find(
+            (c) =>
+              c.userData.sceneObjectDuplicate &&
+              c.userData.sceneObjectId === id
+          ) ?? null;
+    if (!visual) return null;
+    let rt = fxObjetosRef.current.get(id);
+    if (!rt) {
+      if (!crear) return null;
+      const obj = objectsRefFx.current?.find((o) => o.id === id);
+      rt = crearRuntimeFxObjeto(id, obj?.mesh ?? null);
+      fxObjetosRef.current.set(id, rt);
+    }
+    if (rt.grupo.parent !== visual) {
+      rt.grupo.parent?.remove(rt.grupo);
+      visual.add(rt.grupo);
+    }
+    return rt;
+  };
+  fxApiRef.current.sincronizar = () => sincronizarFxRef.current();
+
     // --- Highlight for multi-selected objects: draw a wireframe box ---
     useEffect(() => {
      const meshGroup = meshGroupRef.current;
@@ -8378,145 +8741,6 @@ export default function Viewer3D({
       });
     }, [selectedObjectId, booleanToolObjectId, mesh, forceObjectsUpdate]);
  
-    // --- Halo de neón: copia un poco más grande de cada malla, con
-  // --- material aditivo por detrás: brilla alrededor del texto sin
-  // --- tocar la malla original. En modo "vista plana" se omite.
-  useEffect(() => {
-    const glowGroup = glowGroupRef.current;
-     const meshGroup = meshGroupRef.current;
-     if (!glowGroup) return;
-     while (glowGroup.children.length > 0) {
-       glowGroup.remove(glowGroup.children[0]);
-     }
-     // Also remove shells attached directly to scene objects
-     if (meshGroup) {
-       for (const child of meshGroup.children) {
-         if (child instanceof THREE.Mesh) {
-           while (child.children.length > 0) {
-             const sub = child.children[child.children.length - 1];
-             if (sub.userData?.isGlowShell) child.remove(sub);
-             else break;
-           }
-         }
-       }
-     }
-     if (!glowValue || !meshGroup) return;
-    for (const child of meshGroup.children) {
-      if (!(child instanceof THREE.Mesh)) continue;
-      const shell = new THREE.Mesh(child.geometry, getGlowMaterial());
-      shell.scale.setScalar(1.1);
-      if (child.userData.sceneObjectDuplicate && !fx.glowObjects) continue;
-      (shell as any).userData = { isGlowShell: true };
-      if (child.userData.sceneObjectDuplicate) {
-        // Object: attach directly so it inherits the object's transform
-        child.add(shell);
-      } else {
-        // Text: add to glowGroup (text transform handles positioning)
-        glowGroup.add(shell);
-      }
-    }
-    }, [mesh, glowValue, fx.glowObjects]);
-
-    // Update glow material uniforms (color + intensity) when fxConfig changes
-    useEffect(() => {
-     if (glowValue) updateGlowMaterial(fx);
-   }, [fx.glowColor, fx.glowIntensity, glowValue]);
-
-    // --- Chispas: partículas brillantes que saltan desde el texto ---
-    useEffect(() => {
-      const group = effectsGroupRef.current;
-      if (!group) return;
-      if (sparksValue && !sparksRef.current) {
-        sparksRef.current = createParticleSystem(fx.sparksCount, fx.sparksSize);
-        group.add(sparksRef.current.points);
-      } else if (!sparksValue && sparksRef.current) {
-        group.remove(sparksRef.current.points);
-        sparksRef.current.points.geometry.dispose();
-        (sparksRef.current.points.material as THREE.Material)?.dispose();
-        sparksRef.current = null;
-      }
-      if (sparksRef.current) sparksRef.current.points.visible = sparksValue;
-    }, [sparksValue, fx.sparksCount, fx.sparksSize]);
-
-    // --- Fuego: partículas de llama que suben por el texto ---
-    useEffect(() => {
-      const group = effectsGroupRef.current;
-      if (!group) return;
-      if (fireValue && !fireRef.current) {
-        fireRef.current = createParticleSystem(fx.fireCount, fx.fireSize);
-        group.add(fireRef.current.points);
-      } else if (!fireValue && fireRef.current) {
-        group.remove(fireRef.current.points);
-        fireRef.current.points.geometry.dispose();
-        (fireRef.current.points.material as THREE.Material)?.dispose();
-        fireRef.current = null;
-      }
-      if (fireRef.current) fireRef.current.points.visible = fireValue;
-    }, [fireValue, fx.fireCount, fx.fireSize]);
-
-    // --- Lluvia: gotas que caen sobre el texto ---
-    useEffect(() => {
-      const group = effectsGroupRef.current;
-      if (!group) return;
-       if (rainValue && !rainRef.current && mesh.vertices.length > 0) {
-         const box = new THREE.Box3();
-         for (const v of mesh.vertices) box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
-         const pad = box.getSize(new THREE.Vector3()).multiplyScalar(0.15);
-         box.min.sub(pad);
-         box.max.add(pad);
-         box.max.y += 0.3;
-         // Recrear si el count/speed cambió
-         const sys = createRainSystem(box, fx.rainCount, fx.rainSpeed);
-         group.add(sys.points);
-         rainRef.current = sys;
-       } else if (!rainValue && rainRef.current) {
-         group.remove(rainRef.current.points);
-         rainRef.current.points.geometry.dispose();
-         (rainRef.current.points.material as THREE.Material)?.dispose();
-         rainRef.current = null;
-       }
-       rainEnabledRef.current = !!rainValue;
-     }, [rainValue, fx.rainCount, fx.rainSpeed, mesh.vertices]);
-
-     // --- Humo: nube que asciende desde la base del texto ---
-     useEffect(() => {
-       const group = effectsGroupRef.current;
-       if (!group) return;
-       if (smokeValue && !smokeRef.current && mesh.vertices.length > 0) {
-         const box = new THREE.Box3();
-         for (const v of mesh.vertices) box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
-         const min = box.min.clone();
-         const center = new THREE.Vector3();
-         box.getCenter(center);
-         const origin = new THREE.Vector3(center.x, min.y, center.z);
-         const sys = createSmokeSystem(origin, fx.smokeCount, fx.smokeSize, fx.smokeColor, fx.smokeRiseSpeed, fx.fireIntensity);
-         group.add(sys.points);
-         smokeRef.current = sys;
-       } else if (!smokeValue && smokeRef.current) {
-         group.remove(smokeRef.current.points);
-         smokeRef.current.points.geometry.dispose();
-         (smokeRef.current.points.material as THREE.Material)?.dispose();
-         smokeRef.current = null;
-       }
-       smokeEnabledRef.current = !!smokeValue;
-     }, [smokeValue, fx.smokeCount, fx.smokeSize, fx.smokeColor, fx.smokeRiseSpeed, mesh.vertices]);
-
-     // Sincroniza los flags de enabled para el animation loop (controlled mode)
-     useEffect(() => {
-       rainEnabledRef.current = !!rainValue;
-       smokeEnabledRef.current = !!smokeValue;
-       }, [rainValue, smokeValue]);
-
-   // --- Estrellas de brillo: destellos en cruz sobre el texto ---
-  useEffect(() => {
-    const group = effectsGroupRef.current;
-    if (!group) return;
-    if (fxStars && !starsRef.current) {
-      starsRef.current = createStarSystem();
-      group.add(starsRef.current.group);
-    }
-    if (starsRef.current) starsRef.current.group.visible = fxStars;
-  }, [fxStars]);
 
   // --- Modo colocación de estrellas: cursor de mira ---
   useEffect(() => {
@@ -8524,29 +8748,33 @@ export default function Viewer3D({
     if (dom) dom.style.cursor = placeTarget ? 'crosshair' : '';
   }, [placeTarget]);
 
-  // Al activar un efecto, salir del modo colocación de ese efecto: los
-  // círculos-guía desaparecen en cuanto el efecto empieza a emitir.
+  // Al cambiar la malla del objeto ACTIVO (edición de vértices, nuevo
+  // texto...), sus focos y estrellas colocadas pierden su sitio: se quitan
+  // de sus efectos (persistidos). Cambiar de objeto NO limpia nada: los
+  // efectos de cada objeto son suyos.
+  const fxMallaLimpiaRef = useRef<{ oid: string | null | undefined; mesh: Mesh | null }>({
+    oid: null,
+    mesh: null,
+  });
   useEffect(() => {
-    setPlaceTarget((prev) => {
-      if (
-        (prev === 'fire' && fireValue) ||
-        (prev === 'smoke' && smokeValue) ||
-        (prev === 'sparks' && sparksValue)
-      ) {
-        return null;
-      }
-      return prev;
-    });
-  }, [fireValue, smokeValue, sparksValue]);
-
-  // Al cambiar el texto, las estrellas colocadas pierden su sitio:
-  // se quitan para no quedar flotando fuera de la figura.
-  useEffect(() => {
-    clearPlacedStars(placedStarsRef.current);
-    if (fxAnchorGroupRef.current) {
-      clearFxAnchors(fxAnchorGroupRef.current, fxAnchorsRef.current);
+    const oid = displayedObjectIdRef.current ?? selectedObjectId ?? null;
+    const prev = fxMallaLimpiaRef.current;
+    if (prev.oid !== oid) {
+      // Cambio de objeto (o primer render): no limpiar nada ajeno.
+      prev.oid = oid;
+      prev.mesh = mesh;
+      return;
     }
-  }, [mesh]);
+    if (prev.mesh === mesh) return;
+    prev.mesh = mesh;
+    if (!oid) return;
+    const lista = objectsRefFx.current?.find((o) => o.id === oid)?.efectos;
+    if (!lista?.length) return;
+    const cambios: Record<string, EfectoObjeto[]> = {
+      [oid]: lista.map((e) => ({ ...e, focos: [], estrellas: [] })),
+    };
+    onEfectosObjetosRef.current?.(cambios);
+  }, [mesh, selectedObjectId]);
 
   useEffect(() => {
     const vertexGroup = vertexHelpersRef.current;
@@ -8875,7 +9103,14 @@ export default function Viewer3D({
       const off = gizmoOffsetRef.current;
       g.scale.set(base * off.sx, base * off.sy, base * off.sz);
     };
-    g.visible = showGizmo && (mesh.vertices.length > 0 || esCamara);
+    // Los objetos congelados no se pueden seleccionar ni manipular:
+    // aunque queden seleccionados (v. el desplegable de la escena),
+    // el manipulador no aparece para ellos.
+    const congelado =
+      (objectsRef.current ?? []).find(
+        (o) => o.id === selectedObjectIdRef.current
+      )?.frozen === true;
+    g.visible = showGizmo && !congelado && (mesh.vertices.length > 0 || esCamara);
      // Filtra las asas del manipulador según los modos activos: si el
      // usuario desactivó 'move', 'rotate' o 'scale', esas asas desaparecen.
       const activeModes = gizmoModes ?? ['move', 'rotate', 'scale'];
@@ -8912,7 +9147,7 @@ export default function Viewer3D({
       Math.abs(transform.sz)
     );
     applyScale(Math.min(Math.max(r * 0.9 * objectScale, 0.35), 8));
-   }, [showGizmo, mesh.vertices, transform, gizmoModes, gizmoColorOverride, gizmoOffset]);
+   }, [showGizmo, mesh.vertices, transform, gizmoModes, gizmoColorOverride, gizmoOffset, objects]);
 
   // Captura el texto 3D como PNG con fondo transparente (solo la malla).
   // Si el suavizado está activo, la captura usa una COPIA suavizada de la
@@ -8950,7 +9185,6 @@ export default function Viewer3D({
     const objectMotionPath = objectMotionPathRef.current;
     const faceSelectionOverlay = faceSelectionOverlayRef.current;
     const faceGuide = faceGuideRef.current;
-    const fxAnchorGroup = fxAnchorGroupRef.current;
     const textureHelperGroup = textureHelperGroupRef.current;
     const textureHelperGizmoGroup = textureHelperGizmoGroupRef.current;
     const latheAxis = latheAxisRef.current;
@@ -8958,7 +9192,9 @@ export default function Viewer3D({
     const prevObjectMotionPathVisible = objectMotionPath?.group.visible ?? false;
     const prevFaceSelectionOverlayVisible = faceSelectionOverlay?.visible ?? false;
     const prevFaceGuideVisible = faceGuide?.visible ?? false;
-    const prevFxAnchorGroupVisible = fxAnchorGroup?.visible ?? false;
+    // Marcadores de focos de FX: ayudas de edición, fuera de la imagen.
+    const anchorsFx = [...fxObjetosRef.current.values()].map((rt) => rt.anchorGroup);
+    const prevAnchorsFxVisible = anchorsFx.map((g) => g.visible);
     const prevTextureHelperVisible = textureHelperGroup?.visible ?? false;
     const prevTextureHelperGizmoVisible = textureHelperGizmoGroup?.visible ?? false;
     const prevLatheAxisVisible = latheAxis?.visible ?? false;
@@ -8966,7 +9202,7 @@ export default function Viewer3D({
     if (objectMotionPath) objectMotionPath.group.visible = false;
     if (faceSelectionOverlay) faceSelectionOverlay.visible = false;
     if (faceGuide) faceGuide.visible = false;
-    if (fxAnchorGroup) fxAnchorGroup.visible = false;
+    for (const g of anchorsFx) g.visible = false;
     if (textureHelperGroup) textureHelperGroup.visible = false;
     if (textureHelperGizmoGroup) textureHelperGizmoGroup.visible = false;
     if (latheAxis) latheAxis.visible = false;
@@ -8992,19 +9228,24 @@ export default function Viewer3D({
     }
 
     // Halo de neón durante la captura suavizada: se envuelve la
-    // geometría suavizada temporal para que el brillo siga el contorno
-    const glowGroup = glowGroupRef.current;
-    const savedGlowChildren = glowGroup ? [...glowGroup.children] : [];
+    // geometría suavizada temporal para que el brillo siga el contorno.
+    // Usa el material del runtime del objeto activo (si tiene brillo).
+    const activoRt = selectedObjectIdRef.current
+      ? fxObjetosRef.current.get(selectedObjectIdRef.current)
+      : undefined;
     let tempGlow: THREE.Object3D[] = [];
-     if (doSmooth && glowValue && glowGroup && tempObjects[0] instanceof THREE.Mesh) {
+    if (
+      doSmooth &&
+      activoRt?.glowMaterial &&
+      tempObjects[0] instanceof THREE.Mesh
+    ) {
       const shell = new THREE.Mesh(
         (tempObjects[0] as THREE.Mesh).geometry,
-        getGlowMaterial()
+        activoRt.glowMaterial
       );
       shell.scale.setScalar(1.1);
       tempGlow = [shell];
-      for (const child of savedGlowChildren) glowGroup.remove(child);
-      glowGroup.add(shell);
+      (tempObjects[0] as THREE.Mesh).add(shell);
     }
 
     // El scene.background pinta un color opaco sobre el canvas y anula
@@ -9017,9 +9258,10 @@ export default function Viewer3D({
 
     scene.background = prevBackground;
 
-    if (glowGroup && tempGlow.length > 0) {
-      for (const obj of tempGlow) glowGroup.remove(obj);
-      for (const child of savedGlowChildren) glowGroup.add(child);
+    // El shell temporal comparte el material del runtime: se quita ANTES
+    // de disponer los temporales para no disponerlo por error.
+    if (tempGlow.length > 0 && tempObjects[0]) {
+      tempObjects[0].remove(tempGlow[0]);
     }
 
     if (meshGroup && tempObjects.length > 0) {
@@ -9042,7 +9284,9 @@ export default function Viewer3D({
     if (objectMotionPath) objectMotionPath.group.visible = prevObjectMotionPathVisible;
     if (faceSelectionOverlay) faceSelectionOverlay.visible = prevFaceSelectionOverlayVisible;
     if (faceGuide) faceGuide.visible = prevFaceGuideVisible;
-    if (fxAnchorGroup) fxAnchorGroup.visible = prevFxAnchorGroupVisible;
+    anchorsFx.forEach((g, i) => {
+      g.visible = prevAnchorsFxVisible[i];
+    });
     if (textureHelperGroup) textureHelperGroup.visible = prevTextureHelperVisible;
     if (textureHelperGizmoGroup)
       textureHelperGizmoGroup.visible = prevTextureHelperGizmoVisible;
@@ -9052,7 +9296,7 @@ export default function Viewer3D({
     link.href = dataURL;
     link.download = 'texto-3d.png';
     link.click();
-   }, [smoothCapture, wireframe, glowValue]);
+   }, [smoothCapture, wireframe]);
 
   const resetCamera = useCallback(() => {
     const cam = cameraRef.current;
@@ -9346,8 +9590,8 @@ export default function Viewer3D({
             </DropdownMenuTrigger>
             <DropdownMenuContent className="bg-gray-900 border-gray-800 text-white min-w-[200px]">
               <DropdownMenuCheckboxItem
-                checked={glowValue}
-                onCheckedChange={toggleGlow}
+                checked={estadoEfectoSel('glow')}
+                onCheckedChange={() => toggleEfectoObjetos('glow')}
                 className="hover:bg-gray-800 cursor-pointer"
               >
                 <div className="flex items-center gap-2">
@@ -9356,8 +9600,8 @@ export default function Viewer3D({
                 </div>
               </DropdownMenuCheckboxItem>
               <DropdownMenuCheckboxItem
-                checked={sparksValue}
-                onCheckedChange={toggleSparks}
+                checked={estadoEfectoSel('sparks')}
+                onCheckedChange={() => toggleEfectoObjetos('sparks')}
                 className="hover:bg-gray-800 cursor-pointer"
               >
                 <div className="flex items-center gap-2">
@@ -9366,8 +9610,8 @@ export default function Viewer3D({
                 </div>
               </DropdownMenuCheckboxItem>
               <DropdownMenuCheckboxItem
-                checked={fireValue}
-                onCheckedChange={toggleFire}
+                checked={estadoEfectoSel('fire')}
+                onCheckedChange={() => toggleEfectoObjetos('fire')}
                 className="hover:bg-gray-800 cursor-pointer"
               >
                 <div className="flex items-center gap-2">
@@ -9376,8 +9620,8 @@ export default function Viewer3D({
                 </div>
               </DropdownMenuCheckboxItem>
               <DropdownMenuCheckboxItem
-                checked={rainValue}
-                onCheckedChange={toggleRain}
+                checked={estadoEfectoSel('rain')}
+                onCheckedChange={() => toggleEfectoObjetos('rain')}
                 className="hover:bg-gray-800 cursor-pointer"
               >
                 <div className="flex items-center gap-2">
@@ -9386,8 +9630,8 @@ export default function Viewer3D({
                 </div>
               </DropdownMenuCheckboxItem>
               <DropdownMenuCheckboxItem
-                checked={smokeValue}
-                onCheckedChange={toggleSmoke}
+                checked={estadoEfectoSel('smoke')}
+                onCheckedChange={() => toggleEfectoObjetos('smoke')}
                 className="hover:bg-gray-800 cursor-pointer"
               >
                 <div className="flex items-center gap-2">
@@ -9396,8 +9640,8 @@ export default function Viewer3D({
                 </div>
               </DropdownMenuCheckboxItem>
               <DropdownMenuCheckboxItem
-                checked={fxStars}
-                onCheckedChange={() => setFxStars(!fxStars)}
+                checked={estadoEfectoSel('stars')}
+                onCheckedChange={() => toggleEfectoObjetos('stars')}
                 className="hover:bg-gray-800 cursor-pointer"
               >
                 <div className="flex items-center gap-2">
@@ -9437,24 +9681,19 @@ export default function Viewer3D({
                     ))}
                   </div>
                   <span className="text-[10px] leading-tight text-gray-500">
-                    Clic en el objeto para añadir un foco de {PLACE_TARGET_LABEL[placeTarget]}.
+                    Clic en un objeto para añadir un foco de {PLACE_TARGET_LABEL[placeTarget]}.
                     Clic sobre un foco existente para quitarlo.
                   </span>
                   <button
                     type="button"
-                    onClick={() => {
-                      clearPlacedStars(placedStarsRef.current);
-                      if (fxAnchorGroupRef.current) {
-                        clearFxAnchors(fxAnchorGroupRef.current, fxAnchorsRef.current);
-                      }
-                    }}
+                    onClick={() => limpiarPuntosObjetos(idsFx())}
                     className="rounded border border-gray-700 px-1.5 py-0.5 text-[10px] text-gray-400 hover:bg-gray-800"
                   >
                     Borrar todos los puntos
                   </button>
                 </div>
               )}
-              {(fxStars || placeTarget === 'stars') && (
+              {(estadoEfectoSel('stars') !== false || placeTarget === 'stars') && (
                 <div className="px-2 py-1.5 flex items-center gap-1">
                   <Star className="w-3 h-3 text-amber-300" />
                   <Slider
@@ -9462,7 +9701,10 @@ export default function Viewer3D({
                     max={3}
                     step={0.1}
                     value={[starSize]}
-                    onValueChange={([v]) => setStarSize(v)}
+                    onValueChange={([v]) => {
+                      setStarSize(v);
+                      editarValoresEfectoSel('stars', { starSize: v });
+                    }}
                     className="flex-1 h-4"
                   />
                 </div>
@@ -9496,14 +9738,8 @@ export default function Viewer3D({
         <FxConfigEditor
           isOpen={showFxConfigModal}
           onClose={() => setShowFxConfigModal(false)}
-          fxConfig={fx}
-          onFxChange={(partial) => {
-            if (fxConfig !== undefined) {
-              onFxChange?.(partial);
-            } else {
-              setFxConfigLocal((prev) => ({ ...DEFAULT_FX_CONFIG, ...prev, ...partial }));
-            }
-          }}
+          seleccion={efectosDe(idsFx())}
+          onValores={editarValoresEfectoSel}
         />
       )}
       <div
@@ -9697,6 +9933,8 @@ type PlacedStar = {
   phase: number;
   /** Tamaño base SIN el factor del deslizador (se aplica cada frame). */
   rawScale: number;
+  /** Tamaño relativo serializado de esta estrella (1 = por defecto). */
+  tamaño: number;
 };
 
 type PlacedStarSystem = {
@@ -9707,7 +9945,7 @@ type PlacedStarSystem = {
 function addPlacedStar(
   sys: PlacedStarSystem,
   pos: THREE.Vector3,
-  starSize: number
+  tamaño: number
 ): void {
     const material = new THREE.SpriteMaterial({
       map: getStarTexture(),
@@ -9727,12 +9965,13 @@ function addPlacedStar(
   sprite.position.copy(pos);
   sprite.renderOrder = 999;
   const rawScale = 0.28 + Math.random() * 0.14;
-  sprite.scale.setScalar(rawScale * starSize);
+  sprite.scale.setScalar(rawScale * tamaño);
   sys.group.add(sprite);
   sys.stars.push({
     sprite,
     phase: Math.random() * Math.PI * 2,
     rawScale,
+    tamaño,
   });
 }
 
@@ -9879,14 +10118,6 @@ function getGlowMaterial(): THREE.ShaderMaterial {
     side: THREE.BackSide,
   });
   return glowMaterialCache;
-}
-
-/** Update glow material uniforms from the current fxConfig (color + intensity). */
-function updateGlowMaterial(fx: FxConfig): void {
-  if (!glowMaterialCache) return;
-  glowMaterialCache.uniforms.uColor.value = new THREE.Color(fx.glowColor);
-  glowMaterialCache.uniforms.uIntensity.value = fx.glowIntensity;
-  glowMaterialCache.uniformsNeedUpdate = true;
 }
 
 function createParticleSystem(count: number, size: number): ParticleSystem {
@@ -10304,4 +10535,591 @@ function clearFxAnchors(
     const sp = child as THREE.Sprite;
     sp.material?.dispose?.();
   }
+}
+
+// ============================================================
+// Efectos por objeto: runtime + sincronización
+// ============================================================
+
+const TIPOS_FX: EffectType[] = ['rain', 'smoke', 'stars', 'fire', 'sparks', 'glow'];
+
+/**
+ * Runtime de FX de UN objeto: los sistemas de partículas, los focos
+ * colocados, las estrellas colocadas y los shells del halo viven en un
+ * grupo hijo del grupo visual del objeto (duplicado o malla principal),
+ * así el efecto sigue al objeto sin matemática extra.
+ */
+type RuntimeFxObjeto = {
+  objectId: string;
+  /** Grupo FX (userData.esGrupoFx = true), hijo del grupo visual del objeto. */
+  grupo: THREE.Group;
+  /** Marcadores de los focos colocados (hijo del grupo FX). */
+  anchorGroup: THREE.Group;
+  /** Focos por tipo, en coordenadas locales del grupo FX. */
+  focos: { fire: THREE.Vector3[]; smoke: THREE.Vector3[]; sparks: THREE.Vector3[] };
+  rain: RainSystem | null;
+  smoke: SmokeSystem | null;
+  fire: ParticleSystem | null;
+  sparks: ParticleSystem | null;
+  stars: StarSystem | null;
+  /** Estrellas colocadas con clic (persistentes por objeto). */
+  colocadas: PlacedStarSystem;
+  /** Copia local de las estrellas serializadas (para quitar al clic). */
+  estrellas: { x: number; y: number; z: number; tamaño?: number }[];
+  /** Shells del halo de neón + material propio (uniformes por objeto). */
+  glowShells: THREE.Mesh[];
+  glowShellsFirma: string;
+  glowMaterial: THREE.ShaderMaterial | null;
+  /** Luz cálida del fuego (hija del grupo FX). */
+  luz: THREE.PointLight | null;
+  /** Firmas de los focos/estrellas serializados (reconstruir al deshacer). */
+  firmaFocos: string;
+  firmaEstrellas: string;
+  /** Malla del objeto (para cajas de lluvia/humo y muestreo). */
+  malla: Mesh | null;
+  /** Muestreador de superficie de la malla del objeto. */
+  sampler: () => THREE.Vector3 | null;
+  /** Valores estáticos resueltos por tipo (dictados por obj.efectos). */
+  estatico: Partial<Record<EffectType, EfectoValores>>;
+  /** Flags de emisión (las pistas de efecto los apagan/encienden). */
+  rainActivo: boolean;
+  smokeActivo: boolean;
+  starsOn: boolean;
+  /** Tamaño de estrella estático (1 si el objeto no tiene el efecto). */
+  starSize: number;
+  /** Conteos actuales (para recrear sistemas cuando cambia count). */
+  counts: { rain: number; fire: number; sparks: number };
+};
+
+/** Firma estable de una lista de focos runtime. */
+function firmaDeFocos(focos: {
+  fire: THREE.Vector3[];
+  smoke: THREE.Vector3[];
+  sparks: THREE.Vector3[];
+}): string {
+  return (
+    ['fire', 'smoke', 'sparks'] as const
+  )
+    .map((k) => firmaPuntos(focos[k]))
+    .join('#');
+}
+
+/** Firma estable de una lista de puntos serializados. */
+function firmaPuntos(
+  puntos: { x: number; y: number; z: number; tamaño?: number }[] | undefined
+): string {
+  if (!puntos || puntos.length === 0) return '';
+  return puntos
+    .map((p) =>
+      p.tamaño !== undefined
+        ? `${p.x.toFixed(4)},${p.y.toFixed(4)},${p.z.toFixed(4)},${p.tamaño}`
+        : `${p.x.toFixed(4)},${p.y.toFixed(4)},${p.z.toFixed(4)}`
+    )
+    .join('|');
+}
+
+/** Punto aleatorio de la superficie de una malla (emisor de partículas). */
+function muestreadorDeMalla(malla: Mesh | null): () => THREE.Vector3 | null {
+  return () => {
+    if (!malla || malla.vertices.length === 0) return null;
+    if (malla.texture) {
+      // Modo "vista plana": muestrea el rectángulo del panel
+      const v = malla.vertices;
+      const x = v[0].x + Math.random() * (v[1].x - v[0].x);
+      const y = v[0].y + Math.random() * (v[3].y - v[0].y);
+      return new THREE.Vector3(x, y, 0);
+    }
+    const v = malla.vertices[(Math.random() * malla.vertices.length) | 0];
+    return new THREE.Vector3(v.x, v.y, v.z);
+  };
+}
+
+/** Caja expandida para la lluvia y origen del humo (base-centro). */
+function cajaDeMalla(
+  malla: Mesh | null
+): { box: THREE.Box3; origin: THREE.Vector3 } | null {
+  if (!malla || malla.vertices.length === 0) return null;
+  const box = new THREE.Box3();
+  for (const v of malla.vertices) box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
+  const min = box.min.clone();
+  const center = new THREE.Vector3();
+  box.getCenter(center);
+  const origin = new THREE.Vector3(center.x, min.y, center.z);
+  const pad = box.getSize(new THREE.Vector3()).multiplyScalar(0.15);
+  box.min.sub(pad);
+  box.max.add(pad);
+  box.max.y += 0.3;
+  return { box, origin };
+}
+
+function crearRuntimeFxObjeto(objectId: string, malla: Mesh | null): RuntimeFxObjeto {
+  const grupo = new THREE.Group();
+  grupo.userData.esGrupoFx = true;
+  const anchorGroup = new THREE.Group();
+  anchorGroup.userData.esGrupoFx = true;
+  grupo.add(anchorGroup);
+  const colocadas: PlacedStarSystem = { group: new THREE.Group(), stars: [] };
+  colocadas.group.userData.esGrupoFx = true;
+  grupo.add(colocadas.group);
+  const luz = new THREE.PointLight(0xff8040, 0, 6, 1.6);
+  luz.position.set(0, 0.2, 1.4);
+  grupo.add(luz);
+  return {
+    objectId,
+    grupo,
+    anchorGroup,
+    focos: { fire: [], smoke: [], sparks: [] },
+    rain: null,
+    smoke: null,
+    fire: null,
+    sparks: null,
+    stars: null,
+    colocadas,
+    estrellas: [],
+    glowShells: [],
+    glowShellsFirma: '',
+    glowMaterial: null,
+    luz,
+    firmaFocos: '',
+    firmaEstrellas: '',
+    malla,
+    sampler: muestreadorDeMalla(malla),
+    estatico: {},
+    rainActivo: false,
+    smokeActivo: false,
+    starsOn: false,
+    starSize: 1,
+    counts: { rain: 0, fire: 0, sparks: 0 },
+  };
+}
+
+/** Libera TODOS los recursos THREE del runtime (sin tocar la geometría
+ *  compartida de los shells: vive en las mallas del objeto). */
+function disponerSistemasFx(rt: RuntimeFxObjeto): void {
+  for (const sys of [rt.rain, rt.smoke, rt.fire, rt.sparks]) {
+    if (!sys) continue;
+    rt.grupo.remove(sys.points);
+    sys.points.geometry.dispose();
+    (sys.points.material as THREE.Material)?.dispose();
+  }
+  rt.rain = null;
+  rt.smoke = null;
+  rt.fire = null;
+  rt.sparks = null;
+  if (rt.stars) {
+    for (const s of rt.stars.stars) s.sprite.material.dispose();
+    rt.grupo.remove(rt.stars.group);
+    rt.stars = null;
+  }
+  if (rt.colocadas) {
+    clearPlacedStars(rt.colocadas);
+    rt.grupo.remove(rt.colocadas.group);
+  }
+  clearFxAnchors(rt.anchorGroup, rt.focos);
+  for (const shell of rt.glowShells) rt.grupo.remove(shell);
+  rt.glowShells = [];
+  rt.glowShellsFirma = '';
+  rt.glowMaterial?.dispose();
+  rt.glowMaterial = null;
+  rt.focos = { fire: [], smoke: [], sparks: [] };
+  rt.estrellas = [];
+  rt.estatico = {};
+  rt.counts = { rain: 0, fire: 0, sparks: 0 };
+}
+
+/** Añade un foco de efecto con su marcador visible al runtime. */
+function anadirFocoObjeto(
+  rt: RuntimeFxObjeto,
+  kind: 'fire' | 'smoke' | 'sparks',
+  local: THREE.Vector3
+): void {
+  const marker = makeAnchorMarker(kind);
+  marker.position.copy(local);
+  rt.anchorGroup.add(marker);
+  rt.focos[kind].push(local.clone());
+}
+
+/** Quita el foco del efecto dado más cercano al rayo (en espacio local). */
+function quitarFocoObjeto(
+  rt: RuntimeFxObjeto,
+  kind: 'fire' | 'smoke' | 'sparks',
+  localRay: THREE.Ray
+): boolean {
+  const list = rt.focos[kind];
+  let best = -1;
+  let bestDist = 0.09;
+  for (let i = 0; i < list.length; i++) {
+    const d = localRay.distanceToPoint(list[i]);
+    if (d < bestDist) {
+      bestDist = d;
+      best = i;
+    }
+  }
+  if (best < 0) return false;
+  const [punto] = list.splice(best, 1);
+  const marcador = rt.anchorGroup.children.find(
+    (c) =>
+      c.userData.kind === kind &&
+      c.position.distanceToSquared(punto) < 1e-8
+  );
+  if (marcador) {
+    rt.anchorGroup.remove(marcador);
+    (marcador as THREE.Sprite).material?.dispose?.();
+  }
+  return true;
+}
+
+/**
+ * Crea (o ajusta) el sistema de partículas de un tipo con los valores
+ * dados. Recrea el sistema cuando cambia `count`; los demás parámetros
+ * se ajustan en el sitio. `activo` controla la visibilidad.
+ */
+function asegurarSistemaFx(
+  rt: RuntimeFxObjeto,
+  tipo: EffectType,
+  valores: EfectoValores,
+  activo: boolean
+): void {
+  const grupo = rt.grupo;
+  switch (tipo) {
+    case 'sparks': {
+      const count = valores.sparksCount ?? DEFAULT_FX_CONFIG.sparksCount;
+      const size = valores.sparksSize ?? DEFAULT_FX_CONFIG.sparksSize;
+      if (rt.sparks && rt.sparks.life.length !== count) {
+        grupo.remove(rt.sparks.points);
+        rt.sparks.points.geometry.dispose();
+        (rt.sparks.points.material as THREE.Material)?.dispose();
+        rt.sparks = null;
+      }
+      if (!rt.sparks) {
+        rt.sparks = createParticleSystem(count, size);
+        grupo.add(rt.sparks.points);
+      } else {
+        const mat = rt.sparks.points.material as THREE.PointsMaterial;
+        if (mat.size !== size) {
+          mat.size = size;
+          mat.needsUpdate = true;
+        }
+      }
+      rt.sparks.points.visible = activo;
+      rt.counts.sparks = count;
+      break;
+    }
+    case 'fire': {
+      const count = valores.fireCount ?? DEFAULT_FX_CONFIG.fireCount;
+      const size = valores.fireSize ?? DEFAULT_FX_CONFIG.fireSize;
+      if (rt.fire && rt.fire.life.length !== count) {
+        grupo.remove(rt.fire.points);
+        rt.fire.points.geometry.dispose();
+        (rt.fire.points.material as THREE.Material)?.dispose();
+        rt.fire = null;
+      }
+      if (!rt.fire) {
+        rt.fire = createParticleSystem(count, size);
+        grupo.add(rt.fire.points);
+      } else {
+        const mat = rt.fire.points.material as THREE.PointsMaterial;
+        if (mat.size !== size) {
+          mat.size = size;
+          mat.needsUpdate = true;
+        }
+      }
+      rt.fire.points.visible = activo;
+      rt.counts.fire = count;
+      break;
+    }
+    case 'rain': {
+      if (!rt.malla || rt.malla.vertices.length === 0) break;
+      const count = valores.rainCount ?? DEFAULT_FX_CONFIG.rainCount;
+      const speed = valores.rainSpeed ?? DEFAULT_FX_CONFIG.rainSpeed;
+      if (rt.rain && (rt.rain.velocities.length / 3 !== count)) {
+        grupo.remove(rt.rain.points);
+        rt.rain.points.geometry.dispose();
+        (rt.rain.points.material as THREE.Material)?.dispose();
+        rt.rain = null;
+      }
+      if (!rt.rain) {
+        const caja = cajaDeMalla(rt.malla);
+        if (!caja) break;
+        rt.rain = createRainSystem(caja.box, count, speed);
+        grupo.add(rt.rain.points);
+      } else {
+        rt.rain.speed = speed;
+      }
+      rt.rain.points.visible = activo;
+      rt.counts.rain = count;
+      break;
+    }
+    case 'smoke': {
+      if (!rt.malla || rt.malla.vertices.length === 0) break;
+      const count = valores.smokeCount ?? DEFAULT_FX_CONFIG.smokeCount;
+      const size = valores.smokeSize ?? DEFAULT_FX_CONFIG.smokeSize;
+      const color = valores.smokeColor ?? DEFAULT_FX_CONFIG.smokeColor;
+      const riseSpeed = valores.smokeRiseSpeed ?? DEFAULT_FX_CONFIG.smokeRiseSpeed;
+      if (rt.smoke && (rt.smoke.life.length !== count)) {
+        grupo.remove(rt.smoke.points);
+        rt.smoke.points.geometry.dispose();
+        (rt.smoke.points.material as THREE.Material)?.dispose();
+        rt.smoke = null;
+      }
+      if (!rt.smoke) {
+        const caja = cajaDeMalla(rt.malla);
+        if (!caja) break;
+        rt.smoke = createSmokeSystem(caja.origin, count, size, color, riseSpeed, valores.fireIntensity ?? DEFAULT_FX_CONFIG.fireIntensity);
+        grupo.add(rt.smoke.points);
+      } else {
+        const mat = rt.smoke.points.material as THREE.PointsMaterial;
+        if (mat.size !== size) {
+          mat.size = size;
+          mat.needsUpdate = true;
+        }
+        rt.smoke.riseSpeed = riseSpeed;
+        rt.smoke.color.set(color);
+      }
+      rt.smoke.points.visible = activo;
+      break;
+    }
+    case 'stars': {
+      if (!rt.stars) {
+        rt.stars = createStarSystem();
+        grupo.add(rt.stars.group);
+      }
+      rt.stars.group.visible = activo;
+      break;
+    }
+    case 'glow': {
+      asegurarGlowFx(rt, valores, activo);
+      break;
+    }
+  }
+}
+
+/** Crea o ajusta el halo de neón del runtime (shells + uniformes). */
+function asegurarGlowFx(
+  rt: RuntimeFxObjeto,
+  valores: EfectoValores,
+  activo: boolean
+): void {
+  if (!rt.glowMaterial) {
+    // La copia clona los uniformes: cada objeto tiene color/intensidad propios.
+    rt.glowMaterial = getGlowMaterial().clone();
+  }
+  const mat = rt.glowMaterial;
+  if (typeof valores.glowColor === 'string') {
+    mat.uniforms.uColor.value = new THREE.Color(valores.glowColor);
+  }
+  if (typeof valores.glowIntensity === 'number') {
+    mat.uniforms.uIntensity.value = valores.glowIntensity;
+  }
+  mat.uniformsNeedUpdate = true;
+  // Shells: copias ampliadas de las mallas del grupo visual del objeto.
+  // En el objeto activo la figura son mallas hijas directas de la malla
+  // principal; en un duplicado la figura vive DENTRO de un visual anidado
+  // (grupo que las encierra), así que se recorre ese visual — sin bajarlo
+  // el neón solo salía en el objeto seleccionado.
+  const padre = rt.grupo.parent;
+  const firmas: string[] = [];
+  const fuentes: THREE.Mesh[] = [];
+  if (padre) {
+    const esDuplicado = !!padre.userData?.sceneObjectDuplicate;
+    for (const child of padre.children) {
+      if (child === rt.grupo) continue;
+      if (child instanceof THREE.Mesh) {
+        if (child.userData?.isGlowShell) continue;
+        fuentes.push(child);
+        firmas.push(child.geometry.uuid);
+        continue;
+      }
+      // Solo el visual PROPIO (transplantes de su figura, plugin, etc.):
+      // al activo no se bajan los duplicados de los demás objetos (no son
+      // su figura) ni los grupos de gizmo/efectos.
+      if (!esDuplicado || !(child instanceof THREE.Group)) continue;
+      child.traverse((item) => {
+        if (item instanceof THREE.Mesh && !item.userData?.isGlowShell) {
+          fuentes.push(item);
+          firmas.push(item.geometry.uuid);
+        }
+      });
+    }
+  }
+  const firma = firmas.join('|');
+  if (firma !== rt.glowShellsFirma) {
+    for (const shell of rt.glowShells) rt.grupo.remove(shell);
+    rt.glowShells = [];
+    for (const fuente of fuentes) {
+      const shell = new THREE.Mesh(fuente.geometry, mat);
+      shell.scale.setScalar(1.1);
+      shell.userData.isGlowShell = true;
+      rt.grupo.add(shell);
+      rt.glowShells.push(shell);
+    }
+    rt.glowShellsFirma = firma;
+  }
+  for (const shell of rt.glowShells) shell.visible = activo;
+}
+
+/** Pone un sistema en silencio (sin disponerlo): lo usan las pistas. */
+function silenciarSistemaFx(rt: RuntimeFxObjeto, tipo: EffectType): void {
+  switch (tipo) {
+    case 'rain':
+      if (rt.rain) rt.rain.points.visible = false;
+      rt.rainActivo = false;
+      break;
+    case 'smoke':
+      if (rt.smoke) rt.smoke.points.visible = false;
+      rt.smokeActivo = false;
+      break;
+    case 'stars':
+      if (rt.stars) rt.stars.group.visible = false;
+      rt.starsOn = false;
+      break;
+    case 'fire':
+      if (rt.fire) rt.fire.points.visible = false;
+      break;
+    case 'sparks':
+      if (rt.sparks) rt.sparks.points.visible = false;
+      break;
+    case 'glow':
+      for (const shell of rt.glowShells) shell.visible = false;
+      break;
+  }
+}
+
+/** Dispara el sistema de un tipo con los valores por defecto (pistas). */
+function dispararSistemaFx(
+  rt: RuntimeFxObjeto,
+  tipo: EffectType,
+  valores: EfectoValores,
+  activo: boolean
+): void {
+  const base = { ...VALORES_DEFECTO_EFECTO[tipo], ...valores };
+  asegurarSistemaFx(rt, tipo, base, activo);
+}
+
+/**
+ * Aplica los valores evaluados de una pista de efecto al runtime de UN
+ * objeto. Generaliza el antiguo applyEffectOverrides (que solo tocaba
+ * los singletons del objeto activo).
+ */
+function aplicarOverrideEfectoObjeto(
+  rt: RuntimeFxObjeto,
+  tipo: EffectType,
+  values: Partial<Record<EffectProperty, number | string | boolean>>
+): void {
+  if (values.enabled === false) {
+    silenciarSistemaFx(rt, tipo);
+    return;
+  }
+  // Asegura el sistema (las pistas pueden activar efectos que el objeto
+  // no tiene de forma estática) y aplica los overrides concretos.
+  const base = { ...VALORES_DEFECTO_EFECTO[tipo], ...(rt.estatico[tipo] ?? {}) };
+  asegurarSistemaFx(rt, tipo, base, true);
+  switch (tipo) {
+    case 'rain':
+      rt.rainActivo = true;
+      if (rt.rain) {
+        if (typeof values.speed === 'number') rt.rain.speed = values.speed;
+        if (
+          typeof values.count === 'number' &&
+          values.count !== rt.counts.rain
+        ) {
+          const anterior = rt.rain;
+          rt.rain = createRainSystem(anterior.box, values.count, anterior.speed);
+          rt.grupo.remove(anterior.points);
+          anterior.points.geometry.dispose();
+          (anterior.points.material as THREE.Material)?.dispose();
+          rt.rain.points.visible = true;
+          rt.counts.rain = values.count;
+        }
+      }
+      break;
+    case 'smoke':
+      rt.smokeActivo = true;
+      if (rt.smoke) {
+        if (typeof values.riseSpeed === 'number') rt.smoke.riseSpeed = values.riseSpeed;
+        if (typeof values.size === 'number') {
+          (rt.smoke.points.material as THREE.PointsMaterial).size = values.size;
+          (rt.smoke.points.material as THREE.PointsMaterial).needsUpdate = true;
+        }
+        if (typeof values.color === 'string') rt.smoke.color.set(values.color);
+      }
+      break;
+    case 'stars':
+      rt.starsOn = true;
+      if (rt.stars) {
+        rt.stars.group.visible = true;
+        if (typeof values.starSize === 'number') rt.starSize = values.starSize;
+      }
+      break;
+    case 'fire':
+      if (rt.fire) {
+        if (typeof values.intensity === 'number' && values.intensity <= 0) {
+          rt.fire.points.visible = false;
+        }
+        if (typeof values.size === 'number') {
+          (rt.fire.points.material as THREE.PointsMaterial).size = values.size;
+          (rt.fire.points.material as THREE.PointsMaterial).needsUpdate = true;
+        }
+        if (
+          typeof values.count === 'number' &&
+          values.count !== rt.counts.fire
+        ) {
+          const anterior = rt.fire;
+          const size = (anterior.points.material as THREE.PointsMaterial).size;
+          rt.fire = createParticleSystem(values.count, size);
+          rt.grupo.remove(anterior.points);
+          anterior.points.geometry.dispose();
+          (anterior.points.material as THREE.Material)?.dispose();
+          rt.fire.points.visible = true;
+          rt.counts.fire = values.count;
+        }
+      }
+      break;
+    case 'sparks':
+      if (rt.sparks) {
+        if (typeof values.size === 'number') {
+          (rt.sparks.points.material as THREE.PointsMaterial).size = values.size;
+          (rt.sparks.points.material as THREE.PointsMaterial).needsUpdate = true;
+        }
+        if (
+          typeof values.count === 'number' &&
+          values.count !== rt.counts.sparks
+        ) {
+          const anterior = rt.sparks;
+          const size = (anterior.points.material as THREE.PointsMaterial).size;
+          rt.sparks = createParticleSystem(values.count, size);
+          rt.grupo.remove(anterior.points);
+          anterior.points.geometry.dispose();
+          (anterior.points.material as THREE.Material)?.dispose();
+          rt.sparks.points.visible = true;
+          rt.counts.sparks = values.count;
+        }
+      }
+      break;
+    case 'glow': {
+      if (!rt.glowMaterial) rt.glowMaterial = getGlowMaterial().clone();
+      const mat = rt.glowMaterial;
+      if (typeof values.glowColor === 'string') {
+        mat.uniforms.uColor.value = new THREE.Color(values.glowColor);
+      }
+      if (typeof values.glowIntensity === 'number') {
+        mat.uniforms.uIntensity.value = values.glowIntensity;
+      }
+      mat.uniformsNeedUpdate = true;
+      for (const shell of rt.glowShells) shell.visible = true;
+      break;
+    }
+  }
+}
+
+/** Emisor de partículas del runtime: focos colocados o superficie. */
+function emisorDeFoco(
+  rt: RuntimeFxObjeto,
+  kind: 'fire' | 'smoke' | 'sparks'
+): () => THREE.Vector3 | null {
+  const list = rt.focos[kind];
+  if (list.length > 0) {
+    return () => list[(Math.random() * list.length) | 0];
+  }
+  return rt.sampler;
 }

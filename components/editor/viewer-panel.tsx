@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, type FC } from 'react';
 import { createPortal } from 'react-dom';
 import Viewer3D, { type ObjectTransform, type GizmoMode } from '@/components/viewer-3d';
+import type { EfectoObjeto } from '@/lib/efectos-objeto';
 import { PanelButtons } from '@/components/editor/Editor3D';
 import { useI18n } from '@/lib/i18n';
 import type {
@@ -68,6 +69,8 @@ interface ViewerPanelProps {
     onFaceSelectionToolChange?: (tool: 'rectangle' | 'circle' | 'line') => void;
     onFaceSelectionTargetChange?: (target: 'cara' | 'vertice' | 'segmento') => void;
     onMultiObjectTransform?: (transforms: { id: string; transform: ObjectTransform }[]) => void;
+    /** Efectos por objeto cambiados desde el visor (aplicar/retirar, params, focos). */
+    onEfectosObjetos?: (cambios: Record<string, EfectoObjeto[] | undefined>) => void;
     objectName?: string;
     onObjectNameChange?: (name: string) => void;
    showGizmo: boolean;
@@ -205,6 +208,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
     onFaceSelectionToolChange,
     onFaceSelectionTargetChange,
     onMultiObjectTransform,
+    onEfectosObjetos,
     objectName,
     onObjectNameChange,
    showGizmo,
@@ -483,6 +487,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
            onFaceSelectionToolChange={onFaceSelectionToolChange}
            onFaceSelectionTargetChange={onFaceSelectionTargetChange}
           onMultiObjectTransform={onMultiObjectTransform}
+          onEfectosObjetos={onEfectosObjetos}
            objectName={objectName}
            onObjectNameChange={onObjectNameChange}
             gizmo={showGizmo}

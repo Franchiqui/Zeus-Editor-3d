@@ -96,6 +96,34 @@ export default function LightingModal({
     }));
   }, []);
 
+  /** Marca/desmarca un objeto como excluido de la luz ambiente. */
+  const alternarExcluidoAmbiente = useCallback((oid: string) => {
+    setConfig((prev) => {
+      const lista = prev.ambient.excluyeObjetos ?? [];
+      const nueva = lista.includes(oid)
+        ? lista.filter((x) => x !== oid)
+        : [...lista, oid];
+      return { ...prev, ambient: { ...prev.ambient, excluyeObjetos: nueva } };
+    });
+  }, []);
+
+  /** Marca/desmarca un objeto como excluido de UN foco. */
+  const alternarExcluidoFoco = useCallback((focoId: string, oid: string) => {
+    setConfig((prev) => ({
+      ...prev,
+      spotlights: prev.spotlights.map((s) =>
+        s.id === focoId
+          ? {
+              ...s,
+              excluyeObjetos: (s.excluyeObjetos ?? []).includes(oid)
+                ? (s.excluyeObjetos ?? []).filter((x) => x !== oid)
+                : [...(s.excluyeObjetos ?? []), oid],
+            }
+          : s
+      ),
+    }));
+  }, []);
+
   const hexColor = (c: number) => '#' + c.toString(16).padStart(6, '0');
   const fromHex = (h: string) => parseInt(h.replace('#', ''), 16);
 
@@ -181,6 +209,42 @@ export default function LightingModal({
               className="w-full"
             />
           </div>
+
+          {/* Excluir objetos de la luz ambiente */}
+          <details className="rounded-md bg-black/20 border border-white/5 p-2">
+            <summary className="text-xs text-muted-foreground cursor-pointer select-none">
+              Excluir objetos de la luz ambiente
+              {(config.ambient.excluyeObjetos?.length ?? 0) > 0 && (
+                <span className="ml-1.5 text-red-300">
+                  ({config.ambient.excluyeObjetos?.length})
+                </span>
+              )}
+            </summary>
+            <div className="mt-2 max-h-40 overflow-y-auto custom-scrollbar space-y-1">
+              {objects.length === 0 && (
+                <p className="text-[10px] text-muted-foreground/60">
+                  No hay objetos en la escena.
+                </p>
+              )}
+              {objects.map((o) => (
+                <label
+                  key={o.id}
+                  className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={config.ambient.excluyeObjetos?.includes(o.id) ?? false}
+                    onChange={() => alternarExcluidoAmbiente(o.id)}
+                    className="w-3 h-3 accent-red-500 cursor-pointer"
+                  />
+                  {o.name || 'Objeto'}
+                </label>
+              ))}
+            </div>
+            <p className="mt-1 text-[10px] text-muted-foreground/60">
+              Los objetos marcados no reciben la luz ambiente.
+            </p>
+          </details>
         </div>
 
         {/* Fondo (cielo) afectado por las luces */}
@@ -375,6 +439,42 @@ export default function LightingModal({
                       </p>
                     )}
                   </div>
+
+                  {/* Excluir objetos de ESTE foco */}
+                  <details className="rounded-md bg-black/20 border border-white/5 p-2">
+                    <summary className="text-xs text-muted-foreground cursor-pointer select-none">
+                      Excluir objetos de este foco
+                      {(spot.excluyeObjetos?.length ?? 0) > 0 && (
+                        <span className="ml-1.5 text-red-300">
+                          ({spot.excluyeObjetos?.length})
+                        </span>
+                      )}
+                    </summary>
+                    <div className="mt-2 max-h-40 overflow-y-auto custom-scrollbar space-y-1">
+                      {objects.length === 0 && (
+                        <p className="text-[10px] text-muted-foreground/60">
+                          No hay objetos en la escena.
+                        </p>
+                      )}
+                      {objects.map((o) => (
+                        <label
+                          key={o.id}
+                          className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={spot.excluyeObjetos?.includes(o.id) ?? false}
+                            onChange={() => alternarExcluidoFoco(spot.id, o.id)}
+                            className="w-3 h-3 accent-red-500 cursor-pointer"
+                          />
+                          {o.name || 'Objeto'}
+                        </label>
+                      ))}
+                    </div>
+                    <p className="mt-1 text-[10px] text-muted-foreground/60">
+                      Los objetos marcados no reciben la luz de este foco.
+                    </p>
+                  </details>
 
                   {/* Color + Intensity */}
                   <div className="flex items-center gap-3">

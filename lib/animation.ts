@@ -594,6 +594,14 @@ export type EffectProperty =
 export interface EffectTrack {
   id: string;
   effectType: EffectType;
+  /**
+   * Objeto de la escena al que se aplica la pista (efectos por objeto).
+   * `null`/ausente = objeto activo del visor (compatibilidad con pistas
+   * de proyectos antiguos, que eran globales).
+   */
+  objectId?: string | null;
+  /** Objetos adicionales que comparten la pista (aplicación en lote). */
+  objectIds?: string[];
   /** Duración en segundos. */
   duration: number;
   looping: boolean;
@@ -636,17 +644,22 @@ export function evaluateEffectTrack(
         const from = (start.values ?? {})[prop];
         const to = (end.values ?? {})[prop];
         if (from === undefined && to === undefined) continue;
+        // Booleanos y strings (Activo, color) NO se interpolan: se
+        // sostienen en el valor del fotograma de origen y cambian al
+        // LLEGAR al fotograma destino. Interpolar los booleanos como
+        // números (false→0.5→true) rompía la agenda: «Activo» nunca era
+        // `=== false` dentro del tramo y el efecto seguía encendido.
         if (typeof from === 'boolean' || typeof to === 'boolean') {
-          result[prop] = to ?? from;
+          result[prop] = from !== undefined ? from : to;
         } else if (typeof from === 'string' || typeof to === 'string') {
-          result[prop] = to ?? from;
+          result[prop] = from !== undefined ? from : to;
         } else {
           const numFrom = from as number | undefined;
           const numTo = to as number | undefined;
           if (numFrom !== undefined && numTo !== undefined) {
             result[prop] = numFrom + (numTo - numFrom) * eased;
           } else {
-            result[prop] = to ?? from;
+            result[prop] = from !== undefined ? from : to;
           }
         }
       }
@@ -679,11 +692,13 @@ export const EFFECT_TYPE_LABELS: Record<EffectType, string> = {
 /** Crea una pista de efecto con un fotograma inicial en tiempo 0. */
 export function createEffectTrack(
   effectType: EffectType,
-  duration: number = 5
+  duration: number = 5,
+  objectId: string | null = null
 ): EffectTrack {
   return {
     id: `etrack-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
     effectType,
+    objectId,
     duration,
     looping: false,
     keyframes: [
@@ -835,7 +850,7 @@ export function effectTrackToUnified(track: EffectTrack): UnifiedTrack {
     id: `etrack-${track.id}`,
     kind: 'effect',
     name: `${EFFECT_TYPE_LABELS[track.effectType]}`,
-    objectId: null,
+    objectId: track.objectId ?? null,
     originalId: track.id,
     duration: track.duration,
     looping: track.looping,

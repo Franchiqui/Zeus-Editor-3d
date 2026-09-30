@@ -872,6 +872,10 @@ export function applyZeiaPlansToScene<T extends ZeiaSceneObject>(
             warnOnce(`${action}: tipo de efecto no soportado ("${String(params.name ?? params.type)}").`);
             break;
           }
+          // La pista pertenece al objeto indicado (los efectos son por
+          // objeto); sin objeto, queda ligada al activo (objectId null).
+          const dueño = resolve(pickId(params.id, params.object_id, res.object_id));
+          if (dueño) track.objectId = dueño.id;
           effectTracks = [...effectTracks, track];
           effects++;
           applied++;

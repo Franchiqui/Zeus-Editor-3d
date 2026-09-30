@@ -2,6 +2,7 @@
 
 import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { FC } from 'react';
+import * as THREE from 'three';
 import type { Dispatch, SetStateAction } from 'react';
 import {
   Play,
@@ -269,8 +270,10 @@ export const MotionEditor: FC<MotionEditorProps> = ({
   const dragRef = useRef<{ trackId: string; originalTime: number; kind: 'transform' | 'plugin' | 'effect' } | null>(null);
   const [dragTime, setDragTime] = useState<number | null>(null);
   // `dragTime` en el closure de `up` quedaría obsoleto: se lee vía ref.
+  // El `move` escribe la ref DIRECTAMENTE (no vía render): si el render va
+  // por detrás de los eventos, `up` soltaba el rombo en un tiempo viejo y
+  // el fotograma «volvía» al sitio.
   const dragTimeRef = useRef<number | null>(null);
-  dragTimeRef.current = dragTime;
 
   const globalDuration = Math.max(5, motionMaxDuration(transformTracks, pluginTracks, effectTracks));
   const timelineWidth = globalDuration * pxPerSecond;
@@ -577,15 +580,19 @@ export const MotionEditor: FC<MotionEditorProps> = ({
   /** Estado del selector de efectos en el panel izquierdo. */
   const [selectedEffectType, setSelectedEffectType] = useState<EffectType | ''>('');
 
-  /** Crea una pista de efecto visual. */
+  /** Crea una pista de efecto visual (del objeto seleccionado; los efectos
+   *  son por objeto, como en el visor). */
   const addEffectTrack = () => {
     if (!selectedEffectType) return;
-    const existing = effectTracks.find((tr) => tr.effectType === selectedEffectType);
+    const oid = selectedObjectId ?? null;
+    const existing = effectTracks.find(
+      (tr) => tr.effectType === selectedEffectType && (tr.objectId ?? null) === oid
+    );
     if (existing) {
       setSelectedTrackId(existing.id);
       return;
     }
-    const nueva = createEffectTrack(selectedEffectType, Math.max(5, currentTime));
+    const nueva = createEffectTrack(selectedEffectType, Math.max(5, currentTime), oid);
     nueva.keyframes = upsertKeyframeAt(nueva.keyframes, {
       time: currentTime,
       values: { ...EFFECT_DEFAULTS[selectedEffectType], enabled: true },
@@ -614,7 +621,14 @@ export const MotionEditor: FC<MotionEditorProps> = ({
 
     const nuevas: TransformTrack[] = [];
     for (const oid of targetIds) {
-      if (transformTracks.some((tr) => tr.objectId === oid)) continue;
+      // Un miembro ya cubierto por una pista de grupo (objectId u
+      // objectIds) no recibe pista individual: chocaría con la de grupo.
+      if (
+        transformTracks.some(
+          (tr) => tr.objectId === oid || tr.objectIds?.includes(oid)
+        )
+      )
+        continue;
       const objeto = sceneObjects.find((o) => o.id === oid);
       if (!objeto) continue;
       nuevas.push(createTransformTrack(oid, objeto.transform, Math.max(5, currentTime)));
@@ -653,22 +667,76 @@ export const MotionEditor: FC<MotionEditorProps> = ({
     setSelectedObjectGroupId(null);
   };
 
-  /** Desvincula una pista de grupo: la reemplaza por pistas individuales. */
+  /**
+   * Desvincula una pista de grupo: la reemplaza por pistas individuales.
+   * La pista de grupo guarda SOLO la pose del objeto principal: copiarla
+   * tal cual a cada miembro aplanaba el grupo sobre el principal (mismo
+   * problema de deformación que en la reproducción). Cada miembro recibe
+   * la MISMA delta rígida por fotograma (pose del principal ∘ pose
+   * estática del principal⁻¹) aplicada sobre SU transformada estática,
+   * igual que hace el visor.
+   */
   const unmergeGroupTrack = (trackId: string) => {
     const groupTrack = transformTracks.find((tr) => tr.id === trackId);
     if (!groupTrack || !groupTrack.objectIds) return;
 
     const allIds = [groupTrack.objectId, ...(groupTrack.objectIds ?? [])];
-    const memberIdSet = new Set(allIds);
     const newTracks: TransformTrack[] = [];
 
+    const kfs = [...groupTrack.keyframes].sort((a, b) => a.time - b.time);
+    if (kfs.length === 0) return;
+    const principal = sceneObjects.find((o) => o.id === groupTrack.objectId);
+    if (!principal) return;
+    const matrizDe = (t: Partial<Record<TransformProperty, number>>) =>
+      new THREE.Matrix4().compose(
+        new THREE.Vector3(t.px ?? 0, t.py ?? 0, t.pz ?? 0),
+        new THREE.Quaternion().setFromEuler(
+          new THREE.Euler(t.rx ?? 0, t.ry ?? 0, t.rz ?? 0)
+        ),
+        new THREE.Vector3(t.sx ?? 1, t.sy ?? 1, t.sz ?? 1)
+      );
+    // Base de la delta: la pose estática del principal (o el fotograma 0
+    // si la pista nació con otra pose).
+    const principalM = matrizDe(
+      kfs.some((kf) => kf.time === 0) ? kfs[0].values : principal.transform
+    );
+
     for (const oid of allIds) {
-      if (transformTracks.some((tr) => tr.id !== trackId && tr.objectId === oid)) continue;
+      if (
+        transformTracks.some(
+          (tr) =>
+            tr.id !== trackId &&
+            (tr.objectId === oid || tr.objectIds?.includes(oid))
+        )
+      )
+        continue;
       const obj = sceneObjects.find((o) => o.id === oid);
       if (!obj) continue;
       const track = createTransformTrack(oid, obj.transform, groupTrack.duration);
-      track.keyframes = groupTrack.keyframes.map((kf) => ({ ...kf }));
       track.looping = groupTrack.looping;
+      if (oid === groupTrack.objectId) {
+        // El principal conserva los fotogramas tal cual (son SU pose).
+        track.keyframes = kfs.map((kf) => ({ ...kf }));
+      } else {
+        // Miembro secundario: aplicar cada delta rígida sobre SU pose.
+        const base = matrizDe(obj.transform);
+        track.keyframes = kfs.map((kf) => {
+          const delta = matrizDe(kf.values).multiply(principalM.clone().invert());
+          const m = delta.multiply(base.clone());
+          const pos = new THREE.Vector3();
+          const quat = new THREE.Quaternion();
+          const scl = new THREE.Vector3();
+          m.decompose(pos, quat, scl);
+          const euler = new THREE.Euler().setFromQuaternion(quat, 'XYZ');
+          const values: Record<TransformProperty, number> = {
+            px: pos.x, py: pos.y, pz: pos.z,
+            rx: euler.x, ry: euler.y, rz: euler.z,
+            sx: scl.x, sy: scl.y, sz: scl.z,
+            o: obj.opacity ?? 1,
+          };
+          return { time: kf.time, values, easing: kf.easing };
+        });
+      }
       newTracks.push(track);
     }
 
@@ -688,16 +756,19 @@ export const MotionEditor: FC<MotionEditorProps> = ({
       const el = timelineRef.current;
       if (!el) return 0;
       const rect = el.getBoundingClientRect();
-      // getBoundingClientRect() es relativo al viewport: al hacer scroll
-      // horizontal del contenedor padre, rect.left se desplaza. Hay que
-      // compensar sumando scrollLeft de todos los ancestros scrollables.
-      let scrollLeft = 0;
-      let parent = el.parentElement;
-      while (parent) {
-        scrollLeft += parent.scrollLeft || 0;
-        parent = parent.parentElement;
-      }
-      return clampTime((clientX - rect.left + scrollLeft) / pxPerSecond);
+      // getBoundingClientRect() ya refleja el desplazamiento por el
+      // scroll de los ancestros: rect.left se mueve con ellos, así que
+      // clientX - rect.left es directamente la coordenada de contenido.
+      // Sumar además el scrollLeft de los ancestros LO CONTABA DOBLE y
+      // desplazaba todos los clics/arrastres (con scroll horizontal el
+      // pinchado caía más adelante, hasta clavarse al final).
+      // Si un ancestro escalara (zoom CSS), rect.width ≠ el.clientWidth:
+      // convertimos además de visual a contenido con la proporción.
+      const escala =
+        rect.width > 0 && el.clientWidth > 0 && el.clientWidth !== rect.width
+          ? el.clientWidth / rect.width
+          : 1;
+      return clampTime(((clientX - rect.left) * escala) / pxPerSecond);
     },
     [pxPerSecond, globalDuration] // eslint-disable-line react-hooks/exhaustive-deps
   );
@@ -759,7 +830,9 @@ export const MotionEditor: FC<MotionEditorProps> = ({
           kind: ref.kind,
         };
       }
-      setDragTime(timeFromEvent(ev.clientX));
+      const t = timeFromEvent(ev.clientX);
+      dragTimeRef.current = t;
+      setDragTime(t);
     };
      const up = () => {
        const ref = keyframeDragRef.current;
@@ -984,7 +1057,12 @@ key={kf.time}
   };
 
   const effectTrackLabel = (track: EffectTrack): string => {
-    return EFFECT_TYPE_LABELS[track.effectType] ?? track.effectType;
+    const base = EFFECT_TYPE_LABELS[track.effectType] ?? track.effectType;
+    // «Fuego — Silla»: a qué objeto pertenece la pista de efecto.
+    const objeto = track.objectId
+      ? sceneObjects.find((o) => o.id === track.objectId)
+      : undefined;
+    return objeto ? `${base} — ${objeto.name}` : base;
   };
 
   // Aviso: pistas de plugin cuyo aplicar() produce malla inválida en
@@ -1078,7 +1156,11 @@ key={kf.time}
           </div>
           {selectedObjectId &&
             !selectedObjectGroupId &&
-            !transformTracks.some((tr) => tr.objectId === selectedObjectId) && (
+            !transformTracks.some(
+              (tr) =>
+                tr.objectId === selectedObjectId ||
+                tr.objectIds?.includes(selectedObjectId)
+            ) && (
             <button
               onClick={addTransformTrack}
               className="mt-1.5 w-full px-2 py-1 rounded bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 flex items-center justify-center gap-1"
@@ -1103,7 +1185,10 @@ key={kf.time}
                   .filter((o): o is MotionEditorObject => !!o && !o.hidden);
                 const activo = grp.id === selectedObjectGroupId;
                 const sinTrackT = groupObjs.filter(
-                  (o) => !transformTracks.some((tr) => tr.objectId === o.id)
+                  (o) =>
+                    !transformTracks.some(
+                      (tr) => tr.objectId === o.id || tr.objectIds?.includes(o.id)
+                    )
                 ).length;
                 if (groupObjs.length === 0) return null;
                 return (
@@ -1143,7 +1228,10 @@ key={kf.time}
                   .filter((o): o is MotionEditorObject => !!o && !o.hidden);
                 if (groupObjs.length === 0) return null;
                 const sinTrackT = groupObjs.filter(
-                  (o) => !transformTracks.some((tr) => tr.objectId === o.id)
+                  (o) =>
+                    !transformTracks.some(
+                      (tr) => tr.objectId === o.id || tr.objectIds?.includes(o.id)
+                    )
                 ).length;
                 const hayGrupoTrack = transformTracks.some(
                   (tr) =>
@@ -1260,7 +1348,11 @@ key={kf.time}
             {selectedEffectType && (
               <button
                 onClick={addEffectTrack}
-                disabled={effectTracks.some((tr) => tr.effectType === selectedEffectType)}
+                disabled={effectTracks.some(
+                  (tr) =>
+                    tr.effectType === selectedEffectType &&
+                    (tr.objectId ?? null) === (selectedObjectId ?? null)
+                )}
                 className="w-full px-2 py-1 rounded bg-orange-500/20 hover:bg-orange-500/30 text-orange-300 disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-1"
               >
                 <Plus className="w-3 h-3" />
@@ -1444,7 +1536,9 @@ key={kf.time}
                 value={selectedTrack.duration}
                 onChange={(e) => {
                   const v = parseFloat(e.target.value) || 0.1;
-                  if (transformTracks.some((tk) => tk.id === selectedTrack.id)) {
+                  if (effectTracks.some((tk) => tk.id === selectedTrack.id)) {
+                    updateEffectTrack(selectedTrack.id, { duration: v });
+                  } else if (transformTracks.some((tk) => tk.id === selectedTrack.id)) {
                     updateTransformTrack(selectedTrack.id, { duration: v });
                   } else {
                     updatePluginTrack(selectedTrack.id, { duration: v });
@@ -1457,7 +1551,9 @@ key={kf.time}
                   type="checkbox"
                   checked={selectedTrack.looping}
                   onChange={() => {
-                    if (transformTracks.some((tk) => tk.id === selectedTrack.id)) {
+                    if (effectTracks.some((tk) => tk.id === selectedTrack.id)) {
+                      updateEffectTrack(selectedTrack.id, { looping: !selectedTrack.looping });
+                    } else if (transformTracks.some((tk) => tk.id === selectedTrack.id)) {
                       updateTransformTrack(selectedTrack.id, { looping: !selectedTrack.looping });
                     } else {
                       updatePluginTrack(selectedTrack.id, { looping: !selectedTrack.looping });
@@ -1580,11 +1676,13 @@ key={kf.time}
                 );
               })}
             </div>
-            <div className="flex-1 relative" ref={timelineRef}>
+            {/* Toda la zona de regla+filas responde al scrub: pinchar en
+                cualquier sitio (y arrastrar) mueve el playhead. Los rombos
+                de fotograma hacen stopPropagation, así no se pelean. */}
+            <div className="flex-1 relative" ref={timelineRef} onPointerDown={beginScrub} data-testid="motion-timeline-area">
               {/* Regla */}
               <div
-                className="h-7 border-b border-white/10 relative cursor-pointer select-none"
-                onPointerDown={beginScrub}
+                className="h-7 border-b border-white/10 relative select-none"
               >
                 {marks.map((tt) => (
                   <div key={tt} className="absolute top-0 h-full" style={{ left: tt * pxPerSecond }}>
@@ -1614,29 +1712,36 @@ key={kf.time}
           </div>
         </div>
 
-        {/* Inspector del fotograma seleccionado */}
-        {(selectedTransformKf || selectedPluginKf || selectedEffectKf) && selectedTrackId && (
+        {/* Inspector del fotograma seleccionado. Visible SIEMPRE que hay
+            una pista seleccionada: sin fotograma elegido solo ofrece
+            «Añadir fotograma» (antes, para programar había que picar un
+            kf existente primero, y ese click además saltaba el playhead). */}
+        {selectedTrackId && (
           <div className="border-t border-white/10 px-2 py-1.5 flex items-center gap-2 flex-wrap">
-            <span className="text-muted-foreground">
-              {t('editor3D.motion.keyframe')} @ {formatTime(selectedKeyframeTime ?? 0)}s
-            </span>
-            <select
-              value={(selectedTransformKf ?? selectedPluginKf ?? selectedEffectKf)?.easing ?? 'linear'}
-              onChange={(e) =>
-                setKeyframeEasing(
-                  selectedTrackId,
-                  selectedKeyframeTime ?? 0,
-                  e.target.value as EasingFunction,
-                  transformTracks.some((tk) => tk.id === selectedTrackId) ? 'transform' : pluginTracks.some((tk) => tk.id === selectedTrackId) ? 'plugin' : 'effect'
-                )
-              }
-              className="px-1.5 py-0.5 rounded bg-black/30 border border-white/10 text-foreground"
-              title={t('editor3D.motion.easing')}
-            >
-              {EASING_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>{opt.label}</option>
-              ))}
-            </select>
+            {(selectedTransformKf || selectedPluginKf || selectedEffectKf) && (
+              <>
+                <span className="text-muted-foreground">
+                  {t('editor3D.motion.keyframe')} @ {formatTime(selectedKeyframeTime ?? 0)}s
+                </span>
+                <select
+                  value={(selectedTransformKf ?? selectedPluginKf ?? selectedEffectKf)?.easing ?? 'linear'}
+                  onChange={(e) =>
+                    setKeyframeEasing(
+                      selectedTrackId,
+                      selectedKeyframeTime ?? 0,
+                      e.target.value as EasingFunction,
+                      transformTracks.some((tk) => tk.id === selectedTrackId) ? 'transform' : pluginTracks.some((tk) => tk.id === selectedTrackId) ? 'plugin' : 'effect'
+                    )
+                  }
+                  className="px-1.5 py-0.5 rounded bg-black/30 border border-white/10 text-foreground"
+                  title={t('editor3D.motion.easing')}
+                >
+                  {EASING_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
+              </>
+            )}
             {selectedPluginKf && (
               (() => {
                 const tr = pluginTracks.find((tk) => tk.id === selectedTrackId);
@@ -1690,13 +1795,14 @@ key={kf.time}
               />
             )}
             <button
+              disabled={selectedKeyframeTime === null}
               onClick={() => selectedKeyframeTime !== null && deleteKeyframe(
                 selectedTrackId,
                 selectedKeyframeTime,
                 transformTracks.some((tk) => tk.id === selectedTrackId) ? 'transform' : pluginTracks.some((tk) => tk.id === selectedTrackId) ? 'plugin' : 'effect'
               )}
-              className="p-1 rounded hover:bg-red-500/20 text-red-300"
-              title={t('editor3D.motion.deleteKeyframe')}
+              className="p-1 rounded hover:bg-red-500/20 text-red-300 disabled:opacity-40"
+              title={selectedKeyframeTime === null ? t('editor3D.motion.pickKeyframe') : t('editor3D.motion.deleteKeyframe')}
             >
               <Trash2 className="w-3.5 h-3.5" />
             </button>

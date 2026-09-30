@@ -2208,7 +2208,8 @@ export const es = {
       addTransformTracks: 'Añadir {count} pistas de transformación',
       addKeyframe: 'Añadir fotograma',
       deleteKeyframe: 'Eliminar fotograma',
-      deleteTrack: 'Eliminar pista',
+
+      pickKeyframe: 'Selecciona un fotograma',      deleteTrack: 'Eliminar pista',
       easing: 'Suavizado',
       keyframe: 'Fotograma',
       selectObject: 'Selecciona un objeto para animarlo',
@@ -6063,7 +6064,8 @@ export const en: TranslationKeys = {
       addTransformTracks: 'Add {count} transform tracks',
       addKeyframe: 'Add keyframe',
       deleteKeyframe: 'Delete keyframe',
-      deleteTrack: 'Delete track',
+
+      pickKeyframe: 'Select a keyframe',      deleteTrack: 'Delete track',
       easing: 'Easing',
       keyframe: 'Keyframe',
       selectObject: 'Select an object to animate it',
@@ -9929,7 +9931,8 @@ export const fr: TranslationKeys = {
       addTransformTracks: 'Ajouter {count} pistes de transformation',
       addKeyframe: 'Ajouter une image clé',
       deleteKeyframe: 'Supprimer l’image clé',
-      deleteTrack: 'Supprimer la piste',
+
+      pickKeyframe: 'Sélectionnez une image clé',      deleteTrack: 'Supprimer la piste',
       easing: 'Interpolation',
       keyframe: 'Image clé',
       selectObject: 'Sélectionnez un objet pour l’animer',
@@ -13761,7 +13764,8 @@ export const de: TranslationKeys = {
       addTransformTracks: '{count} Transformationsspuren hinzufügen',
       addKeyframe: 'Keyframe hinzufügen',
       deleteKeyframe: 'Keyframe löschen',
-      deleteTrack: 'Piste löschen',
+
+      pickKeyframe: 'Keyframe auswählen',      deleteTrack: 'Piste löschen',
       easing: 'Übergang',
       keyframe: 'Keyframe',
       selectObject: 'Objekt auswählen, um es zu animieren',
@@ -17593,7 +17597,8 @@ export const it: TranslationKeys = {
       addTransformTracks: 'Aggiungi {count} tracce di trasformazione',
       addKeyframe: 'Aggiungi keyframe',
       deleteKeyframe: 'Elimina keyframe',
-      deleteTrack: 'Elimina traccia',
+
+      pickKeyframe: 'Seleziona un keyframe',      deleteTrack: 'Elimina traccia',
       easing: 'Interpolazione',
       keyframe: 'Keyframe',
       selectObject: 'Seleziona un oggetto per animarlo',
@@ -21425,7 +21430,8 @@ export const zh: TranslationKeys = {
       addTransformTracks: '添加{count}个变换轨道',
       addKeyframe: '添加关键帧',
       deleteKeyframe: '删除关键帧',
-      deleteTrack: '删除轨道',
+
+      pickKeyframe: '选择一个关键帧',      deleteTrack: '删除轨道',
       easing: '缓动',
       keyframe: '关键帧',
       selectObject: '选择一个对象进行动画',
@@ -25257,7 +25263,8 @@ export const hi: TranslationKeys = {
       addTransformTracks: '{count} ट्रांसफ़ॉर्म ट्रैक जोड़ें',
       addKeyframe: 'कीफ़्रेम जोड़ें',
       deleteKeyframe: 'कीफ़्रेम हटाएँ',
-      deleteTrack: 'ट्रैक हटाएँ',
+
+      pickKeyframe: 'एक कीफ़्रेम चुनें',      deleteTrack: 'ट्रैक हटाएँ',
       easing: 'ईज़िंग',
       keyframe: 'कीफ़्रेम',
       selectObject: 'एनिमेट करने के लिए एक वस्तु चुनें',

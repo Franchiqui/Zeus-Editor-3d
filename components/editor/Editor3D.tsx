@@ -21,6 +21,12 @@ const PANEL_VIEW_LABEL_KEY: Record<PanelViewKind, string> = {
 import { KeyframeEditor } from '@/components/editor/keyframe-editor';
 import type { LightConfig } from '@/components/viewer-3d';
 import type { FxConfig } from '@/components/viewer-3d';
+import {
+  DEFAULT_FX_CONFIG,
+  validarEfectos,
+  migrarFxConfigGlobal,
+  type EfectoObjeto,
+} from '@/lib/efectos-objeto';
 import type {
   AnimationTrack,
   Keyframe,
@@ -432,6 +438,13 @@ type SceneObject = {
      baseMesh?: Mesh;
      baseVacia?: boolean;
    };
+   /**
+    * Efectos visuales del objeto (lluvia, humo, fuego, chispas,
+    * estrellas, brillo) con sus parámetros y focos. Viajan con el
+    * proyecto y puede animarlos el editor de movimiento con pistas
+    * de efecto dirigidas al objeto (EffectTrack.objectId).
+    */
+   efectos?: EfectoObjeto[];
  };
 
 /**
@@ -7697,12 +7710,29 @@ pluginTracks,
             ? data.editedVertices
             : null
         );
+        // FxConfig global tras la migración v3 (todo-apagado si hubo
+        // efectos que pasar a objetos; null = usar el del archivo).
+        let fxConfigMigrado: FxConfig | null = null;
         if (Array.isArray(data.sceneObjects) && data.sceneObjects.length > 0) {
+          const idsCargados = data.sceneObjects.map((o: { id?: string }) => o.id);
+          const dueñoMigracion =
+            typeof data.configObjectId === 'string' &&
+            idsCargados.includes(data.configObjectId)
+              ? data.configObjectId
+              : null;
+          const migracion = migrarFxConfigGlobal(data.fxConfig, idsCargados, dueñoMigracion);
+          const efectosMigrados = migracion.efectos;
+          fxConfigMigrado = Object.keys(efectosMigrados).length > 0 ? migracion.fxConfigLimpio : null;
           setSceneObjects(
-            data.sceneObjects.map((obj: Partial<SceneObject>, i: number) => ({
-              ...obj,
-              name: obj.name ?? t('editor3D.objectN', { n: i + 1 }),
-            }))
+            data.sceneObjects.map((obj: Partial<SceneObject>, i: number) => {
+              const propios = validarEfectos((obj as Partial<SceneObject>).efectos);
+              const efectos = propios ?? (obj.id ? efectosMigrados[obj.id] : undefined);
+              return {
+                ...obj,
+                name: obj.name ?? t('editor3D.objectN', { n: i + 1 }),
+                ...(efectos ? { efectos } : {}),
+              };
+            })
           );
           const loadedSelected =
             typeof data.selectedObjectId === 'string'
@@ -7845,7 +7875,10 @@ pluginTracks,
             setWindowLayout(data.windowLayout as WindowLayout);
           }
           if (data.fxConfig && typeof data.fxConfig === 'object') {
-           setFxConfig(data.fxConfig);
+            // La migración v3 (bloque de sceneObjects) ya lo dejó todo-
+            // apagado si había efectos que pasar a objetos; si no, se
+            // completa con los valores por defecto.
+            setFxConfig(fxConfigMigrado ?? { ...DEFAULT_FX_CONFIG, ...data.fxConfig });
           }
           if (typeof data.groundTexture === 'string') {
             setGroundTexture(restoreTextureUrl(data.groundTexture));
@@ -7915,15 +7948,43 @@ pluginTracks,
           }
           if (Array.isArray(data.effectTracks)) {
             const validEffectTypes = new Set(['rain', 'smoke', 'stars', 'fire', 'sparks', 'glow']);
-            setEffectTracks(
-              data.effectTracks.filter(
-                (t: { id?: unknown; effectType?: unknown; duration?: unknown; keyframes?: unknown }) =>
-                  typeof t.id === 'string' &&
-                  typeof t.effectType === 'string' &&
-                  validEffectTypes.has(t.effectType as string) &&
-                  typeof t.duration === 'number' &&
-                  Array.isArray(t.keyframes)
+            const idsValidos = new Set(
+              (Array.isArray(data.sceneObjects) ? data.sceneObjects : []).map(
+                (o: { id?: string }) => o.id
               )
+            );
+            setEffectTracks(
+              data.effectTracks
+                .filter(
+                  (t: { id?: unknown; effectType?: unknown; duration?: unknown; keyframes?: unknown }) =>
+                    typeof t.id === 'string' &&
+                    typeof t.effectType === 'string' &&
+                    validEffectTypes.has(t.effectType as string) &&
+                    typeof t.duration === 'number' &&
+                    Array.isArray(t.keyframes)
+                )
+                .map(
+                  (t: {
+                    objectId?: unknown;
+                    objectIds?: unknown;
+                    [k: string]: unknown;
+                  }) => {
+                    // objectId/objectIds solo si apuntan a objetos que
+                    // existen: si no, la pista queda global (objeto activo).
+                    const oid = t.objectId;
+                    const oids = t.objectIds;
+                    return {
+                      ...t,
+                      objectId:
+                        typeof oid === 'string' && idsValidos.has(oid) ? oid : null,
+                      objectIds: Array.isArray(oids)
+                        ? oids.filter(
+                            (x: unknown) => typeof x === 'string' && idsValidos.has(x)
+                          )
+                        : undefined,
+                    };
+                  }
+                )
             );
           }
           if (data.pluginBaseMeshes && typeof data.pluginBaseMeshes === 'object') {
@@ -8910,6 +8971,28 @@ pluginTracks,
             };
           }
           return obj;
+        })
+      );
+    },
+    []
+  );
+
+  /**
+   * Efectos por objeto cambiados desde el visor (aplicar/retirar en
+   * lote, editar parámetros, focos colocados con clic). Solo llegan los
+   * objetos que cambian; el historial los captura con el debounce de
+   * sceneObjects (los efectos viven dentro de cada objeto).
+   */
+  const handleEfectosObjetos = useCallback(
+    (cambios: Record<string, EfectoObjeto[] | undefined>) => {
+      setSceneObjects((prev) =>
+        prev.map((obj) => {
+          if (!(obj.id in cambios)) return obj;
+          const lista = cambios[obj.id];
+          const next = { ...obj };
+          if (lista && lista.length > 0) next.efectos = lista;
+          else delete next.efectos;
+          return next;
         })
       );
     },
@@ -10582,6 +10665,7 @@ pluginTracks,
       sceneObjects={sceneObjects}
       handleObjectSelect={handleObjectSelect}
       onMultiObjectTransform={handleMultiObjectTransform}
+      onEfectosObjetos={handleEfectosObjetos}
       objectName={sceneObjects.find((o) => o.id === selectedObjectId)?.name}
       onObjectNameChange={(name) => handleObjectNameChange(selectedObjectId!, name)}
       selectedObjectIds={selectedObjectIds}
