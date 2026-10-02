@@ -264,6 +264,8 @@ interface Viewer3DProps {
     textureProjection?: LatheTextureProjection;
    /** Número de veces que se repite la textura (1 = sin repetición) */
     textureRepeat?: number;
+   /** Veces que se repite la textura en VERTICAL (ausente = igual que X) */
+    textureRepeatY?: number;
     /** Si el objeto está oculto (no se dibuja) */
     hidden?: boolean;
     /** Si el objeto está congelado (gris, no interactivo) */
@@ -361,6 +363,8 @@ interface Viewer3DProps {
    showLatheAxis?: boolean;
    textureProjection?: LatheTextureProjection;
    textureRepeat?: number;
+   /** Veces que se repite la textura en VERTICAL (ausente = igual que X). */
+   textureRepeatY?: number;
   /**
    * Pieza amarilla de la ayuda de proyección: el marco editable de la
    * textura (rectángulo plano, tubo cilíndrico o esfera) que se ve al
@@ -415,6 +419,10 @@ interface Viewer3DProps {
     groundTexture?: string | null;
     /** Number of times the ground texture repeats (tiling) */
     groundTextureRepeat?: number;
+    /** Veces que se repite la textura del suelo en VERTICAL (ausente = igual que X). */
+    groundTextureRepeatY?: number;
+    /** Intensidad del relieve de la textura del suelo (0 = suelo liso). */
+    groundTextureRelief?: number;
       /** Finish for ground texture: glossy, semi-matte, matte, mirror, or metallic */
       groundTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
       /** Finish for object textures: glossy, semi-matte, matte, mirror, or metallic */
@@ -727,7 +735,8 @@ export function buildSnapshotObjectVisual(
   smooth: boolean,
   projection: LatheTextureProjection,
   textureFinishOverride?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic',
-  textureRepeat?: number
+  textureRepeat?: number,
+  textureRepeatY?: number
 ): THREE.Group {
   const group = new THREE.Group();
   if (!mesh.vertices.length || !mesh.faces.length) return group;
@@ -760,25 +769,29 @@ export function buildSnapshotObjectVisual(
     const indices: number[] = [];
     let minX = Infinity, maxX = -Infinity;
     let minY = Infinity, maxY = -Infinity;
+    let minZ = Infinity, maxZ = -Infinity;
     for (const v of mesh.vertices) {
       if (v.x < minX) minX = v.x;
       if (v.x > maxX) maxX = v.x;
       if (v.y < minY) minY = v.y;
       if (v.y > maxY) maxY = v.y;
+      if (v.z < minZ) minZ = v.z;
+      if (v.z > maxZ) maxZ = v.z;
     }
-    const rangeX = maxX - minX || 1;
-    const rangeY = maxY - minY || 1;
+    // Caja + ejes: los MISMOS que la pieza amarilla y que la malla
+    // principal (cara plana más probable / eje más redondo).
+    const cajaProy = { minX, maxX, minY, maxY, minZ, maxZ };
     const projectionUv = (v: Vertex3D): [number, number] => {
       const angle = Math.atan2(v.z, v.x);
       const u = (angle / (Math.PI * 2) + 1) % 1;
       if (projection === 'planar') {
-        return [(v.x - minX) / rangeX, 1 - (v.y - minY) / rangeY];
+        return uvCaraPlana(v, cajaProy, ejeCaraPlana(cajaProy));
       }
       if (projection === 'spherical') {
         const length = Math.max(1e-6, Math.hypot(v.x, v.y, v.z));
         return [u, 1 - Math.acos(v.y / length) / Math.PI];
       }
-      return [u, 1 - (v.y - minY) / rangeY];
+      return uvCilindrica(v, cajaProy, ejeCilindro(cajaProy));
     };
     const faceEntries: Array<{ triCount: number; tex: string | null }> = [];
     const faceTexturesList = mesh.faceTextures ?? null;
@@ -914,7 +927,10 @@ export function buildSnapshotObjectVisual(
            texture.anisotropy = 4;
            texture.needsUpdate = true;
             const repeat = mesh.textureRepeat ?? textureRepeat ?? 1;
-            texture.repeat.set(repeat, repeat);
+            // Vertical: el propio de la malla; si no, el del panel; si no,
+            // copia el horizontal.
+            const repeatY = mesh.textureRepeatY ?? textureRepeatY ?? repeat;
+            texture.repeat.set(repeat, repeatY);
            texture.wrapS = THREE.RepeatWrapping;
            texture.wrapT = THREE.RepeatWrapping;
            material.map = texture;
@@ -925,7 +941,7 @@ export function buildSnapshotObjectVisual(
            material.bumpScale = (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP;
            material.color.set(0xffffff);
            material.needsUpdate = true;
-           aplicarTexturaRelieve(material, mesh, repeat);
+           aplicarTexturaRelieve(material, mesh, repeat, repeatY);
         },
         undefined,
         () => {
@@ -935,7 +951,11 @@ export function buildSnapshotObjectVisual(
     } else if (mesh.bumpTexture) {
       // Sin textura normal: solo color blanco + relieve dedicado.
       material.color.set(0xffffff);
-      aplicarTexturaRelieve(material, mesh, mesh.textureRepeat ?? textureRepeat ?? 1);
+      aplicarTexturaRelieve(
+        material, mesh,
+        mesh.textureRepeat ?? textureRepeat ?? 1,
+        mesh.textureRepeatY ?? textureRepeatY
+      );
     }
     return group;
   }
@@ -1392,6 +1412,157 @@ function closestPointOnAxis(
   return (b * e - c) / denom;
 }
 
+/** Caja alineada de una lista de vértices (mínimos y máximos por eje). */
+type CajaV = {
+  minX: number; maxX: number;
+  minY: number; maxY: number;
+  minZ: number; maxZ: number;
+};
+
+function cajaDeVertices(vertices: Vertex3D[]): CajaV | null {
+  if (vertices.length === 0) return null;
+  const c: CajaV = {
+    minX: Infinity, maxX: -Infinity,
+    minY: Infinity, maxY: -Infinity,
+    minZ: Infinity, maxZ: -Infinity,
+  };
+  for (const v of vertices) {
+    if (v.x < c.minX) c.minX = v.x;
+    if (v.x > c.maxX) c.maxX = v.x;
+    if (v.y < c.minY) c.minY = v.y;
+    if (v.y > c.maxY) c.maxY = v.y;
+    if (v.z < c.minZ) c.minZ = v.z;
+    if (v.z > c.maxZ) c.maxZ = v.z;
+  }
+  return c;
+}
+
+/** Eje normal de una cara alineada: 'x' (cara YZ), 'y' (cara XZ), 'z' (cara XY). */
+type EjeProy = 'x' | 'y' | 'z';
+
+/**
+ * Cara PLANA más probable de la figura: la perpendicular al eje de MENOR
+ * extensión — la caja es más delgada por ahí, o sea que esa es la cara
+ * grande (una placa de pie abraza su cara YZ, tumbada abraza la XZ de
+ * arriba). En empate gana Z: la proyección frontal de siempre.
+ */
+function ejeCaraPlana(c: CajaV): EjeProy {
+  const ex = c.maxX - c.minX;
+  const ey = c.maxY - c.minY;
+  const ez = c.maxZ - c.minZ;
+  if (ez <= ex && ez <= ey) return 'z';
+  if (ex <= ey) return 'x';
+  return 'y';
+}
+
+/**
+ * Eje de la envolvente CILÍNDRICA: la figura gira alrededor del eje cuyos
+ * DOS ejes perpendiculares se parecen más (la sección es redonda). Una
+ * taza de torno: X≈Z → eje Y (siempre, como hasta ahora); un tubo tumbado
+ * a lo largo de X: Y≈Z → eje X.
+ */
+function ejeCilindro(c: CajaV): EjeProy {
+  const ex = c.maxX - c.minX;
+  const ey = c.maxY - c.minY;
+  const ez = c.maxZ - c.minZ;
+  const dY = Math.abs(ex - ez); // perpendiculares del eje Y: X y Z
+  const dX = Math.abs(ey - ez); // perpendiculares del eje X: Y y Z
+  const dZ = Math.abs(ex - ey); // perpendiculares del eje Z: X y Y
+  if (dY <= dX && dY <= dZ) return 'y';
+  if (dX <= dZ) return 'x';
+  return 'z';
+}
+
+/**
+ * UV de la proyección PLANA sobre la cara más probable. V crece hacia
+ * ARRIBA de la cara (la convención de lib/geometry.ts). El eje `eje` es
+ * el normal de la cara (ejeCaraPlana) y la pieza amarilla se coloca en
+ * ese mismo lado, así que pieza y textura siempre coinciden.
+ */
+function uvCaraPlana(
+  p: { x: number; y: number; z: number },
+  c: CajaV,
+  eje: EjeProy
+): [number, number] {
+  const rx = c.maxX - c.minX || 1;
+  const ry = c.maxY - c.minY || 1;
+  const rz = c.maxZ - c.minZ || 1;
+  if (eje === 'z') return [(p.x - c.minX) / rx, (p.y - c.minY) / ry];
+  // Cara superior (visto desde arriba): arriba de la textura = -Z.
+  if (eje === 'y') return [(p.x - c.minX) / rx, (c.maxZ - p.z) / rz];
+  // Cara de costado (vista desde +X): arriba de la textura = +Y.
+  return [(c.maxZ - p.z) / rz, (p.y - c.minY) / ry];
+}
+
+/**
+ * UV de la envolvente CILÍNDRICA alrededor del eje `eje`.
+ */
+function uvCilindrica(
+  p: { x: number; y: number; z: number },
+  c: CajaV,
+  eje: EjeProy
+): [number, number] {
+  const rx = c.maxX - c.minX || 1;
+  const ry = c.maxY - c.minY || 1;
+  const rz = c.maxZ - c.minZ || 1;
+  if (eje === 'y') {
+    const u = ((Math.atan2(p.z, p.x) / (Math.PI * 2)) + 1) % 1;
+    return [u, (p.y - c.minY) / ry];
+  }
+  if (eje === 'x') {
+    const u = ((Math.atan2(p.y, p.z) / (Math.PI * 2)) + 1) % 1;
+    return [u, (p.x - c.minX) / rx];
+  }
+  const u = ((Math.atan2(p.y, p.x) / (Math.PI * 2)) + 1) % 1;
+  return [u, (p.z - c.minZ) / rz];
+}
+
+/**
+ * Los tres lados del objeto DENTRO DE LA ESCENA: el lado de cada eje
+ * local multiplicado por la escala de ese eje. Los VÉRTICES no cambian
+ * al estirar el objeto con el gizmo (un cubo estirado sigue siendo un
+ * cubo por dentro, con sus tres lados iguales) — el muro se crea con la
+ * ESCALA. Mirar solo la caja de vértices daba empate y la pieza caía en
+ * el canto; con la escala, un cubo estirado en pared delgada×alto×largo
+ * elige la cara grande de pared. El GIRO no entra: la cara y la normal
+ * giran con el objeto, sus anchuras relativas no cambian.
+ */
+function ladosDeEscena(
+  c: CajaV,
+  sx: number, sy: number, sz: number
+): [number, number, number] {
+  return [
+    (c.maxX - c.minX) * Math.abs(sx || 1),
+    (c.maxY - c.minY) * Math.abs(sy || 1),
+    (c.maxZ - c.minZ) * Math.abs(sz || 1),
+  ];
+}
+
+/** CARA MÁS PROBABLE mirando el objeto tal y como se ve (con su escala). */
+function ejeCaraPlanaDeEscena(
+  c: CajaV, sx: number, sy: number, sz: number
+): EjeProy {
+  const [ex, ey, ez] = ladosDeEscena(c, sx, sy, sz);
+  // Misma regla y desempates que ejeCaraPlana, pero con la escala.
+  if (ez <= ex && ez <= ey) return 'z';
+  if (ex <= ey) return 'x';
+  return 'y';
+}
+
+/** EJE CILÍNDRICO mirando el objeto tal y como se ve (con su escala). */
+function ejeCilindroDeEscena(
+  c: CajaV, sx: number, sy: number, sz: number
+): EjeProy {
+  const [ex, ey, ez] = ladosDeEscena(c, sx, sy, sz);
+  const dY = Math.abs(ex - ez); // perpendiculares del eje Y: X y Z
+  const dX = Math.abs(ey - ez); // perpendiculares del eje X: Y y Z
+  const dZ = Math.abs(ex - ey); // perpendiculares del eje Z: X y Y
+  // Misma regla y desempates que ejeCilindro, pero con la escala.
+  if (dY <= dX && dY <= dZ) return 'y';
+  if (dX <= dZ) return 'x';
+  return 'z';
+}
+
 /**
  * Pieza amarilla de la ayuda de proyección: el marco que enseña dónde
  * está sentada la textura y que se mueve/gira/estira con su propio
@@ -1399,16 +1570,23 @@ function closestPointOnAxis(
  * mismas con las que se calculan las UV), así que en reposo la pieza
  * abraza la figura y la textura queda igual que sin ayuda.
  *
- * - Plana: rectángulo delante de la figura con una rayita arriba (la
- *   proyección va a lo largo de Z, así que alejarlo del objeto no
- *   cambia el mapeo, solo dónde se ve el marco).
- * - Envolvente cilíndrica: tubo de segmentos alrededor del eje Y.
+ * - Plana: rectángulo delante de la CARA MÁS PROBABLE (la perpendicular
+ *   al eje más delgado de la caja — la cara grande, no el canto) con una
+ *   rayita marcando el «arriba» de la textura. Alejarlo de la cara no
+ *   cambia el mapeo, solo dónde se ve el marco.
+ * - Envolvente cilíndrica: tubo de segmentos alrededor del eje de la
+ *   figura (el que tiene la sección más redonda).
  * - Esférica: esfera envolviendo la figura.
  */
 function buildTextureHelperVisual(
   projection: LatheTextureProjection,
-  vertices: Vertex3D[]
+  vertices: Vertex3D[],
+  /** Escala ACTUAL del objeto: la cara se elige en la escena (estirada). */
+  escala?: { sx?: number; sy?: number; sz?: number }
 ): THREE.Group {
+  const sx = escala?.sx ?? 1;
+  const sy = escala?.sy ?? 1;
+  const sz = escala?.sz ?? 1;
   const group = new THREE.Group();
   if (vertices.length === 0) return group;
   const mat = new THREE.LineBasicMaterial({
@@ -1428,6 +1606,8 @@ function buildTextureHelperVisual(
   let minZ = Infinity, maxZ = -Infinity;
   let maxR = 0; // distancia horizontal máxima al eje Y
   let maxR3 = 0; // distancia 3D máxima al origen
+  let maxRYZ = 0; // radio máximo en el plano YZ (tubo a lo largo de X)
+  let maxRXY = 0; // radio máximo en el plano XY (tubo a lo largo de Z)
   for (const v of vertices) {
     if (v.x < minX) minX = v.x;
     if (v.x > maxX) maxX = v.x;
@@ -1437,45 +1617,129 @@ function buildTextureHelperVisual(
     if (v.z > maxZ) maxZ = v.z;
     maxR = Math.max(maxR, Math.hypot(v.x, v.z));
     maxR3 = Math.max(maxR3, Math.hypot(v.x, v.y, v.z));
+    maxRYZ = Math.max(maxRYZ, Math.hypot(v.y, v.z));
+    maxRXY = Math.max(maxRXY, Math.hypot(v.x, v.y));
   }
 
   if (projection === 'planar') {
-    const z = maxZ + Math.max(0.15, (maxZ - minZ) * 0.4);
-    const corners: Array<[number, number]> = [
-      [minX, minY], [maxX, minY], [maxX, maxY], [minX, maxY],
-    ];
-    for (let i = 0; i < 4; i++) {
-      const [ax, ay] = corners[i];
-      const [bx, by] = corners[(i + 1) % 4];
-      seg(ax, ay, z, bx, by, z);
+    // La pieza abraza la cara MÁS PROBABLE (la perpendicular al eje de
+    // menor extensión de la caja: la cara grande), no el canto. La
+    // rayita marca el «arriba» de la textura (v=1), igual que las UV.
+    const eje = ejeCaraPlanaDeEscena({ minX, maxX, minY, maxY, minZ, maxZ }, sx, sy, sz);
+    const tickZ = Math.max(0.06, (maxZ - minZ) * 0.12);
+    const tickY = Math.max(0.06, (maxY - minY) * 0.12);
+    if (eje === 'z') {
+      const z = maxZ + Math.max(0.15, (maxZ - minZ) * 0.4);
+      const corners: Array<[number, number]> = [
+        [minX, minY], [maxX, minY], [maxX, maxY], [minX, maxY],
+      ];
+      for (let i = 0; i < 4; i++) {
+        const [ax, ay] = corners[i];
+        const [bx, by] = corners[(i + 1) % 4];
+        seg(ax, ay, z, bx, by, z);
+      }
+      // Rayita sobre el borde de arriba: marca qué lado es el de arriba
+      const cx = (minX + maxX) / 2;
+      seg(cx, maxY, z, cx, maxY + tickY, z);
+    } else if (eje === 'y') {
+      // Cara horizontal (placa tumbada): rectángulo encima.
+      const y = maxY + Math.max(0.15, (maxY - minY) * 0.4);
+      const corners: Array<[number, number]> = [
+        [minX, minZ], [maxX, minZ], [maxX, maxZ], [minX, maxZ],
+      ];
+      for (let i = 0; i < 4; i++) {
+        const [ax, az] = corners[i];
+        const [bx, bz] = corners[(i + 1) % 4];
+        seg(ax, y, az, bx, y, bz);
+      }
+      // v=1 en z=minZ (arriba de la textura = -Z): rayita ahí, saliendo.
+      const cx = (minX + maxX) / 2;
+      seg(cx, y, minZ, cx, y + tickY, minZ);
+    } else {
+      // Cara de costado: rectángulo al lado de la figura (plano YZ).
+      const x = maxX + Math.max(0.15, (maxX - minX) * 0.4);
+      const corners: Array<[number, number]> = [
+        [minY, minZ], [maxY, minZ], [maxY, maxZ], [minY, maxZ],
+      ];
+      for (let i = 0; i < 4; i++) {
+        const [ay, az] = corners[i];
+        const [by, bz] = corners[(i + 1) % 4];
+        seg(x, ay, az, x, by, bz);
+      }
+      // v=1 arriba (y=maxY): rayita ahí, saliendo en +X.
+      const cz = (minZ + maxZ) / 2;
+      seg(x, maxY, cz, x + tickZ, maxY, cz);
     }
-    // Rayita sobre el borde de arriba: marca qué lado es el de arriba
-    const cx = (minX + maxX) / 2;
-    const tick = Math.max(0.06, (maxY - minY) * 0.12);
-    seg(cx, maxY, z, cx, maxY + tick, z);
   } else if (projection === 'cylindrical') {
-    // Tubo por segmentos: aros a varias alturas + verticales en ángulo
-    const r = Math.max(0.25, maxR * 1.1);
+    // Tubo por segmentos: aros + verticales alrededor del eje de la
+    // FIGURA — el eje cuya sección (los dos ejes perpendiculares) se
+    // parece más. Para las figuras de torno eso es el eje Y de siempre.
+    const eje = ejeCilindroDeEscena({ minX, maxX, minY, maxY, minZ, maxZ }, sx, sy, sz);
     const RINGS = 5;
     const RSEG = 48;
     const VSEG = 12;
-    for (let i = 0; i < RINGS; i++) {
-      const y = minY + ((maxY - minY) * i) / (RINGS - 1);
-      for (let k = 0; k < RSEG; k++) {
-        const a0 = (k / RSEG) * Math.PI * 2;
-        const a1 = ((k + 1) / RSEG) * Math.PI * 2;
+    if (eje === 'y') {
+      const r = Math.max(0.25, maxR * 1.1);
+      for (let i = 0; i < RINGS; i++) {
+        const y = minY + ((maxY - minY) * i) / (RINGS - 1);
+        for (let k = 0; k < RSEG; k++) {
+          const a0 = (k / RSEG) * Math.PI * 2;
+          const a1 = ((k + 1) / RSEG) * Math.PI * 2;
+          seg(
+            r * Math.cos(a0), y, r * Math.sin(a0),
+            r * Math.cos(a1), y, r * Math.sin(a1)
+          );
+        }
+      }
+      for (let k = 0; k < VSEG; k++) {
+        const a = (k / VSEG) * Math.PI * 2;
         seg(
-          r * Math.cos(a0), y, r * Math.sin(a0),
-          r * Math.cos(a1), y, r * Math.sin(a1)
+          r * Math.cos(a), minY, r * Math.sin(a),
+          r * Math.cos(a), maxY, r * Math.sin(a)
         );
       }
-    }
-    for (let k = 0; k < VSEG; k++) {
-      const a = (k / VSEG) * Math.PI * 2;
-      seg(
-        r * Math.cos(a), minY, r * Math.sin(a),
-        r * Math.cos(a), maxY, r * Math.sin(a)
-      );
+    } else if (eje === 'x') {
+      // Tubo tumbado a lo largo de X: aros en el plano YZ.
+      const r = Math.max(0.25, maxRYZ * 1.1);
+      for (let i = 0; i < RINGS; i++) {
+        const x = minX + ((maxX - minX) * i) / (RINGS - 1);
+        for (let k = 0; k < RSEG; k++) {
+          const a0 = (k / RSEG) * Math.PI * 2;
+          const a1 = ((k + 1) / RSEG) * Math.PI * 2;
+          seg(
+            x, r * Math.cos(a0), r * Math.sin(a0),
+            x, r * Math.cos(a1), r * Math.sin(a1)
+          );
+        }
+      }
+      for (let k = 0; k < VSEG; k++) {
+        const a = (k / VSEG) * Math.PI * 2;
+        seg(
+          minX, r * Math.cos(a), r * Math.sin(a),
+          maxX, r * Math.cos(a), r * Math.sin(a)
+        );
+      }
+    } else {
+      // Tubo a lo largo de Z: aros en el plano XY.
+      const r = Math.max(0.25, maxRXY * 1.1);
+      for (let i = 0; i < RINGS; i++) {
+        const z = minZ + ((maxZ - minZ) * i) / (RINGS - 1);
+        for (let k = 0; k < RSEG; k++) {
+          const a0 = (k / RSEG) * Math.PI * 2;
+          const a1 = ((k + 1) / RSEG) * Math.PI * 2;
+          seg(
+            r * Math.cos(a0), r * Math.sin(a0), z,
+            r * Math.cos(a1), r * Math.sin(a1), z
+          );
+        }
+      }
+      for (let k = 0; k < VSEG; k++) {
+        const a = (k / VSEG) * Math.PI * 2;
+        seg(
+          r * Math.cos(a), r * Math.sin(a), minZ,
+          r * Math.cos(a), r * Math.sin(a), maxZ
+        );
+      }
     }
   } else {
     // Esfera: paralelos de latitud + meridianos completos por los polos
@@ -1794,8 +2058,9 @@ function buildVertexSelectionOverlay(
   vertexIds: Set<number>
 ): THREE.Group | null {
   if (vertexIds.size === 0) return null;
-  // Radio en función del tamaño de la malla: la mitad del tamaño anterior
-  // (el usuario lo pidió: las esferas de vértice salían muy grandes).
+  // Radio en función del tamaño de la malla: 1/4 del tamaño anterior
+  // (el usuario lo pidió: las esferas amarillas de vértice seleccionado
+  // se ven muy grandes).
   let maxDim = 1;
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
   for (const v of mesh.vertices) {
@@ -1806,7 +2071,7 @@ function buildVertexSelectionOverlay(
   if (mesh.vertices.length > 0) {
     maxDim = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
   }
-  const radio = Math.max(0.02, Math.min(0.15, maxDim * 0.01));
+  const radio = Math.max(0.005, Math.min(0.0375, maxDim * 0.0025));
   const geometry = new THREE.SphereGeometry(radio, 10, 8);
   const material = new THREE.MeshBasicMaterial({
     // Amarillo: el MISMO color de «seleccionado» que las caras; la guía
@@ -2133,6 +2398,7 @@ export default function Viewer3D({
   showLatheAxis = false,
    textureProjection = 'cylindrical',
    textureRepeat = 1,
+   textureRepeatY,
   textureHelper = false,
   textureHelperTransform,
   onTextureHelperTransform,
@@ -2156,6 +2422,8 @@ export default function Viewer3D({
      showGround = false,
       groundTexture = null,
       groundTextureRepeat = 4,
+      groundTextureRepeatY,
+      groundTextureRelief = 0,
       groundTextureFinish = 'semi-matte',
      objectTextureFinish = 'semi-matte',
      skyboxImage = null,
@@ -2422,6 +2690,14 @@ export default function Viewer3D({
 
     const [showVertices, setShowVertices] = useState(showVerticesDefault);
     const [smoothCapture, setSmoothCapture] = useState(true);
+    // Espejo del estado en ref: los handlers de puntero del efecto grande
+    // del montado (3110-7771) leen el valor ACTUAL por esta vía para que
+    // la lista de dependencias NO incluya showVertices. Cada vez que lo
+    // incluía, activar/desactivar «Vértices» (y con ello el modo selección
+    // de caras, que lo enciende solo) desmontaba TODO el visor y la escena
+    // quedaba vacía: los duplicados de objeto no se repueblan solos.
+    const showVerticesRef = useRef(showVertices);
+    showVerticesRef.current = showVertices;
 
     const [showFxConfigModal, setShowFxConfigModal] = useState(false);
 
@@ -2647,7 +2923,9 @@ export default function Viewer3D({
   const lightPresetRef = useRef(lightPreset);
   lightPresetRef.current = lightPreset;
   const [selectedVertex, setSelectedVertex] = useState<number | null>(null);
-  const [vertexSize, setVertexSize] = useState(0.008);
+  // La mitad del tamaño original (0.008): el usuario pidió los vértices
+  // principales más chicos; el deslizador "Tamaño de vértices" lo ajusta.
+  const [vertexSize, setVertexSize] = useState(0.004);
   const vertexSizeRef = useRef(vertexSize);
   vertexSizeRef.current = vertexSize;
   const meshRef = useRef(mesh);
@@ -4113,7 +4391,8 @@ export default function Viewer3D({
               obj?.smooth ?? false,
               obj?.textureProjection ?? 'planar',
               undefined,
-              resultado.textureRepeat ?? 1
+              resultado.textureRepeat ?? 1,
+              resultado.textureRepeatY
             );
             if (visual.children.length === 0) continue;
             if (oid === selId) {
@@ -6795,7 +7074,7 @@ export default function Viewer3D({
           }
         }
       }
-      if (!showVertices) return;
+      if (!showVerticesRef.current) return;
       const rect = renderer.domElement.getBoundingClientRect();
       pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
@@ -6820,7 +7099,7 @@ export default function Viewer3D({
           )?.frozen;
           if (congelado) return;
           onObjectSelectRef.current?.(pid);
-          if (!showVertices) return;
+          if (!showVerticesRef.current) return;
         }
         const obj = hit.object as THREE.Mesh;
         const idx = (obj.userData as any).index;
@@ -7768,7 +8047,12 @@ export default function Viewer3D({
          selectionRectRef.current.parentElement.removeChild(selectionRectRef.current);
        }
      };
-  }, [showVertices]);
+  // showVertices se lee por showVerticesRef (ver su declaración): no debe
+  // entrar aquí — si entrara, cada toggle de «Vértices» (y al entrar en el
+  // modo selección de caras) desmontaría y recrearía TODO el visor y la
+  // escena perdía los objetos sin mecanismo de repoblado.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (latheAxisRef.current) latheAxisRef.current.visible = showLatheAxis;
@@ -7848,14 +8132,21 @@ export default function Viewer3D({
 
       let minX = Infinity, maxX = -Infinity;
       let minY = Infinity, maxY = -Infinity;
+      let minZ = Infinity, maxZ = -Infinity;
       for (const v of mesh.vertices) {
         if (v.x < minX) minX = v.x;
         if (v.x > maxX) maxX = v.x;
         if (v.y < minY) minY = v.y;
         if (v.y > maxY) maxY = v.y;
+        if (v.z < minZ) minZ = v.z;
+        if (v.z > maxZ) maxZ = v.z;
       }
-      const rangeX = maxX - minX || 1;
-      const rangeY = maxY - minY || 1;
+      // Caja + ejes de la proyección: los MISMOS que usa la pieza
+      // amarilla (misma caja y MISMA ESCALA del objeto al elegir la
+      // cara), así el marco y la textura siempre calzan sobre la misma
+      // cara — el cubo estirado en pared elige la cara grande de pared.
+      const cajaProy = { minX, maxX, minY, maxY, minZ, maxZ };
+      const escalaObjeto = { sx: transform.sx, sy: transform.sy, sz: transform.sz };
       // Pieza de textura: su colocación se aplica SIEMPRE (la casilla
       // solo esconde la pieza, no la desactiva), así que lo que se mueve
       // se mantiene al quitar la ayuda. En reposo es la identidad y las
@@ -7881,20 +8172,19 @@ export default function Viewer3D({
       };
       const projectionUv = (v: Vertex3D): [number, number] => {
         const p = mapToHelper(v);
-        const angle = Math.atan2(p.z, p.x);
-        const u = (angle / (Math.PI * 2) + 1) % 1;
         // MISMA convención que lib/geometry.ts: V crece hacia ARRIBA
         // (v=1 arriba del objeto). flipY=true hace que V=1 muestre la
         // PARTE ALTA de la imagen — así la textura sale derecha. El
         // viejo «1 - …» la ponía boca abajo.
         if (textureProjection === 'planar') {
-          return [(p.x - minX) / rangeX, (p.y - minY) / rangeY];
+          return uvCaraPlana(p, cajaProy, ejeCaraPlanaDeEscena(cajaProy, escalaObjeto.sx, escalaObjeto.sy, escalaObjeto.sz));
         }
         if (textureProjection === 'spherical') {
           const length = Math.max(1e-6, Math.hypot(p.x, p.y, p.z));
+          const u = ((Math.atan2(p.z, p.x) / (Math.PI * 2)) + 1) % 1;
           return [u, 1 - Math.acos(p.y / length) / Math.PI];
         }
-        return [u, (p.y - minY) / rangeY];
+        return uvCilindrica(p, cajaProy, ejeCilindroDeEscena(cajaProy, escalaObjeto.sx, escalaObjeto.sy, escalaObjeto.sz));
       };
 
       // Textura SOBRE LA SELECCIÓN: UNA imagen global estirada sobre las
@@ -8137,7 +8427,10 @@ export default function Viewer3D({
             texture.colorSpace = THREE.SRGBColorSpace;
             texture.anisotropy = 4;
             texture.needsUpdate = true;
-            texture.repeat.set(textureRepeat, textureRepeat);
+            texture.repeat.set(
+              mesh.textureRepeat ?? textureRepeat,
+              mesh.textureRepeatY ?? textureRepeatY ?? textureRepeat
+            );
             texture.wrapS = THREE.RepeatWrapping;
             texture.wrapT = THREE.RepeatWrapping;
             material.map = texture;
@@ -8146,7 +8439,11 @@ export default function Viewer3D({
             material.bumpScale = (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP;
             material.color.set(0xffffff);
             material.needsUpdate = true;
-            aplicarTexturaRelieve(material, mesh, textureRepeat);
+            aplicarTexturaRelieve(
+              material, mesh,
+              mesh.textureRepeat ?? textureRepeat,
+              mesh.textureRepeatY ?? textureRepeatY ?? textureRepeat
+            );
           },
           undefined,
           (err) => {
@@ -8163,7 +8460,11 @@ export default function Viewer3D({
           ? meshMaterials
           : [meshMaterials];
         for (const m of materialesRelieve) {
-          aplicarTexturaRelieve(m as THREE.MeshPhysicalMaterial, mesh, textureRepeat);
+          aplicarTexturaRelieve(
+            m as THREE.MeshPhysicalMaterial, mesh,
+            mesh.textureRepeat ?? textureRepeat,
+            mesh.textureRepeatY ?? textureRepeatY ?? textureRepeat
+          );
         }
       }
 
@@ -8206,14 +8507,19 @@ export default function Viewer3D({
       mesh.vertices.forEach((v) => positions.push(v.x, v.y, v.z));
       let minX = Infinity, maxX = -Infinity;
       let minY = Infinity, maxY = -Infinity;
+      let minZ = Infinity, maxZ = -Infinity;
       for (const v of mesh.vertices) {
         if (v.x < minX) minX = v.x;
         if (v.x > maxX) maxX = v.x;
         if (v.y < minY) minY = v.y;
         if (v.y > maxY) maxY = v.y;
+        if (v.z < minZ) minZ = v.z;
+        if (v.z > maxZ) maxZ = v.z;
       }
-      const rangeX = maxX - minX || 1;
-      const rangeY = maxY - minY || 1;
+      // Caja + ejes de la proyección: los MISMOS que usa la pieza
+      // amarilla, así el marco y la textura siempre calzan.
+      const cajaProy = { minX, maxX, minY, maxY, minZ, maxZ };
+      const escalaObjeto = { sx: transform.sx, sy: transform.sy, sz: transform.sz };
       // Pieza de textura: mismo criterio que en la malla con textura —
       // la colocación se aplica SIEMPRE (la casilla solo esconde la
       // pieza); en reposo es la identidad y no cambia nada.
@@ -8239,17 +8545,16 @@ export default function Viewer3D({
           return;
         }
         const p = mapToHelper(vertex);
-        const angle = Math.atan2(p.z, p.x);
-        const u = (angle / (Math.PI * 2) + 1) % 1;
         if (textureProjection === 'planar') {
-          uvs.push((p.x - minX) / rangeX, (p.y - minY) / rangeY);
+          uvs.push(...uvCaraPlana(p, cajaProy, ejeCaraPlanaDeEscena(cajaProy, escalaObjeto.sx, escalaObjeto.sy, escalaObjeto.sz)));
           return;
         }
         if (textureProjection === 'spherical') {
           const length = Math.max(1e-6, Math.hypot(p.x, p.y, p.z));
+          const u = ((Math.atan2(p.z, p.x) / (Math.PI * 2)) + 1) % 1;
           uvs.push(u, 1 - Math.acos(p.y / length) / Math.PI);
         } else {
-          uvs.push(u, (p.y - minY) / rangeY);
+          uvs.push(...uvCilindrica(p, cajaProy, ejeCilindroDeEscena(cajaProy, escalaObjeto.sx, escalaObjeto.sy, escalaObjeto.sz)));
         }
       });
       for (const face of mesh.faces) {
@@ -8416,6 +8721,17 @@ export default function Viewer3D({
             }
             texture.colorSpace = THREE.SRGBColorSpace;
             texture.anisotropy = 4;
+            // Envolver la imagen en vez de recortar al borde: sin esto, en
+            // cuanto la repetición pasa de 1 las UV (>1) quedan fuera de la
+            // imagen y three.js clampa al borde — la "copia" que entra sale
+            // como rayas del color del borde, no como la textura repetida.
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            // Repetición por eje: horizontal (X) y vertical (Y) — la Y
+            // copia la X salvo que se haya fijado una propia.
+            const repiteX = mesh.textureRepeat ?? textureRepeat ?? 1;
+            const repiteY = mesh.textureRepeatY ?? textureRepeatY ?? repiteX;
+            texture.repeat.set(repiteX, repiteY);
             texture.needsUpdate = true;
             const materials = Array.isArray(meshMaterials)
               ? meshMaterials
@@ -8435,8 +8751,7 @@ export default function Viewer3D({
               currentMaterial.needsUpdate = true;
             }
             if (mesh.bumpTexture) {
-              const repite = mesh.textureRepeat ?? 1;
-              for (const m of materials) aplicarTexturaRelieve(m, mesh, repite);
+              for (const m of materials) aplicarTexturaRelieve(m, mesh, repiteX, repiteY);
             }
           },
           undefined,
@@ -8461,7 +8776,11 @@ export default function Viewer3D({
             ? meshMaterials
             : [meshMaterials];
           for (const m of materialesRelieve) {
-            aplicarTexturaRelieve(m, mesh, mesh.textureRepeat ?? 1);
+            aplicarTexturaRelieve(
+              m, mesh,
+              mesh.textureRepeat ?? textureRepeat ?? 1,
+              mesh.textureRepeatY ?? textureRepeatY
+            );
           }
         }
       }
@@ -8593,7 +8912,19 @@ export default function Viewer3D({
       const wireOverlay = new THREE.LineSegments(edges, lineMat);
       meshGroup.add(wireOverlay);
     }
-  }, [mesh, wireframe, smoothShading, textureProjection, textureHelperTransform]);
+  }, [
+    mesh,
+    wireframe,
+    smoothShading,
+    textureProjection,
+    textureHelperTransform,
+    // La cara elegida para la UV depende de la ESCALA del objeto (mismo
+    // criterio que la pieza amarilla): al estirarlo, la textura se
+    // reproyecta sobre la cara que ahora es la grande.
+    transform.sx,
+    transform.sy,
+    transform.sz,
+  ]);
 
   // Pieza de textura: el transform que fija su manipulador va al marco
   // (posición, giro y tamaño) y a sus asas (solo posición y giro).
@@ -8622,10 +8953,22 @@ export default function Viewer3D({
     visual.visible = on;
     giz.visible = on;
     if (on) {
-      visual.add(buildTextureHelperVisual(textureProjection, mesh.vertices));
+      visual.add(
+        buildTextureHelperVisual(textureProjection, mesh.vertices, transform)
+      );
     }
     applyTextureHelperTransform(textureHelperTransformRef.current);
-  }, [textureHelper, textureProjection, mesh, applyTextureHelperTransform]);
+  }, [
+    textureHelper,
+    textureProjection,
+    mesh,
+    applyTextureHelperTransform,
+    // La cara elegida depende de la ESCALA del objeto: al estirarlo se
+    // recoloca la pieza (la posición y el giro no la cambian).
+    transform.sx,
+    transform.sy,
+    transform.sz,
+  ]);
 
   // Escala las asas del gizmo de ayuda de textura al tamaño de la malla,
   // igual que el gizmo principal.
@@ -8653,7 +8996,22 @@ export default function Viewer3D({
     // padre para que su tamaño en pantalla coincida con el del gizmo
     // principal (que cuelga de la escena, sin escala heredada).
     const worldScale = Math.min(Math.max(r * 0.9 * objectScale, 0.35), 8);
-    giz.scale.setScalar(worldScale / objectScale);
+    // La escala del padre se descuenta EJE A EJE, no con un escalar único:
+    // un escalar solo vale si la escala del objeto es uniforme. Con una
+    // figura plana o estirada (una pared, una placa, un tubo) el eje corto
+    // aplastaba el manipulador contra esa dirección y los tres aros
+    // cruzados quedaban como una calcomanía de dos dimensiones pegada al
+    // objeto. Dividiendo por la escala de cada eje el manipulador vuelve a
+    // ser uniforme en el mundo — igual que el principal, que al colgar de
+    // la escena nunca se deformaba.
+    // Se divide por la escala CON signo: así el producto padre×hijo sale
+    // positivo (+worldScale) en los tres ejes y una figura espejada no
+    // invierte el manipulador ni lo hace desaparecer por el culling.
+    giz.scale.set(
+      worldScale / (transform.sx || 1),
+      worldScale / (transform.sy || 1),
+      worldScale / (transform.sz || 1)
+    );
   }, [textureHelper, mesh.vertices, transform]);
 
   // Clona el material del cortador para el preview boolean (no mutar el original)
@@ -8848,7 +9206,8 @@ export default function Viewer3D({
               object.smooth ?? false,
               object.textureProjection ?? 'planar',
               undefined,
-              object.mesh.textureRepeat ?? 1
+              object.mesh.textureRepeat ?? 1,
+              object.mesh.textureRepeatY
             )
           );
         } else if (
@@ -9469,7 +9828,9 @@ uniform vec3 sombraFocoPos[8];`
     // una esfera por vértice sería una geometría (y un coste) por punto
     const r = vertexSizeRef.current;
     const geo = new THREE.SphereGeometry(r, 8, 8);
-    const matNormal = new THREE.MeshBasicMaterial({ color: 0x66aaff });
+    // AZUL OSCURO (no celeste): el usuario lo pidió — usa el mismo azul de
+    // las guías de selección para que se distinga sobre las texturas claras.
+    const matNormal = new THREE.MeshBasicMaterial({ color: 0x1d4ed8 });
     const matSelected = new THREE.MeshBasicMaterial({ color: 0xffcc33 });
     mesh.vertices.forEach((v, i) => {
       const sphere = new THREE.Mesh(
@@ -9587,22 +9948,30 @@ uniform vec3 sombraFocoPos[8];`
       loader.load(groundTexture, (texture) => {
         texture.wrapS = THREE.RepeatWrapping;
         texture.wrapT = THREE.RepeatWrapping;
-        texture.repeat.set(groundTextureRepeat, groundTextureRepeat);
+        // Repetición por eje: horizontal (X) y vertical (Y) — la Y copia la
+        // X salvo que se haya fijado una propia. La MISMA textura genera el
+        // relieve del suelo (bumpScale = groundTextureRelief * factor).
+        const repeatY = groundTextureRepeatY ?? groundTextureRepeat;
+        texture.repeat.set(groundTextureRepeat, repeatY);
         texture.colorSpace = THREE.SRGBColorSpace;
         texture.anisotropy = 4;
         material.map = texture;
+        material.bumpMap = texture;
+        material.bumpScale = groundTextureRelief * FACTOR_RELIEVE_BUMP;
         material.color.set(0xffffff);
         applyGroundTextureFinish(material, groundTextureFinish);
         material.needsUpdate = true;
       });
     } else {
       material.map = null;
+      material.bumpMap = null;
+      material.bumpScale = 0;
       material.color.set(0x1a1a2e);
       material.roughness = 0.9;
       material.metalness = 0.0;
       material.needsUpdate = true;
     }
-    }, [groundTexture, groundTextureRepeat, groundTextureFinish]);
+    }, [groundTexture, groundTextureRepeat, groundTextureRepeatY, groundTextureFinish, groundTextureRelief]);
 
   const applyGroundTextureFinish = (material: THREE.MeshPhysicalMaterial, finish: string) => {
     material.envMap = cubeRenderTargetRef.current?.texture ?? null;
@@ -10051,6 +10420,44 @@ uniform vec3 sombraFocoPos[8];`
     }
   }, [camera3D]);
 
+  /**
+   * Centrar de nuevo la escena: el pivote de órbita vuelve al origen (el
+   * centro de la rejilla) y la cámara se coloca a la distancia por defecto
+   * por la misma dirección en la que miraba. Lo contrario de lo que pasa
+   * al encuadrar objetos muy grandes: si el pivote queda lejos, cualquier
+   * giro se convierte en una órbita enorme y la rejilla se pierde de vista.
+   */
+  const centrarEscena = useCallback(() => {
+    const cam = cameraRef.current;
+    const ctrl = controlsRef.current;
+    if (!cam || !ctrl) return;
+    const baseDistance = 5.5;
+    // Dirección actual de mirada (del pivote viejo hacia la cámara),
+    // conservada: solo se cambia dónde está el pivote y a qué distancia.
+    const dir = cam.position.clone().sub(ctrl.target).normalize();
+    if (!Number.isFinite(dir.x + dir.y + dir.z) || dir.lengthSq() < 1e-9) {
+      dir.set(0.6, 0.45, 0.73).normalize();
+    }
+    ctrl.target.set(0, 0, 0);
+    cam.position.set(dir.x * baseDistance, dir.y * baseDistance, dir.z * baseDistance);
+    ctrl.update();
+
+    const onCamChange = onCameraChangeRef.current;
+    if (onCamChange) {
+      const pos = cam.position;
+      const dist = pos.distanceTo(ctrl.target);
+      const rotX = Math.asin(Math.max(-1, Math.min(1, dir.y)));
+      const rotY = Math.atan2(dir.x, dir.z);
+      onCamChange({
+        zoom: Math.max(0.1, Math.min(5, dist > 0 ? baseDistance / dist : 1)),
+        offsetX: 0,
+        offsetY: 0,
+        rotationX: Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, rotX)),
+        rotationY: rotY,
+      });
+    }
+  }, []);
+
   // ── Encuadrar (Frente/Superior/Costado/3D) ───────────────────────────────
   // El padre incrementa `frameToken` con el botón del menú de la ventana.
   // Calcula la caja envolvente de lo que se ve (la figura y los objetos de la
@@ -10212,7 +10619,10 @@ uniform vec3 sombraFocoPos[8];`
           </ToggleButton>
            <ToggleButton onClick={resetCamera} title="Reset cámara">
              <Maximize2 className="w-3.5 h-3.5" />
-           </ToggleButton>
+          </ToggleButton>
+          <ToggleButton onClick={centrarEscena} title="Centrar escena: vuelve a poner el eje central de la rejilla como pivote de la órbita (útil si los giros de cámara se han vuelto enormes tras trabajar con objetos muy grandes)">
+            <Crosshair className="w-3.5 h-3.5" />
+          </ToggleButton>
             {objects && objects.length > 0 && (
               <ToggleButton
                 active={selectionMode}
@@ -10222,7 +10632,7 @@ uniform vec3 sombraFocoPos[8];`
                 <MousePointerClick className="w-3.5 h-3.5" />
               </ToggleButton>
             )}
-            {mesh && (
+            {mesh && mesh.vertices.length > 0 && (
               <>
                 <ToggleButton
                   active={faceSelectMode}
@@ -11409,21 +11819,30 @@ function aplicarTexturaRelieve(
   mesh: {
     bumpTexture?: string;
     bumpTextureRepeat?: number;
+    bumpTextureRepeatY?: number;
     textureRelief?: number;
     textureRepeat?: number;
+    textureRepeatY?: number;
   },
-  repeat: number
+  repeat: number,
+  repeatY?: number
 ): void {
   if (!mesh.bumpTexture) return;
   // Su propia repetición si la tiene; si no, la de la textura normal.
-  const repite = mesh.bumpTextureRepeat ?? repeat;
+  // El eje Y del relieve copia el de la TEXTURA salvo que el relieve tenga
+  // repetición horizontal propia (entonces su Y copia su X) o un Y propio.
+  const repiteX = mesh.bumpTextureRepeat ?? repeat;
+  const repiteY =
+    mesh.bumpTextureRepeatY ??
+    (mesh.bumpTextureRepeat != null ? repiteX : repeatY ?? repeat);
   new THREE.TextureLoader().load(
     mesh.bumpTexture,
     (t) => {
       t.anisotropy = 4;
       t.wrapS = THREE.RepeatWrapping;
       t.wrapT = THREE.RepeatWrapping;
-      t.repeat.set(repite, repite);
+      // Repetición INDEPENDIENTE por eje: horizontal (X) y vertical (Y).
+      t.repeat.set(repiteX, repiteY);
       material.bumpMap = t;
       material.bumpScale = (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP;
       material.needsUpdate = true;

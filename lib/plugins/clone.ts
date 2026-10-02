@@ -19,7 +19,11 @@ export function cloneMesh(mesh: Mesh): Mesh {
   if (mesh.textureOriginal !== undefined) clone.textureOriginal = mesh.textureOriginal;
   if (mesh.textureColor !== undefined) clone.textureColor = mesh.textureColor;
   if (mesh.textureRelief !== undefined) clone.textureRelief = mesh.textureRelief;
+  if (mesh.bumpTexture !== undefined) clone.bumpTexture = mesh.bumpTexture;
+  if (mesh.bumpTextureRepeat !== undefined) clone.bumpTextureRepeat = mesh.bumpTextureRepeat;
+  if (mesh.bumpTextureRepeatY !== undefined) clone.bumpTextureRepeatY = mesh.bumpTextureRepeatY;
   if (mesh.textureRepeat !== undefined) clone.textureRepeat = mesh.textureRepeat;
+  if (mesh.textureRepeatY !== undefined) clone.textureRepeatY = mesh.textureRepeatY;
   if (mesh.textureFinish !== undefined) clone.textureFinish = mesh.textureFinish;
   if (mesh.textureHelper !== undefined) clone.textureHelper = mesh.textureHelper;
   if (mesh.textureHelperTransform !== undefined) {

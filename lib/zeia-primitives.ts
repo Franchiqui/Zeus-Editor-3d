@@ -118,7 +118,11 @@ function sphere(radius: number, rings: number = 16, segments: number = 24): Mesh
     for (let j = 0; j < segments; j++) {
       const a = i * rowLen + j;
       const b = a + rowLen;
-      faces.push([a, b, b + 1, a + 1]);
+      // Winding hacia FUERA (normal exterior): la regla de la mano derecha
+      // con el orden [a, a+1, b+1, b] apunta la normal hacia el exterior de
+      // la esfera. El orden previo [a, b, b+1, a+1] las dejaba hacia dentro
+      // y el CSG (sustraer/unir) se comportaba invertido con esferas.
+      faces.push([a, a + 1, b + 1, b]);
     }
   }
   return { vertices, faces };
@@ -166,11 +170,12 @@ function cone(radius: number, height: number, segments: number = 24): Mesh {
     vertices.push(v(Math.cos(theta) * radius, -hh, Math.sin(theta) * radius));
   }
   for (let j = 0; j < segments; j++) {
-    faces.push([apex, j + 1, j + 2]);
+    // Winding hacia fuera (ver comentario en sphere)
+    faces.push([apex, j + 2, j + 1]);
   }
   const baseCenter = vertices.push(v(0, -hh, 0)) - 1;
   for (let j = 0; j < segments; j++) {
-    faces.push([baseCenter, j + 2, j + 1]);
+    faces.push([baseCenter, j + 1, j + 2]);
   }
   return { vertices, faces };
 }
@@ -193,7 +198,8 @@ function torus(major: number, minor: number, radialSeg: number = 24, tubularSeg:
     for (let j = 0; j < tubularSeg; j++) {
       const a = i * rowLen + j;
       const b = a + rowLen;
-      faces.push([a, b, b + 1, a + 1]);
+      // Winding hacia fuera (ver comentario en sphere)
+      faces.push([a, a + 1, b + 1, b]);
     }
   }
   return { vertices, faces };
@@ -208,12 +214,13 @@ function pyramid(baseHalf: number, height: number): Mesh {
     v(-baseHalf, -hh, baseHalf),
     v(0, hh, 0), // ápice
   ];
+  // Caras laterales y base con winding hacia fuera (ver comentario en sphere)
   const faces: number[][] = [
-    [0, 1, 4],
-    [1, 2, 4],
-    [2, 3, 4],
-    [3, 0, 4],
-    [0, 3, 2, 1],
+    [0, 4, 1],
+    [1, 4, 2],
+    [2, 4, 3],
+    [3, 4, 0],
+    [0, 1, 2, 3],
   ];
   return { vertices, faces };
 }
@@ -221,10 +228,10 @@ function pyramid(baseHalf: number, height: number): Mesh {
 function tetrahedron(): Mesh {
   const vertices: Vertex3D[] = [v(1, 1, 1), v(-1, -1, 1), v(-1, 1, -1), v(1, -1, -1)];
   const faces: number[][] = [
-    [0, 1, 2],
-    [0, 3, 1],
-    [0, 2, 3],
-    [1, 3, 2],
+    [0, 2, 1],
+    [0, 1, 3],
+    [0, 3, 2],
+    [1, 2, 3],
   ];
   return { vertices, faces };
 }

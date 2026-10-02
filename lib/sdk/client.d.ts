@@ -1,0 +1,30 @@
+import { ZeusProject, Timeline, Asset, Effect, Transition } from './types';
+export declare class ZeusMultieditorAPI {
+    private baseUrl;
+    constructor(baseUrl?: string);
+    getProjects(): Promise<ZeusProject[]>;
+    getProject(id: string): Promise<ZeusProject>;
+    createProject(project: Partial<ZeusProject>): Promise<ZeusProject>;
+    updateProject(id: string, project: Partial<ZeusProject>): Promise<ZeusProject>;
+    deleteProject(id: string): Promise<void>;
+    getTimeline(projectId: string): Promise<Timeline>;
+    insertClip(projectId: string, clip: any): Promise<any>;
+    updateClip(projectId: string, clipId: string, clip: any): Promise<any>;
+    deleteClip(projectId: string, clipId: string): Promise<void>;
+    getAssets(): Promise<Asset[]>;
+    getAsset(id: string): Promise<Asset>;
+    uploadAsset(asset: any): Promise<Asset>;
+    getEffects(): Promise<Effect[]>;
+    applyEffect(projectId: string, effect: any): Promise<any>;
+    getTransitions(): Promise<Transition[]>;
+    applyTransition(projectId: string, transition: any): Promise<any>;
+    addText(projectId: string, text: any): Promise<any>;
+    getStyles(): Promise<any[]>;
+    generateScript(scriptRequest: any): Promise<any>;
+    getSuggestions(request: any): Promise<any>;
+    autoEdit(projectId: string, options: any): Promise<any>;
+    listFiles(folderPath: string, category?: string): Promise<any[]>;
+    exportProject(projectId: string, exportOptions: any): Promise<any>;
+    getExportStatus(jobId: string): Promise<any>;
+    downloadExport(jobId: string): Promise<any>;
+}

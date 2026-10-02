@@ -85,8 +85,19 @@ export type Mesh = {
     * repetición que `textureRepeat`.
     */
    bumpTextureRepeat?: number;
+   /**
+    * Veces que se repite la textura de relieve en VERTICAL. Ausente =
+    * igual que `bumpTextureRepeat` en ambos ejes (que a su vez puede
+    * seguir la repetición de la textura normal).
+    */
+   bumpTextureRepeatY?: number;
    /** Número de veces que se repite la textura (1 = sin repetición). */
    textureRepeat?: number;
+   /**
+    * Veces que se repite la textura en VERTICAL (horizontal =
+    * `textureRepeat`). Ausente = misma repetición en ambos ejes.
+    */
+   textureRepeatY?: number;
   /** Acabado de la superficie texturizada. */
   textureFinish?: TextureFinish;
   /** Si la guía de textura está visible para este objeto. */

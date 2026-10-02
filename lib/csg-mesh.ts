@@ -192,17 +192,12 @@ export function performCSGOperation(
       return { success: false, error: 'No se pudo generar la geometría resultante' };
     }
 
-    // Matriz inversa del objeto base para mantener sus coordenadas locales y gizmo
-    const baseMatrix = new THREE.Matrix4().compose(
-      new THREE.Vector3(baseTransform.px, baseTransform.py, baseTransform.pz),
-      new THREE.Quaternion().setFromEuler(
-        new THREE.Euler(baseTransform.rx, baseTransform.ry, baseTransform.rz)
-      ),
-      new THREE.Vector3(baseTransform.sx || 1, baseTransform.sy || 1, baseTransform.sz || 1)
-    );
-    const inverseBaseMatrix = baseMatrix.clone().invert();
-
-    const resultMesh = threeGeometryToMesh(resultThreeMesh.geometry, inverseBaseMatrix);
+    // La geometría que devuelve three-csg-ts ya está en el espacio LOCAL
+    // del objeto base (aplica la inversa de meshA.matrix dentro de
+    // toMesh/toGeometry): aquí NO se vuelve a aplicar ninguna inversa.
+    // Aplicarla dos veces deformaba el resultado cuando el base estaba
+    // movido, girado o escalado (mallas «raras» al sustraer).
+    const resultMesh = threeGeometryToMesh(resultThreeMesh.geometry);
 
     // Conservar propiedades de textura/material del objeto base si existen
     if (baseMesh.texture) {

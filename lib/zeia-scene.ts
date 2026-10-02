@@ -126,7 +126,7 @@ function buildObject<T extends ZeiaSceneObject>(id: string, params: Record<strin
 /** Extrae las propiedades de textura/acabado/opacity de params al objeto. */
 function extractTextureProps(params: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  const keys = ['texture', 'textureColor', 'textureRelief', 'bumpTexture', 'bumpTextureRepeat', 'textureRepeat', 'textureFinish', 'texturePanela', 'textureHelper', 'textureHelperTransform', 'opacity'];
+  const keys = ['texture', 'textureColor', 'textureRelief', 'bumpTexture', 'bumpTextureRepeat', 'bumpTextureRepeatY', 'textureRepeat', 'textureRepeatY', 'textureFinish', 'texturePanela', 'textureHelper', 'textureHelperTransform', 'opacity'];
   for (const key of keys) {
     if (key in params && params[key] !== undefined) out[key] = params[key];
   }
@@ -460,7 +460,7 @@ function normalizeCreateParams(execute: Record<string, unknown>): Record<string,
    if (explicitMesh) params.mesh = explicitMesh;
 
    // Pasar propiedades de textura/acabado/opacity para que lleguen al objeto.
-   for (const key of ['texture', 'textureColor', 'textureRelief', 'textureRepeat', 'textureFinish', 'texturePanela', 'textureHelper', 'textureHelperTransform', 'opacity']) {
+   for (const key of ['texture', 'textureColor', 'textureRelief', 'textureRepeat', 'textureRepeatY', 'textureFinish', 'texturePanela', 'textureHelper', 'textureHelperTransform', 'opacity']) {
      if (key in execute && execute[key] !== undefined) (params as Record<string, unknown>)[key] = execute[key];
    }
 

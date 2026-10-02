@@ -18,6 +18,8 @@ declare global {
       getFilePath: (file: File) => string | null;
       getDesktopSources: (types?: string[]) => Promise<Array<{ id: string; name: string; display_id?: string; thumbnail?: string | null; appIcon?: string | null }>>;
        saveCapture: (opts: { base64: string; ext: string }) => Promise<{ success: boolean; filePath?: string; error?: string }>;
+       cropVideo: (opts: { inputPath: string; crop: { x: number; y: number; w: number; h: number } }) => Promise<{ success: boolean; outputPath?: string; error?: string }>;
+       onCropVideoProgress: (callback: (data: { inputPath: string; percent: number }) => void) => () => void;
        getTempDir: () => Promise<{ success: boolean; path?: string; error?: string }>;
       setCaptureOverlay: (opts: { dataUrl: string | null; description?: string }) => void;
       startComfyUI: () => Promise<{ success: boolean; message?: string; error?: string }>;
@@ -283,6 +285,32 @@ export async function getDesktopSources(types?: string[]): Promise<Array<{ id: s
 export async function saveCapture(opts: { base64: string; ext: string }): Promise<{ success: boolean; filePath?: string; error?: string }> {
   if (isElectron() && window.electronAPI?.saveCapture) {
     return window.electronAPI.saveCapture(opts);
+  }
+  return { success: false, error: 'Solo disponible en Electron' };
+}
+
+// Recortar un vídeo ya guardado al disco (captura de ventana) según un rectángulo
+// normalizado (0..1) con ffmpeg y devolver la ruta del MP4 resultante.
+export async function cropVideoFile(
+  opts: { inputPath: string; crop: { x: number; y: number; w: number; h: number } },
+  onProgress?: (percent: number) => void
+): Promise<{ success: boolean; outputPath?: string; error?: string }> {
+  if (isElectron() && window.electronAPI?.cropVideo) {
+    let removeListener: (() => void) | null = null;
+    if (onProgress && window.electronAPI?.onCropVideoProgress) {
+      try {
+        removeListener = window.electronAPI.onCropVideoProgress((data: { inputPath?: string; percent?: number }) => {
+          if (data && data.inputPath === opts.inputPath && typeof data.percent === 'number') {
+            onProgress(data.percent);
+          }
+        });
+      } catch {}
+    }
+    try {
+      return await window.electronAPI.cropVideo(opts);
+    } finally {
+      if (removeListener) try { removeListener(); } catch {}
+    }
   }
   return { success: false, error: 'Solo disponible en Electron' };
 }

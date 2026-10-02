@@ -90,6 +90,8 @@ interface ViewerPanelProps {
    textureHelper: any;
    textureHelperTransform: any;
     textureRepeat?: number;
+    /** Veces que se repite la textura en VERTICAL (ausente = igual que X). */
+    textureRepeatY?: number;
     textureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
     textureRelief?: number;
    setTextureHelperTransform: (transform: any) => void;
@@ -104,6 +106,10 @@ interface ViewerPanelProps {
    panelCameras: Record<string, any>;
    groundTexture?: string | null;
    groundTextureRepeat?: number;
+   /** Veces que se repite la textura del suelo en VERTICAL (ausente = igual que X). */
+   groundTextureRepeatY?: number;
+   /** Intensidad del relieve de la textura del suelo (0 = suelo liso). */
+   groundTextureRelief?: number;
    groundTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
   objectTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
    skyboxImage?: string | null;
@@ -227,6 +233,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
    textureHelper,
    textureHelperTransform,
     textureRepeat,
+    textureRepeatY,
     textureFinish,
     textureRelief,
   setTextureHelperTransform,
@@ -235,6 +242,8 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
   showGround,
     groundTexture,
     groundTextureRepeat,
+    groundTextureRepeatY,
+    groundTextureRelief,
     groundTextureFinish,
    objectTextureFinish,
    skyboxImage,
@@ -514,6 +523,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
           textureHelperTransform={textureHelperTransform}
           onTextureHelperTransform={setTextureHelperTransform}
           textureRepeat={textureRepeat}
+          textureRepeatY={textureRepeatY}
           configFinish={textureFinish}
           configRelief={textureRelief}
          lightConfig={lightConfig}
@@ -521,6 +531,8 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
          showGround={showGround}
           groundTexture={groundTexture}
            groundTextureRepeat={groundTextureRepeat}
+           groundTextureRepeatY={groundTextureRepeatY}
+           groundTextureRelief={groundTextureRelief}
            groundTextureFinish={groundTextureFinish}
           objectTextureFinish={objectTextureFinish}
          skyboxImage={skyboxImage}

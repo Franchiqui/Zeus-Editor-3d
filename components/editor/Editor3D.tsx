@@ -578,10 +578,14 @@ type EditorClipboard = {
     bumpTexture: string | null;
     /** Repeticiones de la textura de relieve (null = como la normal). */
     bumpTextureRepeat: number | null;
+    /** Repeticiones VERTICALES del relieve (null = como su horizontal). */
+    bumpTextureRepeatY: number | null;
   textureProjection: LatheTextureProjection;
    textureFinish: TextureFinish;
    textureRelief: number;
    textureRepeat: number;
+   /** Veces que se repite la textura en VERTICAL (null = igual que la horizontal). */
+   textureRepeatY: number | null;
    textureHelper: boolean;
    textureHelperTransform: ObjectTransform;
    editedVertices: Vertex3D[] | null;
@@ -805,11 +809,15 @@ type HistoryState = {
     bumpTexture: string | null;
     /** Repeticiones de la textura de relieve (null = como la normal). */
     bumpTextureRepeat: number | null;
+    /** Repeticiones VERTICALES del relieve (null = como su horizontal). */
+    bumpTextureRepeatY: number | null;
     latheTexture: string | null;
   textureProjection: LatheTextureProjection;
    textureFinish: TextureFinish;
    textureRelief: number;
    textureRepeat: number;
+   /** Veces que se repite la textura en VERTICAL (null = igual que la horizontal). */
+   textureRepeatY: number | null;
    resolution: number;
   meshStyle: 'fusionada' | 'suave' | 'voxeles';
   meshSilhouette: Polygon;
@@ -890,11 +898,13 @@ const isSameHistoryState = (a: HistoryState, b: HistoryState): boolean =>
   a.texture === b.texture &&
   a.bumpTexture === b.bumpTexture &&
   a.bumpTextureRepeat === b.bumpTextureRepeat &&
+  a.bumpTextureRepeatY === b.bumpTextureRepeatY &&
   a.latheTexture === b.latheTexture &&
   a.textureProjection === b.textureProjection &&
   a.textureFinish === b.textureFinish &&
   a.textureRelief === b.textureRelief &&
   a.textureRepeat === b.textureRepeat &&
+  a.textureRepeatY === b.textureRepeatY &&
   a.resolution === b.resolution &&
   a.meshStyle === b.meshStyle &&
   sameHistoryValue(a.meshSilhouette, b.meshSilhouette) &&
@@ -1029,10 +1039,12 @@ const DEFAULT_OBJECT_CONFIG: ObjectConfig = {
   texture: null,
   bumpTexture: null,
   bumpTextureRepeat: null,
+  bumpTextureRepeatY: null,
   textureProjection: 'cylindrical',
    textureFinish: 'semi-matte',
    textureRelief: 0.25,
    textureRepeat: 1,
+   textureRepeatY: null,
    textureHelper: false,
    textureHelperTransform: structuredClone(IDENTITY_TRANSFORM),
    editedVertices: null,
@@ -1115,6 +1127,8 @@ function sanitizeObjectConfig(raw: unknown): ObjectConfig | null {
     bumpTexture: typeof c.bumpTexture === 'string' ? c.bumpTexture : null,
     bumpTextureRepeat:
       typeof c.bumpTextureRepeat === 'number' ? c.bumpTextureRepeat : null,
+    bumpTextureRepeatY:
+      typeof c.bumpTextureRepeatY === 'number' ? c.bumpTextureRepeatY : null,
     textureProjection: oneOf(
       c.textureProjection,
       ['cylindrical', 'planar', 'spherical'] as const,
@@ -1129,6 +1143,8 @@ function sanitizeObjectConfig(raw: unknown): ObjectConfig | null {
        typeof c.textureRelief === 'number' ? c.textureRelief : d.textureRelief,
       textureRepeat:
         typeof c.textureRepeat === 'number' ? c.textureRepeat : d.textureRepeat,
+      textureRepeatY:
+        typeof c.textureRepeatY === 'number' ? c.textureRepeatY : d.textureRepeatY,
       textureHelper:
         typeof c.textureHelper === 'boolean' ? c.textureHelper : d.textureHelper,
       textureHelperTransform:
@@ -1853,12 +1869,16 @@ export default function Home({
    const [textureFinish, setTextureFinish] = useState<TextureFinish>('glossy');
    const [textureRelief, setTextureRelief] = useState(0.25);
    const [textureRepeat, setTextureRepeat] = useState(1);
+  // Veces que se repite la textura en VERTICAL: null = copia la horizontal.
+  const [textureRepeatY, setTextureRepeatY] = useState<number | null>(null);
   // Textura dedicada SOLO al relieve: sube una imagen y su relieve se
   // marca sobre la textura normal del objeto (que queda solo con color).
   const [bumpTexture, setBumpTexture] = useState<string | null>(null);
   const [bumpTextureFileName, setBumpTextureFileName] = useState('');
-  // null = usa la misma repetición que la textura normal.
+  // null = usa la misma repetición que la textura normal (cada eje copia el suyo).
   const [bumpTextureRepeat, setBumpTextureRepeat] = useState<number | null>(null);
+  // Veces que se repite el relieve en VERTICAL: null = copia su horizontal.
+  const [bumpTextureRepeatY, setBumpTextureRepeatY] = useState<number | null>(null);
   const bumpTextureInputRef = useRef<HTMLInputElement | null>(null);
   // El próximo envío del modal de texturas va al campo de RELIEVE (se
   // activa al abrir el modal desde ese campo; se limpia al cerrar o elegir).
@@ -1874,6 +1894,10 @@ export default function Home({
   const [groundTextureFileName, setGroundTextureFileName] = useState('');
   const [groundTextureFinish, setGroundTextureFinish] = useState<TextureFinish>('semi-matte');
   const [groundTextureRepeat, setGroundTextureRepeat] = useState(4);
+  // Veces que se repite la textura del suelo en VERTICAL: null = copia la
+  // horizontal. Y su intensidad de relieve (0 = suelo plano).
+  const [groundTextureRepeatY, setGroundTextureRepeatY] = useState<number | null>(null);
+  const [groundTextureRelief, setGroundTextureRelief] = useState(0);
   const [objectTextureFinish, setObjectTextureFinish] = useState<TextureFinish>('semi-matte');
   const [skyboxImage, setSkyboxImage] = useState<string | null>(null);
   const [skyboxImageFileName, setSkyboxImageFileName] = useState('');
@@ -4639,6 +4663,7 @@ export default function Home({
                mesh.textureRelief = textureRelief;
                mesh.textureFinish = textureFinish;
                mesh.textureRepeat = textureRepeat;
+               if (textureRepeatY != null) mesh.textureRepeatY = textureRepeatY;
                mesh.textureHelper = textureHelper;
                mesh.textureHelperTransform = structuredClone(textureHelperTransform);
              } else if (mesh.faces) {
@@ -5496,7 +5521,9 @@ export default function Home({
       textureRelief,
       bumpTexture,
       bumpTextureRepeat,
+      bumpTextureRepeatY,
       textureRepeat,
+      textureRepeatY,
       resolution,
       meshStyle,
       meshSilhouette,
@@ -5576,7 +5603,9 @@ viewsOpacity,
     textureRelief,
     bumpTexture,
     bumpTextureRepeat,
+    bumpTextureRepeatY,
     textureRepeat,
+    textureRepeatY,
     resolution,
     meshStyle,
     meshSilhouette,
@@ -5640,7 +5669,9 @@ pluginTracks,
     setBumpTexture(state.bumpTexture ?? null);
     setBumpTextureFileName('');
     setBumpTextureRepeat(state.bumpTextureRepeat ?? null);
+    setBumpTextureRepeatY(state.bumpTextureRepeatY ?? null);
     setTextureRepeat(state.textureRepeat ?? 1);
+    setTextureRepeatY(state.textureRepeatY ?? null);
     setResolution(state.resolution);
     setMeshStyle(state.meshStyle);
     setMeshSilhouette(state.meshSilhouette);
@@ -6068,6 +6099,7 @@ pluginTracks,
     setBumpTexture(null);
     setBumpTextureFileName('');
     setBumpTextureRepeat(null);
+    setBumpTextureRepeatY(null);
   }, []);
 
   const openTexturePicker = useCallback(() => {
@@ -6480,6 +6512,7 @@ pluginTracks,
           result.textureRelief = textureRelief;
           result.textureFinish = textureFinish;
           result.textureRepeat = textureRepeat;
+          if (textureRepeatY != null) result.textureRepeatY = textureRepeatY;
           result.textureHelper = textureHelper;
           result.textureHelperTransform = structuredClone(textureHelperTransform);
           result.faceColors = undefined;
@@ -6515,6 +6548,7 @@ pluginTracks,
         m.textureRelief = textureRelief;
         m.textureFinish = textureFinish;
         m.textureRepeat = textureRepeat;
+        if (textureRepeatY != null) m.textureRepeatY = textureRepeatY;
         m.textureHelper = textureHelper;
         m.textureHelperTransform = structuredClone(textureHelperTransform);
         m.faceColors = undefined;
@@ -6551,6 +6585,7 @@ pluginTracks,
         mesh.textureRelief = textureRelief;
         mesh.textureFinish = textureFinish;
         mesh.textureRepeat = textureRepeat;
+        if (textureRepeatY != null) mesh.textureRepeatY = textureRepeatY;
         mesh.textureHelper = textureHelper;
         mesh.textureHelperTransform = structuredClone(textureHelperTransform);
       } else {
@@ -6616,7 +6651,9 @@ pluginTracks,
           textureRelief,
           bumpTexture: bumpTexture ?? undefined,
           bumpTextureRepeat: bumpTextureRepeat ?? undefined,
+          bumpTextureRepeatY: bumpTextureRepeatY ?? undefined,
           textureRepeat,
+          textureRepeatY: textureRepeatY ?? undefined,
           textureFinish,
         };
       } else if (m.faces) {
@@ -6718,7 +6755,9 @@ pluginTracks,
           textureRelief: textureRelief,
           bumpTexture: bumpTexture ?? undefined,
           bumpTextureRepeat: bumpTextureRepeat ?? undefined,
+          bumpTextureRepeatY: bumpTextureRepeatY ?? undefined,
           textureRepeat: textureRepeat,
+          textureRepeatY: textureRepeatY ?? undefined,
           textureFinish: textureFinish,
         };
       } else {
@@ -6755,9 +6794,11 @@ pluginTracks,
      texture,
       bumpTexture,
       bumpTextureRepeat,
+      bumpTextureRepeatY,
       textureProjection,
       textureRelief,
       textureRepeat,
+      textureRepeatY,
       textureFinish,
       textureHelper,
       textureHelperTransform,
@@ -7138,10 +7179,12 @@ pluginTracks,
       texture,
       bumpTexture,
       bumpTextureRepeat,
+      bumpTextureRepeatY,
       textureProjection,
       textureFinish,
       textureRelief,
       textureRepeat,
+      textureRepeatY,
       textureHelper,
       textureHelperTransform: structuredClone(textureHelperTransform),
       editedVertices: editedVertices ? structuredClone(editedVertices) : null,
@@ -7179,10 +7222,12 @@ pluginTracks,
       texture,
       bumpTexture,
       bumpTextureRepeat,
+      bumpTextureRepeatY,
       textureProjection,
       textureFinish,
       textureRelief,
       textureRepeat,
+      textureRepeatY,
       textureHelper,
       textureHelperTransform,
       editedVertices,
@@ -7240,7 +7285,9 @@ pluginTracks,
      setTextureRelief(config.textureRelief);
      setBumpTexture(config.bumpTexture ?? null);
       setBumpTextureRepeat(config.bumpTextureRepeat ?? null);
+      setBumpTextureRepeatY(config.bumpTextureRepeatY ?? null);
       setTextureRepeat(config.textureRepeat ?? 1);
+      setTextureRepeatY(config.textureRepeatY ?? null);
       setTextureHelper(config.textureHelper ?? false);
       setTextureHelperTransform(config.textureHelperTransform ?? IDENTITY_TRANSFORM);
      setEditedVertices(
@@ -7335,7 +7382,9 @@ pluginTracks,
       textureRelief,
       bumpTexture,
       bumpTextureRepeat,
+      bumpTextureRepeatY,
       textureRepeat,
+      textureRepeatY,
       editedVertices,
       latheProfile,
       latheTexture: mode === 'lathe' ? ownerTexture : latheTexture,
@@ -7413,6 +7462,8 @@ pluginTracks,
         groundTexture,
         groundTextureFinish,
         groundTextureRepeat,
+        groundTextureRepeatY: groundTextureRepeatY ?? undefined,
+        groundTextureRelief: groundTextureRelief || undefined,
         objectTextureFinish,
         skyboxImage,
         animationTracks,
@@ -7535,10 +7586,12 @@ pluginTracks,
      texture,
      bumpTexture,
      bumpTextureRepeat,
+     bumpTextureRepeatY,
      textureProjection,
       textureFinish,
       textureRelief,
       textureRepeat,
+      textureRepeatY,
       editedVertices,
     meshSilhouette,
     meshSections,
@@ -7561,6 +7614,9 @@ pluginTracks,
      capturePanelConfig,
      groundTexture,
      groundTextureFinish,
+     groundTextureRepeat,
+     groundTextureRepeatY,
+     groundTextureRelief,
      skyboxImage,
      animationTracks,
       panelCamerasObjeto,
@@ -7596,7 +7652,9 @@ pluginTracks,
        setTextureRelief(mesh.textureRelief ?? 0.25);
        setBumpTexture(mesh.bumpTexture ?? null);
        setBumpTextureRepeat(mesh.bumpTextureRepeat ?? null);
+       setBumpTextureRepeatY(mesh.bumpTextureRepeatY ?? null);
        setTextureRepeat(mesh.textureRepeat ?? 1);
+       setTextureRepeatY(mesh.textureRepeatY ?? null);
        // La transparencia del panel centralizado sigue la del objeto
        // recién seleccionado (mesh.opacity; 1 si nunca se ajustó).
        setFigureOpacity(mesh.opacity ?? 1);
@@ -7648,6 +7706,11 @@ pluginTracks,
            }
            newMesh.textureColor = '#ffffff';
             newMesh.textureRepeat = textureRepeat;
+            if (textureRepeatY != null) {
+              newMesh.textureRepeatY = textureRepeatY;
+            } else {
+              delete newMesh.textureRepeatY;
+            }
             newMesh.textureFinish = textureFinish;
             newMesh.textureRelief = textureRelief;
             // La textura de relieve dedicada del panel manda para los
@@ -7664,6 +7727,11 @@ pluginTracks,
             } else {
               delete newMesh.bumpTextureRepeat;
             }
+            if (bumpTextureRepeatY != null) {
+              newMesh.bumpTextureRepeatY = bumpTextureRepeatY;
+            } else {
+              delete newMesh.bumpTextureRepeatY;
+            }
             newMesh.textureHelper = textureHelper;
             newMesh.textureHelperTransform = structuredClone(textureHelperTransform);
            return {
@@ -7673,7 +7741,7 @@ pluginTracks,
            };
          })
        );
-      }, [selectedObjectId, selectedObjectIds, mode, latheTexture, texture, textureRepeat, textureFinish, textureRelief, textureProjection, textureHelper, textureHelperTransform, bumpTextureRepeat, bumpTexture]);
+      }, [selectedObjectId, selectedObjectIds, mode, latheTexture, texture, textureRepeat, textureRepeatY, textureFinish, textureRelief, textureProjection, textureHelper, textureHelperTransform, bumpTextureRepeat, bumpTextureRepeatY, bumpTexture]);
 
     // --- Textura por caras (selección de caras de la figura activa) ---
     // El objeto cuya malla se está viendo/editando: el seleccionado; si
@@ -7920,12 +7988,14 @@ pluginTracks,
       texture,
       latheTexture,
       textureRepeat,
+      textureRepeatY,
       textureFinish,
       textureRelief,
       textureProjection,
       textureHelper,
       textureHelperTransform,
       bumpTextureRepeat,
+      bumpTextureRepeatY,
       bumpTexture,
     });
     useEffect(() => {
@@ -7934,23 +8004,27 @@ pluginTracks,
         prev.texture !== texture ||
         prev.latheTexture !== latheTexture ||
         prev.textureRepeat !== textureRepeat ||
+        prev.textureRepeatY !== textureRepeatY ||
         prev.textureFinish !== textureFinish ||
         prev.textureRelief !== textureRelief ||
         prev.textureProjection !== textureProjection ||
         prev.textureHelper !== textureHelper ||
         prev.textureHelperTransform !== textureHelperTransform ||
         prev.bumpTextureRepeat !== bumpTextureRepeat ||
+        prev.bumpTextureRepeatY !== bumpTextureRepeatY ||
         prev.bumpTexture !== bumpTexture;
       textureApplyPrevRef.current = {
         texture,
         latheTexture,
         textureRepeat,
+        textureRepeatY,
         textureFinish,
         textureRelief,
         textureProjection,
         textureHelper,
         textureHelperTransform,
         bumpTextureRepeat,
+        bumpTextureRepeatY,
         bumpTexture,
       };
       if (textureApplySkipRef.current) {
@@ -7963,7 +8037,7 @@ pluginTracks,
       if (!changed) return;
       applyTextureToSelectedObjects();
       setViewRefreshTick((t) => t + 1);
-    }, [texture, latheTexture, textureRepeat, textureFinish, textureRelief, textureProjection, textureHelper, textureHelperTransform, bumpTextureRepeat, bumpTexture, applyTextureToSelectedObjects]);
+    }, [texture, latheTexture, textureRepeat, textureRepeatY, textureFinish, textureRelief, textureProjection, textureHelper, textureHelperTransform, bumpTextureRepeat, bumpTextureRepeatY, bumpTexture, applyTextureToSelectedObjects]);
 
   // Crea en la escena actual los objetos guardados en un archivo .zeus
   // (modo "Abrir en escena"): añade las figuras del archivo como objetos
@@ -8160,8 +8234,10 @@ pluginTracks,
            setTextureRelief(data.textureRelief);
          setBumpTexture(typeof data.bumpTexture === 'string' ? data.bumpTexture : null);
          setBumpTextureRepeat(typeof data.bumpTextureRepeat === 'number' ? data.bumpTextureRepeat : null);
+         setBumpTextureRepeatY(typeof data.bumpTextureRepeatY === 'number' ? data.bumpTextureRepeatY : null);
          if (typeof data.textureRepeat === 'number')
            setTextureRepeat(data.textureRepeat);
+         setTextureRepeatY(typeof data.textureRepeatY === 'number' ? data.textureRepeatY : null);
         if (Array.isArray(data.latheProfile) && data.latheProfile.length >= 3) {
           setLatheProfile(data.latheProfile);
         }
@@ -8307,6 +8383,9 @@ pluginTracks,
               );
               setBumpTexture(selectedLoadedMesh.bumpTexture ?? null);
               setBumpTextureRepeat(selectedLoadedMesh.bumpTextureRepeat ?? null);
+              setBumpTextureRepeatY(selectedLoadedMesh.bumpTextureRepeatY ?? null);
+              setTextureRepeat(selectedLoadedMesh.textureRepeat ?? 1);
+              setTextureRepeatY(selectedLoadedMesh.textureRepeatY ?? null);
               setTextureHelper(selectedLoadedMesh.textureHelper ?? false);
               setTextureHelperTransform(
                 selectedLoadedMesh.textureHelperTransform ?? IDENTITY_TRANSFORM
@@ -8371,6 +8450,16 @@ pluginTracks,
            if (typeof data.groundTextureRepeat === 'number') {
              setGroundTextureRepeat(data.groundTextureRepeat);
            }
+           setGroundTextureRepeatY(
+             typeof data.groundTextureRepeatY === 'number'
+               ? data.groundTextureRepeatY
+               : null
+           );
+           setGroundTextureRelief(
+             typeof data.groundTextureRelief === 'number'
+               ? data.groundTextureRelief
+               : 0
+           );
           if (typeof data.objectTextureFinish === 'string') {
             setObjectTextureFinish(data.objectTextureFinish as TextureFinish);
           }
@@ -9027,9 +9116,11 @@ pluginTracks,
     latheTexture,
     textureRelief,
     textureRepeat,
+    textureRepeatY,
     textureFinish,
     textureProjection,
     bumpTextureRepeat,
+    bumpTextureRepeatY,
     bumpTexture,
   });
   useEffect(() => {
@@ -9040,9 +9131,11 @@ pluginTracks,
       prev.latheTexture !== latheTexture ||
       prev.textureRelief !== textureRelief ||
       prev.textureRepeat !== textureRepeat ||
+      prev.textureRepeatY !== textureRepeatY ||
       prev.textureFinish !== textureFinish ||
       prev.textureProjection !== textureProjection ||
       prev.bumpTextureRepeat !== bumpTextureRepeat ||
+      prev.bumpTextureRepeatY !== bumpTextureRepeatY ||
       prev.bumpTexture !== bumpTexture;
     textureAdjustPrevRef.current = {
       selectedId: frozenSelectedId,
@@ -9050,9 +9143,11 @@ pluginTracks,
       latheTexture,
       textureRelief,
       textureRepeat,
+      textureRepeatY,
       textureFinish,
       textureProjection,
       bumpTextureRepeat,
+      bumpTextureRepeatY,
       bumpTexture,
     };
     // Durante un deshacer/rehacer no se copia nada: la foto restaurada
@@ -9087,7 +9182,9 @@ pluginTracks,
             textureRelief,
             bumpTexture: bumpTexture ?? undefined,
             bumpTextureRepeat: bumpTextureRepeat ?? undefined,
+            bumpTextureRepeatY: bumpTextureRepeatY ?? undefined,
             textureRepeat,
+            textureRepeatY: textureRepeatY ?? undefined,
             textureFinish,
           },
         };
@@ -9102,9 +9199,11 @@ pluginTracks,
      latheTexture,
      textureRelief,
      textureRepeat,
+     textureRepeatY,
      textureFinish,
      textureProjection,
      bumpTextureRepeat,
+     bumpTextureRepeatY,
      bumpTexture,
      frozenSelectedId,
      selectedObjectIds,
@@ -10143,9 +10242,30 @@ pluginTracks,
    const handleObjectTransform = useCallback(
      (transform: ObjectTransform) => {
        if (!selectedObjectId) return;
-       setSceneObjects((current) =>
-         current.map((object) => {
-           if (object.id !== selectedObjectId) return object;
+       // Con un GRUPO / selección múltiple que incluye al activo, los
+       // campos numéricos transforman al CONJUNTO entero, no solo al
+       // activo: posición y giro con el mismo delta para todos (el grupo
+       // no se abre), escala con el mismo factor por eje (la composición
+       // no se deforma — como escalar el grupo como una sola pieza).
+       const multiIds =
+         selectedObjectIds.length > 1 && selectedObjectIds.includes(selectedObjectId)
+           ? selectedObjectIds
+           : null;
+       setSceneObjects((current) => {
+         const activeTr = current.find((o) => o.id === selectedObjectId)?.transform;
+         const dpx = multiIds && activeTr ? transform.px - activeTr.px : 0;
+         const dpy = multiIds && activeTr ? transform.py - activeTr.py : 0;
+         const dpz = multiIds && activeTr ? transform.pz - activeTr.pz : 0;
+         const drx = multiIds && activeTr ? transform.rx - activeTr.rx : 0;
+         const dry = multiIds && activeTr ? transform.ry - activeTr.ry : 0;
+         const drz = multiIds && activeTr ? transform.rz - activeTr.rz : 0;
+         const kx = multiIds && activeTr && activeTr.sx !== 0 ? transform.sx / activeTr.sx : 1;
+         const ky = multiIds && activeTr && activeTr.sy !== 0 ? transform.sy / activeTr.sy : 1;
+         const kz = multiIds && activeTr && activeTr.sz !== 0 ? transform.sz / activeTr.sz : 1;
+         return current.map((object) => {
+           const esActivo = object.id === selectedObjectId;
+           if (!esActivo && !(multiIds && multiIds.includes(object.id))) return object;
+           if (esActivo) {
            // Cámara-objeto con fotograma seleccionado: mover el cuerpo
            // con el gizmo actualiza TAMBIÉN la posición de ese fotograma,
            // para que el recorrido y el objeto no se desincronicen. En
@@ -10176,8 +10296,26 @@ pluginTracks,
              };
            }
            return { ...object, transform };
+           }
+           // El resto del conjunto: misma delta de posición/giro y mismo
+           // factor de escala que el activo (el grupo va como una pieza).
+           return {
+             ...object,
+             transform: {
+               ...object.transform,
+               px: object.transform.px + dpx,
+               py: object.transform.py + dpy,
+               pz: object.transform.pz + dpz,
+               rx: object.transform.rx + drx,
+               ry: object.transform.ry + dry,
+               rz: object.transform.rz + drz,
+               sx: object.transform.sx * kx,
+               sy: object.transform.sy * ky,
+               sz: object.transform.sz * kz,
+             },
+           };
          })
-       );
+         });
 
        // AUTO-KEY: con la grabación armada, un gesto del gizmo registra
        // un fotograma de la pista de transformada en el tiempo actual
@@ -10242,7 +10380,7 @@ pluginTracks,
          });
        }
      },
-     [selectedObjectId, cameraKeyframeIndex]
+     [selectedObjectId, selectedObjectIds, cameraKeyframeIndex]
    );
 
    // Arrastre del asa cian del recorrido: mueve la posición del fotograma.
@@ -10676,7 +10814,46 @@ pluginTracks,
         const sel = current.filter((o) => ids.includes(o.id));
         if (sel.length < 2) return current;
         const boxes = sel.map(objectWorldBounds);
-        // Coordenada de pantalla de cada objeto sobre un eje cualquiera:
+        // Grupos completos dentro de la selección se alinean como UNA pieza
+        // (mismo delta para todos sus miembros: la composición interna del
+        // grupo no se deforma). Solo si el grupo entero está seleccionado y
+        // con «transformación individual» apagada; con parte de él, sus
+        // miembros seleccionados se alinean sueltos.
+        const grupoDeObjeto = new Map<string, string>();
+        if (!giroIndividual) {
+          for (const g of groups) {
+            if (g.objectIds.length < 2) continue;
+            if (!g.objectIds.every((id) => ids.includes(id))) continue;
+            for (const id of g.objectIds) grupoDeObjeto.set(id, g.id);
+          }
+        }
+        // Unidad de alineación de cada objeto: su grupo completo o él mismo.
+        const unidadDe = (i: number) => grupoDeObjeto.get(sel[i].id) ?? `obj:${sel[i].id}`;
+        // Caja envolvente de cada unidad: la unión de las cajas de sus
+        // miembros (para un suelto, su propia caja).
+        const unidades = new Map<
+          string,
+          {
+            box: ReturnType<typeof objectWorldBounds>;
+          }
+        >();
+        for (let i = 0; i < sel.length; i++) {
+          const u = unidadDe(i);
+          const b = boxes[i];
+          const entry = unidades.get(u);
+          if (!entry) {
+            unidades.set(u, { box: { ...b } });
+          } else {
+            const c = entry.box;
+            c.minX = Math.min(c.minX, b.minX);
+            c.maxX = Math.max(c.maxX, b.maxX);
+            c.minY = Math.min(c.minY, b.minY);
+            c.maxY = Math.max(c.maxY, b.maxY);
+            c.minZ = Math.min(c.minZ, b.minZ);
+            c.maxZ = Math.max(c.maxZ, b.maxZ);
+          }
+        }
+        // Coordenada de pantalla de una caja sobre un eje cualquiera:
         // se proyectan las 8 esquinas de su caja envolvente mundo.
         const proj = (
           b: ReturnType<typeof objectWorldBounds>,
@@ -10693,15 +10870,16 @@ pluginTracks,
               }
           return { min, max, center: (min + max) / 2 };
         };
-        const hp = boxes.map((b) => proj(b, h));
-        const vp = boxes.map((b) => proj(b, v));
+        const uids = [...unidades.keys()];
+        const hp = uids.map((u) => proj(unidades.get(u)!.box, h));
+        const vp = uids.map((u) => proj(unidades.get(u)!.box, v));
         const avg = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
         // Objetivo de cada modo: el borde extremo de la selección o la
-        // media de sus centros. El eje y la coordenada de cada objeto
+        // media de sus centros. El eje y la coordenada de cada unidad
         // dependen del modo; "top"/"bottom" trabajan sobre el vertical
         // de pantalla (que en vista superior es el fondo del mundo).
         let axis: THREE.Vector3;
-        let coordOf: (i: number) => number;
+        let coordOf: (ui: number) => number;
         let target: number;
         switch (alignMode) {
           // Fila horizontal: los centros a la misma altura de pantalla
@@ -10710,44 +10888,47 @@ pluginTracks,
           // como fila.
           case 'horizontal':
             axis = v;
-            coordOf = (i) => vp[i].center;
+            coordOf = (ui) => vp[ui].center;
             target = avg(vp.map((p) => p.center));
             break;
           // Columna vertical: centros en la misma posición horizontal de
           // pantalla (el eje de columnas de la vista).
           case 'vertical':
             axis = h;
-            coordOf = (i) => hp[i].center;
+            coordOf = (ui) => hp[ui].center;
             target = avg(hp.map((p) => p.center));
             break;
           // Juntar el borde extremo de todos al borde extremo de la selección
           case 'left':
             axis = h;
-            coordOf = (i) => hp[i].min;
+            coordOf = (ui) => hp[ui].min;
             target = Math.min(...hp.map((p) => p.min));
             break;
           case 'right':
             axis = h;
-            coordOf = (i) => hp[i].max;
+            coordOf = (ui) => hp[ui].max;
             target = Math.max(...hp.map((p) => p.max));
             break;
           case 'top':
             axis = v;
-            coordOf = (i) => vp[i].max;
+            coordOf = (ui) => vp[ui].max;
             target = Math.max(...vp.map((p) => p.max));
             break;
           case 'bottom':
             axis = v;
-            coordOf = (i) => vp[i].min;
+            coordOf = (ui) => vp[ui].min;
             target = Math.min(...vp.map((p) => p.min));
             break;
           default:
             return current;
         }
+        // Delta de cada unidad (grupo completo o objeto suelto).
+        const deltaPorUnidad = new Map<string, number>();
+        uids.forEach((u, ui) => deltaPorUnidad.set(u, target - coordOf(ui)));
         return current.map((o) => {
           if (!ids.includes(o.id)) return o;
           const i = sel.findIndex((s) => s.id === o.id);
-          const delta = target - coordOf(i);
+          const delta = deltaPorUnidad.get(unidadDe(i)) ?? 0;
           const tr = o.transform;
           return {
             ...o,
@@ -10762,7 +10943,7 @@ pluginTracks,
       });
       setAlignModalOpen(false);
     },
-    [selectedObjectIds, activeView, panelCameras]
+    [selectedObjectIds, activeView, panelCameras, groups, giroIndividual]
   );
 
   // Ejecuta la operación booleana (sustracción, unión o intersección) entre dos objetos
@@ -11621,6 +11802,7 @@ pluginTracks,
 
       viewerProjection={viewerProjection}
       textureRepeat={textureRepeat}
+      textureRepeatY={textureRepeatY ?? undefined}
       textureFinish={textureFinish}
       textureRelief={textureRelief}
       textureHelper={textureHelper}
@@ -11632,6 +11814,8 @@ pluginTracks,
       groundTexture={groundTexture}
       groundTextureFinish={groundTextureFinish}
       groundTextureRepeat={groundTextureRepeat}
+      groundTextureRepeatY={groundTextureRepeatY ?? undefined}
+      groundTextureRelief={groundTextureRelief}
       objectTextureFinish={objectTextureFinish}
       skyboxImage={skyboxImage}
       booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
@@ -11922,9 +12106,49 @@ pluginTracks,
                          onChange={(e) => setGroundTextureRepeat(Math.max(1, Math.min(100, parseInt(e.target.value) || 1)))}
                          className="w-14 px-1 py-0.5 text-xs bg-black/40 border border-white/10 rounded text-foreground"
                        />
+                       {/* Veces que se repite en VERTICAL (vacío = copia la horizontal). */}
+                       <input
+                         type="number"
+                         min={1}
+                         max={100}
+                         value={groundTextureRepeatY ?? ''}
+                         placeholder={String(groundTextureRepeat)}
+                         title={t('editor3D.textureRepeatVHint')}
+                         onChange={(e) => {
+                           const raw = e.target.value;
+                           setGroundTextureRepeatY(
+                             raw === '' ? null : Math.max(1, Math.min(100, parseInt(raw) || 1))
+                           );
+                         }}
+                         className="w-14 px-1 py-0.5 text-xs bg-black/40 border border-white/10 rounded text-foreground placeholder:text-muted-foreground/40"
+                       />
                      </div>
                    )}
                  </DropdownMenuItem>
+                 {groundTexture && (
+                   <DropdownMenuItem
+                    onSelect={(e) => e.preventDefault()}
+                     className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5"
+                   >
+                    <span className="text-sm font-bold flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                      <Palette className={`w-3.5 h-3.5 ${groundTextureRelief > 0 ? 'text-green-400' : ''}`} />
+                      {t('editor3D.textureRelief')}: {Math.round(groundTextureRelief * 100)}%
+                    </span>
+                    {/* Relieve del suelo: la MISMA textura del suelo genera
+                        el bulto con escala marcada (0 = suelo liso). */}
+                    <div className="w-full px-1 py-0.5" onClick={(e) => e.stopPropagation()}>
+                      <Slider
+                        min={0}
+                        max={1}
+                        step={0.01}
+                        value={[groundTextureRelief]}
+                        onValueChange={([v]) => setGroundTextureRelief(v)}
+                        className="w-full"
+                        data-testid="ground-texture-relief"
+                      />
+                    </div>
+                   </DropdownMenuItem>
+                 )}
                  {groundTexture && (
                    <DropdownMenuItem
                     onSelect={(e) => {
@@ -12490,6 +12714,63 @@ pluginTracks,
                          }`}
                        >
                          <div className="flex items-center gap-1">
+                           {/* Checkbox del grupo: como el de los objetos,
+                               añade/retira a TODOS sus miembros de la
+                               selección múltiple (para varias cosas a la
+                               vez: mover, alinear, copias calculadas…). */}
+                           <input
+                             type="checkbox"
+                             checked={
+                               groupObjCount > 0 &&
+                               grp.objectIds
+                                 .filter((oid) => sceneObjects.some((o) => o.id === oid))
+                                 .every((oid) => selectedObjectIds.includes(oid))
+                             }
+                             onClick={(e) => e.stopPropagation()}
+                             onChange={() => {
+                               const miembros = grp.objectIds.filter((oid) =>
+                                 sceneObjects.some((o) => o.id === oid)
+                               );
+                               if (
+                                 groupObjCount > 0 &&
+                                 miembros.every((oid) => selectedObjectIds.includes(oid))
+                               ) {
+                                 const next = selectedObjectIds.filter(
+                                   (id) => !miembros.includes(id)
+                                 );
+                                 setSelectedObjectIds(next);
+                                 if (selectedObjectId && miembros.includes(selectedObjectId)) {
+                                   const siguiente = next.length > 0 ? next[0] : null;
+                                   if (
+                                     configObjectId &&
+                                     siguiente !== configObjectId
+                                   ) {
+                                     freezeObjectSnapshot(configObjectId);
+                                   }
+                                   setSelectedObjectId(siguiente);
+                                   syncTextureStateToSelection(siguiente);
+                                 }
+                               } else {
+                                 const nuevos = miembros.filter(
+                                   (id) => !selectedObjectIds.includes(id)
+                                 );
+                                 setSelectedObjectIds([...selectedObjectIds, ...nuevos]);
+                                 if (nuevos.length > 0 && selectedObjectId !== nuevos[0]) {
+                                   if (
+                                     configObjectId &&
+                                     nuevos[0] !== configObjectId
+                                   ) {
+                                     freezeObjectSnapshot(configObjectId);
+                                   }
+                                   setSelectedObjectId(nuevos[0]);
+                                   syncTextureStateToSelection(nuevos[0]);
+                                 }
+                               }
+                             }}
+                             className="w-3 h-3 accent-green-500 cursor-pointer shrink-0"
+                             data-testid={`group-check-${grp.id}`}
+                             title={t('editor3D.selectMultipleObjects')}
+                           />
                            <button
                              onClick={() => selectGroup(grp.id)}
                              className="flex-1 text-left px-2 py-1.5 rounded-md text-xs text-foreground"
@@ -14187,20 +14468,44 @@ pluginTracks,
                     </div>
                   )}
                   {texture && (
-                    <div className="flex items-center gap-2 mt-1">
-                      <label className="text-[10px] text-muted-foreground/80">
-                        {t('editor3D.textureRepeat')}
-                      </label>
-                      <input
-                        type="number"
-                        min={0.1}
-                        max={10}
-                        step={0.1}
-                        value={textureRepeat}
-                        data-testid="scene-texture-repeat"
-                        onChange={(e) => setTextureRepeat(Math.max(0.1, Math.min(10, parseFloat(e.target.value) || 1)))}
-                        className="w-16 px-1 py-0.5 text-xs bg-black/40 border border-white/10 rounded text-foreground focus:outline-none focus:border-green-500"
-                      />
+                    <div className="mt-1 flex flex-col gap-1">
+                      {/* Repetición por eje: horizontal (X) y vertical (Y).
+                          El campo Vertical vacío copia la horizontal. */}
+                      <div className="flex items-center gap-2">
+                        <label className="text-[10px] text-muted-foreground/80">
+                          {t('editor3D.textureRepeatH')}
+                        </label>
+                        <input
+                          type="number"
+                          min={0.1}
+                          max={10}
+                          step={0.1}
+                          value={textureRepeat}
+                          data-testid="scene-texture-repeat"
+                          onChange={(e) => setTextureRepeat(Math.max(0.1, Math.min(10, parseFloat(e.target.value) || 1)))}
+                          className="w-16 px-1 py-0.5 text-xs bg-black/40 border border-white/10 rounded text-foreground focus:outline-none focus:border-green-500"
+                        />
+                        <label className="text-[10px] text-muted-foreground/80">
+                          {t('editor3D.textureRepeatV')}
+                        </label>
+                        <input
+                          type="number"
+                          min={0.1}
+                          max={10}
+                          step={0.1}
+                          value={textureRepeatY ?? ''}
+                          placeholder={String(textureRepeat)}
+                          title={t('editor3D.textureRepeatVHint')}
+                          data-testid="scene-texture-repeat-y"
+                          onChange={(e) => {
+                            const raw = e.target.value;
+                            setTextureRepeatY(
+                              raw === '' ? null : Math.max(0.1, Math.min(10, parseFloat(raw) || 1))
+                            );
+                          }}
+                          className="w-16 px-1 py-0.5 text-xs bg-black/40 border border-white/10 rounded text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:border-green-500"
+                        />
+                      </div>
                     </div>
                   )}
                   <label className="text-[10px] text-muted-foreground/80 mt-1">
@@ -14412,20 +14717,45 @@ pluginTracks,
                       sigue la de la textura normal; al escribir un valor
                       queda fija para el relieve solo. */}
                   {bumpTexture && (
-                    <div className="flex items-center gap-2 mt-1">
-                      <label className="text-[10px] text-muted-foreground/80">
-                        {t('editor3D.textureRepeat')}
-                      </label>
-                      <input
-                        type="number"
-                        min={0.1}
-                        max={10}
-                        step={0.1}
-                        value={bumpTextureRepeat ?? textureRepeat}
-                        data-testid="scene-bump-texture-repeat"
-                        onChange={(e) => setBumpTextureRepeat(Math.max(0.1, Math.min(10, parseFloat(e.target.value) || 1)))}
-                        className="w-16 px-1 py-0.5 text-xs bg-black/40 border border-white/10 rounded text-foreground focus:outline-none focus:border-green-500"
-                      />
+                    <div className="mt-1 flex flex-col gap-1">
+                      {/* Repetición del relieve por eje: cada campo vacío
+                          copia el valor que corresponda (su horizontal, que
+                          a su vez sigue la textura normal si no se cambió). */}
+                      <div className="flex items-center gap-2">
+                        <label className="text-[10px] text-muted-foreground/80">
+                          {t('editor3D.textureRepeatH')}
+                        </label>
+                        <input
+                          type="number"
+                          min={0.1}
+                          max={10}
+                          step={0.1}
+                          value={bumpTextureRepeat ?? textureRepeat}
+                          data-testid="scene-bump-texture-repeat"
+                          onChange={(e) => setBumpTextureRepeat(Math.max(0.1, Math.min(10, parseFloat(e.target.value) || 1)))}
+                          className="w-16 px-1 py-0.5 text-xs bg-black/40 border border-white/10 rounded text-foreground focus:outline-none focus:border-green-500"
+                        />
+                        <label className="text-[10px] text-muted-foreground/80">
+                          {t('editor3D.textureRepeatV')}
+                        </label>
+                        <input
+                          type="number"
+                          min={0.1}
+                          max={10}
+                          step={0.1}
+                          value={bumpTextureRepeatY ?? bumpTextureRepeat ?? textureRepeatY ?? ''}
+                          placeholder={String(bumpTextureRepeat ?? textureRepeat)}
+                          title={t('editor3D.textureRepeatVHint')}
+                          data-testid="scene-bump-texture-repeat-y"
+                          onChange={(e) => {
+                            const raw = e.target.value;
+                            setBumpTextureRepeatY(
+                              raw === '' ? null : Math.max(0.1, Math.min(10, parseFloat(raw) || 1))
+                            );
+                          }}
+                          className="w-16 px-1 py-0.5 text-xs bg-black/40 border border-white/10 rounded text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:border-green-500"
+                        />
+                      </div>
                     </div>
                   )}
 
