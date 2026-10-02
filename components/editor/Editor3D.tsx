@@ -61,6 +61,9 @@ import LightingModal from '@/components/LightingModal';
 import TextureBrowserModal from '@/components/texture-browser-modal';
 import BooleanCSGModal from './BooleanCSGModal';
 import PluginsModal from './PluginsModal';
+import CalculatedCopiesModal, {
+  type CalculatedCopiesParams,
+} from './CalculatedCopiesModal';
 import WindowLayoutModal, { type WindowLayout } from './WindowLayoutModal';
 import { MotionEditor } from './MotionEditor';
 import { ObjectTransformFields } from './object-transform-fields';
@@ -259,6 +262,228 @@ const EditorCanvasComponent = EditorCanvas as unknown as ComponentType<any>;
  * ni una "hinchazón" en la unión. Con vecinos de esquina recta el resultado es
  * idéntico al redondeo clásico.
  */
+/**
+ * Tamaño de la caja envolvente de una malla (min-max por eje, en
+ * coordenadas de modelo). La escala del objeto se aplica aparte: el
+ * tamaño en el mundo es este valor por el escalado correspondiente.
+ */
+function meshBBoxSize(mesh: Mesh): { x: number; y: number; z: number } {
+  if (!mesh?.vertices?.length) return { x: 0, y: 0, z: 0 };
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (const v of mesh.vertices) {
+    if (v.x < minX) minX = v.x;
+    if (v.x > maxX) maxX = v.x;
+    if (v.y < minY) minY = v.y;
+    if (v.y > maxY) maxY = v.y;
+    if (v.z < minZ) minZ = v.z;
+    if (v.z > maxZ) maxZ = v.z;
+  }
+  return { x: maxX - minX, y: maxY - minY, z: maxZ - minZ };
+}
+
+/**
+ * PRNG determinista (mulberry32): misma semilla siempre genera la misma
+ * sucesión de números. «Copias calculadas» lo usa para que la variación
+ * aleatoria sea reproducible con la misma semilla y parámetros.
+ */
+function mulberry32(seed: number) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Construye el lote de copias de «Copias calculadas». Vive fuera del
+ * componente: la misma matemática crea el lote desde el modal y lo
+ * reconstruye en vivo desde la pestaña Escena.
+ *
+ * Cada lote i aplica el MISMO delta de posición/giro/escala a todos los
+ * objetos fuente (la composición del grupo se conserva) y el jitter
+ * aleatorio se sortea UNA vez por lote (los objetos del grupo no se
+ * rompen entre sí).
+ */
+function construirCopiasCalculadas(
+  fuentes: Array<{
+    /** Id del objeto origen: lo usan los grupos replicados para mappear miembros */
+    id: string;
+    nombre: string;
+    mode?: Mode;
+    smooth?: boolean;
+    projection?: LatheTextureProjection;
+    config?: ObjectConfig;
+    mesh: Mesh;
+    efectos?: EfectoObjeto[];
+    pluginEdit?: SceneObject['pluginEdit'];
+    transform: ObjectTransform;
+  }>,
+  params: CalculatedCopiesParams,
+  tamañoSel: { x: number; y: number; z: number },
+  idBase: number,
+  traducir: (
+    key: string,
+    vars?: Record<string, string | number>
+  ) => string
+): SceneObject[] {
+  const multi = fuentes.length > 1;
+  const rand = params.random ? mulberry32(params.seed) : null;
+  const lote: SceneObject[] = [];
+
+  for (let i = 1; i <= params.count; i++) {
+    let dx = 0, dy = 0, dz = 0;
+    const rotAdd = { rx: 0, ry: 0, rz: 0 };
+    if (params.layout === 'linea') {
+      const paso = params.autoSpacing ? tamañoSel[params.axis] : 0;
+      const total = (paso + params.spacing) * i;
+      if (params.axis === 'x') dx = total;
+      else if (params.axis === 'y') dy = total;
+      else dz = total;
+    } else {
+      const θ =
+        ((params.startAngle + (params.arc * i) / params.count) * Math.PI) /
+        180;
+      dx = params.radius * Math.cos(θ);
+      if (params.plane === 'xz') {
+        dz = params.radius * Math.sin(θ);
+        if (params.orient) rotAdd.ry = θ * (180 / Math.PI) + 90;
+      } else if (params.plane === 'xy') {
+        dy = params.radius * Math.sin(θ);
+        if (params.orient) rotAdd.rz = θ * (180 / Math.PI) + 90;
+      } else {
+        dy = params.radius * Math.cos(θ);
+        dz = params.radius * Math.sin(θ);
+        if (params.orient) rotAdd.rx = θ * (180 / Math.PI) + 90;
+      }
+    }
+    // Rotación incremental y escalado progresivo (acumulados por
+    // lote: el lote i lleva i pasos).
+    rotAdd.rx += params.rotStepX * i;
+    rotAdd.ry += params.rotStepY * i;
+    rotAdd.rz += params.rotStepZ * i;
+    const crece = Math.pow(1 + params.scaleStep / 100, i);
+    // Variación aleatoria del lote: posición en unidades, rotación en
+    // grados (amplitud ×30) y escala en proporción.
+    const j = { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1 };
+    if (rand) {
+      j.px = (rand() * 2 - 1) * params.randomAmount;
+      j.py = (rand() * 2 - 1) * params.randomAmount;
+      j.pz = (rand() * 2 - 1) * params.randomAmount;
+      j.rx = (rand() * 2 - 1) * params.randomAmount * 30;
+      j.ry = (rand() * 2 - 1) * params.randomAmount * 30;
+      j.rz = (rand() * 2 - 1) * params.randomAmount * 30;
+      j.s = 1 + (rand() * 2 - 1) * params.randomAmount;
+    }
+
+    fuentes.forEach((fuente, k) => {
+      const tr = fuente.transform;
+      lote.push({
+        id: `object-${idBase}-${i}-${k}`,
+        name: multi
+          ? traducir('editor3D.calcCopies.copyNameObj', { n: i, name: fuente.nombre })
+          : traducir('editor3D.calcCopies.copyName', { n: i, name: fuente.nombre }),
+        // La copia vive en la pestaña del objeto original.
+        mode: fuente.mode,
+        transform: {
+          px: tr.px + dx + j.px,
+          py: tr.py + dy + j.py,
+          pz: tr.pz + dz + j.pz,
+          rx: tr.rx + rotAdd.rx + j.rx,
+          ry: tr.ry + rotAdd.ry + j.ry,
+          rz: tr.rz + rotAdd.rz + j.rz,
+          sx: tr.sx * crece * j.s,
+          sy: tr.sy * crece * j.s,
+          sz: tr.sz * crece * j.s,
+        },
+        mesh: structuredClone(fuente.mesh),
+        smooth: fuente.smooth,
+        textureProjection: fuente.projection,
+        config: fuente.config,
+        efectos: fuente.efectos,
+        pluginEdit: fuente.pluginEdit,
+      });
+    });
+  }
+
+  return lote;
+}
+
+/**
+ * Caja envolvente EN MUNDO de un conjunto de objetos (rotación y escala
+ * incluidas, vía objectWorldBounds). La consumen tanto el modal «Copias
+ * calculadas» (separación automática) como la reconstrucción en vivo del
+ * lote desde la pestaña Escena.
+ */
+function tamañoDeObjetos(objetos: SceneObject[]): { x: number; y: number; z: number } {
+  if (objetos.length === 0) return { x: 0, y: 0, z: 0 };
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (const objeto of objetos) {
+    if (objeto.kind === 'camera') continue;
+    const b = objectWorldBounds(objeto);
+    minX = Math.min(minX, b.minX);
+    maxX = Math.max(maxX, b.maxX);
+    minY = Math.min(minY, b.minY);
+    maxY = Math.max(maxY, b.maxY);
+    minZ = Math.min(minZ, b.minZ);
+    maxZ = Math.max(maxZ, b.maxZ);
+  }
+  if (!Number.isFinite(minX)) return { x: 0, y: 0, z: 0 };
+  return { x: maxX - minX, y: maxY - minY, z: maxZ - minZ };
+}
+
+/**
+ * Grupos de usuario completamente contenidos en el conjunto de fuentes
+ * (y con ≥2 miembros vivos en la escena): uno por lote, cada uno con los
+ * ids de copia de sus miembros (los ids de copia son deterministas:
+ * object-{idBase}-{i}-{k} con k la posición de la fuente). Así, si el
+ * origen era un grupo, la copia también lo es: el lote nace con grupos,
+ * no con objetos sueltos.
+ */
+function crearGruposReplicados(
+  prevGroups: ObjectGroup[],
+  fuentesIds: string[],
+  idBase: number,
+  setId: string,
+  count: number,
+  escena: SceneObject[],
+  traducir: (key: string, vars?: Record<string, string | number>) => string
+): ObjectGroup[] {
+  const miembros = new Set(fuentesIds);
+  const nuevos: ObjectGroup[] = [];
+  prevGroups.forEach((grp, gIdx) => {
+    // Los grupos replicados de otros lotes no vuelven a replicarse.
+    if (grp.copiasSetId) return;
+    const existentes = grp.objectIds.filter((oid) =>
+      escena.some((o) => o.id === oid)
+    );
+    if (existentes.length < 2) return;
+    if (!existentes.every((oid) => miembros.has(oid))) return;
+    for (let i = 1; i <= count; i++) {
+      const copyIds = existentes
+        .map((oid) => {
+          const k = fuentesIds.indexOf(oid);
+          return k >= 0 ? `object-${idBase}-${i}-${k}` : null;
+        })
+        .filter((v): v is string => v !== null);
+      nuevos.push({
+        id: `group-${idBase}-${gIdx}-${i}`,
+        name: traducir('editor3D.calcCopies.copyName', {
+          n: i,
+          name: grp.name,
+        }),
+        objectIds: copyIds,
+        copiasSetId: setId,
+        lote: i,
+      });
+    }
+  });
+  return nuevos;
+}
+
 function cornerArcPoints(
   poly: Polygon,
   i: number,
@@ -396,6 +621,14 @@ type ObjectGroup = {
   id: string;
   name: string;
   objectIds: string[];
+  /**
+   * Marca de grupo replicado por «Copias calculadas»: apunta al set
+   * (setId) y lote (i) del que nació. Así la reedición en vivo del lote
+   * sabe cuáles borrar y regenerar, y los grupos de usuario se quedan
+   * sin marca.
+   */
+  copiasSetId?: string;
+  lote?: number;
 };
 
 type SceneObject = {
@@ -456,6 +689,24 @@ type SceneObject = {
     * de efecto dirigidas al objeto (EffectTrack.objectId).
     */
    efectos?: EfectoObjeto[];
+   /**
+    * Lote de «Copias calculadas» creado DESDE este objeto (solo los
+    * objetos fuente lo llevan): guarda los parámetros del lote para
+    * reeditarlos en vivo desde la pestaña Escena, como pluginEdit.
+    * Viaja con el objeto en los .zeus.
+    */
+   copiasCalculadas?: {
+     setId: string;
+     /** Base de los ids de copia (object-{idBase}-{i}-{k}): estable entre reconstrucciones para que los grupos replicados sigan apuntando a sus copias */
+     idBase: number;
+     params: CalculatedCopiesParams;
+   };
+   /**
+    * Enlace de una COPIA de «Copias calculadas» con el lote que la
+    * originó: al reconstruir el lote, las copias antiguas se localizan
+    * y sustituyen con este marcador.
+    */
+   copiasSetId?: string;
  };
 
 /**
@@ -3469,6 +3720,13 @@ export default function Home({
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
     const [selectedObjectIds, setSelectedObjectIds] = useState<string[]>([]);
     const [groups, setGroups] = useState<ObjectGroup[]>([]);
+  // Espejo del estado de escena para lecturas fuera de los updaters
+  // (el timer del debounce de «Copias calculadas» lee el estado fresco
+  // sin encadenar setState dentro de setState).
+  const sceneObjectsRef = useRef<SceneObject[]>(sceneObjects);
+  useEffect(() => {
+    sceneObjectsRef.current = sceneObjects;
+  }, [sceneObjects]);
   const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState('');
    const [selectionMode, setSelectionMode] = useState(false);
@@ -6540,6 +6798,8 @@ pluginTracks,
   const [pluginsModalOpen, setPluginsModalOpen] = useState<boolean>(false);
   // Modal de alineación de los objetos seleccionados (menú «Acciones»)
   const [alignModalOpen, setAlignModalOpen] = useState<boolean>(false);
+  // Modal de copias calculadas del objeto seleccionado (menú «Acciones»)
+  const [calcCopiesModalOpen, setCalcCopiesModalOpen] = useState<boolean>(false);
   // Temporizador del debounce para la re-edición en vivo de plugins
   // (el registro del plugin viaja dentro del propio SceneObject).
   const pluginRegenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -9297,6 +9557,11 @@ pluginTracks,
             smooth: obj.smooth,
             textureProjection: obj.textureProjection,
             config: obj.config,
+            // El pegado desvincula: un duplicado del origen no hereda el
+            // lote vinculado (sus copias no son las de este duplicado) y
+            // una copia pegada no conserva el vínculo con su origen.
+            copiasCalculadas: undefined as never,
+            copiasSetId: undefined as never,
           })
         );
         setSceneObjects((objects) => [...objects, ...pastedObjects]);
@@ -9389,6 +9654,365 @@ pluginTracks,
     capturePanelConfig,
     freezeObjectSnapshot,
   ]);
+
+  // Ids de los objetos seleccionados para «Copias calculadas»: la
+  // multiselección (grupo incluido) o, si no hay, el objeto activo.
+  const calcCopiesSelection = useMemo(() => {
+    const ids = selectedObjectIds.length > 0
+      ? selectedObjectIds
+      : selectedObjectId
+        ? [selectedObjectId]
+        : [];
+    return sceneObjects.filter(
+      (o) => ids.includes(o.id) && o.kind !== 'camera'
+    );
+  }, [selectedObjectIds, selectedObjectId, sceneObjects]);
+
+  // Caja envolvente de la selección EN MUNDO (rotación y escala
+  // incluidas, vía objectWorldBounds): lo consume el modal «Copias
+  // calculadas» para la separación automática.
+  const calcCopiesSize = useMemo(() => {
+    // El dueño de la configuración aún no tiene instantánea: sus
+    // límites salen de la malla viva de la pestaña.
+    return tamañoDeObjetos(
+      calcCopiesSelection.map((objeto) =>
+        objeto.id === configObjectId
+          ? { ...objeto, mesh: triMesh ?? objeto.mesh }
+          : objeto
+      )
+    );
+  }, [calcCopiesSelection, configObjectId, triMesh]);
+
+  /**
+   * «Copias calculadas»: crea N lotes de copias de los objetos
+   * seleccionados (grupo incluido) dispuestos en línea recta o en
+   * círculo. Cada lote aplica el MISMO desplazamiento/giro/escala a
+   * todos los objetos de la selección: la composición del grupo se
+   * conserva, como en el pegado múltiple. Cada copia nace con su propia
+   * malla y configuración (instantánea), como las copias pegadas.
+   *
+   * El lote queda VINCULADO a los objetos origen: éstos guardan
+   * copiasCalculadas {setId, params} y cada copia lleva copiasSetId.
+   * Así la pestaña Escena puede reeditar los parámetros en vivo (solo
+   * con el objeto origen seleccionado) y un nuevo lote desde los mismos
+   * objetos sustituye al anterior en vez de acumularse.
+   */
+  const createCalculatedCopies = useCallback(
+    (params: CalculatedCopiesParams) => {
+      if (calcCopiesSelection.length === 0) return;
+
+      // Instantánea por objeto: el dueño de la configuración aporta su
+      // malla viva y el panel actual; los demás su propia instantánea.
+      // Efectos y plugin viajan también: una copia es gemela a su
+      // fuente (efectos, registro de plugin para reedición en vivo).
+      const resolver = (obj: SceneObject) => {
+        const esDueño = obj.id === configObjectId;
+        const mesh = esDueño ? triMesh : obj.mesh;
+        if (!mesh || mesh.vertices.length === 0) return null;
+        return {
+          id: obj.id,
+          mesh: structuredClone(mesh),
+          smooth: esDueño ? smoothShadingValue : (obj.smooth ?? false),
+          projection: esDueño ? textureProjection : obj.textureProjection,
+          config: esDueño
+            ? capturePanelConfig()
+            : obj.config
+              ? structuredClone(obj.config)
+              : undefined,
+          efectos: obj.efectos ? structuredClone(obj.efectos) : undefined,
+          pluginEdit: obj.pluginEdit
+            ? structuredClone(obj.pluginEdit)
+            : undefined,
+          nombre: obj.name || t('editor3D.defaultObjectName'),
+          mode: obj.mode ?? mode,
+          transform: { ...obj.transform },
+        };
+      };
+      const fuentes = calcCopiesSelection
+        .map(resolver)
+        .filter((f): f is NonNullable<ReturnType<typeof resolver>> => f !== null);
+      if (fuentes.length === 0) return;
+
+      const now = Date.now();
+      const setId = `copias-${now}`;
+      // Un lote anterior generado desde estos mismos objetos se
+      // sustituye: sus copias desaparecen (y su marca en el origen se
+      // sobreescribe). Nunca se acumulan lotes hermanos.
+      const setsAnteriores = new Set(
+        calcCopiesSelection
+          .map((o) => o.copiasCalculadas?.setId)
+          .filter((s): s is string => !!s)
+      );
+      const fuentesIds = new Set(calcCopiesSelection.map((o) => o.id));
+      const copiasCreadas = construirCopiasCalculadas(
+        fuentes,
+        params,
+        calcCopiesSize,
+        now,
+        t
+      ).map((c) => ({ ...c, copiasSetId: setId }));
+
+      // Si el origen era un grupo (de usuario, sin marca), cada lote se
+      // agrupa igual: las copias nacen como grupos, no sueltos.
+      const fuentesOrdenIds = fuentes.map((f) => f.id);
+      const gruposReplicados = crearGruposReplicados(
+        groups,
+        fuentesOrdenIds,
+        now,
+        setId,
+        params.count,
+        sceneObjects,
+        t
+      );
+      if (gruposReplicados.length > 0) {
+        setGroups((prev) => [...prev, ...gruposReplicados]);
+      }
+
+      setSceneObjects((prev) => [
+        ...prev
+          // Copias viejas de sets anteriores de estos orígenes: fuera.
+          .filter(
+            (o) =>
+              !(
+                o.copiasSetId &&
+                setsAnteriores.has(o.copiasSetId) &&
+                !fuentesIds.has(o.id)
+              )
+          )
+          // Los orígenes estampan la marca del lote nuevo.
+          .map((o) =>
+            fuentesIds.has(o.id)
+              ? {
+                  ...o,
+                  copiasCalculadas: {
+                    setId,
+                    idBase: now,
+                    params: { ...params },
+                  },
+                }
+              : o
+          ),
+        ...copiasCreadas,
+      ]);
+      // Las copias quedan seleccionadas: alinearlas o moverlas juntas
+      // es el paso típico a continuación.
+      setSelectedObjectIds(copiasCreadas.map((c) => c.id));
+      setSelectedObjectId(copiasCreadas[0]?.id ?? null);
+      setCalcCopiesModalOpen(false);
+    },
+    [
+      calcCopiesSelection,
+      calcCopiesSize,
+      groups,
+      sceneObjects,
+      configObjectId,
+      triMesh,
+      smoothShadingValue,
+      textureProjection,
+      capturePanelConfig,
+      mode,
+      t,
+    ]
+  );
+
+  // Reconstruye (sobre el estado `current`) el lote de «Copias
+  // calculadas» `setId`: fn de render que relee las fuentes del estado
+  // fresco — si el usuario movió, giró o editó el original después de
+  // crear el lote, las copias se reconstruyen siguiendo al original
+  // ACTUAL. La usa el debounce de la reedición en vivo. Los ids de las
+  // copias son ESTABLES (mismo idBase del lote y misma ordenación de
+  // fuentes): los grupos replicados siguen apuntando a sus copias.
+  const reconstruirSetCopias = (
+    current: SceneObject[],
+    setId: string
+  ): SceneObject[] => {
+    const lote = current.find((o) => o.copiasCalculadas?.setId === setId)
+      ?.copiasCalculadas;
+    if (!lote) return current;
+    const params = lote.params;
+    const fuentesObjs = current.filter(
+      (o) => o.copiasCalculadas?.setId === setId && o.kind !== 'camera'
+    );
+    if (fuentesObjs.length === 0) return current;
+    const fuentes = fuentesObjs
+      .map((obj) => {
+        const esDueño = obj.id === configObjectId;
+        const mesh = esDueño ? triMesh : obj.mesh;
+        if (!mesh || mesh.vertices.length === 0) return null;
+        return {
+          id: obj.id,
+          nombre: obj.name || t('editor3D.defaultObjectName'),
+          mode: obj.mode ?? mode,
+          smooth: esDueño ? smoothShadingValue : (obj.smooth ?? false),
+          projection: esDueño ? textureProjection : obj.textureProjection,
+          config: esDueño
+            ? capturePanelConfig()
+            : obj.config
+              ? structuredClone(obj.config)
+              : undefined,
+          mesh: structuredClone(mesh),
+          efectos: obj.efectos ? structuredClone(obj.efectos) : undefined,
+          pluginEdit: obj.pluginEdit
+            ? structuredClone(obj.pluginEdit)
+            : undefined,
+          transform: { ...obj.transform },
+        };
+      })
+      .filter((f): f is NonNullable<typeof f> => f !== null);
+    if (fuentes.length === 0) return current;
+    const tamañoSel = tamañoDeObjetos(fuentesObjs);
+    const copiasNuevas = construirCopiasCalculadas(
+      fuentes,
+      params,
+      tamañoSel,
+      // Ids estables: misma base que la creación original para que los
+      // grupos replicados sigan apuntando a sus copias tras el rebuild.
+      lote.idBase,
+      t
+    ).map((c) => ({ ...c, copiasSetId: setId }));
+    const fuentesIds = new Set(fuentesObjs.map((o) => o.id));
+    // Quitar las copias viejas del set y añadir las nuevas. Las fuentes
+    // y el resto de la escena quedan intactos y la selección no cambia
+    // (el usuario sigue editando el origen).
+    return current
+      .filter((o) => !(o.copiasSetId === setId && !fuentesIds.has(o.id)))
+      .concat(copiasNuevas);
+  };
+
+  const copiasRegenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleLiveCopiasParam = useCallback(
+    (objectId: string, paramsNuevos: CalculatedCopiesParams) => {
+      // 1) Guardar los parámetros nuevos (todos los objetos del set
+      // comparten setId: el grupo entero se actualiza).
+      setSceneObjects((current) => {
+        const setId = current.find((o) => o.id === objectId)?.copiasCalculadas
+          ?.setId;
+        if (!setId) return current;
+        return current.map((o) =>
+          o.copiasCalculadas?.setId === setId
+            ? {
+                ...o,
+                copiasCalculadas: {
+                  ...o.copiasCalculadas,
+                  params: { ...paramsNuevos },
+                },
+              }
+            : o
+        );
+      });
+
+      // 2) Reconstruir el lote tras el debounce.
+      if (copiasRegenTimerRef.current) clearTimeout(copiasRegenTimerRef.current);
+      copiasRegenTimerRef.current = setTimeout(() => {
+        copiasRegenTimerRef.current = null;
+        setSceneObjects((current) => {
+          const setId = current.find((o) => o.id === objectId)?.copiasCalculadas
+            ?.setId;
+          if (!setId) return current;
+          return reconstruirSetCopias(current, setId);
+        });
+        // 2b) Los grupos replicados del set siguen a la reconstrucción: se
+        // borran los de este set y se recrean con el número de copias
+        // vigente (mismo idBase y orden de fuentes ⇒ mismos ids, los
+        // objetos de cada grupo siguen siendo los mismos). Fuera del
+        // updater de escena: setGroups es otro estado.
+        const actual = sceneObjectsRef.current;
+        const setIdActual = actual.find((o) => o.id === objectId)
+          ?.copiasCalculadas?.setId;
+        if (!setIdActual) return;
+        const rec = actual.find((o) => o.copiasCalculadas?.setId === setIdActual)
+          ?.copiasCalculadas;
+        if (!rec) return;
+        // Mismo filtro que hace el rebuild para las fuentes (mismo orden
+        // k que el builder): para mappear los miembros de los grupos.
+        const fuentesIds = actual
+          .filter(
+            (o) =>
+              o.copiasCalculadas?.setId === setIdActual &&
+              o.kind !== 'camera' &&
+              ((o.id === configObjectId ? triMesh : o.mesh)?.vertices.length ??
+                0) > 0
+          )
+          .map((o) => o.id);
+        setGroups((prev) => {
+          const limpios = prev.filter((g) => g.copiasSetId !== setIdActual);
+          return [
+            ...limpios,
+            ...crearGruposReplicados(
+              limpios,
+              fuentesIds,
+              rec.idBase,
+              setIdActual,
+              rec.params.count,
+              actual,
+              t
+            ),
+          ];
+        });
+      }, 150);
+    },
+    // reconstruirSetCopias y copiasRegenTimerRef son del render actual /
+    // estables: solo entran aqui los valores que la reconstrucción lee.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      configObjectId,
+      triMesh,
+      smoothShadingValue,
+      textureProjection,
+      capturePanelConfig,
+      mode,
+      t,
+    ]
+  );
+
+  // Desvincular: quita la marca del lote de los objetos origen (las
+  // copias ya creadas se quedan como objetos independientes, y sus
+  // grupos como grupos normales). El panel de reedición desaparece con
+  // la marca.
+  const desvincularCopiasCalculadas = useCallback((objectId: string) => {
+    const setId = sceneObjectsRef.current.find(
+      (o) => o.id === objectId
+    )?.copiasCalculadas?.setId;
+    if (!setId) return;
+    setSceneObjects((current) =>
+      current.map((o) => {
+        if (o.copiasCalculadas?.setId !== setId) return o;
+        const { copiasCalculadas: _marca, ...resto } = o;
+        void _marca;
+        return resto;
+      })
+    );
+    setGroups((prev) =>
+      prev.map((g) => {
+        if (g.copiasSetId !== setId) return g;
+        const { copiasSetId: _marcaG, lote: _loteG, ...restoG } = g;
+        void _marcaG;
+        void _loteG;
+        return restoG;
+      })
+    );
+  }, []);
+
+  // Al deshacer/rehacer o cargar, los lotes vinculados se reevalúan
+  // solos: la marca viaja dentro de los objetos. Los grupos replicados
+  // con lote huérfano (su set ya no existe en la escena) se limpian.
+  useEffect(() => {
+    const setsVivos = new Set(
+      sceneObjects
+        .map((o) => o.copiasCalculadas?.setId)
+        .filter((s): s is string => !!s)
+    );
+    setGroups((prev) => {
+      const necesitanLimpieza = prev.some(
+        (g) => g.copiasSetId && !setsVivos.has(g.copiasSetId)
+      );
+      if (!necesitanLimpieza) return prev;
+      return prev.filter(
+        (g) => !g.copiasSetId || setsVivos.has(g.copiasSetId)
+      );
+    });
+  }, [sceneObjects]);
 
   // Cámara de animación: se crea como un objeto MÁS de la escena, con su
   // propio recorrido editable. Nace mirando al centro desde delante y
@@ -11147,6 +11771,25 @@ pluginTracks,
                 <span className="text-sm font-bold flex items-center gap-1.5">
                   <Magnet className="w-3.5 h-3.5 text-emerald-400" />
                   {t('editor3D.align')}
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={(e) => {
+                  e.preventDefault();
+                  setCalcCopiesModalOpen(true);
+                }}
+                disabled={calcCopiesSelection.length === 0}
+                data-testid="open-calculated-copies-modal"
+                className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5 disabled:opacity-40"
+                title={
+                  calcCopiesSelection.length === 0
+                    ? t('editor3D.calcCopies.needObject')
+                    : t('editor3D.calcCopies.menuDesc')
+                }
+              >
+                <span className="text-sm font-bold flex items-center gap-1.5">
+                  <Copy className="w-3.5 h-3.5 text-cyan-400" />
+                  {t('editor3D.calcCopies.menuTitle')}
                 </span>
               </DropdownMenuItem>
               <DropdownMenuItem
@@ -13075,13 +13718,14 @@ pluginTracks,
                     </div>
                   )}
                </div>
-               {/* Giro de la multi-selección: por defecto la selección
-                   entera gira como una sola pieza alrededor del centro del
-                   conjunto; activado, cada objeto gira sobre su propio
-                   centro. La alineación no se ve afectada. */}
-               <div className="mt-2 border-t border-white/5 pt-2 px-3 pb-2">
-                 <label
-                   data-testid="toggle-giro-individual"
+               {/* Transformación de la multi-selección: por defecto la
+                  selección entera se mueve, escala y gira como una sola
+                  pieza alrededor del centro del conjunto (las distancias
+                  entre piezas se mantienen); activado, cada objeto usa su
+                  propio centro para su posición, escala y giro. */}
+              <div className="mt-2 border-t border-white/5 pt-2 px-3 pb-2">
+                <label
+                   data-testid="toggle-transformacion-individual"
                    title={t('editor3D.individualRotationHint')}
                    className="flex items-center gap-2 cursor-pointer select-none"
                  >
@@ -13206,6 +13850,229 @@ pluginTracks,
                         </p>
                       </div>
                     )}
+                  </div>
+                );
+              })()}
+              {/* ▼ Re-edición en vivo de «Copias calculadas»: con el
+                  objeto ORIGEN del lote seleccionado (selección simple) o
+                  con el grupo / selección de varios orígenes del MISMO
+                  lote (p. ej. el grupo que se usó para crearlas), los
+                  parámetros del lote se editan aquí, como los de un
+                  plugin, y las copias se reconstruyen al momento. ▼ */}
+              {(() => {
+                // Resolución del lote: selección simple → ese objeto;
+                // selección múltiple (checkboxes / grupo) → todos deben
+                // pertenecer al mismo lote para que el panel salga.
+                const enSeleccion =
+                  selectedObjectIds.length > 1
+                    ? sceneObjects.filter((o) => selectedObjectIds.includes(o.id))
+                    : sceneObjects.filter((o) => o.id === selectedObjectId);
+                const lotesSel = new Set(
+                  enSeleccion
+                    .map((o) => o.copiasCalculadas?.setId)
+                    .filter((id): id is string => Boolean(id))
+                );
+                if (enSeleccion.length === 0 || lotesSel.size !== 1) return null;
+                const setIdSel = [...lotesSel][0];
+                const loteRec = enSeleccion.find(
+                  (o) => o.copiasCalculadas?.setId === setIdSel
+                )?.copiasCalculadas;
+                if (!loteRec) return null;
+                const p = loteRec.params;
+                const setP = (
+                  k: keyof CalculatedCopiesParams,
+                  v: number | string | boolean
+                ) =>
+                  handleLiveCopiasParam(
+                    enSeleccion[0].id,
+                    {
+                      ...p,
+                      [k]: v,
+                    } as CalculatedCopiesParams
+                  );
+                return (
+                  <div
+                    className="border-t border-white/5 px-3 py-3 space-y-2 bg-[hsl(224_50%_6%)] shrink-0 min-w-0"
+                    data-testid="calc-copies-live-panel"
+                  >
+                    <h3 className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center gap-2 min-w-0">
+                      <Copy className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                      <span className="truncate">
+                        {t('editor3D.calcCopies.liveTitle')}
+                      </span>
+                    </h3>
+                    <p className="text-[9px] text-muted-foreground/70 break-words">
+                      {t('editor3D.calcCopies.liveCopiesHint')}
+                    </p>
+                    <div className="flex flex-col gap-1.5 min-w-0">
+                      {/* Cantidad */}
+                      <div className="flex items-center justify-between gap-2 min-w-0">
+                        <span className="text-[10px] text-foreground/90 truncate">
+                          {t('editor3D.calcCopies.count')}
+                        </span>
+                        <input
+                          type="number"
+                          value={p.count}
+                          min={1}
+                          max={500}
+                          step={1}
+                          data-testid="calc-copies-live-count"
+                          onChange={(e) => {
+                            const v = parseInt(e.target.value, 10);
+                            if (!Number.isNaN(v))
+                              setP('count', Math.max(1, Math.min(500, v)));
+                          }}
+                          className="w-16 shrink-0 bg-black/40 border border-white/10 rounded px-1.5 py-1 text-[11px] text-foreground focus:outline-none focus:border-cyan-500"
+                        />
+                      </div>
+                      {/* Disposición: línea / círculo */}
+                      <div className="grid grid-cols-2 gap-1.5">
+                        {([
+                          { id: 'linea', label: t('editor3D.calcCopies.line') },
+                          { id: 'circulo', label: t('editor3D.calcCopies.circle') },
+                        ] as const).map((opt) => (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() => setP('layout', opt.id)}
+                            data-testid={`calc-copies-live-layout-${opt.id}`}
+                            className={`px-2 py-1.5 rounded-md text-[10px] font-semibold border transition-colors ${
+                              p.layout === opt.id
+                                ? 'bg-cyan-500/20 border-cyan-500/60 text-cyan-200'
+                                : 'bg-white/5 border-white/10 text-muted-foreground hover:bg-white/10 hover:text-foreground'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                      {p.layout === 'linea' ? (
+                        <div className="flex flex-col gap-1.5 min-w-0">
+                          <select
+                            value={p.axis}
+                            onChange={(e) => setP('axis', e.target.value)}
+                            data-testid="calc-copies-live-axis"
+                            className="w-full min-w-0 bg-black/40 border border-white/10 rounded px-1.5 py-1 text-[11px] text-foreground focus:outline-none focus:border-cyan-500"
+                          >
+                            <option value="x">{t('editor3D.calcCopies.dirX')}</option>
+                            <option value="y">{t('editor3D.calcCopies.dirY')}</option>
+                            <option value="z">{t('editor3D.calcCopies.dirZ')}</option>
+                          </select>
+                          <div className="flex items-center justify-between gap-2 min-w-0">
+                            <span className="text-[10px] text-foreground/90 truncate">
+                              {t('editor3D.calcCopies.spacing')}
+                            </span>
+                            <input
+                              type="number"
+                              value={p.spacing}
+                              min={0.01}
+                              step={0.1}
+                              onChange={(e) => {
+                                const v = parseFloat(e.target.value);
+                                if (!Number.isNaN(v)) setP('spacing', v);
+                              }}
+                              className="w-16 shrink-0 bg-black/40 border border-white/10 rounded px-1.5 py-1 text-[11px] text-foreground focus:outline-none focus:border-cyan-500"
+                            />
+                          </div>
+                          <label className="flex items-center justify-between gap-2 cursor-pointer min-w-0">
+                            <span className="text-[10px] text-foreground/90 truncate">
+                              {t('editor3D.calcCopies.autoSpacing')}
+                            </span>
+                            <input
+                              type="checkbox"
+                              checked={p.autoSpacing}
+                              onChange={(e) => setP('autoSpacing', e.target.checked)}
+                              className="shrink-0 accent-cyan-500"
+                            />
+                          </label>
+                        </div>
+                      ) : (
+                        <div className="flex flex-col gap-1.5 min-w-0">
+                          <select
+                            value={p.plane}
+                            onChange={(e) => setP('plane', e.target.value)}
+                            data-testid="calc-copies-live-plane"
+                            className="w-full min-w-0 bg-black/40 border border-white/10 rounded px-1.5 py-1 text-[11px] text-foreground focus:outline-none focus:border-cyan-500"
+                          >
+                            <option value="xz">{t('editor3D.calcCopies.planeXZ')}</option>
+                            <option value="xy">{t('editor3D.calcCopies.planeXY')}</option>
+                            <option value="yz">{t('editor3D.calcCopies.planeYZ')}</option>
+                          </select>
+                          <div className="grid grid-cols-3 gap-1.5">
+                            <label className="flex flex-col gap-0.5 min-w-0">
+                              <span className="text-[9px] text-muted-foreground truncate">
+                                {t('editor3D.calcCopies.radius')}
+                              </span>
+                              <input
+                                type="number"
+                                value={p.radius}
+                                min={0.01}
+                                step={0.1}
+                                onChange={(e) => {
+                                  const v = parseFloat(e.target.value);
+                                  if (!Number.isNaN(v)) setP('radius', v);
+                                }}
+                                className="w-full min-w-0 bg-black/40 border border-white/10 rounded px-1.5 py-1 text-[11px] text-foreground focus:outline-none focus:border-cyan-500"
+                              />
+                            </label>
+                            <label className="flex flex-col gap-0.5 min-w-0">
+                              <span className="text-[9px] text-muted-foreground truncate">
+                                {t('editor3D.calcCopies.startAngle')}
+                              </span>
+                              <input
+                                type="number"
+                                value={p.startAngle}
+                                step={15}
+                                onChange={(e) => {
+                                  const v = parseFloat(e.target.value);
+                                  if (!Number.isNaN(v)) setP('startAngle', v);
+                                }}
+                                className="w-full min-w-0 bg-black/40 border border-white/10 rounded px-1.5 py-1 text-[11px] text-foreground focus:outline-none focus:border-cyan-500"
+                              />
+                            </label>
+                            <label className="flex flex-col gap-0.5 min-w-0">
+                              <span className="text-[9px] text-muted-foreground truncate">
+                                {t('editor3D.calcCopies.arc')}
+                              </span>
+                              <input
+                                type="number"
+                                value={p.arc}
+                                min={1}
+                                max={360}
+                                step={15}
+                                onChange={(e) => {
+                                  const v = parseFloat(e.target.value);
+                                  if (!Number.isNaN(v))
+                                    setP('arc', Math.max(1, Math.min(360, v)));
+                                }}
+                                className="w-full min-w-0 bg-black/40 border border-white/10 rounded px-1.5 py-1 text-[11px] text-foreground focus:outline-none focus:border-cyan-500"
+                              />
+                            </label>
+                          </div>
+                          <label className="flex items-center justify-between gap-2 cursor-pointer min-w-0">
+                            <span className="text-[10px] text-foreground/90 truncate">
+                              {t('editor3D.calcCopies.orient')}
+                            </span>
+                            <input
+                              type="checkbox"
+                              checked={p.orient}
+                              onChange={(e) => setP('orient', e.target.checked)}
+                              className="shrink-0 accent-cyan-500"
+                            />
+                          </label>
+                        </div>
+                      )}
+                      {/* Desvincular: las copias quedan como objetos
+                          independientes y el panel desaparece. */}
+                      <button
+                        type="button"
+                        onClick={() => desvincularCopiasCalculadas(enSeleccion[0].id)}
+                        data-testid="calc-copies-unlink"
+                        className="mt-0.5 px-2 py-1.5 rounded-md text-[10px] font-medium text-red-300 hover:text-red-200 bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 transition-colors"
+                      >
+                        {t('editor3D.calcCopies.unlinkCopies')}
+                      </button>
+                    </div>
                   </div>
                 );
               })()}
@@ -15797,6 +16664,14 @@ pluginTracks,
           </div>
         </div>
       )}
+      <CalculatedCopiesModal
+        isOpen={calcCopiesModalOpen}
+        onClose={() => setCalcCopiesModalOpen(false)}
+        objectName={selectedSceneObject?.name ?? null}
+        objectCount={calcCopiesSelection.length}
+        objectSize={calcCopiesSize}
+        onApply={createCalculatedCopies}
+      />
         <BooleanCSGModal
           isOpen={booleanModalOpen}
           onClose={() => { setBooleanModalOpen(false); setBooleanPreview(false); setBooleanToolObjectId(null); }}

@@ -7480,7 +7480,42 @@ export default function Viewer3D({
         // en vivo), así que aquí solo queda confirmar el del objeto.
         // El arrastre del gizmo-offset también avisó en cada movimiento.
         if (!wasHelper && !wasGizmo) {
-          const t = transformRef.current;
+          let t = transformRef.current;
+          // Escala de CONJUNTO (multi-selección, transformación individual
+          // apagada): el gizmo escala el activo en su sitio; para que la
+          // composición entera crezca del pivote común sin separarse, el
+          // activo también órbita alrededor del centro del conjunto con el
+          // mismo factor (equivale a escalar el grupo como una sola pieza).
+          const startPre = multiTransformStartRef.current;
+          const selPre = selectedObjectIdsRef.current ?? [];
+          const actPre = selectedObjectIdRef.current;
+          const esMultiEscala =
+            dragFinal.target === 'object' &&
+            (dragFinal.mode === 'scale' ||
+              dragFinal.mode === 'uniform-scale' ||
+              dragFinal.mode === 'planar-scale') &&
+            selPre.length > 1 &&
+            selPre.includes(actPre ?? '') &&
+            !!startPre[actPre ?? ''] &&
+            !giroIndividualRef.current;
+          const pivotConjunto = esMultiEscala
+            ? dragFinal.multiCenter ?? null
+            : null;
+          let kxConjunto = 1;
+          let kyConjunto = 1;
+          let kzConjunto = 1;
+          if (pivotConjunto) {
+            const sA = startPre[actPre ?? ''];
+            kxConjunto = sA.sx !== 0 ? t.sx / sA.sx : 1;
+            kyConjunto = sA.sy !== 0 ? t.sy / sA.sy : 1;
+            kzConjunto = sA.sz !== 0 ? t.sz / sA.sz : 1;
+            t = {
+              ...t,
+              px: pivotConjunto.x + (sA.px - pivotConjunto.x) * kxConjunto,
+              py: pivotConjunto.y + (sA.py - pivotConjunto.y) * kyConjunto,
+              pz: pivotConjunto.z + (sA.pz - pivotConjunto.z) * kzConjunto,
+            };
+          }
           setTransform(t);
           onObjectTransformRef.current?.(t);
           // Modo grabación: soltar el gizmo sobre la cámara grabada
@@ -7571,6 +7606,35 @@ export default function Viewer3D({
                       sx: startObj.sx,
                       sy: startObj.sy,
                       sz: startObj.sz,
+                    },
+                  });
+                }
+              } else if (pivotConjunto) {
+                // Escala de CONJUNTO: cada seleccionado se mueve alrededor
+                // del pivote común con el mismo factor del gesto y su
+                // tamaño se multiplica igual; la composición se mantiene
+                // (el grupo crece como una sola pieza en su conjunto).
+                for (const id of selIds) {
+                  if (id === activeId) continue;
+                  const startObj = startTransforms[id];
+                  if (!startObj) continue;
+                  const objQuat = new THREE.Quaternion().setFromEuler(
+                    new THREE.Euler(startObj.rx, startObj.ry, startObj.rz)
+                  );
+                  const newQuat = deltaQuat.clone().multiply(objQuat);
+                  const newEuler = new THREE.Euler().setFromQuaternion(newQuat, 'XYZ');
+                  updatedTransforms.push({
+                    id,
+                    transform: {
+                      px: pivotConjunto.x + (startObj.px - pivotConjunto.x) * kxConjunto,
+                      py: pivotConjunto.y + (startObj.py - pivotConjunto.y) * kyConjunto,
+                      pz: pivotConjunto.z + (startObj.pz - pivotConjunto.z) * kzConjunto,
+                      rx: newEuler.x,
+                      ry: newEuler.y,
+                      rz: newEuler.z,
+                      sx: startObj.sx * kxConjunto,
+                      sy: startObj.sy * kyConjunto,
+                      sz: startObj.sz * kzConjunto,
                     },
                   });
                 }
