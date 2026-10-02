@@ -349,6 +349,10 @@ type EditorClipboard = {
     baseColor: string;
     figureColor: string;
     texture: string | null;
+    /** Textura dedicada SOLO al relieve (data URL). */
+    bumpTexture: string | null;
+    /** Repeticiones de la textura de relieve (null = como la normal). */
+    bumpTextureRepeat: number | null;
   textureProjection: LatheTextureProjection;
    textureFinish: TextureFinish;
    textureRelief: number;
@@ -546,6 +550,10 @@ type HistoryState = {
     baseColor: string;
     figureColor: string;
     texture: string | null;
+    /** Textura dedicada SOLO al relieve (data URL). */
+    bumpTexture: string | null;
+    /** Repeticiones de la textura de relieve (null = como la normal). */
+    bumpTextureRepeat: number | null;
     latheTexture: string | null;
   textureProjection: LatheTextureProjection;
    textureFinish: TextureFinish;
@@ -629,6 +637,8 @@ const isSameHistoryState = (a: HistoryState, b: HistoryState): boolean =>
   a.baseColor === b.baseColor &&
   a.figureColor === b.figureColor &&
   a.texture === b.texture &&
+  a.bumpTexture === b.bumpTexture &&
+  a.bumpTextureRepeat === b.bumpTextureRepeat &&
   a.latheTexture === b.latheTexture &&
   a.textureProjection === b.textureProjection &&
   a.textureFinish === b.textureFinish &&
@@ -766,6 +776,8 @@ const DEFAULT_OBJECT_CONFIG: ObjectConfig = {
   baseColor: '#e8e8e8',
   figureColor: '#121ca7',
   texture: null,
+  bumpTexture: null,
+  bumpTextureRepeat: null,
   textureProjection: 'cylindrical',
    textureFinish: 'semi-matte',
    textureRelief: 0.25,
@@ -849,6 +861,9 @@ function sanitizeObjectConfig(raw: unknown): ObjectConfig | null {
     figureColor:
       typeof c.figureColor === 'string' ? c.figureColor : d.figureColor,
     texture: typeof c.texture === 'string' ? c.texture : null,
+    bumpTexture: typeof c.bumpTexture === 'string' ? c.bumpTexture : null,
+    bumpTextureRepeat:
+      typeof c.bumpTextureRepeat === 'number' ? c.bumpTextureRepeat : null,
     textureProjection: oneOf(
       c.textureProjection,
       ['cylindrical', 'planar', 'spherical'] as const,
@@ -1587,6 +1602,16 @@ export default function Home({
    const [textureFinish, setTextureFinish] = useState<TextureFinish>('glossy');
    const [textureRelief, setTextureRelief] = useState(0.25);
    const [textureRepeat, setTextureRepeat] = useState(1);
+  // Textura dedicada SOLO al relieve: sube una imagen y su relieve se
+  // marca sobre la textura normal del objeto (que queda solo con color).
+  const [bumpTexture, setBumpTexture] = useState<string | null>(null);
+  const [bumpTextureFileName, setBumpTextureFileName] = useState('');
+  // null = usa la misma repetición que la textura normal.
+  const [bumpTextureRepeat, setBumpTextureRepeat] = useState<number | null>(null);
+  const bumpTextureInputRef = useRef<HTMLInputElement | null>(null);
+  // El próximo envío del modal de texturas va al campo de RELIEVE (se
+  // activa al abrir el modal desde ese campo; se limpia al cerrar o elegir).
+  const [pickingBumpTexture, setPickingBumpTexture] = useState(false);
   const [textureBrowserOpen, setTextureBrowserOpen] = useState(false);
 
   const [showTextureModal, setShowTextureModal] = useState(false);
@@ -5211,6 +5236,8 @@ export default function Home({
       textureProjection,
       textureFinish,
       textureRelief,
+      bumpTexture,
+      bumpTextureRepeat,
       textureRepeat,
       resolution,
       meshStyle,
@@ -5289,6 +5316,8 @@ viewsOpacity,
     textureProjection,
     textureFinish,
     textureRelief,
+    bumpTexture,
+    bumpTextureRepeat,
     textureRepeat,
     resolution,
     meshStyle,
@@ -5350,6 +5379,9 @@ pluginTracks,
     setTextureProjection(state.textureProjection);
     setTextureFinish(state.textureFinish);
     setTextureRelief(state.textureRelief);
+    setBumpTexture(state.bumpTexture ?? null);
+    setBumpTextureFileName('');
+    setBumpTextureRepeat(state.bumpTextureRepeat ?? null);
     setTextureRepeat(state.textureRepeat ?? 1);
     setResolution(state.resolution);
     setMeshStyle(state.meshStyle);
@@ -5752,12 +5784,48 @@ pluginTracks,
     [mode]
   );
 
+  /** Sube una imagen SOLO para el relieve: no toca la textura de color. */
+  const handleBumpTextureFile = useCallback(async (file: File) => {
+    if (!file) return;
+    try {
+      const buffer = await file.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        const slice = bytes.subarray(i, i + chunk);
+        for (let j = 0; j < slice.length; j++) {
+          binary += String.fromCharCode(slice[j]);
+        }
+      }
+      const base64 = btoa(binary);
+      setBumpTexture(`data:image/${file.type};base64,${base64}`);
+      setBumpTextureFileName(file.name);
+    } catch (error) {
+      console.error('Error al cargar la textura de relieve:', error);
+    }
+  }, []);
+
+  const clearBumpTexture = useCallback(() => {
+    setBumpTexture(null);
+    setBumpTextureFileName('');
+    setBumpTextureRepeat(null);
+  }, []);
+
   const openTexturePicker = useCallback(() => {
     textureInputRef.current?.click();
   }, []);
 
   const handleTextureSelect = useCallback(
     (dataUrl: string, fileName: string) => {
+      // Si el modal se abrió desde el campo de TEXTURA DE RELIEVE, la
+      // imagen elegida va SOLO al relieve: no toca la textura normal.
+      if (pickingBumpTexture) {
+        setPickingBumpTexture(false);
+        setBumpTexture(dataUrl);
+        setBumpTextureFileName(fileName);
+        return;
+      }
       if (mode === 'lathe') {
         setLatheTexture(dataUrl);
         setLatheTextureFileName(fileName);
@@ -5767,7 +5835,7 @@ pluginTracks,
       }
       setEditedVertices(null);
     },
-    [mode]
+    [mode, pickingBumpTexture]
   );
 
   const clearTexture = useCallback(() => {
@@ -6288,6 +6356,8 @@ pluginTracks,
           texture,
           textureColor: '#ffffff',
           textureRelief,
+          bumpTexture: bumpTexture ?? undefined,
+          bumpTextureRepeat: bumpTextureRepeat ?? undefined,
           textureRepeat,
           textureFinish,
         };
@@ -6388,6 +6458,8 @@ pluginTracks,
           texture: texture,
           textureColor: '#ffffff',
           textureRelief: textureRelief,
+          bumpTexture: bumpTexture ?? undefined,
+          bumpTextureRepeat: bumpTextureRepeat ?? undefined,
           textureRepeat: textureRepeat,
           textureFinish: textureFinish,
         };
@@ -6423,6 +6495,8 @@ pluginTracks,
     extrudeHoles,
     figureColor,
      texture,
+      bumpTexture,
+      bumpTextureRepeat,
       textureProjection,
       textureRelief,
       textureRepeat,
@@ -6802,6 +6876,8 @@ pluginTracks,
       baseColor,
       figureColor,
       texture,
+      bumpTexture,
+      bumpTextureRepeat,
       textureProjection,
       textureFinish,
       textureRelief,
@@ -6841,6 +6917,8 @@ pluginTracks,
       baseColor,
       figureColor,
       texture,
+      bumpTexture,
+      bumpTextureRepeat,
       textureProjection,
       textureFinish,
       textureRelief,
@@ -6900,6 +6978,8 @@ pluginTracks,
      setTextureProjection(config.textureProjection);
      setTextureFinish(config.textureFinish);
      setTextureRelief(config.textureRelief);
+     setBumpTexture(config.bumpTexture ?? null);
+      setBumpTextureRepeat(config.bumpTextureRepeat ?? null);
       setTextureRepeat(config.textureRepeat ?? 1);
       setTextureHelper(config.textureHelper ?? false);
       setTextureHelperTransform(config.textureHelperTransform ?? IDENTITY_TRANSFORM);
@@ -6993,6 +7073,8 @@ pluginTracks,
       textureHelperTransform: ownerHelperTransform,
       textureFinish,
       textureRelief,
+      bumpTexture,
+      bumpTextureRepeat,
       textureRepeat,
       editedVertices,
       latheProfile,
@@ -7105,29 +7187,53 @@ pluginTracks,
         URL.revokeObjectURL(url);
         setSaveMsg({ ok: true, text: t('editor3D.downloadedAs', { name }) });
       } else {
-        // 'object' con ruta cargada → sobreescribe el archivo abierto;
-        // 'project' o sin ruta cargada → crea uno nuevo en la carpeta
-        // correspondiente (objetos_3d o proyectos_3d según el destino).
-        const hadExistingPath = !!currentProjectPath && saveTarget === 'object';
+        // Con un archivo abierto: solo sobreescribe EN SITIO si el nombre
+        // escrito sigue siendo el del archivo abierto y el destino es
+        // 'objeto' (guardado rápido). Con OTRO nombre — o con el destino
+        // 'proyecto' o sin archivo abierto — crea un archivo NUEVO y pasa
+        // a editar ese: "guardar con otro nombre" nunca pisa el abierto.
+        const nombreAbierto = currentProjectPath
+          ? (currentProjectPath.split(/[\\/]/).pop() ?? '').replace(/\.zeus$/i, '')
+          : null;
+        const guardadoRapido =
+          !!currentProjectPath &&
+          saveTarget === 'object' &&
+          !!nombreAbierto &&
+          name.toLowerCase() === nombreAbierto.toLowerCase();
         let savePath: string;
-        if (currentProjectPath && saveTarget === 'object') {
+        if (guardadoRapido && currentProjectPath) {
           savePath = currentProjectPath;
         } else {
-          const paths = await getLocalPaths();
-          const folderKey = saveTarget === 'project' ? 'proyectos_3d' : 'objetos_3d';
-          const folder = paths?.[folderKey];
+          // Carpeta de destino: al bifurcar un archivo abierto se respeta SU
+          // carpeta; sin archivo abierto, proyectos_3d para 'project' y
+          // objetos_3d para 'object'.
+          let folder: string | undefined;
+          if (currentProjectPath) {
+            const lastSep = Math.max(
+              currentProjectPath.lastIndexOf('/'),
+              currentProjectPath.lastIndexOf('\\')
+            );
+            if (lastSep > 0) folder = currentProjectPath.slice(0, lastSep);
+          }
+          if (!folder) {
+            const paths = await getLocalPaths();
+            folder =
+              paths?.[saveTarget === 'project' ? 'proyectos_3d' : 'objetos_3d'];
+          }
           if (!folder) {
             setSaveMsg({ ok: false, text: t('editor3D.noFolderMsg') });
             return;
           }
           savePath = `${folder}/${name}.zeus`;
-          if (saveTarget === 'project') setCurrentProjectPath(savePath);
+          // El editor pasa a editar el archivo recién creado: el próximo
+          // guardado rápido (mismo nombre) actualiza ESE archivo.
+          setCurrentProjectPath(savePath);
         }
         const ok = await saveProject(savePath, projectData);
         if (!ok) throw new Error(t('editor3D.cannotWriteFile'));
         setSaveMsg({
           ok: true,
-          text: hadExistingPath
+          text: guardadoRapido
             ? t('editor3D.updated')
             : t('editor3D.savedAs', { name }),
         });
@@ -7167,6 +7273,8 @@ pluginTracks,
      baseColor,
      figureColor,
      texture,
+     bumpTexture,
+     bumpTextureRepeat,
      textureProjection,
       textureFinish,
       textureRelief,
@@ -7226,6 +7334,8 @@ pluginTracks,
        setTextureProjection(object?.textureProjection ?? 'planar');
        setTextureFinish(mesh.textureFinish ?? 'semi-matte');
        setTextureRelief(mesh.textureRelief ?? 0.25);
+       setBumpTexture(mesh.bumpTexture ?? null);
+       setBumpTextureRepeat(mesh.bumpTextureRepeat ?? null);
        setTextureRepeat(mesh.textureRepeat ?? 1);
        // La transparencia del panel centralizado sigue la del objeto
        // recién seleccionado (mesh.opacity; 1 si nunca se ajustó).
@@ -7280,6 +7390,20 @@ pluginTracks,
             newMesh.textureRepeat = textureRepeat;
             newMesh.textureFinish = textureFinish;
             newMesh.textureRelief = textureRelief;
+            // La textura de relieve dedicada del panel manda para los
+            // objetos seleccionados: sube una y sustituye la anterior;
+            // se limpia el panel y sale del objeto.
+            if (bumpTexture) {
+              newMesh.bumpTexture = bumpTexture;
+            } else {
+              delete newMesh.bumpTexture;
+            }
+            // Repetición propia del relieve (null = la de la textura normal).
+            if (bumpTextureRepeat != null) {
+              newMesh.bumpTextureRepeat = bumpTextureRepeat;
+            } else {
+              delete newMesh.bumpTextureRepeat;
+            }
             newMesh.textureHelper = textureHelper;
             newMesh.textureHelperTransform = structuredClone(textureHelperTransform);
            return {
@@ -7289,7 +7413,7 @@ pluginTracks,
            };
          })
        );
-      }, [selectedObjectId, selectedObjectIds, mode, latheTexture, texture, textureRepeat, textureFinish, textureRelief, textureProjection, textureHelper, textureHelperTransform]);
+      }, [selectedObjectId, selectedObjectIds, mode, latheTexture, texture, textureRepeat, textureFinish, textureRelief, textureProjection, textureHelper, textureHelperTransform, bumpTextureRepeat, bumpTexture]);
 
     // --- Textura por caras (selección de caras de la figura activa) ---
     // El objeto cuya malla se está viendo/editando: el seleccionado; si
@@ -7541,6 +7665,8 @@ pluginTracks,
       textureProjection,
       textureHelper,
       textureHelperTransform,
+      bumpTextureRepeat,
+      bumpTexture,
     });
     useEffect(() => {
       const prev = textureApplyPrevRef.current;
@@ -7552,7 +7678,9 @@ pluginTracks,
         prev.textureRelief !== textureRelief ||
         prev.textureProjection !== textureProjection ||
         prev.textureHelper !== textureHelper ||
-        prev.textureHelperTransform !== textureHelperTransform;
+        prev.textureHelperTransform !== textureHelperTransform ||
+        prev.bumpTextureRepeat !== bumpTextureRepeat ||
+        prev.bumpTexture !== bumpTexture;
       textureApplyPrevRef.current = {
         texture,
         latheTexture,
@@ -7562,6 +7690,8 @@ pluginTracks,
         textureProjection,
         textureHelper,
         textureHelperTransform,
+        bumpTextureRepeat,
+        bumpTexture,
       };
       if (textureApplySkipRef.current) {
         textureApplySkipRef.current = false;
@@ -7573,7 +7703,7 @@ pluginTracks,
       if (!changed) return;
       applyTextureToSelectedObjects();
       setViewRefreshTick((t) => t + 1);
-    }, [texture, latheTexture, textureRepeat, textureFinish, textureRelief, textureProjection, textureHelper, textureHelperTransform, applyTextureToSelectedObjects]);
+    }, [texture, latheTexture, textureRepeat, textureFinish, textureRelief, textureProjection, textureHelper, textureHelperTransform, bumpTextureRepeat, bumpTexture, applyTextureToSelectedObjects]);
 
   // Crea en la escena actual los objetos guardados en un archivo .zeus
   // (modo "Abrir en escena"): añade las figuras del archivo como objetos
@@ -7768,6 +7898,8 @@ pluginTracks,
         }
          if (typeof data.textureRelief === 'number')
            setTextureRelief(data.textureRelief);
+         setBumpTexture(typeof data.bumpTexture === 'string' ? data.bumpTexture : null);
+         setBumpTextureRepeat(typeof data.bumpTextureRepeat === 'number' ? data.bumpTextureRepeat : null);
          if (typeof data.textureRepeat === 'number')
            setTextureRepeat(data.textureRepeat);
         if (Array.isArray(data.latheProfile) && data.latheProfile.length >= 3) {
@@ -7913,6 +8045,8 @@ pluginTracks,
                   ? selectedLoadedMesh.textureRelief
                   : 0.25
               );
+              setBumpTexture(selectedLoadedMesh.bumpTexture ?? null);
+              setBumpTextureRepeat(selectedLoadedMesh.bumpTextureRepeat ?? null);
               setTextureHelper(selectedLoadedMesh.textureHelper ?? false);
               setTextureHelperTransform(
                 selectedLoadedMesh.textureHelperTransform ?? IDENTITY_TRANSFORM
@@ -8245,6 +8379,7 @@ pluginTracks,
         name: string;
         source: 'public' | 'local' | 'project';
         path?: string;
+        size?: number;
         mesh?: Mesh | null;
       }> = [];
       // public/Obj-3D (se crea en la escena al pinchar): miniaturas incluidas
@@ -8253,7 +8388,7 @@ pluginTracks,
         const data = await res.json();
         for (const f of Array.isArray(data.files) ? data.files : []) {
           if (f && typeof f.name === 'string') {
-            files.push({ name: f.name, source: 'public', mesh: f.mesh ?? null });
+            files.push({ name: f.name, source: 'public', size: f.size, mesh: f.mesh ?? null });
           }
         }
       } catch {
@@ -8319,17 +8454,41 @@ pluginTracks,
       setObj3dFiles(files);
       setObj3dLoading(false);
 
+      // Precarga perezosa de los archivos públicos completos: al pinchar una
+      // tarjeta sin pasar antes el ratón por ella, el .zeus ya viene bajado.
+      // Con presupuesto de tamaño para no meter megas ilimitadas en RAM.
+      let prefetchedBytes = 0;
+      for (const f of files) {
+        if (f.source !== 'public') continue;
+        const cacheKey = `public/${f.name}`;
+        if (obj3dDataCacheRef.current.has(cacheKey)) continue;
+        const estimated = f.size ?? 0;
+        if (prefetchedBytes + estimated > 64 * 1024 * 1024) continue;
+        prefetchedBytes += estimated;
+        obj3dDataCacheRef.current.set(
+          cacheKey,
+          getObj3dFileData({ ...f }).catch(() => null)
+        );
+      }
+
       // Miniaturas de la carpeta local (objetos y proyectos): en paralelo
       // (antes una detrás de otra) y cacheadas entre aperturas del modal.
+      const localFiles = files.filter(
+        (f) => (f.source === 'local' || f.source === 'project') && f.path
+      );
       await Promise.all(
-        files
-          .filter((f) => (f.source === 'local' || f.source === 'project') && f.path)
-          .map(async (f) => {
-            const cacheKey = `${f.source}/${f.name}`;
-            let mesh = obj3dMeshCacheRef.current.get(cacheKey) ?? null;
+        localFiles.map(async (f) => {
+          const cacheKey = `${f.source}/${f.name}`;
+          let mesh = obj3dMeshCacheRef.current.get(cacheKey) ?? null;
             if (!mesh) {
               try {
                 const fileData = await readProject(f.path!);
+                // El archivo completo ya está aquí: se precacha para que
+                // pinchar esta tarjeta no tenga que volver a leerlo.
+                obj3dDataCacheRef.current.set(
+                  cacheKey,
+                  Promise.resolve(fileData)
+                );
                 const source = extractObj3dMesh(fileData);
                 if (source) {
                   mesh = decimateMesh(source.mesh);
@@ -8610,6 +8769,8 @@ pluginTracks,
     textureRepeat,
     textureFinish,
     textureProjection,
+    bumpTextureRepeat,
+    bumpTexture,
   });
   useEffect(() => {
     const prev = textureAdjustPrevRef.current;
@@ -8620,7 +8781,9 @@ pluginTracks,
       prev.textureRelief !== textureRelief ||
       prev.textureRepeat !== textureRepeat ||
       prev.textureFinish !== textureFinish ||
-      prev.textureProjection !== textureProjection;
+      prev.textureProjection !== textureProjection ||
+      prev.bumpTextureRepeat !== bumpTextureRepeat ||
+      prev.bumpTexture !== bumpTexture;
     textureAdjustPrevRef.current = {
       selectedId: frozenSelectedId,
       texture,
@@ -8629,6 +8792,8 @@ pluginTracks,
       textureRepeat,
       textureFinish,
       textureProjection,
+      bumpTextureRepeat,
+      bumpTexture,
     };
     // Durante un deshacer/rehacer no se copia nada: la foto restaurada
     // ya trae la textura correcta en la instantánea del objeto, y
@@ -8660,6 +8825,8 @@ pluginTracks,
               (object.mode === 'text' ? object.mesh.texture : undefined),
             textureColor: '#ffffff',
             textureRelief,
+            bumpTexture: bumpTexture ?? undefined,
+            bumpTextureRepeat: bumpTextureRepeat ?? undefined,
             textureRepeat,
             textureFinish,
           },
@@ -8677,6 +8844,8 @@ pluginTracks,
      textureRepeat,
      textureFinish,
      textureProjection,
+     bumpTextureRepeat,
+     bumpTexture,
      frozenSelectedId,
      selectedObjectIds,
      isUndoRedo,
@@ -13309,6 +13478,90 @@ pluginTracks,
                     data-testid="scene-texture-relief"
                   />
 
+                  {/* Textura dedicada SOLO al relieve: su relieve se marca
+                      sobre la textura normal, que queda solo con color. */}
+                  <label className="text-[10px] text-muted-foreground/80 mt-1">
+                    {t('editor3D.bumpTexture')}
+                  </label>
+                  <div className="flex gap-1.5">
+                    <input
+                      type="text"
+                      value={bumpTextureFileName}
+                      readOnly
+                      placeholder={t('editor3D.bumpTextureEmpty')}
+                      className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-black/40 border border-white/10 text-foreground placeholder:text-muted-foreground/40 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap"
+                      onClick={() => bumpTextureInputRef.current?.click()}
+                      data-testid="scene-bump-texture-field"
+                    />
+                    <button
+                      onClick={() => {
+                        setPickingBumpTexture(true);
+                        setTextureBrowserOpen(true);
+                      }}
+                      title={t('editor3D.selectImageAsTexture')}
+                      data-testid="scene-bump-texture-browse"
+                      className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-md text-xs font-medium bg-green-500/20 hover:bg-green-500/30 text-green-200 border border-green-500/30 transition-colors"
+                    >
+                      <ImageIcon className="w-3.5 h-3.5" />
+                      {t('editor3D.browse')}
+                    </button>
+                    {bumpTexture && (
+                      <button
+                        onClick={clearBumpTexture}
+                        title={t('editor3D.removeTextureLabel')}
+                        data-testid="scene-bump-texture-remove"
+                        className="shrink-0 flex items-center gap-1.5 px-2 py-2 rounded-md text-xs font-medium bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/30 transition-colors"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                  <input
+                    ref={bumpTextureInputRef}
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    data-testid="scene-bump-texture-file-input"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) handleBumpTextureFile(file);
+                      e.target.value = '';
+                    }}
+                  />
+                  <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
+                    <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
+                    {t('editor3D.bumpTextureHint')}
+                  </p>
+                  {bumpTexture && (
+                    <div className="mt-1 rounded-md border border-white/10 overflow-hidden w-16 h-16 bg-black/40">
+                      <img
+                        src={bumpTexture}
+                        alt={t('editor3D.bumpTexture')}
+                        className="w-full h-full object-cover"
+                      />
+                    </div>
+                  )}
+                  {/* Repetición de la textura de relieve: por defecto
+                      sigue la de la textura normal; al escribir un valor
+                      queda fija para el relieve solo. */}
+                  {bumpTexture && (
+                    <div className="flex items-center gap-2 mt-1">
+                      <label className="text-[10px] text-muted-foreground/80">
+                        {t('editor3D.textureRepeat')}
+                      </label>
+                      <input
+                        type="number"
+                        min={0.1}
+                        max={10}
+                        step={0.1}
+                        value={bumpTextureRepeat ?? textureRepeat}
+                        data-testid="scene-bump-texture-repeat"
+                        onChange={(e) => setBumpTextureRepeat(Math.max(0.1, Math.min(10, parseFloat(e.target.value) || 1)))}
+                        className="w-16 px-1 py-0.5 text-xs bg-black/40 border border-white/10 rounded text-foreground focus:outline-none focus:border-green-500"
+                      />
+                    </div>
+                  )}
+
                   {/* Tipo de malla del objeto seleccionado (solo
                       visualización: no cambia la figura real). */}
                   <label className="text-[10px] text-muted-foreground/80 mt-1">
@@ -15417,7 +15670,10 @@ pluginTracks,
       </Modal>
       <TextureBrowserModal
         isOpen={textureBrowserOpen}
-        onClose={() => setTextureBrowserOpen(false)}
+        onClose={() => {
+          setTextureBrowserOpen(false);
+          setPickingBumpTexture(false);
+        }}
         onSelectTexture={handleTextureSelect}
         mode={mode}
       />

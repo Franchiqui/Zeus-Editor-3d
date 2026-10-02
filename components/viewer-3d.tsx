@@ -750,9 +750,10 @@ export function buildSnapshotObjectVisual(
   const finalOpacity = Math.min(opacity, sideOpacity);
 
   // --- Con textura: triángulos planos con UV, como la malla principal ---
-  // También entra una malla sin textura general pero con texturas por cara.
+  // También entra una malla sin textura general pero con texturas por cara,
+  // o con la textura de relieve dedicada (sin textura normal).
   const tieneTexturasPorCara = (mesh.faceTextures ?? []).some((tx) => !!tx);
-  if (mesh.texture || tieneTexturasPorCara) {
+  if (mesh.texture || mesh.bumpTexture || tieneTexturasPorCara) {
     const positions: number[] = [];
     const normals: number[] = [];
     const uvs: number[] = [];
@@ -831,7 +832,7 @@ export function buildSnapshotObjectVisual(
         side: THREE.DoubleSide,
         map: null,
         bumpMap: null,
-        bumpScale: (mesh.textureRelief ?? 0) * 0.5,
+        bumpScale: (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP,
         transparent: true,
         opacity: finalOpacity,
         alphaTest: 0,
@@ -905,27 +906,37 @@ export function buildSnapshotObjectVisual(
     meshObj.receiveShadow = true;
     group.add(meshObj);
 
-    new THREE.TextureLoader().load(
-      mesh.texture ?? '',
-       (texture) => {
-         texture.colorSpace = THREE.SRGBColorSpace;
-         texture.anisotropy = 4;
-         texture.needsUpdate = true;
-          const repeat = mesh.textureRepeat ?? textureRepeat ?? 1;
-          texture.repeat.set(repeat, repeat);
-         texture.wrapS = THREE.RepeatWrapping;
-         texture.wrapT = THREE.RepeatWrapping;
-         material.map = texture;
-         material.bumpMap = texture;
-         material.bumpScale = (mesh.textureRelief ?? 0) * 0.5;
-         material.color.set(0xffffff);
-         material.needsUpdate = true;
-      },
-      undefined,
-      () => {
-        material.color.set(0xcccccc);
-      }
-    );
+    if (mesh.texture) {
+      new THREE.TextureLoader().load(
+        mesh.texture,
+         (texture) => {
+           texture.colorSpace = THREE.SRGBColorSpace;
+           texture.anisotropy = 4;
+           texture.needsUpdate = true;
+            const repeat = mesh.textureRepeat ?? textureRepeat ?? 1;
+            texture.repeat.set(repeat, repeat);
+           texture.wrapS = THREE.RepeatWrapping;
+           texture.wrapT = THREE.RepeatWrapping;
+           material.map = texture;
+           // Textura de relieve dedicada: SOLO ella genera el relieve; la
+           // normal queda solo con el color. Sin ella el relieve sale de la
+           // textura normal (ahora mucho más marcado).
+           material.bumpMap = mesh.bumpTexture ? null : texture;
+           material.bumpScale = (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP;
+           material.color.set(0xffffff);
+           material.needsUpdate = true;
+           aplicarTexturaRelieve(material, mesh, repeat);
+        },
+        undefined,
+        () => {
+          material.color.set(0xcccccc);
+        }
+      );
+    } else if (mesh.bumpTexture) {
+      // Sin textura normal: solo color blanco + relieve dedicado.
+      material.color.set(0xffffff);
+      aplicarTexturaRelieve(material, mesh, mesh.textureRepeat ?? textureRepeat ?? 1);
+    }
     return group;
   }
 
@@ -7742,7 +7753,14 @@ export default function Viewer3D({
     // por cara tienen prioridad sobre el sombreado suave (ese camino no
     // sabe pintarlas; sin esto no se verían).
     const tieneTexturasPorCara = (mesh.faceTextures ?? []).some((tx) => !!tx);
-    if (((mesh.texture && !smoothShading) || tieneTexturasPorCara) && !wireframe) {
+    if (
+      ((mesh.texture && !smoothShading) ||
+        // La textura de relieve dedicada también exige UVs: entra en la
+        // construcción con texturas aunque no haya textura normal.
+        (mesh.bumpTexture && !smoothShading) ||
+        tieneTexturasPorCara) &&
+      !wireframe
+    ) {
       // Limpiar grupo
       for (const child of [...meshGroup.children]) {
         if (
@@ -7969,7 +7987,7 @@ export default function Viewer3D({
         side: THREE.DoubleSide,
         map: null, // Se cargará después
         bumpMap: null,
-        bumpScale: (mesh.textureRelief ?? 0) * 0.5,
+        bumpScale: (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP,
         transparent: true,
         opacity,
         alphaTest: 0,
@@ -8059,10 +8077,12 @@ export default function Viewer3D({
             texture.wrapS = THREE.RepeatWrapping;
             texture.wrapT = THREE.RepeatWrapping;
             material.map = texture;
-            material.bumpMap = texture;
-            material.bumpScale = (mesh.textureRelief ?? 0) * 0.5;
+            // Textura de relieve dedicada: SOLO ella genera el relieve.
+            material.bumpMap = mesh.bumpTexture ? null : texture;
+            material.bumpScale = (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP;
             material.color.set(0xffffff);
             material.needsUpdate = true;
+            aplicarTexturaRelieve(material, mesh, textureRepeat);
           },
           undefined,
           (err) => {
@@ -8070,6 +8090,17 @@ export default function Viewer3D({
             material.color.set(0xcccccc); // Fallback
           }
         );
+      }
+
+      // Sin textura normal pero con textura de relieve dedicada: el
+      // relieve sale solo de ella (el material queda blanco).
+      if (!mesh.texture && mesh.bumpTexture) {
+        const materialesRelieve = Array.isArray(meshMaterials)
+          ? meshMaterials
+          : [meshMaterials];
+        for (const m of materialesRelieve) {
+          aplicarTexturaRelieve(m as THREE.MeshPhysicalMaterial, mesh, textureRepeat);
+        }
       }
 
       // Líneas de wireframe si está activado
@@ -8276,7 +8307,7 @@ export default function Viewer3D({
           side: THREE.DoubleSide,
           map: null,
           bumpMap: null,
-          bumpScale: (mesh.textureRelief ?? 0) * 0.5,
+          bumpScale: (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP,
           alphaTest: mesh.texture ? 0 : 0,
           // La textura del texto incluye un canal alfa, pero las tapas ya
           // siguen el contorno del glifo. Tratarlas como transparentes hace
@@ -8295,7 +8326,10 @@ export default function Viewer3D({
         if (hasFaceOpacity) {
           sideMaterial.transparent = sideOpacity < 1;
           sideMaterial.opacity = sideOpacity;
-          sideMaterial.depthWrite = sideOpacity >= 1;
+          // Siempre escribe profundidad: si fuera false con opacidades
+          // semitransparentes, las caras casi opacas no taparian los efectos
+          // (chispas/llamas) detrás de ellas y se verían atravesarlas.
+          sideMaterial.depthWrite = true;
           sideMaterial.needsUpdate = true;
         }
         const meshMaterials = hasFaceOpacity
@@ -8327,12 +8361,18 @@ export default function Viewer3D({
               : 1;
             for (const currentMaterial of materials) {
               currentMaterial.map = texture;
-              currentMaterial.bumpMap = texture;
-              currentMaterial.bumpScale = (mesh.textureRelief ?? 0) * 0.5;
+              // Textura de relieve dedicada: SOLO ella genera el relieve.
+              currentMaterial.bumpMap = mesh.bumpTexture ? null : texture;
+              currentMaterial.bumpScale =
+                (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP;
               currentMaterial.color.set(mesh.textureColor ?? 0xffffff);
               // NO forzar transparent = false. Respetar lo que ya tenía
               // (las caras del costado con opacidad parcial lo necesitan).
               currentMaterial.needsUpdate = true;
+            }
+            if (mesh.bumpTexture) {
+              const repite = mesh.textureRepeat ?? 1;
+              for (const m of materials) aplicarTexturaRelieve(m, mesh, repite);
             }
           },
           undefined,
@@ -8350,6 +8390,15 @@ export default function Viewer3D({
               currentMaterial.needsUpdate = true;
             }
           });
+        }
+        // Sin textura normal pero con textura de relieve dedicada.
+        if (!mesh.texture && mesh.bumpTexture) {
+          const materialesRelieve = Array.isArray(meshMaterials)
+            ? meshMaterials
+            : [meshMaterials];
+          for (const m of materialesRelieve) {
+            aplicarTexturaRelieve(m, mesh, mesh.textureRepeat ?? 1);
+          }
         }
       }
       return;
@@ -8450,16 +8499,21 @@ export default function Viewer3D({
       const ghostMesh = new THREE.Mesh(geometry, ghostMat);
       meshGroup.add(ghostMesh);
     } else {
-      const material = new THREE.MeshStandardMaterial({
+      // El acabado del panel también manda aquí: un objeto sin textura
+      // puede ser mate, brillante, metálico o espejo.
+      const finish = mesh.textureFinish ?? 'semi-matte';
+      const material = new THREE.MeshPhysicalMaterial({
         color: hasVertexColors ? 0xffffff : 0xdedede,
         vertexColors: hasVertexColors,
-        metalness: 0.3,
-        roughness: 0.45,
+        metalness: finish === 'metallic' ? 0.3 : finish === 'glossy' ? 0 : finish === 'matte' ? 0.05 : finish === 'mirror' ? 1 : 0.3,
+        roughness: finish === 'metallic' ? 0.1 : finish === 'glossy' ? 0 : finish === 'matte' ? 0.9 : finish === 'mirror' ? 0.05 : 0.45,
+        clearcoat: finish === 'metallic' ? 1 : finish === 'glossy' ? 0 : finish === 'mirror' ? 1 : 0,
+        clearcoatRoughness: finish === 'metallic' ? 0.015 : finish === 'glossy' ? 0.015 : finish === 'mirror' ? 0 : 0,
+        envMapIntensity: finish === 'mirror' ? 1.5 : 0,
         flatShading: true,
         side: THREE.DoubleSide,
         transparent: typeof mesh.opacity === 'number' && mesh.opacity < 1,
         opacity: typeof mesh.opacity === 'number' ? Math.max(0, Math.min(1, mesh.opacity)) : 1,
-        envMapIntensity: 0,
       });
       const meshObj = new THREE.Mesh(geometry, material);
       meshObj.castShadow = true;
@@ -10521,7 +10575,12 @@ function addPlacedStar(
       // Opacidad visible: las colocadas no tienen fade propio (solo latido
       // de escala en el bucle); con 0 quedaban invisibles.
       opacity: 0.95,
-    depthTest: false, // siempre por delante del texto
+    // Oclusión como el resto de FX. polygonOffset evita que se corte
+    // contra la propia superficie donde está colocada la estrella.
+    depthTest: true,
+    polygonOffset: true,
+    polygonOffsetFactor: -4,
+    polygonOffsetUnits: -4,
     blending: THREE.AdditiveBlending,
     rotation: Math.random() * Math.PI,
   });
@@ -10688,7 +10747,11 @@ function getGlowMaterial(): THREE.ShaderMaterial {
   return glowMaterialCache;
 }
 
-function createParticleSystem(count: number, size: number): ParticleSystem {
+function createParticleSystem(
+  count: number,
+  size: number,
+  opciones?: { depthTest?: boolean }
+): ParticleSystem {
   const positions = new Float32Array(count * 3);
   const colors = new Float32Array(count * 3);
   const geometry = new THREE.BufferGeometry();
@@ -10699,7 +10762,9 @@ function createParticleSystem(count: number, size: number): ParticleSystem {
     map: getSoftDotTexture(),
     transparent: true,
     depthWrite: false,
-    depthTest: false, // siempre por delante del texto
+    // Por defecto van siempre por delante del texto; se puede pedir
+    // oclusión (depthTest) para que un objeto delante tape al efecto.
+    depthTest: opciones?.depthTest ?? false,
     blending: THREE.AdditiveBlending,
     vertexColors: true,
   });
@@ -10723,7 +10788,8 @@ function createParticleSystem(count: number, size: number): ParticleSystem {
  * sistema lleva su propio uniforme para que cada objeto tenga su valor.
  */
 function crearSistemaFuego(count: number, size: number): ParticleSystem {
-  const sys = createParticleSystem(count, size);
+  // El fuego respeta la oclusión: un objeto delante lo tape (depthTest).
+  const sys = createParticleSystem(count, size, { depthTest: true });
   const vidaA = new Float32Array(count);
   sys.points.geometry.setAttribute('aVida', new THREE.BufferAttribute(vidaA, 1));
   const uniformesEstilo = { uEstilo: { value: 0 } };
@@ -10874,8 +10940,9 @@ function createSmokeSystem(origin: THREE.Vector3, count: number, size: number, c
     size,
     map: getSoftDotTexture(),
     transparent: true,
+    // El humo respeta la oclusión: un objeto delante lo tapa (depthTest).
     depthWrite: false,
-    depthTest: false,
+    depthTest: true,
     blending: THREE.AdditiveBlending,
     vertexColors: true,
   });
@@ -10958,8 +11025,10 @@ function updateFire(
     if (sys.life[i] <= 0) {
       const p = randomPoint();
       if (!p) continue;
+      // Nace justo en la superficie (sin hundirse dentro: con la oclusión
+      // activa una llama nacida dentro del objeto se vería oculta al nacer).
       sys.positions[o] = p.x;
-      sys.positions[o + 1] = p.y - 0.04;
+      sys.positions[o + 1] = p.y;
       sys.positions[o + 2] = p.z;
       if (converge && s > 0) {
         if (!sys.origen) {
@@ -11018,7 +11087,13 @@ function createStarSystem(): StarSystem {
       map: getStarTexture(),
       transparent: true,
       depthWrite: false,
-      depthTest: false, // siempre por delante del texto
+      // Las estrellas también las tapa un objeto delante (depthTest).
+      // polygonOffset las alza una pizca en profundidad para que, al nacer
+      // pegadas a la superficie del objeto, no se corten contra ella propia.
+      depthTest: true,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -4,
       blending: THREE.AdditiveBlending,
       opacity: 0,
       rotation: Math.random() * Math.PI,
@@ -11256,6 +11331,46 @@ function firmaPuntos(
 }
 
 /** Punto aleatorio de la superficie de una malla (emisor de partículas). */
+/** Factor del relieve de textura: mucho más marcado que antes (era 0.5). */
+const FACTOR_RELIEVE_BUMP = 15;
+
+/**
+ * Textura dedicada SOLO al relieve (bump): si la malla trae
+ * `bumpTexture`, se carga como bumpMap del material en espacio lineal
+ * (el bump se lee crudo; SRGB lo aplastaría) y la textura normal queda
+ * solo con el color. Intensidad según `textureRelief`.
+ */
+function aplicarTexturaRelieve(
+  material: THREE.MeshPhysicalMaterial,
+  mesh: {
+    bumpTexture?: string;
+    bumpTextureRepeat?: number;
+    textureRelief?: number;
+    textureRepeat?: number;
+  },
+  repeat: number
+): void {
+  if (!mesh.bumpTexture) return;
+  // Su propia repetición si la tiene; si no, la de la textura normal.
+  const repite = mesh.bumpTextureRepeat ?? repeat;
+  new THREE.TextureLoader().load(
+    mesh.bumpTexture,
+    (t) => {
+      t.anisotropy = 4;
+      t.wrapS = THREE.RepeatWrapping;
+      t.wrapT = THREE.RepeatWrapping;
+      t.repeat.set(repite, repite);
+      material.bumpMap = t;
+      material.bumpScale = (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP;
+      material.needsUpdate = true;
+    },
+    undefined,
+    () => {
+      // Sin la textura de relieve el objeto queda liso: no hay nada que hacer.
+    }
+  );
+}
+
 function muestreadorDeMalla(malla: Mesh | null): () => THREE.Vector3 | null {
   return () => {
     if (!malla || malla.vertices.length === 0) return null;
@@ -11429,7 +11544,9 @@ function asegurarSistemaFx(
         rt.sparks = null;
       }
       if (!rt.sparks) {
-        rt.sparks = createParticleSystem(count, size);
+        // Las chispas también respetan la oclusión (depthTest): nacen dentro
+        // del objeto y se ven al saltar fuera, sin atravesar lo que delante haya.
+        rt.sparks = createParticleSystem(count, size, { depthTest: true });
         grupo.add(rt.sparks.points);
       } else {
         const mat = rt.sparks.points.material as THREE.PointsMaterial;
@@ -11734,7 +11851,7 @@ function aplicarOverrideEfectoObjeto(
         ) {
           const anterior = rt.sparks;
           const size = (anterior.points.material as THREE.PointsMaterial).size;
-          rt.sparks = createParticleSystem(values.count, size);
+          rt.sparks = createParticleSystem(values.count, size, { depthTest: true });
           rt.grupo.remove(anterior.points);
           anterior.points.geometry.dispose();
           (anterior.points.material as THREE.Material)?.dispose();

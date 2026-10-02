@@ -73,7 +73,7 @@ export interface FxConfig {
   sparksSize: number;     // 0.01..0.2
   fire: boolean;
   fireCount: number;      // 50..500
-  fireSize: number;       // 0.05..0.3
+  fireSize: number;       // 0.05..1.2
   fireIntensity: number;  // 0..3 (multiplica color + luz)
   fireEstilo: number;     // 0..1 (0 = partículas sueltas, 1 = llama real)
   rain: boolean;

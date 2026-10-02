@@ -209,6 +209,8 @@ export function performCSGOperation(
       resultMesh.texture = baseMesh.texture;
       resultMesh.textureColor = baseMesh.textureColor;
       resultMesh.textureRelief = baseMesh.textureRelief;
+      resultMesh.bumpTexture = baseMesh.bumpTexture;
+      resultMesh.bumpTextureRepeat = baseMesh.bumpTextureRepeat;
       resultMesh.textureFinish = baseMesh.textureFinish;
       resultMesh.opacity = baseMesh.opacity;
     }

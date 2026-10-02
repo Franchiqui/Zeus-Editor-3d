@@ -75,6 +75,16 @@ export type Mesh = {
   textureColor?: string;
    /** Intensidad del relieve de la textura (0 = plano). */
    textureRelief?: number;
+   /**
+    * Textura dedicada SOLO al relieve (data URL): si está presente, el
+    * relieve sale de ella y la textura normal queda solo con el color.
+    */
+   bumpTexture?: string;
+   /**
+    * Veces que se repite la textura de relieve. Ausente = usa la misma
+    * repetición que `textureRepeat`.
+    */
+   bumpTextureRepeat?: number;
    /** Número de veces que se repite la textura (1 = sin repetición). */
    textureRepeat?: number;
   /** Acabado de la superficie texturizada. */

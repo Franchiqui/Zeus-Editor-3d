@@ -126,7 +126,7 @@ function buildObject<T extends ZeiaSceneObject>(id: string, params: Record<strin
 /** Extrae las propiedades de textura/acabado/opacity de params al objeto. */
 function extractTextureProps(params: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  const keys = ['texture', 'textureColor', 'textureRelief', 'textureRepeat', 'textureFinish', 'texturePanela', 'textureHelper', 'textureHelperTransform', 'opacity'];
+  const keys = ['texture', 'textureColor', 'textureRelief', 'bumpTexture', 'bumpTextureRepeat', 'textureRepeat', 'textureFinish', 'texturePanela', 'textureHelper', 'textureHelperTransform', 'opacity'];
   for (const key of keys) {
     if (key in params && params[key] !== undefined) out[key] = params[key];
   }
