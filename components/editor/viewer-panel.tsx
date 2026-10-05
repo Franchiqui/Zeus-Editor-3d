@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, type FC } from 'react';
 import { createPortal } from 'react-dom';
 import Viewer3D, { type ObjectTransform, type GizmoMode } from '@/components/viewer-3d';
+import type { TextureMaterialParams } from '@/lib/geometry';
 import type { EfectoObjeto } from '@/lib/efectos-objeto';
 import { PanelButtons } from '@/components/editor/Editor3D';
 import { useI18n } from '@/lib/i18n';
@@ -111,6 +112,8 @@ interface ViewerPanelProps {
    /** Intensidad del relieve de la textura del suelo (0 = suelo liso). */
    groundTextureRelief?: number;
    groundTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
+  /** Parámetros de una textura CREADA en el suelo (material = vista previa). */
+  groundTextureParams?: TextureMaterialParams | null;
   objectTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
    skyboxImage?: string | null;
    /** Objeto cortador en modo boolean preview: se muestra transparente */
@@ -245,6 +248,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
     groundTextureRepeatY,
     groundTextureRelief,
     groundTextureFinish,
+    groundTextureParams,
    objectTextureFinish,
    skyboxImage,
    booleanToolObjectId,
@@ -534,6 +538,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
            groundTextureRepeatY={groundTextureRepeatY}
            groundTextureRelief={groundTextureRelief}
            groundTextureFinish={groundTextureFinish}
+           groundTextureParams={groundTextureParams}
           objectTextureFinish={objectTextureFinish}
          skyboxImage={skyboxImage}
          showGrid={showGrid}

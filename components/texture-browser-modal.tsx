@@ -4,8 +4,29 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import * as THREE from 'three';
 import { getLocalPaths, listDirectory, getMediaUrl, isElectron } from '@/lib/electron-fs';
 import { Modal } from '@/components/ui/modal';
-import { ImageIcon, FolderOpen, Loader2, LayoutGrid, Circle, Folder } from 'lucide-react';
+import {
+  X,
+  Eye,
+  Pencil,
+  ImageIcon,
+  FolderOpen,
+  Loader2,
+  LayoutGrid,
+  Circle,
+  Folder,
+  Sparkles,
+} from 'lucide-react';
 import { Mode } from 'fs';
+import {
+  CREATED_TYPE_LABELS,
+  readCreatedTextures,
+  renderTextureTile,
+  type CreatedTexture,
+} from '@/lib/texture-generator';
+import CreateTextureModal from '@/components/CreateTextureModal';
+// Vista 3D de las texturas creadas (cubo/esfera): en este archivo ya
+// existe una TexturePreview local (canvas pequeño), por eso otro nombre.
+import TexturePreview3D from '@/components/TexturePreview';
 
 interface TextureItem {
   name: string;
@@ -13,6 +34,8 @@ interface TextureItem {
   isDirectory: boolean;
   size: number;
   category?: string;
+  /** Textura creada por el usuario (categoría «Creadas»): permite previsualizarla y reeditarla. */
+  creada?: CreatedTexture;
 }
 
 type ViewMode = 'planar' | 'cylindrical';
@@ -21,7 +44,16 @@ type PreviewFinish = 'semi-matte' | 'matte' | 'glossy' | 'metallic';
 interface TextureBrowserModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSelectTexture: (dataUrl: string, fileName: string) => void;
+  /**
+   * El tercer argumento `creada` llega SOLO con texturas creadas (Crea
+   * texturas): el editor la usa para montar en el objeto el mismo
+   * material físico que la vista previa (transmisión, metalidad…).
+   */
+  onSelectTexture: (
+    dataUrl: string,
+    fileName: string,
+    creada?: CreatedTexture
+  ) => void;
   mode: Mode;
 }
 
@@ -30,6 +62,14 @@ const IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp', '.svg', '.gif', '.bm
 function isImageFile(name: string): boolean {
   const ext = name.substring(name.lastIndexOf('.')).toLowerCase();
   return IMAGE_EXTENSIONS.includes(ext);
+}
+
+// Fuente de la miniatura: las texturas creadas por el usuario (app Crear
+// Texturas) llegan como data URL del mosaico generado y NO pueden pasar
+// por getMediaUrl (que solo sirve rutas de archivo del disco).
+function itemSrc(item: TextureItem): string {
+  if (item.path.startsWith('data:')) return item.path;
+  return isElectron() ? getMediaUrl(item.path) : item.path;
 }
 
 // Opciones de acabado para el selector
@@ -252,12 +292,20 @@ export default function TextureBrowserModal({
   const [previewFinish, setPreviewFinish] = useState<PreviewFinish>('semi-matte');
   const [previewTextureUrl, setPreviewTextureUrl] = useState<string | null>(null);
   const [previewFileName, setPreviewFileName] = useState('');
+  // Texturas creadas (app Crear Texturas): con su tarjeta se pueden
+  // previsualizar en 3D (ojo) y reeditar (lápiz), como en el origen.
+  const [creadas, setCreadas] = useState<CreatedTexture[]>([]);
+  const [creadaEnVista, setCreadaEnVista] = useState<CreatedTexture | null>(null);
+  const [creadaEditando, setCreadaEditando] = useState<CreatedTexture | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
     let cancelled = false;
+
     const load = async () => {
       setLoading(true);
+      // Las texturas creadas se cargan aparte y se combinan al render.
+      if (!cancelled) setCreadas(readCreatedTextures());
       try {
         if (!isElectron()) {
           // Navegador: cargar desde public/Texturas vía API
@@ -266,8 +314,8 @@ export default function TextureBrowserModal({
           const data = await res.json();
           if (!cancelled) {
             setTextureFolder(data.folder);
-            setItems(data.items);
-            setCategories(data.categories);
+            setItems(Array.isArray(data.items) ? data.items : []);
+            setCategories(Array.isArray(data.categories) ? data.categories : []);
             setSelectedCategory('todas');
           }
           return;
@@ -275,7 +323,13 @@ export default function TextureBrowserModal({
         const paths = await getLocalPaths();
         const folder = paths.texturas || paths.objetos_3d || paths.objetos || null;
         if (!folder) {
-          if (!cancelled) setLoading(false);
+          // Sin carpeta configurada igual se pueden usar las creadas.
+          if (!cancelled) {
+            setTextureFolder(null);
+            setItems([]);
+            setCategories([]);
+            setSelectedCategory('todas');
+          }
           return;
         }
         if (!cancelled) {
@@ -329,12 +383,20 @@ export default function TextureBrowserModal({
           }
           
           const sortedItems = categorizedItems.sort((a: TextureItem, b: TextureItem) => a.name.localeCompare(b.name));
-          setItems(sortedItems);
-          setCategories(categoryList);
-          setSelectedCategory('todas');
+          if (!cancelled) {
+            setItems(sortedItems);
+            setCategories(categoryList);
+            setSelectedCategory('todas');
+          }
         }
       } catch (e) {
         console.error('Error loading texture folder:', e);
+        // Aunque falle la carpeta, las texturas creadas siguen disponibles.
+        if (!cancelled) {
+          setItems([]);
+          setCategories([]);
+          setSelectedCategory('todas');
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -344,28 +406,54 @@ export default function TextureBrowserModal({
   }, [isOpen]);
 
   const handleSelectTexture = useCallback((item: TextureItem) => {
-    const dataUrl = isElectron() ? getMediaUrl(item.path) : item.path;
+    const dataUrl = itemSrc(item);
     setPreviewTextureUrl(dataUrl);
     setPreviewFileName(item.name);
-    onSelectTexture(dataUrl, item.name);
+    onSelectTexture(dataUrl, item.name, item.creada);
     onClose();
   }, [onSelectTexture, onClose]);
 
+  // Las texturas creadas se rasterizan al vuelo y van primero, como
+  // categoría «Creadas», con su textura enlazada (ojo/lápiz).
+  const creadasItems = useMemo<TextureItem[]>(() => {
+    return creadas
+      .map((t) => {
+        let path = '';
+        try {
+          path = renderTextureTile(t, 256);
+        } catch (e) {
+          console.error('No se pudo generar la textura creada:', e);
+        }
+        return { name: t.name, path, isDirectory: false, size: 0, category: 'Creadas', creada: t } as TextureItem;
+      })
+      .filter((i) => i.path);
+  }, [creadas]);
+
+  const allItems = useMemo(
+    () => (creadasItems.length ? [...creadasItems, ...items] : items),
+    [creadasItems, items]
+  );
+  const allCategories = useMemo(
+    () => (creadasItems.length ? ['Creadas', ...categories] : categories),
+    [creadasItems, categories]
+  );
+
   const filteredItems = useMemo(() => {
     if (selectedCategory === 'todas') {
-      return items;
+      return allItems;
     }
-    return items.filter(item => item.category === selectedCategory);
-  }, [items, selectedCategory]);
+    return allItems.filter(item => item.category === selectedCategory);
+  }, [allItems, selectedCategory]);
 
   return (
-    <Modal
-      isOpen={isOpen}
-      onClose={onClose}
-      title="Explorador de Texturas"
-       description="Texturas de public/Texturas (subcarpetas como categorías)."
-       size="2xl"
-    >
+    <>
+      <Modal
+        isOpen={isOpen}
+        onClose={onClose}
+        title="Explorador de Texturas"
+         description="Texturas de public/Texturas (subcarpetas como categorías)."
+         size="2xl"
+      >
       <div className="flex flex-col h-[75vh]">
         {/* Ruta de la carpeta */}
         <div className="flex items-center gap-2 px-3 py-2 bg-black/40 rounded-md border border-white/10 mb-3">
@@ -379,7 +467,7 @@ export default function TextureBrowserModal({
           <div className="flex-1 flex items-center justify-center">
             <Loader2 className="w-8 h-8 text-green-400 animate-spin" />
           </div>
-        ) : items.length === 0 ? (
+        ) : allItems.length === 0 ? (
           <div className="flex-1 flex items-center justify-center">
             <div className="text-center">
               <ImageIcon className="w-12 h-12 text-muted-foreground/30 mx-auto mb-3" />
@@ -394,8 +482,9 @@ export default function TextureBrowserModal({
           <div className="flex flex-1 min-h-0 gap-3">
             {/* Lista de texturas */}
             <div className="flex-1 flex flex-col">
-              {/* Selector de categorías */}
-              {categories.length > 1 && (
+              {/* Selector de categorías: siempre que haya más de una, o
+                  cuando existan texturas creadas por el usuario. */}
+              {(allCategories.length > 1 || allItems.some(item => item.category === 'Creadas')) && (
                 <div className="px-3 py-2 mb-2">
                   <div className="flex items-center gap-2 mb-2">
                     <Folder className="w-4 h-4 text-green-400" />
@@ -413,9 +502,9 @@ export default function TextureBrowserModal({
                       }`}
                     >
                       <LayoutGrid className="w-3 h-3" />
-                      Todas ({items.length})
+                      Todas ({allItems.length})
                     </button>
-                    {categories.map((category) => (
+                    {allCategories.map((category) => (
                       <button
                         key={category}
                         onClick={() => setSelectedCategory(category)}
@@ -425,8 +514,12 @@ export default function TextureBrowserModal({
                             : 'bg-black/40 text-muted-foreground border border-white/10 hover:text-foreground'
                         }`}
                       >
-                        <Folder className="w-3 h-3" />
-                        {category} ({items.filter(item => item.category === category).length})
+                        {category === 'Creadas' ? (
+                          <Sparkles className="w-3 h-3" />
+                        ) : (
+                          <Folder className="w-3 h-3" />
+                        )}
+                        {category} ({allItems.filter(item => item.category === category).length})
                       </button>
                     ))}
                   </div>
@@ -514,19 +607,54 @@ export default function TextureBrowserModal({
                       key={item.path}
                       onClick={() => handleSelectTexture(item)}
                       onMouseEnter={() => {
-                        setPreviewTextureUrl(isElectron() ? getMediaUrl(item.path) : item.path);
+                        setPreviewTextureUrl(itemSrc(item));
                         setPreviewFileName(item.name);
                       }}
                       className="group relative aspect-square rounded-md overflow-hidden border border-white/10 bg-black/20 hover:border-green-500/50 transition-all"
                     >
                       <img
-                        src={isElectron() ? getMediaUrl(item.path) : item.path}
+                        src={itemSrc(item)}
                         alt={item.name}
                         className="w-full h-full object-cover"
                         loading="lazy"
                       />
                       <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                        <ImageIcon className="w-6 h-6 text-green-400" />
+                        {item.creada ? (
+                          /* Textura creada: ver en 3D y reeditar, como en
+                             la app de origen. El clic no debe seleccionar.
+                            (role="button": HTML no admite <button> dentro
+                             de <button>, causaría error de hidratación) */
+                          <div className="flex items-center gap-2">
+                            <div
+                              role="button"
+                              tabIndex={-1}
+                              title="Vista previa 3D"
+                              aria-label={`Vista previa 3D de ${item.name}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setCreadaEnVista(item.creada!);
+                              }}
+                              className="p-2.5 text-indigo-200 hover:text-white hover:bg-indigo-500/40 rounded-lg transition-colors cursor-pointer"
+                            >
+                              <Eye className="w-5 h-5" />
+                            </div>
+                            <div
+                              role="button"
+                              tabIndex={-1}
+                              title="Editar textura"
+                              aria-label={`Editar ${item.name}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setCreadaEditando(item.creada!);
+                              }}
+                              className="p-2.5 text-indigo-200 hover:text-white hover:bg-indigo-500/40 rounded-lg transition-colors cursor-pointer"
+                            >
+                              <Pencil className="w-5 h-5" />
+                            </div>
+                          </div>
+                        ) : (
+                          <ImageIcon className="w-6 h-6 text-green-400" />
+                        )}
                       </div>
                       <div className="absolute bottom-0 left-0 right-0 p-1 bg-gradient-to-t from-black/80 to-transparent">
                         <span className="text-[9px] text-white truncate block">{item.name}</span>
@@ -539,6 +667,57 @@ export default function TextureBrowserModal({
           </div>
         )}
       </div>
-    </Modal>
+      </Modal>
+
+      {/* Vista previa 3D de una textura creada (como en la app de origen):
+          cubo y esfera girando con las propiedades del material. */}
+      {creadaEnVista && (
+      <div
+        className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[60] flex items-center justify-center p-4"
+        onClick={() => setCreadaEnVista(null)}
+      >
+        <div
+          className="relative bg-slate-900 rounded-xl border border-slate-700 shadow-2xl w-full max-w-full md:max-w-6xl h-[85vh] md:h-[80vh]"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="absolute top-4 right-4 z-10 flex gap-2">
+            <button
+              onClick={() => setCreadaEnVista(null)}
+              className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
+              aria-label="Cerrar vista previa"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+          <TexturePreview3D
+            texture={{
+              color: creadaEnVista.color,
+              opacity: creadaEnVista.opacity,
+              roughness: creadaEnVista.roughness,
+              type: creadaEnVista.type,
+            }}
+          />
+          <div className="absolute bottom-4 left-0 right-0 text-center pointer-events-none">
+            <p className="text-slate-300 text-sm">{creadaEnVista.name}</p>
+            <p className="text-slate-500 text-xs mt-1">
+              Tipo: {CREATED_TYPE_LABELS[creadaEnVista.type] || creadaEnVista.type} | Color: {creadaEnVista.color} |
+              Opacidad: {Math.round(creadaEnVista.opacity * 100)}% | Rugosidad: {Math.round(creadaEnVista.roughness * 100)}%
+            </p>
+          </div>
+        </div>
+      </div>
+    )}
+
+      {/* Editar una textura creada: al guardar se regeneran las tarjetas. */}
+      <CreateTextureModal
+        isOpen={!!creadaEditando}
+        onClose={() => setCreadaEditando(null)}
+        initialData={creadaEditando}
+        onSaved={() => {
+          setCreadaEditando(null);
+          setCreadas(readCreatedTextures());
+        }}
+      />
+    </>
   );
 }

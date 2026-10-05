@@ -68,7 +68,7 @@ const TOOLS: { id: CanvasTool; label: string; title: string }[] = [
     id: 'select',
     label: 'Selección',
     title:
-      'Selección: arrastra un cuadrado para seleccionar varios vértices (contorno y líneas) y muévelos todos a la vez; Ctrl+clic alterna uno',
+      'Selección: pinchar dentro de la figura la arrastra COMPLETA sin deformarla; Ctrl+A selecciona todos los vértices; arrastra un cuadrado para elegir varios (contorno y líneas) y muévelos a la vez; Ctrl+clic alterna uno',
   },
 ];
 
@@ -102,6 +102,9 @@ interface EditorCanvasProps {
   templateImage?: string | null;
   templateOpacity?: number;
   templateScale?: number;
+  /** Desplazamiento de la imagen de referencia en unidades SVG del
+      lienzo (100 = ancho completo), respecto al centro. */
+  templateOffset?: { x: number; y: number };
 }
 
 /**
@@ -128,6 +131,7 @@ export default function EditorCanvas({
   templateImage = null,
   templateOpacity = 0.5,
   templateScale = 1,
+  templateOffset = { x: 0, y: 0 },
 }: EditorCanvasProps) {
   const [snap, setSnap] = useState(true);
   const [selectedObject, setSelectedObject] = useState<string | null>(null);
@@ -1049,8 +1053,16 @@ export default function EditorCanvas({
             {templateImage && (
               <image
                 href={templateImage}
-                x={50 - (templateScale * 100) / 2}
-                y={50 - (templateScale * 100) / 2}
+                x={
+                  50 -
+                  (templateScale * 100) / 2 +
+                  (templateOffset?.x ?? 0)
+                }
+                y={
+                  50 -
+                  (templateScale * 100) / 2 +
+                  (templateOffset?.y ?? 0)
+                }
                 width={templateScale * 100}
                 height={templateScale * 100}
                 opacity={templateOpacity}

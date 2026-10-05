@@ -23,7 +23,9 @@ let mp4ExportActive = false;
 import { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { Mesh, Vertex3D, LatheTextureProjection } from '@/lib/geometry';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { Mesh, Vertex3D, LatheTextureProjection, type TextureMaterialParams } from '@/lib/geometry';
+import { aplicarMaterialCreado, limpiarExtrasCreados } from '@/lib/texture-generator';
 import {
    evaluateCameraKeyframes,
    evaluateTransformTrack,
@@ -425,6 +427,12 @@ interface Viewer3DProps {
     groundTextureRelief?: number;
       /** Finish for ground texture: glossy, semi-matte, matte, mirror, or metallic */
       groundTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
+      /**
+       * Parámetros de una textura CREADA aplicada al suelo: se aplican al
+       * material del suelo para que coincida con la vista previa
+       * (transmisión, metalidad…). Ausente = acabado normal.
+       */
+      groundTextureParams?: TextureMaterialParams | null;
       /** Finish for object textures: glossy, semi-matte, matte, mirror, or metallic */
       objectTextureFinish?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic';
      /** Background image URL for the skybox */
@@ -851,6 +859,10 @@ export function buildSnapshotObjectVisual(
         alphaTest: 0,
         envMapIntensity: finish === 'mirror' ? 1.5 : 0,
     });
+    // Textura CREADA: mismo material físico que la vista previa.
+    if (mesh.textureMaterialParams) {
+      aplicarMaterialCreado(material, mesh.textureMaterialParams);
+    }
     // Texturas por cara: material extra por textura distinta + grupos de
     // índices por tramo contiguo (mismo esquema que la malla principal).
     let meshMaterials: THREE.Material | THREE.Material[] = material;
@@ -919,7 +931,13 @@ export function buildSnapshotObjectVisual(
     meshObj.receiveShadow = true;
     group.add(meshObj);
 
-    if (mesh.texture) {
+    if (mesh.texture && mesh.textureMaterialParams && !mesh.bumpTexture) {
+      // Textura CREADA (Crea texturas): material PURO, igual que la vista
+      // previa — sin mapa (la imagen traería vetas/grano que la
+      // previsualización no muestra) y teñido con su color.
+      material.color.set(mesh.textureMaterialParams.color);
+      material.needsUpdate = true;
+    } else if (mesh.texture) {
       new THREE.TextureLoader().load(
         mesh.texture,
          (texture) => {
@@ -2425,6 +2443,7 @@ export default function Viewer3D({
       groundTextureRepeatY,
       groundTextureRelief = 0,
       groundTextureFinish = 'semi-matte',
+      groundTextureParams = null,
      objectTextureFinish = 'semi-matte',
      skyboxImage = null,
     onEfectosObjetos,
@@ -2466,6 +2485,11 @@ export default function Viewer3D({
   const axisGizmoCameraRef = useRef<THREE.OrthographicCamera | null>(null);
   const cubeCameraRef = useRef<THREE.CubeCamera | null>(null);
   const cubeRenderTargetRef = useRef<THREE.WebGLCubeRenderTarget | null>(null);
+  // Entorno brillante (el de la vista previa de texturas creadas): el visor
+  // normal refrata el ESCENARIO, que suele ser oscuro — un cristal aplicado
+  // saldría negro. Los materiales de texturas creadas llevan este envMap
+  // propio, como en la previsualización.
+  const envCreadaRef = useRef<THREE.Texture | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const meshGroupRef = useRef<THREE.Group | null>(null);
   const selectedObjectIdRef = useRef(selectedObjectId);
@@ -3532,6 +3556,19 @@ export default function Viewer3D({
     cubeRenderTargetRef.current = cubeRenderTarget;
     scene.environment = cubeRenderTarget.texture;
 
+    // Entorno «sala» para las texturas CREADAS: igual que el de la vista
+    // previa (RoomEnvironment → PMREM). Su material lo asigna como envMap
+    // propio para que cristal/metal reflejen un entorno brillante aunque
+    // el escenario del editor sea oscuro.
+    try {
+      const pmremCreada = new THREE.PMREMGenerator(renderer);
+      envCreadaRef.current = pmremCreada.fromScene(new RoomEnvironment(), 0.04).texture;
+      pmremCreada.dispose();
+    } catch (e) {
+      console.error('No se pudo crear el entorno de texturas creadas:', e);
+      envCreadaRef.current = null;
+    }
+
     // Directional lights (main, fill, rim) - only if not using custom config
     // or ambient is the only custom light
     const dirLight = new THREE.DirectionalLight(
@@ -3662,9 +3699,13 @@ export default function Viewer3D({
           const baseGeo = new THREE.CircleGeometry(coneRadius, segs);
           const baseMat = new THREE.MeshBasicMaterial({
             color: coneColor,
+            // Casi invisible: solo insinúa el charco de luz, sin dibujar un
+            // círculo grande encima del objeto iluminado (solicitud del
+            // usuario). El pool de luz real ya lo pinta la propia iluminación.
             transparent: true,
-            opacity: 0.08,
+            opacity: 0.04,
             depthTest: false,
+            depthWrite: false,
             side: THREE.DoubleSide,
           });
           const base = new THREE.Mesh(baseGeo, baseMat);
@@ -3673,21 +3714,43 @@ export default function Viewer3D({
           base.userData = { spotlightIdx: idx, lightType: 'spotlight', handleType: 'cone-base' };
           lightHelpers.add(base);
 
-          // Position handle: sphere at the spotlight position for dragging
-          const posGeo = new THREE.SphereGeometry(0.25, 16, 16);
-          const posMat = new THREE.MeshBasicMaterial({
-            color: 0xffff00,
+          // Position handle: marker at the spotlight position for dragging.
+          // Es un punto MUY pequeño y translúcido: al posar el foco sobre un
+          // objeto no tapa la figura con un círculo amarillo grande. El agarre
+          // sigue siendo cómodo porque debajo queda una esfera invisible más
+          // amplia (opacity 0, depthWrite false) que solo existe para el raycast.
+          const grabGeo = new THREE.SphereGeometry(0.2, 8, 8);
+          const grabMat = new THREE.MeshBasicMaterial({
             transparent: true,
-            opacity: 0.85,
+            opacity: 0,
             depthTest: false,
+            depthWrite: false,
           });
-          const posHandle = new THREE.Mesh(posGeo, posMat);
+          const posHandle = new THREE.Mesh(grabGeo, grabMat);
           posHandle.name = `spotlight-pos-${idx}`;
           posHandle.position.set(
             sp.position.x,
             sp.position.y,
             sp.position.z
           );
+          const posDot = new THREE.Mesh(
+            new THREE.SphereGeometry(0.07, 12, 12),
+            new THREE.MeshBasicMaterial({
+              color: 0xffff00,
+              transparent: true,
+              opacity: 0.35,
+              depthTest: false,
+              depthWrite: false,
+            })
+          );
+          posDot.name = `spotlight-pos-dot-${idx}`;
+          // El punto NO se ve por defecto (solicitud del usuario: en la escena
+          // no debe marcarse el objeto con un círculo amarillo). Solo aparece
+          // al pasar el ratón sobre el foco o mientras se arrastra (ver el
+          // bucle, sección de hover de ayudantes de luz).
+          posDot.visible = false;
+          posDot.renderOrder = 998;
+          posHandle.add(posDot);
           posHandle.userData = {
             spotlightIdx: idx,
             lightType: 'spotlight',
@@ -3723,15 +3786,17 @@ export default function Viewer3D({
            lightHelpers.add(ring);
           lightAngleRingsRef.current.push(ring);
 
-          // Forward direction circle: a ring around the yellow position ball,
+          // Forward direction circle: a small ring around the yellow marker,
           // oriented in the plane perpendicular to the spotlight's forward
           // direction (position → target). Shows where the light projects.
-          const fwdGeo = new THREE.TorusGeometry(0.4, 0.03, 6, 32);
+          // Pequeño y translúcido para no tapar la figura donde se posa.
+          const fwdGeo = new THREE.TorusGeometry(0.14, 0.015, 6, 32);
           const fwdMat = new THREE.MeshBasicMaterial({
             color: 0xffaa00,
             transparent: true,
-            opacity: 0.85,
+            opacity: 0.4,
             depthTest: false,
+            depthWrite: false,
             side: THREE.DoubleSide,
           });
           const fwdCircle = new THREE.Mesh(fwdGeo, fwdMat);
@@ -5987,7 +6052,12 @@ export default function Viewer3D({
         renderer.domElement.style.cursor = hover.length > 0 ? 'pointer' : '';
       }
 
-      // Hover cursor for light helpers (when not dragging)
+      // Hover cursor for light helpers (when not dragging). El punto amarillo
+      // de cada foco solo es visible al pasar el ratón sobre él o mientras se
+      // arrastra (por defecto no se dibuja; solicitud del usuario).
+      const lightDragEstado = lightDragRef.current as { spotlightIdx?: number } | null;
+      const lightDragIdx = lightDragEstado?.spotlightIdx;
+      let posHelperHovered: THREE.Object3D | null = null;
       if (lightHelpersGroupRef.current && !lightDragRef.current && !dragRef.current) {
         raycasterRef.current.setFromCamera(pointerRef.current, camera);
         const interactiveHelpers = [
@@ -6000,6 +6070,7 @@ export default function Viewer3D({
             false
           );
           renderer.domElement.style.cursor = lightHover.length > 0 ? 'grab' : '';
+          posHelperHovered = lightHover[0]?.object ?? null;
         }
 
         // Hover for light gizmo arrows
@@ -6013,6 +6084,15 @@ export default function Viewer3D({
             renderer.domElement.style.cursor = ud.mode === 'move' ? `grab` : '';
           }
         }
+      }
+      // Punto visible solo si está under el ratón o en pleno arrastre.
+      for (const helper of lightPositionHelpersRef.current) {
+        const dot = helper.children[0] as THREE.Mesh | undefined;
+        if (!dot) continue;
+        const esArrastrado =
+          lightDragIdx !== undefined &&
+          (helper.userData as { spotlightIdx?: number }).spotlightIdx === lightDragIdx;
+        dot.visible = helper === posHelperHovered || esArrastrado;
       }
       if (dragRef.current) {
         raycasterRef.current.setFromCamera(pointerRef.current, camera);
@@ -8348,6 +8428,17 @@ export default function Viewer3D({
         envMapIntensity: finish === 'mirror' ? 1.5 : 0,
       });
 
+      // Textura CREADA (Crea texturas): mismo material físico que la vista
+      // previa (transmisión en cristal/agua, metalidad, barniz…). Va
+      // ANTES de crear los materiales por cara para que hereden sus
+      // propiedades (metalidad/rugosidad).
+      if (mesh.textureMaterialParams) {
+        aplicarMaterialCreado(material, mesh.textureMaterialParams);
+        // Y el entorno brillante de la vista previa (la escena del editor
+        // suele ser oscura: sin esto el cristal se refracta negro).
+        if (envCreadaRef.current) material.envMap = envCreadaRef.current;
+      }
+
       // Texturas por cara: un material extra por textura distinta y un
       // grupo de índices por tramo contiguo de caras con la misma textura.
       // Las caras sin textura quedan en el material 0 (el general).
@@ -8418,7 +8509,16 @@ export default function Viewer3D({
       meshGroup.add(meshObj);
 
       // Cargar la textura
-      if (mesh.texture) {
+      if (mesh.texture && mesh.textureMaterialParams && !mesh.bumpTexture) {
+        // Textura CREADA: material PURO, igual que la vista previa — sin
+        // mapa (no hay vetas/grano que la previsualización no muestre) y
+        // teñido con el color de la textura.
+        for (const m of Array.isArray(meshMaterials) ? meshMaterials : [meshMaterials]) {
+          const fisico = m as THREE.MeshPhysicalMaterial;
+          fisico.color.set(mesh.textureMaterialParams.color);
+          fisico.needsUpdate = true;
+        }
+      } else if (mesh.texture) {
         const loader = new THREE.TextureLoader();
         loader.load(
           mesh.texture,
@@ -8686,6 +8786,13 @@ export default function Viewer3D({
           transparent: typeof mesh.opacity === 'number' && mesh.opacity < 1,
           opacity: typeof mesh.opacity === 'number' ? Math.max(0, Math.min(1, mesh.opacity)) : 1,
         });
+        // Textura CREADA: mismo material físico que la vista previa
+        // (transmisión en cristal/agua, metalidad, barniz…), con el
+        // entorno brillante de la previsualización.
+        if (mesh.textureMaterialParams) {
+          aplicarMaterialCreado(material, mesh.textureMaterialParams);
+          if (envCreadaRef.current) material.envMap = envCreadaRef.current;
+        }
         const sideOpacity = hasFaceOpacity
           ? Math.max(0, Math.min(1, mesh.faceOpacities!.find((value) => value < 1) ?? 1))
           : 1;
@@ -8712,7 +8819,17 @@ export default function Viewer3D({
         meshObj.receiveShadow = true;
         meshGroup.add(meshObj);
 
-        if (mesh.texture) {
+        if (mesh.texture && mesh.textureMaterialParams && !mesh.bumpTexture) {
+          // Textura CREADA: material PURO sin mapa, igual que la vista
+          // previa (la imagen traería vetas/grano de más); teñido con su
+          // color. Los materiales por cara (costado) idem.
+          for (const currentMaterial of hasFaceOpacity
+            ? [material, sideMaterial]
+            : [material]) {
+            currentMaterial.color.set(mesh.textureMaterialParams.color);
+            currentMaterial.needsUpdate = true;
+          }
+        } else if (mesh.texture) {
           const loader = new THREE.TextureLoader();
           loader.load(mesh.texture, (texture) => {
             if (cancelled) {
@@ -9306,6 +9423,47 @@ export default function Viewer3D({
       );
       duplicate.matrix.copy(inverseSelected).multiply(objectMatrix);
       duplicate.matrixAutoUpdate = false;
+    }
+
+    // --- Orden de pintado de transparencias anidadas ------------------------
+    // Todos los objetos de la escena se pintan como transparentes y three
+    // los ordena por distancia al centro: con uno DENTRO de otro (líquido
+    // dentro de la botella) esa ordenación cambia con la inclinación de la
+    // cámara y a veces sale el contenedor primero. Entonces su pared
+    // delantera escribe profundidad y CULLE al líquido: desaparecía según
+    // el ángulo. Regla estable: quien esté contenido en la caja de otro
+    // pinta ANTES (interior → contenedor), fijando renderOrder (que manda
+    // sobre el orden por distancia); sin contención manda la distancia.
+    const transparencias: { obj: THREE.Object3D; box: THREE.Box3 }[] = [];
+    meshGroup.updateMatrixWorld(true);
+    for (const object of objects) {
+      if (object.hidden || object.kind === 'camera') continue;
+      if (selected && object.id === selected.id) {
+        const mainObj = findMainMesh(meshGroup);
+        if (mainObj) {
+          mainObj.updateMatrixWorld(true);
+          transparencias.push({ obj: mainObj, box: new THREE.Box3().setFromObject(mainObj) });
+        }
+        continue;
+      }
+      const duplicate = meshGroup.children.find(
+        (child) => child.userData.sceneObjectDuplicate && child.userData.sceneObjectId === object.id
+      );
+      if (!duplicate) continue;
+      duplicate.updateMatrixWorld(true);
+      transparencias.push({ obj: duplicate, box: new THREE.Box3().setFromObject(duplicate) });
+    }
+    for (const a of transparencias) {
+      if (a.box.isEmpty()) continue;
+      let contenedores = 0;
+      for (const b of transparencias) {
+        if (b === a || b.box.isEmpty()) continue;
+        if (b.box.containsPoint(a.box.getCenter(new THREE.Vector3()))) contenedores++;
+      }
+      const orden = -contenedores;
+      a.obj.traverse((hijo) => {
+        hijo.renderOrder = orden;
+      });
     }
   }, [
     objects,
@@ -9943,7 +10101,18 @@ uniform vec3 sombraFocoPos[8];`
     const ground = groundRef.current;
     if (!ground) return;
      const material = ground.material as THREE.MeshPhysicalMaterial;
-    if (groundTexture) {
+    if (groundTextureParams) {
+      // Textura creada: material PURO, idéntico a la vista previa — el PNG
+      // del mosaico no se usa ni como mapa ni como relieve.
+      material.map = null;
+      material.bumpMap = null;
+      material.bumpScale = 0;
+      material.color.set(groundTextureParams.color);
+      limpiarExtrasCreados(material);
+      aplicarMaterialCreado(material, groundTextureParams);
+      if (envCreadaRef.current) material.envMap = envCreadaRef.current;
+      material.needsUpdate = true;
+    } else if (groundTexture) {
       const loader = new THREE.TextureLoader();
       loader.load(groundTexture, (texture) => {
         texture.wrapS = THREE.RepeatWrapping;
@@ -9959,7 +10128,17 @@ uniform vec3 sombraFocoPos[8];`
         material.bumpMap = texture;
         material.bumpScale = groundTextureRelief * FACTOR_RELIEVE_BUMP;
         material.color.set(0xffffff);
+        // El material persiste entre texturas: limpiar los efectos de una
+        // textura creada anterior (transmisión, sheen…) antes de aplicar.
+        limpiarExtrasCreados(material);
         applyGroundTextureFinish(material, groundTextureFinish);
+        // La textura creada manda sobre el acabado: mismo material que la
+        // vista previa (transmisión, metalidad, brillo…), con su entorno
+        // brillante.
+        if (groundTextureParams) {
+          aplicarMaterialCreado(material, groundTextureParams);
+          if (envCreadaRef.current) material.envMap = envCreadaRef.current;
+        }
         material.needsUpdate = true;
       });
     } else {
@@ -9969,9 +10148,12 @@ uniform vec3 sombraFocoPos[8];`
       material.color.set(0x1a1a2e);
       material.roughness = 0.9;
       material.metalness = 0.0;
+      material.envMapIntensity = 0;
+      material.envMap = null;
       material.needsUpdate = true;
+      limpiarExtrasCreados(material);
     }
-    }, [groundTexture, groundTextureRepeat, groundTextureRepeatY, groundTextureFinish, groundTextureRelief]);
+    }, [groundTexture, groundTextureRepeat, groundTextureRepeatY, groundTextureFinish, groundTextureRelief, groundTextureParams]);
 
   const applyGroundTextureFinish = (material: THREE.MeshPhysicalMaterial, finish: string) => {
     material.envMap = cubeRenderTargetRef.current?.texture ?? null;

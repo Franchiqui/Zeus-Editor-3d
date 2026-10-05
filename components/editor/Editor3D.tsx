@@ -59,6 +59,7 @@ import {
 } from '@/lib/animation';
 import LightingModal from '@/components/LightingModal';
 import TextureBrowserModal from '@/components/texture-browser-modal';
+import CreateTextureModal from '@/components/CreateTextureModal';
 import BooleanCSGModal from './BooleanCSGModal';
 import PluginsModal from './PluginsModal';
 import CalculatedCopiesModal, {
@@ -108,11 +109,13 @@ import {
 type LatheTextureProjection,
   type TextureFinish,
   type Mesh,
+  type TextureMaterialParams,
   type Point2D,
   type Handle2D,
   type HoleSpec,
   nuevoGrupoTextura,
 } from '@/lib/geometry';
+import { creadaComoParams, type CreatedTexture } from '@/lib/texture-generator';
 import {
   regionSegunObjetivo,
   extrudeRegionMesh,
@@ -933,6 +936,10 @@ const DEFAULT_LATHE_PROFILE: Polygon = [];
 
 const DEFAULT_MESH_SILHOUETTE: Polygon = [];
 
+/** Salto de cada pulsación de flecha al mover la imagen de referencia,
+    en unidades SVG del lienzo (100 = ancho completo del lienzo). */
+const TEMPLATE_MOVE_STEP = 2.5;
+
 const DEFAULT_MESH_SIDE_VIEW: Polygon = [];
 
 const DEFAULT_MESH_SECTIONS: Array<{
@@ -1717,6 +1724,9 @@ export default function Home({
   const [templateImage, setTemplateImage] = useState<string | null>(null);
   const [templateOpacity, setTemplateOpacity] = useState(0.5);
   const [templateScale, setTemplateScale] = useState(1);
+  /** Desplazamiento de la imagen de referencia en el lienzo 2D, en
+      unidades SVG (100 = ancho del lienzo). Se mueve con las flechas. */
+  const [templateOffset, setTemplateOffset] = useState({ x: 0, y: 0 });
   const templateInputRef = useRef<HTMLInputElement | null>(null);
 
   const [imageHeightScale, setImageHeightScale] = useState(10);
@@ -1886,6 +1896,9 @@ export default function Home({
   const [textureBrowserOpen, setTextureBrowserOpen] = useState(false);
 
   const [showTextureModal, setShowTextureModal] = useState(false);
+  // Modal de creación de texturas (app Crear Texturas): lo que se crea
+  // queda guardado y aparece en el explorador de Texturas.
+  const [createTextureModalOpen, setCreateTextureModalOpen] = useState(false);
   const [exportMp4Trigger, setExportMp4Trigger] = useState(0);
   const [exportProgress, setExportProgress] = useState<number | null>(null);
   const [exportResult, setExportResult] = useState<{ success: boolean; outputPath?: string; error?: string } | null>(null);
@@ -1893,6 +1906,13 @@ export default function Home({
   const [groundTexture, setGroundTexture] = useState<string | null>(null);
   const [groundTextureFileName, setGroundTextureFileName] = useState('');
   const [groundTextureFinish, setGroundTextureFinish] = useState<TextureFinish>('semi-matte');
+  // Parámetros de una textura CREADA en el suelo: se mandan al visor
+  // para que el material del suelo coincida con la vista previa.
+  const [groundTextureParams, setGroundTextureParams] = useState<TextureMaterialParams | null>(null);
+  // Parámetros de la textura creada que hay en el PANEL de texturas: al
+  // aplicarse a los objetos van a la malla (mesh.textureMaterialParams)
+  // y el visor monta el mismo material físico que la vista previa.
+  const [createdTextureParams, setCreatedTextureParams] = useState<TextureMaterialParams | null>(null);
   const [groundTextureRepeat, setGroundTextureRepeat] = useState(4);
   // Veces que se repite la textura del suelo en VERTICAL: null = copia la
   // horizontal. Y su intensidad de relieve (0 = suelo plano).
@@ -6066,6 +6086,9 @@ pluginTracks,
           setTextureFileName(file.name);
         }
         setEditedVertices(null);
+        // Un archivo normal no es una textura creada: quitar los
+        // parámetros que pudiera dejar la anterior en el panel.
+        setCreatedTextureParams(null);
       } catch (error) {
         console.error('Error al cargar la textura:', error);
       }
@@ -6107,7 +6130,7 @@ pluginTracks,
   }, []);
 
   const handleTextureSelect = useCallback(
-    (dataUrl: string, fileName: string) => {
+    (dataUrl: string, fileName: string, creada?: CreatedTexture) => {
       // Si el modal se abrió desde el campo de TEXTURA DE RELIEVE, la
       // imagen elegida va SOLO al relieve: no toca la textura normal.
       if (pickingBumpTexture) {
@@ -6124,6 +6147,10 @@ pluginTracks,
         setTextureFileName(fileName);
       }
       setEditedVertices(null);
+      // Textura CREADA: memorizar sus parámetros físicos para que, al
+      // aplicarse a los objetos, monten el mismo material que la vista
+      // previa. Con un archivo normal se limpian.
+      setCreatedTextureParams(creada ? creadaComoParams(creada) : null);
     },
     [mode, pickingBumpTexture]
   );
@@ -6165,6 +6192,12 @@ pluginTracks,
           delete newMesh.texturePanela;
           delete newMesh.textureOriginal;
         }
+        // Fuera también los parámetros de la textura creada: sin imagen no
+        // queda material creado que seguir montando. Y si la textura creada
+        // (cristal/agua) había llevado la opacidad del objeto a la suya, el
+        // objeto vuelve a ser sólido.
+        if (newMesh.textureMaterialParams) delete newMesh.opacity;
+        delete newMesh.textureMaterialParams;
         return { ...object, mesh: newMesh };
       })
     );
@@ -7461,6 +7494,7 @@ pluginTracks,
         fxConfig,
         groundTexture,
         groundTextureFinish,
+        groundTextureParams: groundTextureParams ?? undefined,
         groundTextureRepeat,
         groundTextureRepeatY: groundTextureRepeatY ?? undefined,
         groundTextureRelief: groundTextureRelief || undefined,
@@ -7643,6 +7677,10 @@ pluginTracks,
        if (mode === 'lathe') {
          setLatheTexture(objectTexture);
          setLatheTextureFileName(objectTexture ? 'textura-objeto' : '');
+         // La opacidad del torno también salta a la del objeto activo
+         // (su malla congelada la llevó); sin esto el panel arrastraba
+         // la del objeto anterior y al reconstruir se la pasaba al nuevo.
+         setLatheOpacity(mesh.opacity ?? 1);
        } else {
          setTexture(objectTexture);
          setTextureFileName(objectTexture ? 'textura-objeto' : '');
@@ -7660,6 +7698,9 @@ pluginTracks,
        setFigureOpacity(mesh.opacity ?? 1);
        setTextureHelper(mesh.textureHelper ?? false);
        setTextureHelperTransform(mesh.textureHelperTransform ?? IDENTITY_TRANSFORM);
+       // Los parámetros de textura creada también saltan a los del objeto
+       // recién seleccionado (y se limpian si el suyo es un archivo normal).
+       setCreatedTextureParams(mesh.textureMaterialParams ?? null);
      },
      [mode, sceneObjects]
    );
@@ -7711,6 +7752,18 @@ pluginTracks,
             } else {
               delete newMesh.textureRepeatY;
             }
+            if (createdTextureParams && textureUrl) {
+              // Textura CREADA: guardar sus parámetros en la malla — el
+              // visor los usa para montar el mismo material físico que la
+              // vista previa (transmisión en cristal/agua, metalidad…) — y
+              // llevar la opacidad del objeto a la de la textura, igual
+              // que se ve en la previsualización.
+              newMesh.textureMaterialParams = { ...createdTextureParams };
+              newMesh.opacity = createdTextureParams.opacity;
+            } else {
+              // Archivo normal o textura quitada: sin parámetros creados.
+              delete newMesh.textureMaterialParams;
+            }
             newMesh.textureFinish = textureFinish;
             newMesh.textureRelief = textureRelief;
             // La textura de relieve dedicada del panel manda para los
@@ -7741,7 +7794,7 @@ pluginTracks,
            };
          })
        );
-      }, [selectedObjectId, selectedObjectIds, mode, latheTexture, texture, textureRepeat, textureRepeatY, textureFinish, textureRelief, textureProjection, textureHelper, textureHelperTransform, bumpTextureRepeat, bumpTextureRepeatY, bumpTexture]);
+      }, [selectedObjectId, selectedObjectIds, mode, latheTexture, texture, textureRepeat, textureRepeatY, textureFinish, textureRelief, textureProjection, textureHelper, textureHelperTransform, bumpTextureRepeat, bumpTextureRepeatY, bumpTexture, createdTextureParams]);
 
     // --- Textura por caras (selección de caras de la figura activa) ---
     // El objeto cuya malla se está viendo/editando: el seleccionado; si
@@ -8390,6 +8443,9 @@ pluginTracks,
               setTextureHelperTransform(
                 selectedLoadedMesh.textureHelperTransform ?? IDENTITY_TRANSFORM
               );
+              setCreatedTextureParams(
+                selectedLoadedMesh.textureMaterialParams ?? null
+              );
             }
           }
         } else {
@@ -8443,6 +8499,9 @@ pluginTracks,
           }
           if (typeof data.groundTexture === 'string') {
             setGroundTexture(restoreTextureUrl(data.groundTexture));
+          }
+          if (data.groundTextureParams && typeof data.groundTextureParams === 'object') {
+            setGroundTextureParams(data.groundTextureParams as TextureMaterialParams);
           }
            if (typeof data.groundTextureFinish === 'string') {
              setGroundTextureFinish(data.groundTextureFinish as TextureFinish);
@@ -9489,6 +9548,12 @@ pluginTracks,
       if (id && !selectedObjectIds.includes(id)) {
         setSelectedObjectIds([]);
       }
+      // El panel pasa al objeto recién activado: el dueño anterior ya
+      // congeló su configuración y pierde la propiedad del panel. Sin
+      // esto el dueño seguía activo y, al congelarlo otra vez más
+      // tarde, le llegaba la textura/ajustes del objeto intermedio.
+      // (Deseleccionar vacío no mueve el panel: el dueño sigue siendo suyo.)
+      if (id) setConfigObjectId(null);
       syncTextureStateToSelection(id);
     },
     [
@@ -9502,6 +9567,52 @@ pluginTracks,
       selectedObjectIds,
     ]
      );
+
+  /**
+   * Activa un objeto como seleccionado principal DESDE la lista de la
+   * pestaña (casillas de multiselección) conservando la multiselección
+   * que pida el llamador. Hace lo mismo que handleObjectSelect (congelar
+   * al dueño, liberarlo y restaurar la configuración COMPLETA del nuevo
+   * activo, o sincronizar el panel si no la tiene) pero SIN limpiar la
+   * multiselección nueva: así el panel nunca sigue mostrando los ajustes
+   * del objeto anterior — textura, opacidad, plantillas — y no se pasan
+   * de un objeto a otro al reconstruir o congelar.
+   */
+  const activateObjectFromList = useCallback(
+    (id: string | null, futureIds?: string[]) => {
+      if (id === selectedObjectId) return;
+      if (id && configObjectId && id !== configObjectId) {
+        freezeObjectSnapshot(configObjectId);
+        setConfigObjectId(null);
+      }
+      setSelectedObjectId(id);
+      const multi = futureIds ?? selectedObjectIds;
+      if (id && !multi.includes(id)) {
+        setSelectedObjectIds([]);
+      }
+      const nextObject = id ? sceneObjects.find((o) => o.id === id) : undefined;
+      if (
+        nextObject?.config &&
+        mode !== 'scene' &&
+        (nextObject.mode ?? mode) === mode
+      ) {
+        applyObjectConfig(structuredClone(nextObject.config));
+        setConfigObjectId(id);
+      } else {
+        syncTextureStateToSelection(id);
+      }
+    },
+    [
+      selectedObjectId,
+      selectedObjectIds,
+      configObjectId,
+      sceneObjects,
+      mode,
+      freezeObjectSnapshot,
+      applyObjectConfig,
+      syncTextureStateToSelection,
+    ]
+  );
 
     const createGroupFromSelection = useCallback(() => {
       if (selectedObjectIds.length === 0) {
@@ -10766,7 +10877,16 @@ pluginTracks,
     if (borrada?.kind === 'camera' && grabacionRef.current?.camaraId === objectToDelete) {
       setGrabacion(null);
     }
-    if (!configApplied) syncTextureStateToSelection(nextId);
+    if (!configApplied) {
+      // El panel pasa al objeto que toma el relevo: si sigue vivo otro
+      // dueño, congela su figura y lo libera primero, para que la
+      // sincronización con el nuevo activo no acabe escrita en él.
+      if (configObjectId && nextId !== configObjectId) {
+        freezeObjectSnapshot(configObjectId);
+        setConfigObjectId(null);
+      }
+      syncTextureStateToSelection(nextId);
+    }
     setObjectToDelete(null);
   }, [
     objectToDelete,
@@ -11813,6 +11933,7 @@ pluginTracks,
       showGround={showGround}
       groundTexture={groundTexture}
       groundTextureFinish={groundTextureFinish}
+      groundTextureParams={groundTextureParams}
       groundTextureRepeat={groundTextureRepeat}
       groundTextureRepeatY={groundTextureRepeatY ?? undefined}
       groundTextureRelief={groundTextureRelief}
@@ -12084,8 +12205,25 @@ pluginTracks,
                   </span>
                 </DropdownMenuItem>
                 <DropdownMenuItem
-                  onSelect={(e) => {
-                    e.preventDefault();
+                  onSelect={() => {
+                    // Sin preventDefault: el menú se cierra solo al abrir el
+                    // modal (mismo motivo que los otros modales).
+                    setCreateTextureModalOpen(true);
+                  }}
+                  data-testid="open-create-texture-modal"
+                  className="hover:bg-gray-800 cursor-pointer p-2 flex flex-col items-start gap-0.5"
+                  title={t('editor3D.createTextureDesc')}
+                >
+                  <span className="text-sm font-bold flex items-center gap-1.5">
+                    <Palette className="w-3.5 h-3.5 text-pink-400" />
+                    {t('editor3D.createTexture')}
+                  </span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    // Sin preventDefault: el menú debe cerrarse al abrir el
+                    // explorador; si no, Radix deja pointer-events: none en
+                    // el body y el explorador no recibe clics.
                     setTextureSelectTarget('ground');
                     setShowTextureModal(true);
                   }}
@@ -12181,6 +12319,7 @@ pluginTracks,
                         e.preventDefault();
                         setGroundTexture(null);
                         setGroundTextureFileName('');
+                        setGroundTextureParams(null);
                       }}
                       className="hover:bg-gray-800 cursor-pointer p-2 flex items-center text-red-300"
                     >
@@ -12189,8 +12328,9 @@ pluginTracks,
                     </DropdownMenuItem>
                   )}
                  <DropdownMenuItem
-                  onSelect={(e) => {
-                    e.preventDefault();
+                  onSelect={() => {
+                    // Sin preventDefault: el menú debe cerrarse al abrir el
+                    // explorador (mismo motivo que en Textura del suelo).
                     setTextureSelectTarget('skybox');
                     setShowTextureModal(true);
                   }}
@@ -12735,37 +12875,27 @@ pluginTracks,
                                  groupObjCount > 0 &&
                                  miembros.every((oid) => selectedObjectIds.includes(oid))
                                ) {
-                                 const next = selectedObjectIds.filter(
-                                   (id) => !miembros.includes(id)
-                                 );
-                                 setSelectedObjectIds(next);
-                                 if (selectedObjectId && miembros.includes(selectedObjectId)) {
-                                   const siguiente = next.length > 0 ? next[0] : null;
-                                   if (
-                                     configObjectId &&
-                                     siguiente !== configObjectId
-                                   ) {
-                                     freezeObjectSnapshot(configObjectId);
-                                   }
-                                   setSelectedObjectId(siguiente);
-                                   syncTextureStateToSelection(siguiente);
-                                 }
-                               } else {
-                                 const nuevos = miembros.filter(
-                                   (id) => !selectedObjectIds.includes(id)
-                                 );
-                                 setSelectedObjectIds([...selectedObjectIds, ...nuevos]);
-                                 if (nuevos.length > 0 && selectedObjectId !== nuevos[0]) {
-                                   if (
-                                     configObjectId &&
-                                     nuevos[0] !== configObjectId
-                                   ) {
-                                     freezeObjectSnapshot(configObjectId);
-                                   }
-                                   setSelectedObjectId(nuevos[0]);
-                                   syncTextureStateToSelection(nuevos[0]);
-                                 }
-                               }
+                                const next = selectedObjectIds.filter(
+                                  (id) => !miembros.includes(id)
+                                );
+                                setSelectedObjectIds(next);
+                                if (selectedObjectId && miembros.includes(selectedObjectId)) {
+                                  const siguiente = next.length > 0 ? next[0] : null;
+                                  activateObjectFromList(siguiente, next);
+                                }
+                              } else {
+                                const nuevos = miembros.filter(
+                                  (id) => !selectedObjectIds.includes(id)
+                                );
+                                const nuevaMulti = [
+                                  ...selectedObjectIds,
+                                  ...nuevos,
+                                ];
+                                setSelectedObjectIds(nuevaMulti);
+                                if (nuevos.length > 0 && selectedObjectId !== nuevos[0]) {
+                                  activateObjectFromList(nuevos[0], nuevaMulti);
+                                }
+                              }
                              }}
                              className="w-3 h-3 accent-green-500 cursor-pointer shrink-0"
                              data-testid={`group-check-${grp.id}`}
@@ -14874,36 +15004,25 @@ pluginTracks,
                                   // siguiente de la lista toma el relevo
                                   // y el panel pasa a mostrar SUS
                                   // ajustes (textura, acabado, relieve,
-                                  // proyección, transparencia).
+                                  // proyección, transparencia) sin que
+                                  // se le transfieran los del anterior.
                                   const siguiente =
                                     next.length > 0 ? next[0] : null;
-                                  if (
-                                    configObjectId &&
-                                    siguiente !== configObjectId
-                                  ) {
-                                    freezeObjectSnapshot(configObjectId);
-                                  }
-                                  setSelectedObjectId(siguiente);
-                                  syncTextureStateToSelection(siguiente);
+                                  activateObjectFromList(siguiente, next);
                                 }
                               } else {
-                                setSelectedObjectIds([
+                                const nuevaMulti = [
                                   ...selectedObjectIds,
                                   object.id,
-                                ]);
+                                ];
+                                setSelectedObjectIds(nuevaMulti);
                                 if (selectedObjectId !== object.id) {
-                                  if (
-                                    configObjectId &&
-                                    object.id !== configObjectId
-                                  ) {
-                                    freezeObjectSnapshot(configObjectId);
-                                  }
-                                  setSelectedObjectId(object.id);
-                                  // El panel salta a los ajustes del
-                                  // recién activado; así Guardar nunca le
-                                  // escribe la textura que quedara en
-                                  // pantalla del objeto anterior.
-                                  syncTextureStateToSelection(object.id);
+                                  // El panel salta a los ajustes COMPLETOS
+                                  // del recién activado (config del dueño o
+                                  // sincronización): así Guardar nunca le
+                                  // escribe la textura ni la opacidad que
+                                  // quedara en pantalla del objeto anterior.
+                                  activateObjectFromList(object.id, nuevaMulti);
                                 }
                               }
                             }}
@@ -15542,6 +15661,7 @@ pluginTracks,
                 templateImage={templateImage}
                 templateOpacity={templateOpacity}
                 templateScale={templateScale}
+                templateOffset={templateOffset}
               />
             ) : editingViewProfile &&
               (mode === 'views' || mode === 'extrude') ? (
@@ -15578,6 +15698,7 @@ pluginTracks,
                 templateImage={templateImage}
                 templateOpacity={templateOpacity}
                 templateScale={templateScale}
+                templateOffset={templateOffset}
               />
             ) : mode === 'mesh' && editingMeshProfile ? (
               /* Un solo panel maximizado */
@@ -15610,6 +15731,7 @@ pluginTracks,
                     templateImage={templateImage}
                     templateOpacity={templateOpacity}
                     templateScale={templateScale}
+                    templateOffset={templateOffset}
                   />
                 </div>
               ) : editingMeshProfile === 'side' ? (
@@ -15637,6 +15759,7 @@ pluginTracks,
                     templateImage={templateImage}
                     templateOpacity={templateOpacity}
                     templateScale={templateScale}
+                    templateOffset={templateOffset}
                   />
                 </div>
               ) : (
@@ -15683,6 +15806,7 @@ pluginTracks,
                         templateImage={templateImage}
                         templateOpacity={templateOpacity}
                         templateScale={templateScale}
+                        templateOffset={templateOffset}
                       />
                     </div>
                   );
@@ -15720,6 +15844,7 @@ pluginTracks,
                     templateImage={templateImage}
                     templateOpacity={templateOpacity}
                     templateScale={templateScale}
+                    templateOffset={templateOffset}
                   />
                 </div>
                 {/* Mitad izquierda 2: el costado */}
@@ -15748,6 +15873,7 @@ pluginTracks,
                     templateImage={templateImage}
                     templateOpacity={templateOpacity}
                     templateScale={templateScale}
+                    templateOffset={templateOffset}
                   />
                 </div>
 
@@ -15988,6 +16114,7 @@ pluginTracks,
                       templateImage={templateImage}
                       templateOpacity={templateOpacity}
                       templateScale={templateScale}
+                      templateOffset={templateOffset}
                     />
                   )}
                 </div>
@@ -16236,6 +16363,7 @@ pluginTracks,
                     const reader = new FileReader();
                     reader.onload = (ev) => {
                       setTemplateImage(ev.target?.result as string);
+                      setTemplateOffset({ x: 0, y: 0 });
                     };
                     reader.readAsDataURL(file);
                   }
@@ -16281,11 +16409,60 @@ pluginTracks,
                       {Math.round(templateScale * 100)}%
                     </span>
                   </div>
+                  {/* Mover la imagen por el lienzo: flechas + recentrar */}
+                  <div className="flex items-center gap-0.5">
+                    <button
+                      onClick={() =>
+                        setTemplateOffset((o) => ({ ...o, x: o.x - TEMPLATE_MOVE_STEP }))
+                      }
+                      className="w-7 h-7 grid place-items-center rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-white/10 border border-white/10 transition-colors"
+                      title={t('editor3D.templateMoveLeft')}
+                    >
+                      ◀
+                    </button>
+                    <div className="flex flex-col gap-0.5">
+                      <button
+                        onClick={() =>
+                          setTemplateOffset((o) => ({ ...o, y: o.y - TEMPLATE_MOVE_STEP }))
+                        }
+                        className="w-7 h-6 grid place-items-center rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-white/10 border border-white/10 transition-colors"
+                        title={t('editor3D.templateMoveUp')}
+                      >
+                        ▲
+                      </button>
+                      <button
+                        onClick={() =>
+                          setTemplateOffset((o) => ({ ...o, y: o.y + TEMPLATE_MOVE_STEP }))
+                        }
+                        className="w-7 h-6 grid place-items-center rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-white/10 border border-white/10 transition-colors"
+                        title={t('editor3D.templateMoveDown')}
+                      >
+                        ▼
+                      </button>
+                    </div>
+                    <button
+                      onClick={() =>
+                        setTemplateOffset((o) => ({ ...o, x: o.x + TEMPLATE_MOVE_STEP }))
+                      }
+                      className="w-7 h-7 grid place-items-center rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-white/10 border border-white/10 transition-colors"
+                      title={t('editor3D.templateMoveRight')}
+                    >
+                      ▶
+                    </button>
+                    <button
+                      onClick={() => setTemplateOffset({ x: 0, y: 0 })}
+                      className="w-7 h-7 grid place-items-center rounded-md text-xs text-cyan-200 hover:text-cyan-100 hover:bg-cyan-500/20 border border-cyan-500/30 transition-colors"
+                      title={t('editor3D.templateCenter')}
+                    >
+                      ⌖
+                    </button>
+                  </div>
                    <button
                       onClick={() => {
                         setTemplateImage(null);
                         setTemplateOpacity(0.5);
                         setTemplateScale(1);
+                        setTemplateOffset({ x: 0, y: 0 });
                       }}
                       className="px-2 py-1 rounded-md text-xs font-medium bg-red-500/10 hover:bg-red-500/20 text-red-300 border border-red-500/30 transition-colors"
                       title={t('editor3D.removeTemplate')}
@@ -17033,16 +17210,19 @@ pluginTracks,
           setShowTextureModal(false);
           setTextureSelectTarget(null);
         }}
-         onSelectTexture={(dataUrl, fileName) => {
+         onSelectTexture={(dataUrl, fileName, creada) => {
            if (textureSelectTarget === 'ground') {
              setGroundTexture(dataUrl);
              setGroundTextureFileName(fileName);
+             // Textura creada: material del suelo igual a la vista previa.
+             setGroundTextureParams(creada ? creadaComoParams(creada) : null);
            } else if (textureSelectTarget === 'object') {
              setSelectedObjectTexture(dataUrl);
              setSelectedObjectTextureFileName(fileName);
            } else if (textureSelectTarget === 'face') {
              // Textura elegida de la galería para las caras seleccionadas.
              applyFaceTextureToSelection(dataUrl);
+             setCreatedTextureParams(null);
            } else {
              setSkyboxImage(dataUrl);
              setSkyboxImageFileName(fileName);
@@ -17050,6 +17230,10 @@ pluginTracks,
           }}
           mode={mode}
         />
+       <CreateTextureModal
+         isOpen={createTextureModalOpen}
+         onClose={() => setCreateTextureModalOpen(false)}
+       />
       </div>
   );
 }

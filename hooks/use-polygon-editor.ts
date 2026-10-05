@@ -8,6 +8,7 @@ import {
   Handle2D,
   DEFAULT_HANDLE_LEN,
   closestEdgeHit,
+  pointInPolygon,
 } from '@/lib/geometry';
 import {
   nearestPolylineHit,
@@ -27,8 +28,18 @@ import type {
 const HOLD_TO_CURVE_MS = 800;
 /** Desplazamiento mínimo para considerar que es un arrastre (cancela la curva) */
 const DRAG_THRESHOLD = 0.01;
-/** Distancia al vértice por debajo de la cual un asa se elimina al soltar */
+/** Distancia al vértice por debajo de la cual un asa se elimina al
+    soltar. Es un MÁXIMO: el umbral real se ajusta al tamaño de la
+    figura (fracción de la arista vecina más corta). Así las curvas
+    chiquititas de plantillas con vértices apretados se aguatan al
+    soltar en vez de colapsar a recta, mientras que arrastrar el asa
+    hasta el vértice a propósito sigue enderezando la esquina. */
 const HANDLE_EPS = 0.03;
+/** Piso del umbral anterior: una asa a menos de esto (jitter del
+    puntero) siempre se considera colapsada, figura del tamaño que sea. */
+const HANDLE_EPS_MIN = 0.005;
+/** Fracción de la arista vecina más corta que define el umbral real. */
+const HANDLE_EDGE_FRACTION = 0.3;
 /** Cerca de una arista, el clic inserta el vértice EN esa arista */
 const EDGE_HIT_EPS = 0.025;
 /** Segmentos del arco al redondear una esquina (herramienta Curva) */
@@ -350,7 +361,10 @@ export function usePolygonEditor({
     [clampPoint, polygon, onChange]
   );
 
-  /** Arrastra un asa individual a la posición del ratón */
+  /** Arrastra un asa individual a la posición del ratón. La asa del
+      otro lado se CONSERVA: cada patilla se mueve por separado sin
+      borrar la contraria (antes el objeto nuevo se construía solo con
+      la asa arrastrada y la otra se perdía → ese lado quedaba recto). */
   const updateHandle = useCallback(
     (pt: Point2D) => {
       const hd = handleDrag.current;
@@ -361,8 +375,8 @@ export function usePolygonEditor({
         polygon.map((q, idx) => {
           if (idx !== vi) return q;
           return side === 'in'
-            ? { x: q.x, y: q.y, hIn: h }
-            : { x: q.x, y: q.y, hOut: h };
+            ? { x: q.x, y: q.y, hIn: h, ...(q.hOut ? { hOut: q.hOut } : {}) }
+            : { x: q.x, y: q.y, hOut: h, ...(q.hIn ? { hIn: q.hIn } : {}) };
         })
       );
     },
@@ -371,16 +385,30 @@ export function usePolygonEditor({
 
   /**
    * Elimina las asas que hayan quedado sobre el propio vértice
-   * (curva reducida a cero → esquina recta otra vez).
+   * (curva reducida a cero → esquina recta otra vez). El umbral se
+   * adapta al tamaño local de la figura: nunca pasa de HANDLE_EPS y
+   * nunca baja de HANDLE_EPS_MIN, así una curva pequeña en una zona
+   * con aristas cortas sobrevive aunque caiga bajo el umbral global.
    */
   const stripDegenerateHandles = useCallback(
     (vi: number) => {
       const v = polygon[vi];
       if (!v || (!v.hIn && !v.hOut)) return;
+      const n = polygon.length;
+      const prev = polygon[(vi - 1 + n) % n];
+      const next = polygon[(vi + 1) % n];
+      const minEdge = Math.min(
+        Math.hypot(prev.x - v.x, prev.y - v.y),
+        Math.hypot(next.x - v.x, next.y - v.y)
+      );
+      const eps = Math.max(
+        HANDLE_EPS_MIN,
+        Math.min(HANDLE_EPS, minEdge * HANDLE_EDGE_FRACTION)
+      );
       const dIn = v.hIn ? Math.hypot(v.hIn.x - v.x, v.hIn.y - v.y) : 0;
       const dOut = v.hOut ? Math.hypot(v.hOut.x - v.x, v.hOut.y - v.y) : 0;
-      const keepIn = dIn >= HANDLE_EPS;
-      const keepOut = dOut >= HANDLE_EPS;
+      const keepIn = dIn >= eps;
+      const keepOut = dOut >= eps;
       if (keepIn && keepOut) return;
       onChange(
         polygon.map((q, i) => {
@@ -472,6 +500,41 @@ export function usePolygonEditor({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [draft, cancelDraft, commitDraft]);
 
+  /** Prepara el arrastre de grupo con las posiciones de partida.
+      refsOverride permite arrastrar un grupo distinto de la selección
+      actual (p. ej. la figura COMPLETA al pinchar dentro de ella). */
+  const beginGroupDrag = useCallback(
+    (e: ReactPointerEvent, grabbed: VertexRef, refsOverride?: VertexRef[]) => {
+      pushHistory();
+      const refs = refsOverride ?? selection;
+      const contourPositions: GroupDragStart[] = refs
+        .filter((r) => r.line === -1 && r.vertex < polygon.length)
+        .map((r) => {
+          const p = polygon[r.vertex];
+          return {
+            ref: r,
+            x: p.x,
+            y: p.y,
+            ...(p.hIn ? { hIn: p.hIn } : {}),
+            ...(p.hOut ? { hOut: p.hOut } : {}),
+          };
+        });
+      const linePositions: GroupDragStart[] = refs
+        .filter((r) => r.line >= 0 && r.line < polylinesOrDefault.length)
+        .map((r) => {
+          const p = polylinesOrDefault[r.line]?.points[r.vertex];
+          return p ? { ref: r, x: p.x, y: p.y } : null;
+        })
+        .filter((s): s is GroupDragStart => s !== null);
+      groupDrag.current = {
+        origin: toCanvasPoint(e, { snap: false, clamp: false }),
+        grabbed,
+        positions: [...contourPositions, ...linePositions],
+      };
+    },
+    [pushHistory, selection, polygon, polylinesOrDefault, toCanvasPoint]
+  );
+
   const handlePointerDown = useCallback(
     (e: ReactPointerEvent) => {
       if (e.button === 2) {
@@ -519,11 +582,40 @@ export function usePolygonEditor({
         }
         return;
       }
-      // Selección: arrastrar en zona libre abre la marquesina (el
-      // cuadrado discontinuo). La esquina va SIN imantar para que el
-      // cuadrado siga exactamente al ratón.
+      // Selección: pinchar DENTRO de la figura la agarra entera (se
+      // seleccionan todos sus vértices y el grupo se arrastra rígido,
+      // sin deformarse). Pinchar fuera abre la marquesina (el cuadrado
+      // discontinuo); con Ctrl se abre la marquesina también dentro,
+      // para añadir vértices por zonas. La esquina va SIN imantar para
+      // que el cuadrado siga exactamente al ratón.
       if (tool === 'select') {
         const raw = toCanvasPoint(e, { snap: false, clamp: false });
+        if (
+          !e.ctrlKey &&
+          !e.metaKey &&
+          polygon.length >= 3 &&
+          pointInPolygon(raw, polygon)
+        ) {
+          // Vértice de agarre: el más cercano al puntero (manda en la
+          // imantación del grupo al arrastrar).
+          let grab = 0;
+          let bestDist = Infinity;
+          polygon.forEach((p, i) => {
+            const d = Math.hypot(p.x - raw.x, p.y - raw.y);
+            if (d < bestDist) {
+              bestDist = d;
+              grab = i;
+            }
+          });
+          setSelection(polygon.map((_, i) => ({ line: -1, vertex: i })));
+          beginGroupDrag(
+            e,
+            { line: -1, vertex: grab },
+            polygon.map((_, i) => ({ line: -1, vertex: i }))
+          );
+          (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+          return;
+        }
         setMarquee({ x0: raw.x, y0: raw.y, x1: raw.x, y1: raw.y });
         (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
         return;
@@ -572,6 +664,7 @@ export function usePolygonEditor({
       onChange,
       selection,
       deleteSelectedVertices,
+      beginGroupDrag,
     ]
   );
 
@@ -938,6 +1031,36 @@ export function usePolygonEditor({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [selectedVertex, roundCorner]);
 
+  // Ctrl+A (herramienta Selección): selecciona TODOS los vértices del
+  // contorno y de las polilíneas. Así basta Ctrl+A y arrastrar un
+  // vértice cualquiera para desplazar la plantilla completa sin
+  // deformarla (el arrastre de grupo ya la mueve rígida).
+  useEffect(() => {
+    if (tool !== 'select') return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || (e.key !== 'a' && e.key !== 'A'))
+        return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      const refs: VertexRef[] = [];
+      polygon.forEach((_, i) => refs.push({ line: -1, vertex: i }));
+      polylinesOrDefault.forEach((line, li) =>
+        line.points.forEach((_, i) => refs.push({ line: li, vertex: i }))
+      );
+      setSelection(refs);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [tool, polygon, polylinesOrDefault]);
+
   /**
    * Reglas comunes de la herramienta Selección al pulsar un vértice
    * (del contorno o de una polilínea). Devuelve 'toggle' (Ctrl: alternar
@@ -962,38 +1085,6 @@ export function usePolygonEditor({
       return 'single';
     },
     [selection]
-  );
-
-  /** Prepara el arrastre de grupo con las posiciones de partida */
-  const beginGroupDrag = useCallback(
-    (e: ReactPointerEvent, grabbed: VertexRef) => {
-      pushHistory();
-      const contourPositions: GroupDragStart[] = selection
-        .filter((r) => r.line === -1 && r.vertex < polygon.length)
-        .map((r) => {
-          const p = polygon[r.vertex];
-          return {
-            ref: r,
-            x: p.x,
-            y: p.y,
-            ...(p.hIn ? { hIn: p.hIn } : {}),
-            ...(p.hOut ? { hOut: p.hOut } : {}),
-          };
-        });
-      const linePositions: GroupDragStart[] = selection
-        .filter((r) => r.line >= 0 && r.line < polylinesOrDefault.length)
-        .map((r) => {
-          const p = polylinesOrDefault[r.line]?.points[r.vertex];
-          return p ? { ref: r, x: p.x, y: p.y } : null;
-        })
-        .filter((s): s is GroupDragStart => s !== null);
-      groupDrag.current = {
-        origin: toCanvasPoint(e, { snap: false, clamp: false }),
-        grabbed,
-        positions: [...contourPositions, ...linePositions],
-      };
-    },
-    [pushHistory, selection, polygon, polylinesOrDefault, toCanvasPoint]
   );
 
   const handleVertexPointerDown = useCallback(

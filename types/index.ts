@@ -582,3 +582,45 @@ export {
   DARK_THEME,
   LIGHT_THEME,
 } from './index-2';
+// --- Texturas creadas (app Crear Texturas, /edit-texturas y Editor 3D) ---
+// Las texturas creadas no son archivos: son parámetros de material
+// guardados en localStorage (clave 'textures_db', compartida con la
+// página /edit-texturas) y se rasterizan con lib/texture-generator.ts.
+
+export type TextureType = 'glass' | 'water' | 'wood' | 'metal' | 'concrete' | 'plastic';
+
+export interface Texture {
+  id: string;
+  name: string;
+  type: TextureType;
+  /** Color base en hexadecimal (#RRGGBB). */
+  color: string;
+  /** 0 = transparente, 1 = sólida. */
+  opacity: number;
+  /** 0 = lisa, 1 = rugosa. */
+  roughness: number;
+  description?: string;
+  /** Mosaico generado como data URL (normalmente se genera en caliente). */
+  imageUrl?: string;
+  format?: string;
+  size?: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface TextureFormData {
+  name: string;
+  type: TextureType;
+  color: string;
+  opacity: number;
+  roughness: number;
+  description?: string;
+}
+
+export interface TextureStore {
+  textures: Texture[];
+  addTexture: (data: TextureFormData) => Promise<Texture>;
+  updateTexture: (id: string, data: Partial<Texture>) => Promise<Texture | null>;
+  deleteTexture: (id: string) => Promise<boolean>;
+  loadTextures: () => void;
+}

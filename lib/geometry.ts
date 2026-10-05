@@ -123,6 +123,37 @@ export type Mesh = {
    * visor cuando la malla lleva textura.
    */
   opacity?: number;
+  /**
+   * Parámetros de una textura CREADA (Crea texturas) aplicada a la malla:
+   * el visor los usa para montar el MISMO material físico que la vista
+   * previa 3D (transmisión en cristal/agua, metalidad, barniz…). Ausente
+   * = material normal por acabado.
+   */
+  textureMaterialParams?: TextureMaterialParams;
+};
+
+/** Tipo de una textura creada (igual que `TextureType` en types/index.ts). */
+export type CreatedTextureType =
+  | 'glass'
+  | 'water'
+  | 'wood'
+  | 'metal'
+  | 'concrete'
+  | 'plastic';
+
+/**
+ * Ajustes físicos de una textura creada tal como los muestra la vista
+ * previa: se guardan en la malla al aplicarla para que el material del
+ * objeto coincida con lo que se ve en la previsualización.
+ */
+export type TextureMaterialParams = {
+  type: CreatedTextureType;
+  /** Color hex de la textura ('#rrggbb'). */
+  color: string;
+  /** Opacidad 0..1. */
+  opacity: number;
+  /** Rugosidad 0..1. */
+  roughness: number;
 };
 
 /** Contador de asignaciones de textura: cada «Asignar» lleva id nuevo. */
