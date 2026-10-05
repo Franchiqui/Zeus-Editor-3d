@@ -561,7 +561,7 @@ Type: {previewTexture.type} | Color: {previewTexture.color} | Opacity: {Math.rou
         </div>
       )}
 
- 
+  
     </main>
   );
 }
