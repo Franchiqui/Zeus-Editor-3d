@@ -320,8 +320,10 @@ interface Viewer3DProps {
     onSelectionModeChange?: (active: boolean) => void;
     /** Activar modo de selección de caras de la figura activa */
     faceSelectMode?: boolean;
-    /** Herramienta de selección: rectángulo, círculo, línea o polígono (clics sucesivos) */
-    faceSelectionTool?: 'rectangle' | 'circle' | 'line' | 'poligono';
+    /** Herramienta de selección: rectángulo, círculo, línea, polígono
+     * (clics sucesivos) o DIRECTO — el clic elige el elemento bajo el
+     * cursor, sin marco (los botones Polígono/Aristas/Puntos la fijan). */
+    faceSelectionTool?: 'rectangle' | 'circle' | 'line' | 'poligono' | 'directo';
     /** Qué se selecciona: caras, vértices o segmentos (aristas) */
     faceSelectionTarget?: 'cara' | 'vertice' | 'segmento';
     /** Solo capturar lo visible (caras frontales, no lo que está detrás) */
@@ -1295,6 +1297,76 @@ type GizmoDrag = {
     lastDqOrbit?: THREE.Quaternion;
   };
 
+/** Arrastre del gizmo de sub-selección (caras/aristas/vértices): mueve o
+ * escala los vértices de la selección en el espacio LOCAL de la malla.
+ * `vertOriginales`/`vertIdx` son la selección al empezar (índices de
+ * vértice deduplicados) y `centroLocal` el pivote de la escala.
+ * mover: delta del rayo sobre la línea del eje (startT). escala: plano
+ * frontal a la cámara por el centroide (factor = 1 + delta·basisU). */
+type SelectionGizmoDrag = {
+  axis: GizmoAxis;
+  mode: 'move' | 'scale' | 'uniform-scale';
+  /** eje (mundo, sin girar con el objeto) por el que se mueve el gesto */
+  axisWorld: THREE.Vector3;
+  startT: number;
+  centroMundoStart: THREE.Vector3;
+  /** Plano de captura (escala: ⟂ a la vista por el centroide) */
+  plane: THREE.Plane;
+  /** Base para medir el desplazamiento en pantalla del gesto de escala */
+  basisU: THREE.Vector3;
+  /** Vértices al empezar (copia en local) e índices únicos a mover */
+  vertOriginales: Vertex3D[];
+  vertIdx: number[];
+  centroLocal: THREE.Vector3;
+  latestVerts?: Vertex3D[];
+  lastEmit?: number;
+};
+
+/** Vértices ÚNICOS de la sub-selección (dedupe) + su centroide en LOCAL:
+ * pivote del gizmo de la selección. Caras → todos los vértices de las
+ * caras; vértices → tal cual; segmentos → extremos de las aristas. */
+function collectSelectionVerts(
+  m: Mesh,
+  target: 'cara' | 'vertice' | 'segmento',
+  faceIds: number[],
+  vertexIds: number[],
+  edgeIds: string[]
+): { vertIdx: number[]; centroLocal: THREE.Vector3 } {
+  const set = new Set<number>();
+  if (target === 'cara') {
+    for (const f of faceIds) {
+      const face = m.faces[f];
+      if (face) {
+        for (const vi of face) {
+          getVertexGroup(m, vi).forEach(v => set.add(v));
+        }
+      }
+    }
+  } else if (target === 'vertice') {
+    for (const vi of vertexIds) {
+      getVertexGroup(m, vi).forEach(v => set.add(v));
+    }
+  } else {
+    const incluidas = new Set(edgeIds);
+    for (const edge of deriveMeshEdges(m)) {
+      if (!incluidas.has(edge.key)) continue;
+      getVertexGroup(m, edge.a).forEach(v => set.add(v));
+      getVertexGroup(m, edge.b).forEach(v => set.add(v));
+    }
+  }
+  if (set.size === 0) return { vertIdx: [], centroLocal: new THREE.Vector3() };
+  const centro = new THREE.Vector3();
+  for (const idx of set) {
+    const v = m.vertices[idx];
+    if (!v) continue;
+    centro.x += v.x;
+    centro.y += v.y;
+    centro.z += v.z;
+  }
+  centro.divideScalar(set.size);
+  return { vertIdx: [...set], centroLocal: centro };
+}
+
 /** Colores del manipulador por eje (rojo X, verde Y, azul Z) */
 const GIZMO_AXIS_COLORS: Record<GizmoAxis, number> = {
   x: 0xff4444,
@@ -1470,6 +1542,83 @@ function buildGizmoHandles(group: THREE.Group): THREE.Mesh[] {
     handles.push(ring);
     const hitRing = hitHandle(new THREE.TorusGeometry(0.7, 0.06, 10, 64), 'rotate', 0);
     hitRing.rotation.x = Math.PI / 2;
+  }
+  return handles;
+}
+
+/**
+ * Manipulador de la SUB-SELECCIÓN (caras/aristas/vértices): tres flechas
+ * para MOVER, tres bolas para ESCALAR por eje y un cubo central para
+ * escala uniforme. Sin aros de rotación ni cuadrado plano (así se pidió:
+ * solo mover + escalar). Mismo patrón de proxies «hit» invisibles que el
+ * gizmo de objetos; asas con depthTest off para verse siempre delante.
+ */
+function buildSelectionGizmoHandles(group: THREE.Group): THREE.Mesh[] {
+  const handles: THREE.Mesh[] = [];
+  const asa = (
+    geo: THREE.BufferGeometry,
+    mat: THREE.Material,
+    axis: GizmoAxis,
+    mode: 'move' | 'scale' | 'uniform-scale',
+    pos: [number, number, number]
+  ): THREE.Mesh => {
+    const m = new THREE.Mesh(geo, mat);
+    m.userData = { axis, mode, originalColor: (mat as THREE.MeshBasicMaterial).color.getHex() };
+    m.position.set(pos[0], pos[1], pos[2]);
+    m.renderOrder = 999;
+    group.add(m);
+    handles.push(m);
+    return m;
+  };
+  const hitAsa = (
+    geo: THREE.BufferGeometry,
+    axis: GizmoAxis,
+    mode: 'move' | 'scale' | 'uniform-scale',
+    pos: [number, number, number]
+  ): THREE.Mesh => {
+    const hit = new THREE.Mesh(
+      geo,
+      new THREE.MeshBasicMaterial({
+        transparent: true,
+        opacity: 0,
+        depthTest: false,
+        depthWrite: false,
+      })
+    );
+    hit.userData = { axis, mode };
+    hit.position.set(pos[0], pos[1], pos[2]);
+    hit.renderOrder = 1000;
+    group.add(hit);
+    handles.push(hit);
+    return hit;
+  };
+  // Cubo central: escala uniforme de TODOS los vértices seleccionados
+  // (pivote = centroide de la selección) con un solo gesto.
+  asa(new THREE.BoxGeometry(0.14, 0.14, 0.14),
+    new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false }),
+    'x', 'uniform-scale', [0, 0, 0]);
+  hitAsa(new THREE.BoxGeometry(0.2, 0.2, 0.2), 'x', 'uniform-scale', [0, 0, 0]);
+  for (const axis of ['x', 'y', 'z'] as GizmoAxis[]) {
+    const color = GIZMO_AXIS_COLORS[axis];
+    const dir = GIZMO_AXIS_DIR[axis];
+    const mat = new THREE.MeshBasicMaterial({ color, depthTest: false });
+    const amarillo = new THREE.MeshBasicMaterial({ color: 0xffd93d, depthTest: false });
+    // Flecha = mover según el eje (palo corto + punta, como el gizmo de
+    // objetos pero más corto: la selección es pequeña).
+    asa(new THREE.CylinderGeometry(0.007, 0.007, 0.8, 12), mat, axis, 'move',
+      [dir.x * 0.4, dir.y * 0.4, dir.z * 0.4]);
+    asa(new THREE.ConeGeometry(0.032, 0.11, 16), mat, axis, 'move',
+      [dir.x * 0.86, dir.y * 0.86, dir.z * 0.86]);
+    hitAsa(new THREE.CylinderGeometry(0.045, 0.045, 0.92, 12), axis, 'move',
+      [dir.x * 0.42, dir.y * 0.42, dir.z * 0.42]);
+    hitAsa(new THREE.ConeGeometry(0.085, 0.2, 16), axis, 'move',
+      [dir.x * 0.88, dir.y * 0.88, dir.z * 0.88]);
+    // Bola amarilla = estirar/escalar la selección según el eje
+    // (pivote en el centroide: escala por distancia al pivote).
+    asa(new THREE.SphereGeometry(0.036, 16, 12), amarillo, axis, 'scale',
+      [dir.x * 0.55, dir.y * 0.55, dir.z * 0.55]);
+    hitAsa(new THREE.SphereGeometry(0.095, 16, 12), axis, 'scale',
+      [dir.x * 0.55, dir.y * 0.55, dir.z * 0.55]);
   }
   return handles;
 }
@@ -2100,11 +2249,13 @@ function findMainMesh(meshGroup: THREE.Group | null): THREE.Mesh | undefined {
 /**
  * Construye un mesh de overlay (malla de resaltado) para las caras
  * seleccionadas: geometría de triángulos de esas caras con material
- * semitransparente de color cyan brillante.
+ * semitransparente de color cyan brillante. También lo usa el resaltado
+ * al pasar el ratón (hover) con su propio color/opacidad.
  */
 function buildFaceSelectionOverlay(
   mesh: Mesh,
-  faceIds: Set<number>
+  faceIds: Set<number>,
+  estilo?: { fill?: number; fillOpacity?: number }
 ): THREE.Mesh | null {
   if (faceIds.size === 0) return null;
 
@@ -2139,16 +2290,18 @@ function buildFaceSelectionOverlay(
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geometry.setIndex(indices);
 
-  // Tinte sólido y contrastado para que el cambio de color se note claro
-  // AUNQUE el objeto tenga textura: magenta casi opaco. depthTest:true:
-  // la superficie del objeto (empujada con polygonOffset en modo
-  // selección) oculta los resaltes de atrÁS — pero el delantero gana el
-  // test de profundidad coplanar sin z-fight.
+  // Tinte sólido y contrastado: AMARILLO es el color de hover Y de selección
+  // (petición del usuario — el objeto está gris en el modo y el amarillo se
+  // lee claro sobre cualquier fondo). Solo RELLENO (sin contorno de
+  // líneas: nada de look de malla). depthTest:true:
+  // la superficie del objeto (retardada con polygonOffset en modo
+  // selección) oculta los resaltes de atrÁS — el delantero gana el test
+  // de profundidad coplanar sin z-fight.
   const material = new THREE.MeshBasicMaterial({
-    color: 0xff00ff,
-    toneMapped: false, // magenta puro, sin lavado del tonemapping
+    color: estilo?.fill ?? 0xffff00,
+    toneMapped: false, // color puro, sin lavado del tonemapping
     transparent: true,
-    opacity: 0.9,
+    opacity: estilo?.fillOpacity ?? 0.9,
     depthWrite: false,
     depthTest: true,
     side: THREE.DoubleSide,
@@ -2159,64 +2312,169 @@ function buildFaceSelectionOverlay(
 
   const overlay = new THREE.Mesh(geometry, material);
   overlay.renderOrder = 997;
-
-  // Contorno amarillo sólido del borde de cada cara seleccionada: visible
-  // sobre cualquier textura, con el mismo empuje de profundidad.
-  const linePos: number[] = [];
-  let idxFace = 0;
-  for (const face of mesh.faces) {
-    const seleccionada = faceIds.has(idxFace);
-    idxFace++;
-    if (!seleccionada || face.length < 3) continue;
-    const primero = mesh.vertices[face[0]];
-    if (!primero) continue;
-    for (let j = 1; j < face.length; j++) {
-      const v1 = mesh.vertices[face[j]];
-      const v2 = mesh.vertices[face[(j + 1) % face.length]];
-      if (!v1 || !v2) continue;
-      linePos.push(v1.x, v1.y, v1.z, v2.x, v2.y, v2.z);
-    }
-  }
-  if (linePos.length > 0) {
-    const lineGeo = new THREE.BufferGeometry();
-    lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(linePos, 3));
-    const lineMat = new THREE.LineBasicMaterial({
-      color: 0xffff00,
-      toneMapped: false, // amarillo puro, sin lavado del tonemapping
-      transparent: true,
-      opacity: 1,
-      depthWrite: false,
-      depthTest: true,
-      polygonOffset: true,
-      polygonOffsetFactor: -8,
-      polygonOffsetUnits: -8,
-    });
-    overlay.add(new THREE.LineSegments(lineGeo, lineMat));
-  }
-
-  overlay.renderOrder = 997;
   return overlay;
 }
 
-/** Aristas únicas de la malla, derivadas de los bucles de las caras
- * (clave normalizada «a-b» con a < b, sin duplicados). */
-export function deriveMeshEdges(mesh: Mesh): Array<{ a: number; b: number; key: string }> {
-  const seen = new Set<string>();
-  const edges: Array<{ a: number; b: number; key: string }> = [];
-  for (const face of mesh.faces) {
-    for (let i = 0; i < face.length; i++) {
-      const va = face[i];
-      const vb = face[(i + 1) % face.length];
+function computeFaceNormal(mesh: Mesh, faceIdx: number): THREE.Vector3 | null {
+  const face = mesh.faces[faceIdx];
+  if (!face || face.length < 3) return null;
+  const a = mesh.vertices[face[0]];
+  const b = mesh.vertices[face[1]];
+  const c = mesh.vertices[face[2]];
+  if (!a || !b || !c) return null;
+  const va = new THREE.Vector3(a.x, a.y, a.z);
+  const vb = new THREE.Vector3(b.x, b.y, b.z);
+  const vc = new THREE.Vector3(c.x, c.y, c.z);
+  return new THREE.Vector3().subVectors(vb, va).cross(new THREE.Vector3().subVectors(vc, va)).normalize();
+}
+
+export function getFaceGroup(mesh: Mesh, startFaceIdx: number): number[] {
+  const group = new Set<number>();
+  group.add(startFaceIdx);
+  const startNormal = computeFaceNormal(mesh, startFaceIdx);
+  if (!startNormal) return [startFaceIdx];
+
+  const edgeToFaces = new Map<string, number[]>();
+  for (let i = 0; i < mesh.faces.length; i++) {
+    const face = mesh.faces[i];
+    for (let j = 0; j < face.length; j++) {
+      const va = face[j];
+      const vb = face[(j + 1) % face.length];
       if (va === vb) continue;
-      const a = Math.min(va, vb);
-      const b = Math.max(va, vb);
-      const key = `${a}-${b}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      edges.push({ a, b, key });
+      const key = `${Math.min(va, vb)}-${Math.max(va, vb)}`;
+      if (!edgeToFaces.has(key)) edgeToFaces.set(key, []);
+      edgeToFaces.get(key)!.push(i);
     }
   }
-  return edges;
+
+  const queue = [startFaceIdx];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const face = mesh.faces[current];
+    for (let j = 0; j < face.length; j++) {
+      const va = face[j];
+      const vb = face[(j + 1) % face.length];
+      if (va === vb) continue;
+      const key = `${Math.min(va, vb)}-${Math.max(va, vb)}`;
+      const neighbors = edgeToFaces.get(key) || [];
+      for (const n of neighbors) {
+        if (!group.has(n)) {
+          const nNormal = computeFaceNormal(mesh, n);
+          if (nNormal && startNormal.dot(nNormal) > 0.99) {
+            group.add(n);
+            queue.push(n);
+          }
+        }
+      }
+    }
+  }
+  return Array.from(group);
+}
+
+export function getVertexGroup(mesh: Mesh, startVertexIdx: number): number[] {
+  const group: number[] = [];
+  const startV = mesh.vertices[startVertexIdx];
+  if (!startV) return [startVertexIdx];
+  for (let i = 0; i < mesh.vertices.length; i++) {
+    const v = mesh.vertices[i];
+    if (v && Math.abs(v.x - startV.x) < 1e-5 && Math.abs(v.y - startV.y) < 1e-5 && Math.abs(v.z - startV.z) < 1e-5) {
+      group.push(i);
+    }
+  }
+  return group;
+}
+
+export function getEdgeGroup(mesh: Mesh, startEdgeKey: string): string[] {
+  const edges = deriveMeshEdges(mesh);
+  const edgeMap = new Map<string, { a: number; b: number; key: string }>();
+  const adj = new Map<number, string[]>();
+
+  for (const e of edges) {
+    edgeMap.set(e.key, e);
+    if (!adj.has(e.a)) adj.set(e.a, []);
+    adj.get(e.a)!.push(e.key);
+    if (!adj.has(e.b)) adj.set(e.b, []);
+    adj.get(e.b)!.push(e.key);
+  }
+
+  const startEdge = edgeMap.get(startEdgeKey);
+  if (!startEdge) return [startEdgeKey];
+
+  const group = new Set<string>();
+  group.add(startEdgeKey);
+
+  const getDir = (e: { a: number; b: number }) => {
+    const p1 = mesh.vertices[e.a];
+    const p2 = mesh.vertices[e.b];
+    if (!p1 || !p2) return new THREE.Vector3();
+    return new THREE.Vector3(p2.x - p1.x, p2.y - p1.y, p2.z - p1.z).normalize();
+  };
+
+  const startDir = getDir(startEdge);
+  if (startDir.lengthSq() < 0.1) return [startEdgeKey];
+
+  const queue = [startEdgeKey];
+  while (queue.length > 0) {
+    const key = queue.shift()!;
+    const e = edgeMap.get(key);
+    if (!e) continue;
+
+    for (const vIdx of [e.a, e.b]) {
+      for (const nKey of adj.get(vIdx) || []) {
+        if (!group.has(nKey)) {
+          const nEdge = edgeMap.get(nKey)!;
+          const nDir = getDir(nEdge);
+          if (Math.abs(startDir.dot(nDir)) > 0.99) {
+            group.add(nKey);
+            queue.push(nKey);
+          }
+        }
+      }
+    }
+  }
+
+  return Array.from(group);
+}
+
+/** Aristas lógicas de la malla, excluyendo interiores entre caras coplanares */
+export function deriveMeshEdges(mesh: Mesh): Array<{ a: number; b: number; key: string }> {
+  const edgeToFaces = new Map<string, { a: number; b: number; faces: number[] }>();
+  for (let i = 0; i < mesh.faces.length; i++) {
+    const face = mesh.faces[i];
+    for (let j = 0; j < face.length; j++) {
+      const va = face[j];
+      const vb = face[(j + 1) % face.length];
+      if (va === vb) continue;
+      const min = Math.min(va, vb);
+      const max = Math.max(va, vb);
+      const key = `${min}-${max}`;
+      if (!edgeToFaces.has(key)) {
+        edgeToFaces.set(key, { a: min, b: max, faces: [] });
+      }
+      edgeToFaces.get(key)!.faces.push(i);
+    }
+  }
+
+  const logicalEdges: Array<{ a: number; b: number; key: string }> = [];
+  for (const [key, data] of edgeToFaces.entries()) {
+    if (data.faces.length === 1) {
+      logicalEdges.push({ a: data.a, b: data.b, key });
+    } else {
+      let isBoundary = false;
+      const n0 = computeFaceNormal(mesh, data.faces[0]);
+      for (let k = 1; k < data.faces.length; k++) {
+        const nk = computeFaceNormal(mesh, data.faces[k]);
+        if (!n0 || !nk || n0.dot(nk) <= 0.99) {
+          isBoundary = true;
+          break;
+        }
+      }
+      if (isBoundary) {
+        logicalEdges.push({ a: data.a, b: data.b, key });
+      }
+    }
+  }
+  return logicalEdges;
 }
 
 /** Distancia de un punto a un segmento de pantalla (en píxeles). */
@@ -2240,12 +2498,174 @@ const FACE_LINE_TOLERANCE = 12;
 const POLIGONO_CIERRE_PX = 10;
 
 /**
+ * Elemento sub-seleccionable bajo el cursor: cara (raycast contra la
+ * superficie + centroide más próximo), vértice (a <16 px) o arista (a
+ * <12 px de su LÍNEA completa). Lo comparten el hover (mousemove) y el
+ * clic DIRECTO — el hover ilumina EXACTAMENTE lo que el clic elegiría.
+ */
+function pickSubElemento(
+  m: Mesh,
+  meshObj: THREE.Mesh,
+  camera: THREE.Camera,
+  clientX: number,
+  clientY: number,
+  canvasRect: DOMRect,
+  target: 'cara' | 'vertice' | 'segmento',
+  visibleOnly: boolean
+): { t: 'cara' | 'vertice' | 'segmento'; id: number | string } | null {
+  const raycasterPick = new THREE.Raycaster();
+  const ndc = new THREE.Vector2(
+    ((clientX - canvasRect.left) / canvasRect.width) * 2 - 1,
+    -((clientY - canvasRect.top) / canvasRect.height) * 2 + 1
+  );
+  raycasterPick.setFromCamera(ndc, camera);
+  meshObj.updateWorldMatrix(true, false);
+  const worldMatrix = meshObj.matrixWorld;
+  // Visibilidad: solo caras FRONTALES (los elementos de lo que está
+  // detrás no se pueden ni ver ni elegir — casilla «Solo lo visible»).
+  let frente: Uint8Array | null = null;
+  if (visibleOnly) {
+    const camPos = camera.getWorldPosition(new THREE.Vector3());
+    frente = new Uint8Array(m.faces.length);
+    for (let i = 0; i < m.faces.length; i++) {
+      const face = m.faces[i];
+      if (face.length < 3) continue;
+      const a = m.vertices[face[0]];
+      const b = m.vertices[face[1]];
+      const c = m.vertices[face[2]];
+      if (!a || !b || !c) continue;
+      const wa = new THREE.Vector3(a.x, a.y, a.z).applyMatrix4(worldMatrix);
+      const wb = new THREE.Vector3(b.x, b.y, b.z).applyMatrix4(worldMatrix);
+      const wc = new THREE.Vector3(c.x, c.y, c.z).applyMatrix4(worldMatrix);
+      const n = new THREE.Vector3()
+        .subVectors(wb, wa)
+        .cross(new THREE.Vector3().subVectors(wc, wa));
+      if (n.dot(new THREE.Vector3().subVectors(camPos, wa)) > 0) {
+        frente[i] = 1;
+      }
+    }
+  }
+
+  if (target === 'cara') {
+    // Cara: raycast + cara más próxima al punto golpeado por su CENTROIDE
+    // — el hover ilumina SIEMPRE la cara completa que elegiría el clic
+    // (nunca un triángulo suelto del abanico).
+    const hits = raycasterPick.intersectObject(meshObj, false);
+    if (hits.length === 0) return null;
+    const punto = hits[0].point;
+    const centroids = computeFaceCentroids(m, worldMatrix);
+    let mejor = -1;
+    let mejorD = Infinity;
+    for (let i = 0; i < centroids.length; i++) {
+      const d = centroids[i].distanceTo(punto);
+      if (d < mejorD) { mejorD = d; mejor = i; }
+    }
+    return mejor >= 0 ? { t: 'cara', id: mejor } : null;
+  }
+
+  if (target === 'vertice') {
+    // Vértice: el cursor debe estar SOBRE la superficie (raycast con hit)
+    // y la esquina elegida es la más cercana al punto golpeado en 3D,
+    // dentro de una tolerancia relativa al tamaño de la malla. Así solo
+    // se detecta la esquina realmente apuntada: nunca todas a la vez ni
+    // vértices lejanos por mera proximidad en pantalla.
+    const hitsV = raycasterPick.intersectObject(meshObj, false);
+    if (hitsV.length === 0) return null;
+    const puntoV = hitsV[0].point;
+    let verticeVisible: Uint8Array | null = null;
+    if (frente) {
+      verticeVisible = new Uint8Array(m.vertices.length);
+      for (let i = 0; i < m.faces.length; i++) {
+        if (!frente[i]) continue;
+        for (const vi of m.faces[i]) {
+          if (vi < verticeVisible.length) verticeVisible[vi] = 1;
+        }
+      }
+    }
+    // Proyección en mundo de cada vértice + caja envolvente para la
+    // tolerancia relativa (independiente del zoom y de la escala).
+    const worldPts: Array<THREE.Vector3 | null> = [];
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    let minZ = Infinity, maxZ = -Infinity;
+    for (let i = 0; i < m.vertices.length; i++) {
+      const v = m.vertices[i];
+      if (!v) { worldPts.push(null); continue; }
+      const wp = new THREE.Vector3(v.x, v.y, v.z).applyMatrix4(worldMatrix);
+      worldPts.push(wp);
+      minX = Math.min(minX, wp.x); maxX = Math.max(maxX, wp.x);
+      minY = Math.min(minY, wp.y); maxY = Math.max(maxY, wp.y);
+      minZ = Math.min(minZ, wp.z); maxZ = Math.max(maxZ, wp.z);
+    }
+    const maxDimMundo =
+      Math.max(maxX - minX, maxY - minY, maxZ - minZ) || 1;
+    const tolerancia = maxDimMundo * 0.25;
+    let mejorVi = -1;
+    let mejorVd = Infinity;
+    for (let i = 0; i < worldPts.length; i++) {
+      if (verticeVisible && !verticeVisible[i]) continue;
+      const wp = worldPts[i];
+      if (!wp) continue;
+      const dist = wp.distanceTo(puntoV);
+      if (dist < mejorVd) { mejorVd = dist; mejorVi = i; }
+    }
+    if (mejorVi >= 0 && mejorVd <= tolerancia) {
+      return { t: 'vertice', id: mejorVi };
+    }
+    return null;
+  }
+
+  // Arista: la MÁS CERCANA EN PANTALLA a la LÍNEA COMPLETA (<12 px), no a
+  // su punto medio — distancia del puntero al segmento a-b entero.
+  let edgeVisible: Set<string> | null = null;
+  if (frente) {
+    edgeVisible = new Set<string>();
+    for (let i = 0; i < m.faces.length; i++) {
+      if (!frente[i]) continue;
+      const face = m.faces[i];
+      for (let j = 0; j < face.length; j++) {
+        const va = face[j];
+        const vb = face[(j + 1) % face.length];
+        if (va === vb) continue;
+        edgeVisible.add(`${Math.min(va, vb)}-${Math.max(va, vb)}`);
+      }
+    }
+  }
+  let mejorKey: string | null = null;
+  let mejorEd = FACE_LINE_TOLERANCE;
+  for (const edge of deriveMeshEdges(m)) {
+    if (edgeVisible && !edgeVisible.has(edge.key)) continue;
+    const va = m.vertices[edge.a];
+    const vb = m.vertices[edge.b];
+    if (!va || !vb) continue;
+    const pA = projectToScreen(
+      new THREE.Vector3(va.x, va.y, va.z).applyMatrix4(worldMatrix),
+      camera,
+      canvasRect
+    );
+    const pB = projectToScreen(
+      new THREE.Vector3(vb.x, vb.y, vb.z).applyMatrix4(worldMatrix),
+      camera,
+      canvasRect
+    );
+    if (!pA || !pB) continue;
+    const dist = distanceToSegment(
+      clientX, clientY, pA.x, pA.y, pB.x, pB.y
+    );
+    if (dist < mejorEd) { mejorEd = dist; mejorKey = edge.key; }
+  }
+  return mejorKey ? { t: 'segmento', id: mejorKey } : null;
+}
+
+/**
  * Overlay de vértices seleccionados: una esfera pequeña por vértice, en el
  * espacio LOCAL de la malla (el grupo ya sigue la transform del objeto).
  */
 function buildVertexSelectionOverlay(
   mesh: Mesh,
-  vertexIds: Set<number>
+  vertexIds: Set<number>,
+  color?: number,
+  opts?: { hover?: boolean }
 ): THREE.Group | null {
   if (vertexIds.size === 0) return null;
   // Radio en función del tamaño de la malla: 1/4 del tamaño anterior
@@ -2261,14 +2681,18 @@ function buildVertexSelectionOverlay(
   if (mesh.vertices.length > 0) {
     maxDim = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
   }
-  const radio = Math.max(0.005, Math.min(0.0375, maxDim * 0.0025));
+  // Hover: esfera GRANDE (3x la de seleccion) para que el punto apuntado
+  // se vea claramente; la de seleccion sigue discreta para no tapar la malla.
+  const radio = opts?.hover
+    ? Math.max(0.014, Math.min(0.06, maxDim * 0.012))
+    : Math.max(0.005, Math.min(0.0375, maxDim * 0.0025));
   const geometry = new THREE.SphereGeometry(radio, 10, 8);
   const material = new THREE.MeshBasicMaterial({
     // Amarillo: el MISMO color de «seleccionado» que las caras; la guía
     // (todos los vértices) sigue en verde-azulado para que se distinga.
     // depthTest:true — la superficie empujada con polygonOffset deja
     // ganar la esfera coplanar, y el objeto OCULTA los vértices de atrás.
-    color: 0xffff00,
+    color: color ?? 0xffff00,
     toneMapped: false, // amarillo puro, sin lavado del tonemapping
     depthWrite: false,
     depthTest: true,
@@ -2300,7 +2724,8 @@ function buildVertexSelectionOverlay(
  */
 function buildEdgeSelectionOverlay(
   mesh: Mesh,
-  edgeKeys: Set<string>
+  edgeKeys: Set<string>,
+  color?: number
 ): THREE.LineSegments | null {
   if (edgeKeys.size === 0) return null;
   const edges = deriveMeshEdges(mesh);
@@ -2321,7 +2746,7 @@ function buildEdgeSelectionOverlay(
   const material = new THREE.MeshBasicMaterial({
     // Amarillo: mismo color de «seleccionado» que caras y vértices.
     // depthTest:true — oculto tras la superficie (polygonOffset del mesh).
-    color: 0xffff00,
+    color: color ?? 0xffff00,
     toneMapped: false, // amarillo puro, sin lavado del tonemapping
     depthWrite: false,
     depthTest: true,
@@ -2366,13 +2791,26 @@ function buildEdgeSelectionOverlay(
  */
 function buildVertexGuideOverlay(mesh: Mesh): THREE.Points | null {
   if (mesh.vertices.length === 0) return null;
-  const positions = new Float32Array(mesh.vertices.length * 3);
+  // Solo representantes UNICOS por posicion (misma tolerancia 1e-5 que
+  // getVertexGroup): un cubo muestra EXACTAMENTE sus 8 esquinas, aunque la
+  // malla traiga vertices duplicados (uno por cara, etc.).
+  const claves = new Set<string>();
+  const unicos: Array<{ x: number; y: number; z: number }> = [];
   for (let i = 0; i < mesh.vertices.length; i++) {
     const v = mesh.vertices[i];
+    if (!v) continue;
+    const clave =
+      Math.round(v.x * 1e5) + '|' + Math.round(v.y * 1e5) + '|' + Math.round(v.z * 1e5);
+    if (claves.has(clave)) continue;
+    claves.add(clave);
+    unicos.push(v);
+  }
+  const positions = new Float32Array(unicos.length * 3);
+  unicos.forEach((v, i) => {
     positions[i * 3] = v.x;
     positions[i * 3 + 1] = v.y;
     positions[i * 3 + 2] = v.z;
-  }
+  });
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   const material = new THREE.PointsMaterial({
@@ -2384,7 +2822,7 @@ function buildVertexGuideOverlay(mesh: Mesh): THREE.Points | null {
     // el mismo azul sobre cualquier fondo, sin lavado.
     color: 0x1d4ed8,
     toneMapped: false,
-    size: 4,
+    size: 6,
     sizeAttenuation: false,
     depthWrite: false,
     depthTest: true,
@@ -3084,27 +3522,9 @@ export default function Viewer3D({
    }, [showGridProp, onShowGridChange, showGridInternal]);
   const [gridScale, setGridScale] = useState(1);
   const [wireframe, setWireframe] = useState(false);
-  /** Al activar el selector de caras se encienden automáticamente los
-   *  vértices y la vista de alambre; al desactivarlo se devuelven los
-   *  valores que tenían antes (null = el modo no está activo). */
-  const vizAnteriorRef = useRef<{ vertices: boolean; alambre: boolean } | null>(null);
-  useEffect(() => {
-    if (faceSelectMode) {
-      if (!vizAnteriorRef.current) {
-        vizAnteriorRef.current = { vertices: showVertices, alambre: wireframe };
-        setShowVertices(true);
-        setWireframe(true);
-      }
-    } else if (vizAnteriorRef.current) {
-      setShowVertices(vizAnteriorRef.current.vertices);
-      // El alambre se apaga SIEMPRE al salir: el estado correcto final es
-      // el objeto con su textura, sin vista de alambre.
-      setWireframe(false);
-      vizAnteriorRef.current = null;
-    }
-    // Solo reacciona al entrar/salir del modo; los valores guardados no.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [faceSelectMode]);
+  // (Ya NO se fuerza alambre ni vértices al entrar en el modo de
+  // sub-selección: petición del usuario — el objeto se ve NORMAL y en gris
+  // por el lavado del modo, sin vista de alambre ni puntos.)
   // Señal externa para apagar el alambre (p. ej., tras asignar una textura
   // por caras): sin ella, la textura asignada no se ve hasta pulsar a mano
   // el botón «Vista de alambre».
@@ -3209,15 +3629,21 @@ export default function Viewer3D({
     if (target === 'cara') {
       for (const f of selectedFaceIdsRef.current) {
         const face = m.faces[f];
-        if (face) for (const vi of face) vertIdxSet.add(vi);
+        if (face) {
+          for (const vi of face) {
+            getVertexGroup(m, vi).forEach(v => vertIdxSet.add(v));
+          }
+        }
       }
     } else if (target === 'vertice') {
-      for (const vi of selectedVertexIdsRef.current) vertIdxSet.add(vi);
+      for (const vi of selectedVertexIdsRef.current) {
+        getVertexGroup(m, vi).forEach(v => vertIdxSet.add(v));
+      }
     } else {
       for (const edge of deriveMeshEdges(m)) {
         if (!selectedEdgeIdsRef.current.includes(edge.key)) continue;
-        vertIdxSet.add(edge.a);
-        vertIdxSet.add(edge.b);
+        getVertexGroup(m, edge.a).forEach(v => vertIdxSet.add(v));
+        getVertexGroup(m, edge.b).forEach(v => vertIdxSet.add(v));
       }
     }
     if (vertIdxSet.size === 0) return;
@@ -3293,6 +3719,23 @@ export default function Viewer3D({
   const gizmoGroupRef = useRef<THREE.Group | null>(null);
   const gizmoHandlesRef = useRef<THREE.Mesh[]>([]);
   const gizmoDragRef = useRef<GizmoDrag | null>(null);
+  // --- Sub-selección (caras/aristas/vértices): gizmo propio + hover ---
+  // El gizmo vive en la escena (coordenadas de mundo) y se re-ancla al
+  // centroide de la selección en cada frame, como el de objetos.
+  const selectionGizmoGroupRef = useRef<THREE.Group | null>(null);
+  const selectionGizmoHandlesRef = useRef<THREE.Mesh[]>([]);
+  const selectionGizmoDragRef = useRef<SelectionGizmoDrag | null>(null);
+  const selectionGizmoCentroRef = useRef<THREE.Vector3 | null>(null);
+  const selectionKeyRef = useRef(''); // re-deducir el centroide al cambiar
+  // Resaltado al pasar el ratón: un elemento «candidato» (la cara entera,
+  // la arista completa o el punto) se pinta naranja bajo el cursor.
+  const faceHoverOverlayRef = useRef<THREE.Group | null>(null);
+  const hoverElementRef = useRef<{
+    t: 'cara' | 'vertice' | 'segmento';
+    id: number | string;
+  } | null>(null);
+  const hoverKeyRef = useRef(''); // reconstruir el overlay solo al cambiar
+  const lastHoverCheckRef = useRef(0); // throttle ~40 ms
   // --- Pieza amarilla de la ayuda de proyección (marco editable) ---
   // El marco vive DENTRO del grupo de la malla (pegado al objeto), porque
   // su transform se define en las coordenadas locales con las que se
@@ -4284,6 +4727,22 @@ export default function Viewer3D({
     lightGizmoGroupRef.current = lightGizmoGroup;
     lightGizmoHandlesRef.current = buildLightGizmoHandles(lightGizmoGroup);
 
+    // Gizmo de la sub-selección (caras/aristas/vértices): se ancla en vivo
+    // al centroide de la selección dentro del bucle de animación.
+    const selectionGizmoGroup = new THREE.Group();
+    selectionGizmoGroup.visible = false;
+    scene.add(selectionGizmoGroup);
+    selectionGizmoGroupRef.current = selectionGizmoGroup;
+    selectionGizmoHandlesRef.current =
+      buildSelectionGizmoHandles(selectionGizmoGroup);
+
+    // Resaltado del elemento apuntado (hover): vive junto a los overlays
+    // de selección, en el espacio LOCAL de la malla.
+    const faceHoverOverlay = new THREE.Group();
+    faceHoverOverlay.visible = false;
+    faceHoverOverlay.renderOrder = 996;
+    faceHoverOverlayRef.current = faceHoverOverlay;
+
     // Primera intersección del rayo actual con la superficie de CUALQUIER
     // objeto de la escena (recorriendo el grupo entero). Devuelve también
     // el id del objeto golpeado (subiendo por los padres hasta el
@@ -4869,6 +5328,11 @@ export default function Viewer3D({
         if (faceSelectionOverlayRef.current)
           faceSelectionOverlayRef.current.visible = false;
         if (faceGuideRef.current) faceGuideRef.current.visible = false;
+        // Gizmo de sub-selección y resaltado de hover: fuera del vídeo.
+        if (selectionGizmoGroupRef.current)
+          selectionGizmoGroupRef.current.visible = false;
+        if (faceHoverOverlayRef.current)
+          faceHoverOverlayRef.current.visible = false;
       } else if (exportPrevioRef.current) {
         if (gizmoGroupRef.current) {
           const esCamara =
@@ -5187,9 +5651,12 @@ export default function Viewer3D({
           }
         }
         }
-       // Actualizar el CubeCamera para reflejos de espejo
+       // Actualizar el CubeCamera para reflejos de espejo (solo en las
+       // vistas 3D libres: en las ventanas 2D los materiales son planos
+       // sin reflejos, y compilar/renderizar 6 caras por frame sería
+       // trabajo nulo — además el modo plano les cambia el material).
        const cubeCam = cubeCameraRef.current;
-       if (cubeCam) {
+       if (cubeCam && !flat2DRef.current) {
          cubeCam.position.copy(camera.position);
          cubeCam.position.y = Math.max(0.5, cubeCam.position.y);
          cubeCam.update(renderer, scene);
@@ -5201,77 +5668,81 @@ export default function Viewer3D({
         // cualquier hijo llamado 'mesh' que no lo sea de verdad.
         const meshObj = findMainMesh(meshGroupRef.current);
         if (faceSelectModeRef.current && m && meshObj) {
-          // Empujar la superficie una pizca hacia atrás para que la guía y
-          // los resaltes coplanares ganen el test de profundidad (el truco
-          // canónico del overlay de wireframe). Además COLOR LISO: sin la
-          // textura de fondo la malla de puntos no despista (el usuario lo
-          // pidió: con la textura no se ve bien por dónde recortar). Al
-          // salir se restaura lo guardado.
-          const matsPO = Array.isArray(meshObj.material) ? meshObj.material : [meshObj.material];
-          for (const mat of matsPO) {
-            const matU = mat as THREE.Material & { userData: Record<string, unknown>; polygonOffset: boolean };
-            if (!matU) continue;
-            if (!matU.userData || matU.userData.__ovPO !== true) {
-              // Primera vez en modo selección: guardar la apariencia.
-              const comoMat = matU as THREE.MeshStandardMaterial & { userData: Record<string, unknown> };
-              if (matU.userData) {
-                matU.userData.__ovApariencia = {
-                  map: 'map' in comoMat ? comoMat.map : undefined,
-                  color: comoMat.color ? comoMat.color.getHex() : null,
-                };
-              }
-              if ('map' in comoMat && comoMat.map) {
-                comoMat.map = null;
-                comoMat.needsUpdate = true;
-              }
-              if ('color' in comoMat && comoMat.color) comoMat.color.setHex(0xf2f4f7);
-            }
-            matU.polygonOffset = true;
-            // Con segmentos la Línea de 1 px coplanar pierde el test de
-            // profundidad con empuje mínimo: más empuje para la arista.
+          // MODO SUB-SELECCIÓN (petición del usuario): TODA la escena pasa a
+          // gris liso, sin textura — cada objeto pierde su color y así el
+          // hover/selección se leen limpios sobre cualquier figura. Además la
+          // superficie se empuja una pizca hacia atrás (polygonOffset) para
+          // que los resaltes coplanares ganen el test de profundidad. Al
+          // salir se restaura todo.
+          const raizWash = meshGroupRef.current;
+          if (raizWash) {
             const objetivo = faceSelectionTargetRef.current;
-            matU.polygonOffsetFactor = objetivo === 'segmento' ? 3 : 1;
-            matU.polygonOffsetUnits = objetivo === 'segmento' ? 4 : 1;
-            matU.userData.__ovPO = true;
+            raizWash.traverse((o) => {
+              if (!(o instanceof THREE.Mesh)) return;
+              if (o.renderOrder >= 990) return; // overlays/guías: jamás
+              if (o.userData?.sceneObjectDuplicate || o.userData?.cameraBodyActive) return;
+              let padre: THREE.Object3D | null = o.parent;
+              while (padre && padre !== raizWash) {
+                if (padre.userData?.sceneObjectDuplicate || padre.userData?.cameraBodyActive) return;
+                padre = padre.parent;
+              }
+              const matsW = Array.isArray(o.material) ? o.material : [o.material];
+              for (const mat of matsW) {
+                const matU = mat as THREE.MeshStandardMaterial & {
+                  userData: Record<string, unknown>; polygonOffset: boolean;
+                };
+                if (!matU || !matU.userData) continue;
+                if (matU.userData.__ovPO !== true) {
+                  if (!matU.userData.__ovApariencia) {
+                    // Primera vez en el modo: guardar la apariencia.
+                    matU.userData.__ovApariencia = {
+                      map: 'map' in matU ? matU.map : undefined,
+                      color: 'color' in matU && matU.color ? matU.color.getHex() : null,
+                    };
+                  }
+                  if ('map' in matU && matU.map) {
+                    matU.map = null;
+                    matU.needsUpdate = true;
+                  }
+                  if ('color' in matU && matU.color) matU.color.setHex(0xd9d9d9);
+                  matU.needsUpdate = true;
+                }
+                matU.polygonOffset = true;
+                // Con segmentos el resalte coplanar pierde el test de
+                // profundidad con empuje mínimo: más empuje en ambos.
+                matU.polygonOffsetFactor = objetivo === 'segmento' ? 3 : 1;
+                matU.polygonOffsetUnits = objetivo === 'segmento' ? 4 : 1;
+                matU.userData.__ovPO = true;
+              }
+            });
           }
           const worldMatrix = meshObj.matrixWorld;
           const target = faceSelectionTargetRef.current;
 
-          // Los grupos de guía y de resalte deben vivir DENTRO de la malla
-          // viva: un remontaje (HMR/StrictMode) puede dejarlos en la escena
-          // de un montaje anterior — invisibles para siempre. Si el padre no
-          // es la malla actual, se re-adosan aquí (add re-parenta).
+          // El grupo de resalte debe vivir DENTRO de la malla viva: un
+          // remontaje (HMR/StrictMode) puede dejarlo en la escena de un
+          // montaje anterior — invisible para siempre. Si el padre no es la
+          // malla actual, se re-adosa aquí (add re-parenta).
           const overlayGr = faceSelectionOverlayRef.current;
           if (overlayGr && overlayGr.parent !== meshObj) meshObj.add(overlayGr);
-          const guiaGr = faceGuideRef.current;
-          if (guiaGr && guiaGr.parent !== meshObj) meshObj.add(guiaGr);
 
-          // Guía del objetivo activo: todos los vértices/segmentos/
-          // centroides de caras (no solo los seleccionados). Se reconstruye
-          // solo cuando cambia la malla o el objetivo.
+          // Guías DESACTIVADAS (petición del usuario): el objeto se renderiza
+          // NORMAL — sin puntos azules en cada vértice, sin líneas en cada
+          // arista, sin marcas en cada cara. Solo hover/selección colorean el
+          // elemento. La guía se vacía por si quedó sucia de una sesión previa.
           const guideGroup = faceGuideRef.current;
-          if (guideGroup) {
-            const cached = faceGuideCacheRef.current;
-            if (cached.mesh !== m || cached.target !== target) {
-              while (guideGroup.children.length) {
-                const child = guideGroup.children[0];
-                guideGroup.remove(child);
-                child.traverse?.((o) => {
-                  if (o instanceof THREE.Points || o instanceof THREE.LineSegments) {
-                    o.geometry?.dispose?.();
-                    (o.material as THREE.Material)?.dispose?.();
-                  }
-                });
-              }
-              faceGuideCacheRef.current = { mesh: m, target };
-              const guide =
-                target === 'vertice'
-                  ? buildVertexGuideOverlay(m)
-                  : target === 'segmento'
-                    ? buildEdgeGuideOverlay(m)
-                    : buildFaceGuideOverlay(m);
-              if (guide) guideGroup.add(guide);
+          if (guideGroup && guideGroup.children.length > 0) {
+            while (guideGroup.children.length) {
+              const child = guideGroup.children[0];
+              guideGroup.remove(child);
+              child.traverse?.((o) => {
+                if (o instanceof THREE.Points || o instanceof THREE.LineSegments) {
+                  o.geometry?.dispose?.();
+                  (o.material as THREE.Material)?.dispose?.();
+                }
+              });
             }
+            faceGuideCacheRef.current = { mesh: null, target: '' };
           }
 
           // Update 3D overlay of selected faces/vertices/edges
@@ -5320,24 +5791,129 @@ export default function Viewer3D({
           if (faceSelectionPolyDivRef.current && faceSelectionPointsRef.current.length === 0) {
             faceSelectionPolyDivRef.current.style.display = 'none';
           }
-        } else if (!faceSelectModeRef.current) {
-          // Restaurar la apariencia (color liso + polygonOffset del modo
-          // selección).
-          const meshObjOff = findMainMesh(meshGroupRef.current);
-          if (meshObjOff) {
-            const matsPO = Array.isArray(meshObjOff.material) ? meshObjOff.material : [meshObjOff.material];
-            for (const mat of matsPO) {
-              const matU = mat as THREE.MeshStandardMaterial & { userData: Record<string, unknown>; polygonOffset: boolean };
-              if (!matU || !matU.userData || matU.userData.__ovPO !== true) continue;
-              const guardado = matU.userData.__ovApariencia as { map?: THREE.Texture | null; color?: number | null } | undefined;
-              if (guardado) {
-                if (matU.map !== guardado.map) { matU.map = guardado.map ?? null; matU.needsUpdate = true; }
-                if (matU.color && typeof guardado.color === 'number') matU.color.setHex(guardado.color);
+
+          // Resaltado del elemento apuntado (hover) en NARANJA: SIEMPRE el
+          // elemento completo de un golpe (la cara con todos sus triángulos
+          // y bordes, la arista completa, el punto). Reconstruido solo al
+          // cambiar de elemento; durante un arrastre no hay hover.
+          const hovGr = faceHoverOverlayRef.current;
+          if (hovGr) {
+            if (hovGr.parent !== meshObj) meshObj.add(hovGr);
+            const hover =
+              faceMoveDragRef.current ||
+              faceSelectionStartRef.current ||
+              selectionGizmoDragRef.current
+                ? null
+                : hoverElementRef.current;
+            const hovKey = hover ? `${hover.t}|${String(hover.id)}` : '';
+            if (hovKey !== hoverKeyRef.current) {
+              hoverKeyRef.current = hovKey;
+              while (hovGr.children.length) {
+                const hijo = hovGr.children[0];
+                hovGr.remove(hijo);
+                hijo.traverse?.((o) => {
+                  if (o instanceof THREE.Mesh || o instanceof THREE.LineSegments) {
+                    o.geometry?.dispose?.();
+                    (o.material as THREE.Material)?.dispose?.();
+                  }
+                });
               }
-              matU.polygonOffset = false;
-              delete matU.userData.__ovPO;
-              delete matU.userData.__ovApariencia;
+              if (hover) {
+                if (hover.t === 'cara') {
+                  const faceGroup = getFaceGroup(m, hover.id as number);
+                  const overlay = buildFaceSelectionOverlay(
+                    m,
+                    new Set(faceGroup),
+                    { fillOpacity: 0.45 } // hover amarillo translúcido; sel. sólida
+                  );
+                  if (overlay) hovGr.add(overlay);
+                } else if (hover.t === 'vertice') {
+                  const vertexGroup = getVertexGroup(m, hover.id as number);
+                  const overlay = buildVertexSelectionOverlay(
+                    m,
+                    new Set(vertexGroup),
+                    0xffff00, // hover amarillo (mismo esquema que las caras)
+                    { hover: true }
+                  );
+                  if (overlay) hovGr.add(overlay);
+                } else {
+                  const edgeGroup = getEdgeGroup(m, String(hover.id));
+                  const overlay = buildEdgeSelectionOverlay(
+                    m,
+                    new Set(edgeGroup),
+                    0xffff00 // hover amarillo
+                  );
+                  if (overlay) hovGr.add(overlay);
+                }
+              }
             }
+            hovGr.visible = hovGr.children.length > 0;
+          } else {
+            hoverKeyRef.current = '';
+          }
+
+          // Gizmo de la sub-selección: anclado en vivo al centroide de la
+          // selección (en mundo) y a escala 3/4 del gizmo de objetos. El
+          // centroide se re-deduce al cambiar la selección o mientras un
+          // arrastre mueve los vértices.
+          const selKey = `${target}|${selectedFaceIdsRef.current.join(',')}|${selectedVertexIdsRef.current.join(',')}|${selectedEdgeIdsRef.current.join(',')}`;
+          if (selectionKeyRef.current !== selKey || selectionGizmoDragRef.current) {
+            selectionKeyRef.current = selKey;
+            const recogidoSel = collectSelectionVerts(
+              m,
+              target,
+              selectedFaceIdsRef.current,
+              selectedVertexIdsRef.current,
+              selectedEdgeIdsRef.current
+            );
+            selectionGizmoCentroRef.current =
+              recogidoSel.vertIdx.length > 0 ? recogidoSel.centroLocal : null;
+          }
+          const selGizmoGr = selectionGizmoGroupRef.current;
+          if (selGizmoGr) {
+            const centroLocalG = selectionGizmoCentroRef.current;
+            if (centroLocalG && !ayudasOcultas) {
+              selGizmoGr.position.copy(
+                centroLocalG.clone().applyMatrix4(worldMatrix)
+              );
+              selGizmoGr.scale.setScalar(
+                Math.max(0.05, gizmoBaseScaleRef.current * 0.75)
+              );
+              selGizmoGr.visible = true;
+            } else {
+              selGizmoGr.visible = false;
+            }
+          }
+        } else if (!faceSelectModeRef.current) {
+          // Al salir del modo: quitar hover y el gizmo de sub-selección.
+          hoverElementRef.current = null;
+          hoverKeyRef.current = '';
+          if (faceHoverOverlayRef.current)
+            faceHoverOverlayRef.current.visible = false;
+          if (selectionGizmoGroupRef.current)
+            selectionGizmoGroupRef.current.visible = false;
+          selectionKeyRef.current = '';
+
+          // Restaurar la apariencia de TODAS las mallas de la escena (gris +
+          // polygonOffset del modo selección; en modo se grisaron todas).
+          const raizOff = meshGroupRef.current;
+          if (raizOff) {
+            raizOff.traverse((o) => {
+              if (!(o instanceof THREE.Mesh) || !o.material) return;
+              const matsPO = Array.isArray(o.material) ? o.material : [o.material];
+              for (const mat of matsPO) {
+                const matU = mat as THREE.MeshStandardMaterial & { userData: Record<string, unknown>; polygonOffset: boolean };
+                if (!matU || !matU.userData || matU.userData.__ovPO !== true) continue;
+                const guardado = matU.userData.__ovApariencia as { map?: THREE.Texture | null; color?: number | null } | undefined;
+                if (guardado) {
+                  if (matU.map !== guardado.map) { matU.map = guardado.map ?? null; matU.needsUpdate = true; }
+                  if (matU.color && typeof guardado.color === 'number') matU.color.setHex(guardado.color);
+                }
+                matU.polygonOffset = false;
+                delete matU.userData.__ovPO;
+                delete matU.userData.__ovApariencia;
+              }
+            });
           }
           // Only hide 3D overlay when NOT in face select mode
           if (faceSelectionOverlayRef.current) {
@@ -5911,6 +6487,88 @@ export default function Viewer3D({
           return;
         }
 
+        // --- Gizmo de sub-selección: mover/escalar en vivo ---------------
+        const selDrag = selectionGizmoDragRef.current;
+        if (selDrag) {
+          raycasterRef.current.setFromCamera(pointerRef.current, camera);
+          const meshObjSelMove = findMainMesh(meshGroupRef.current);
+          let verts: Vertex3D[] | null = null;
+          if (meshObjSelMove) {
+            meshObjSelMove.updateWorldMatrix(true, false);
+            const invMatrixSel = new THREE.Matrix4()
+              .copy(meshObjSelMove.matrixWorld)
+              .invert();
+            if (selDrag.mode === 'move') {
+              const tc = closestPointOnAxis(
+                raycasterRef.current.ray,
+                selDrag.centroMundoStart,
+                selDrag.axisWorld
+              );
+              if (tc !== null) {
+                // Vector MUNDO del desplazamiento, llevado a LOCAL por la
+                // inversa de matrixWorld (dos puntos: se anula el traslado).
+                const p0 = new THREE.Vector3(0, 0, 0).applyMatrix4(invMatrixSel);
+                const p1 = selDrag.axisWorld
+                  .clone()
+                  .multiplyScalar(tc - selDrag.startT)
+                  .applyMatrix4(invMatrixSel);
+                const dx = p1.x - p0.x;
+                const dy = p1.y - p0.y;
+                const dz = p1.z - p0.z;
+                verts = selDrag.vertOriginales.map((v) => ({ ...v }));
+                for (const idx of selDrag.vertIdx) {
+                  const v = verts[idx];
+                  if (!v) continue;
+                  v.x += dx;
+                  v.y += dy;
+                  v.z += dz;
+                }
+              }
+            } else {
+              // Escala (uniforme con el cubo blanco; por eje con las bolas),
+              // pivotada en el centroide de la selección.
+              const hitSel = new THREE.Vector3();
+              if (raycasterRef.current.ray.intersectPlane(selDrag.plane, hitSel)) {
+                const delta = hitSel.sub(selDrag.centroMundoStart).dot(selDrag.basisU);
+                const factor = Math.max(0.05, 1 + delta);
+                const cx = selDrag.centroLocal.x;
+                const cy = selDrag.centroLocal.y;
+                const cz = selDrag.centroLocal.z;
+                verts = selDrag.vertOriginales.map((v) => ({ ...v }));
+                for (const idx of selDrag.vertIdx) {
+                  const v = verts[idx];
+                  if (!v) continue;
+                  if (selDrag.mode === 'uniform-scale') {
+                    v.x = cx + (v.x - cx) * factor;
+                    v.y = cy + (v.y - cy) * factor;
+                    v.z = cz + (v.z - cz) * factor;
+                  } else if (selDrag.axis === 'x') {
+                    v.x = cx + (v.x - cx) * factor;
+                  } else if (selDrag.axis === 'y') {
+                    v.y = cy + (v.y - cy) * factor;
+                  } else {
+                    v.z = cz + (v.z - cz) * factor;
+                  }
+                }
+              }
+            }
+          }
+          if (verts) {
+            // Misma disciplina que el arrastre de la selección: emisión
+            // como mucho cada 80 ms y posición final exacta al soltar.
+            selDrag.latestVerts = verts;
+            const ahoraSel = performance.now();
+            if (
+              selDrag.lastEmit === undefined ||
+              ahoraSel - selDrag.lastEmit >= 80
+            ) {
+              selDrag.lastEmit = ahoraSel;
+              onVerticesChangeRef.current?.(verts);
+            }
+          }
+          return;
+        }
+
         // --- Polígono: previsualización (clics sucesivos, no arrastra) ---
         if (
           faceSelectModeRef.current &&
@@ -6374,6 +7032,61 @@ export default function Viewer3D({
           }
         }
       }
+
+      // --- Sub-selección: cursor del gizmo propio + hover del elemento ---
+      if (
+        faceSelectModeRef.current &&
+        !dragRef.current &&
+        !faceMoveDragRef.current &&
+        !faceSelectionStartRef.current &&
+        !selectionGizmoDragRef.current
+      ) {
+        // Mano/selector sobre las asas del gizmo de la sub-selección (si
+        // hay selección: sin ella el gizmo está oculto).
+        if (selectionGizmoGroupRef.current?.visible) {
+          raycasterRef.current.setFromCamera(pointerRef.current, camera);
+          const selHoverHandles = raycasterRef.current.intersectObjects(
+            selectionGizmoHandlesRef.current,
+            false
+          );
+          if (selHoverHandles.length > 0) {
+            const udH = selHoverHandles[0].object.userData as { mode?: string };
+            renderer.domElement.style.cursor =
+              udH.mode === 'move' ? 'grab' : 'pointer';
+          }
+        }
+        // Elemento bajo el cursor en AMARILLO, revisado como mucho cada
+        // 40 ms (el raycast/proyecciones no deben ir en cada pointermove).
+        // SIN depender del gizmo: el hover funciona ANTES de seleccionar
+        // nada (el usuario lo pidió: se ilumina al pasar, se elige al clic).
+        const ahoraHover = performance.now();
+        if (ahoraHover - lastHoverCheckRef.current >= 40) {
+          lastHoverCheckRef.current = ahoraHover;
+          const mHover = meshRef.current;
+          const meshObjHover = findMainMesh(meshGroupRef.current);
+          let hoverNuevo: {
+            t: 'cara' | 'vertice' | 'segmento';
+            id: number | string;
+          } | null = null;
+          if (mHover && meshObjHover && mHover.vertices.length > 0) {
+            hoverNuevo = pickSubElemento(
+              mHover,
+              meshObjHover,
+              camera,
+              e.clientX,
+              e.clientY,
+              renderer.domElement.getBoundingClientRect(),
+              faceSelectionTargetRef.current,
+              faceSelectVisibleOnlyRef.current
+            );
+          }
+          hoverElementRef.current = hoverNuevo;
+          if (!hoverNuevo) {
+            renderer.domElement.style.cursor = '';
+          }
+        }
+      }
+
       // Punto visible solo si está under el ratón o en pleno arrastre.
       for (const helper of lightPositionHelpersRef.current) {
         const dot = helper.children[0] as THREE.Mesh | undefined;
@@ -6662,6 +7375,62 @@ export default function Viewer3D({
       };
     };
 
+    // Arrastre del gizmo de SUB-SELECCIÓN. mover: delta del rayo sobre la
+    // línea del eje (en MUNDO; ejes siempre alineados al mundo — la
+    // selección es una parte de la malla, no tiene orientación propia).
+    // escalar: plano frontal a la cámara por el centroide, factor = 1 +
+    // desplazamiento en pantalla (mismo criterio que el cubo blanco del
+    // gizmo de objetos), pivotado en el centroide de la selección.
+    const makeSelectionGizmoDrag = (
+      ud: { axis: GizmoAxis; mode: 'move' | 'scale' | 'uniform-scale' },
+      ray: THREE.Ray,
+      camDir: THREE.Vector3,
+      screenUp: THREE.Vector3,
+      centroMundo: THREE.Vector3,
+      recogido: { vertIdx: number[]; centroLocal: THREE.Vector3 },
+      m: Mesh
+    ): SelectionGizmoDrag | null => {
+      if (recogido.vertIdx.length === 0) return null;
+      if (ud.mode === 'scale' || ud.mode === 'uniform-scale') {
+        const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
+          camDir.clone().negate(),
+          centroMundo
+        );
+        const hit = new THREE.Vector3();
+        if (!ray.intersectPlane(plane, hit)) return null;
+        return {
+          axis: ud.axis,
+          mode: ud.mode,
+          axisWorld:
+            ud.mode === 'uniform-scale'
+              ? new THREE.Vector3() // no se usa: escala los 3 ejes
+              : GIZMO_AXIS_DIR[ud.axis].clone(),
+          startT: 0,
+          centroMundoStart: centroMundo.clone(),
+          plane,
+          basisU: screenUp.clone(),
+          vertOriginales: m.vertices.map((v) => ({ ...v })),
+          vertIdx: recogido.vertIdx,
+          centroLocal: recogido.centroLocal.clone(),
+        };
+      }
+      const axisWorld = GIZMO_AXIS_DIR[ud.axis].clone();
+      const t0 = closestPointOnAxis(ray, centroMundo, axisWorld);
+      if (t0 === null) return null;
+      return {
+        axis: ud.axis,
+        mode: 'move',
+        axisWorld,
+        startT: t0,
+        centroMundoStart: centroMundo.clone(),
+        plane: new THREE.Plane(),
+        basisU: new THREE.Vector3(),
+        vertOriginales: m.vertices.map((v) => ({ ...v })),
+        vertIdx: recogido.vertIdx,
+        centroLocal: recogido.centroLocal.clone(),
+      };
+    };
+
      const onPointerDown = (e: PointerEvent) => {
        if (placeTargetRef.current) {
          // Registrar el punto inicial: solo coloca si NO hubo arrastre
@@ -6688,6 +7457,74 @@ export default function Viewer3D({
         // --- Face selection: start drag ---
          if (faceSelectModeRef.current && !gizmoDragRef.current) {
           const rect = renderer.domElement.getBoundingClientRect();
+
+          // --- Gizmo de la sub-selección: interceptar el gesto ANTES de
+          // las herramientas (con la forma del polígono en curso no: el
+          // clic es de cierre o de punto nuevo).
+          const poligEnCurso =
+            faceSelectionToolRef.current === 'poligono' &&
+            faceSelectionPointsRef.current.length > 0;
+          const mSel = meshRef.current;
+          const meshObjSel = findMainMesh(meshGroupRef.current);
+          if (
+            !poligEnCurso &&
+            mSel &&
+            meshObjSel &&
+            selectionGizmoGroupRef.current?.visible
+          ) {
+            pointerRef.current.x =
+              ((e.clientX - rect.left) / rect.width) * 2 - 1;
+            pointerRef.current.y =
+              -((e.clientY - rect.top) / rect.height) * 2 + 1;
+            raycasterRef.current.setFromCamera(pointerRef.current, camera);
+            const hitsSel = raycasterRef.current.intersectObjects(
+              selectionGizmoHandlesRef.current,
+              false
+            );
+            const udSel = hitsSel[0]?.object
+              .userData as { axis?: GizmoAxis; mode?: SelectionGizmoDrag['mode'] };
+            if (
+              hitsSel.length > 0 &&
+              udSel?.axis &&
+              udSel.mode
+            ) {
+              meshObjSel.updateWorldMatrix(true, false);
+              const recogidoSel = collectSelectionVerts(
+                mSel,
+                faceSelectionTargetRef.current,
+                selectedFaceIdsRef.current,
+                selectedVertexIdsRef.current,
+                selectedEdgeIdsRef.current
+              );
+              const centroMundo = recogidoSel.centroLocal
+                .clone()
+                .applyMatrix4(meshObjSel.matrixWorld);
+              const camDirSel = new THREE.Vector3();
+              camera.getWorldDirection(camDirSel);
+              const screenUpSel = camera.up
+                .clone()
+                .applyQuaternion(camera.quaternion)
+                .normalize();
+              const dragSel = makeSelectionGizmoDrag(
+                udSel as { axis: GizmoAxis; mode: SelectionGizmoDrag['mode'] },
+                raycasterRef.current.ray,
+                camDirSel,
+                screenUpSel,
+                centroMundo,
+                recogidoSel,
+                mSel
+              );
+              if (dragSel) {
+                selectionGizmoDragRef.current = dragSel;
+                controls.enabled = false;
+                renderer.domElement.style.cursor = 'grabbing';
+                // El resaltado de hover se apaga al arrastrar.
+                hoverElementRef.current = null;
+                hoverKeyRef.current = '';
+                return;
+              }
+            }
+          }
 
           // --- Polígono: añadir vértices con clics, cerrar/cancelar ---
           if (faceSelectionToolRef.current === 'poligono') {
@@ -6814,7 +7651,11 @@ export default function Viewer3D({
                 }
                 for (const f of sel) {
                   const face = mNow.faces[f];
-                  if (face) for (const vi of face) vertIdxSet.add(vi);
+                  if (face) {
+                    for (const vi of face) {
+                      getVertexGroup(mNow, vi).forEach(v => vertIdxSet.add(v));
+                    }
+                  }
                 }
               }
             } else if (targetMove === 'vertice') {
@@ -6825,7 +7666,7 @@ export default function Viewer3D({
                   world: new THREE.Vector3(v.x, v.y, v.z).applyMatrix4(worldMatrixMove),
                   idx: vi,
                 });
-                vertIdxSet.add(vi);
+                getVertexGroup(mNow, vi).forEach(vGroup => vertIdxSet.add(vGroup));
               }
             } else {
               for (const edge of deriveMeshEdges(mNow)) {
@@ -6838,8 +7679,8 @@ export default function Viewer3D({
                     .applyMatrix4(worldMatrixMove),
                   idx: edge.a,
                 });
-                vertIdxSet.add(edge.a);
-                vertIdxSet.add(edge.b);
+                getVertexGroup(mNow, edge.a).forEach(v => vertIdxSet.add(v));
+                getVertexGroup(mNow, edge.b).forEach(v => vertIdxSet.add(v));
               }
             }
 
@@ -6883,6 +7724,82 @@ export default function Viewer3D({
                 return;
               }
             }
+          }
+
+          // --- DIRECTO (los botones Polígono/Aristas/Puntos): el clic
+          // elige el ELEMENTO BAJO EL CURSOR, sin marco ni forma intermedia.
+          // Sobre un elemento ya seleccionado y sin teclas NO se llega aquí
+          // (el agarre de arriba lo convierte en arrastre de mover). ---
+          if (faceSelectionToolRef.current === 'directo') {
+            if (e.button !== 0) return; // solo el clic izquierdo pincha
+            const mDir = meshRef.current;
+            const meshObjDir = findMainMesh(meshGroupRef.current);
+            const elegido = mDir && meshObjDir
+              ? pickSubElemento(
+                  mDir,
+                  meshObjDir,
+                  camera,
+                  e.clientX,
+                  e.clientY,
+                  rect,
+                  faceSelectionTargetRef.current,
+                  faceSelectVisibleOnlyRef.current
+                )
+              : null;
+            const targetDir = faceSelectionTargetRef.current;
+            const toggle = !!e.shiftKey || !!e.ctrlKey || !!e.metaKey;
+            if (elegido) {
+              if (targetDir === 'cara') {
+                const prev = selectedFaceIdsRef.current ?? [];
+                const faceGroup = getFaceGroup(mDir!, elegido.id as number);
+                const yaEstaba = faceGroup.some(f => prev.includes(f));
+                const nuevos = toggle
+                  ? yaEstaba
+                    ? prev.filter((f) => !faceGroup.includes(f))
+                    : [...prev, ...faceGroup]
+                  : [...faceGroup];
+                onFaceSelectionChangeRef.current?.(nuevos);
+                selectedFaceIdsRef.current = nuevos;
+              } else if (targetDir === 'vertice') {
+                const prev = selectedVertexIdsRef.current ?? [];
+                const vertexGroup = getVertexGroup(mDir!, elegido.id as number);
+                const yaEstaba = vertexGroup.some(v => prev.includes(v));
+                const nuevos = toggle
+                  ? yaEstaba
+                    ? prev.filter((f) => !vertexGroup.includes(f))
+                    : [...prev, ...vertexGroup]
+                  : [...vertexGroup];
+                onVertexSelectionChangeRef.current?.(nuevos);
+                selectedVertexIdsRef.current = nuevos;
+              } else {
+                const prev = selectedEdgeIdsRef.current ?? [];
+                const edgeGroup = getEdgeGroup(mDir!, String(elegido.id));
+                const yaEstaba = edgeGroup.some(e => prev.includes(e));
+                const nuevos = toggle
+                  ? yaEstaba
+                    ? prev.filter((k) => !edgeGroup.includes(k))
+                    : [...prev, ...edgeGroup]
+                  : [...edgeGroup];
+                onEdgeSelectionChangeRef.current?.(nuevos);
+                selectedEdgeIdsRef.current = nuevos;
+              }
+            } else if (!toggle) {
+              // Clic al vacío: limpia la selección del objetivo activo.
+              if (targetDir === 'cara') {
+                onFaceSelectionChangeRef.current?.([]);
+                selectedFaceIdsRef.current = [];
+              } else if (targetDir === 'vertice') {
+                onVertexSelectionChangeRef.current?.([]);
+                selectedVertexIdsRef.current = [];
+              } else {
+                onEdgeSelectionChangeRef.current?.([]);
+                selectedEdgeIdsRef.current = [];
+              }
+            }
+            // El gizmo se re-anclea en el animate a la nueva selección.
+            hoverElementRef.current = null;
+            hoverKeyRef.current = '';
+            return;
           }
 
           faceSelectionStartRef.current = {
@@ -7579,6 +8496,21 @@ export default function Viewer3D({
           return;
         }
 
+        // --- Gizmo de sub-selección: soltar -------------------------------
+        if (selectionGizmoDragRef.current) {
+          // Emisión final: el último frame pudo quedar throttled.
+          const selDrag = selectionGizmoDragRef.current;
+          if (selDrag.latestVerts) {
+            onVerticesChangeRef.current?.(selDrag.latestVerts);
+          }
+          selectionGizmoDragRef.current = null;
+          // El centroide del gizmo se re-deduce con los vértices ya movidos.
+          selectionKeyRef.current = '';
+          controls.enabled = true;
+          renderer.domElement.style.cursor = '';
+          return;
+        }
+
         // --- Face selection: finalize ---
         if (faceSelectionStartRef.current && faceSelectModeRef.current) {
           const start = faceSelectionStartRef.current;
@@ -7729,24 +8661,33 @@ export default function Viewer3D({
                 if (insideShape(screenPt)) selected.push(i);
               }
             }
+            // Expand selected vertices to their coincident groups
+            const expandedSelected = new Set<number>();
+            for (const v of selected) {
+              if (!expandedSelected.has(v)) {
+                getVertexGroup(m, v).forEach((gv) => expandedSelected.add(gv));
+              }
+            }
+            const expandedArray = Array.from(expandedSelected);
+
             const prev = selectedVertexIdsRef.current ?? [];
             let newIds: number[];
-            if (selected.length === 0 && !modificada) {
+            if (expandedArray.length === 0 && !modificada) {
               // Clic o área en el vacío sin teclas: deselecciona todo.
               newIds = [];
             } else if (esMayus) {
               // Mayús+clic o Mayús+área: QUITA los vértices del área.
-              newIds = selected.length
-                ? prev.filter((f) => !selected.includes(f))
+              newIds = expandedArray.length
+                ? prev.filter((f) => !expandedArray.includes(f))
                 : prev;
             } else if (esCtrl) {
               // Ctrl+clic o Ctrl+área: AÑADE los vértices del área.
-              newIds = selected.length
-                ? [...new Set([...prev, ...selected])]
+              newIds = expandedArray.length
+                ? [...new Set([...prev, ...expandedArray])]
                 : prev;
             } else {
               // Nueva área sin teclas: reemplaza la selección.
-              newIds = selected;
+              newIds = expandedArray;
             }
             onVertexSelectionChangeRef.current?.(newIds);
             selectedVertexIdsRef.current = newIds;
@@ -7828,24 +8769,33 @@ export default function Viewer3D({
                 if (insideShape(screenPt)) selectedKeys.push(edge.key);
               }
             }
+            // Expand selected edges to their collinear macro-edge groups
+            const expandedSelected = new Set<string>();
+            for (const k of selectedKeys) {
+              if (!expandedSelected.has(k)) {
+                getEdgeGroup(m, k).forEach(ge => expandedSelected.add(ge));
+              }
+            }
+            const expandedArray = Array.from(expandedSelected);
+
             const prev = selectedEdgeIdsRef.current ?? [];
             let newIds: string[];
-            if (selectedKeys.length === 0 && !modificada) {
+            if (expandedArray.length === 0 && !modificada) {
               // Clic o área en el vacío sin teclas: deselecciona todo.
               newIds = [];
             } else if (esMayus) {
               // Mayús+clic o Mayús+área: QUITA los segmentos del área.
-              newIds = selectedKeys.length
-                ? prev.filter((k) => !selectedKeys.includes(k))
+              newIds = expandedArray.length
+                ? prev.filter((k) => !expandedArray.includes(k))
                 : prev;
             } else if (esCtrl) {
               // Ctrl+clic o Ctrl+área: AÑADE los segmentos del área.
-              newIds = selectedKeys.length
-                ? [...new Set([...prev, ...selectedKeys])]
+              newIds = expandedArray.length
+                ? [...new Set([...prev, ...expandedArray])]
                 : prev;
             } else {
               // Nueva área sin teclas: reemplaza la selección.
-              newIds = selectedKeys;
+              newIds = expandedArray;
             }
             onEdgeSelectionChangeRef.current?.(newIds);
             selectedEdgeIdsRef.current = newIds;
@@ -7934,30 +8884,39 @@ export default function Viewer3D({
           }
           if (clicSimple && mejorIdx >= 0) selected.push(mejorIdx);
 
-          // Clic simple sin teclas: la selección pasa a ser SOLO esa cara.
+          // Expand selection to coplanar face groups
+          const expandedSelected = new Set<number>();
+          for (const f of selected) {
+            if (!expandedSelected.has(f)) {
+              getFaceGroup(m, f).forEach((gf) => expandedSelected.add(gf));
+            }
+          }
+          const expandedArray = Array.from(expandedSelected);
+
+          // Clic simple sin teclas: la selección pasa a ser SOLO esa cara (y su grupo).
           // Ctrl/Mayús+clic: añade (o quita, si ya estaba) esa cara una a
           // una, sin perder el resto.
           // Nueva área SIN teclas: REEMPLAZA — las caras del área anterior
           // que no vuelven a estar dentro salen de la selección sola.
           let newFaceIds: number[];
           if (clicSimple && !modificada) {
-            newFaceIds = mejorIdx >= 0 ? [mejorIdx] : [];
+            newFaceIds = mejorIdx >= 0 ? getFaceGroup(m, mejorIdx) : [];
           } else if (esMayus) {
             // Mayús+clic: QUITA las caras nuevas de la selección (los que
             // ya no vuelven a estar dentro salen; el resto se conserva).
-            newFaceIds = selected.length
-              ? selectedFaceIds.filter((f) => !selected.includes(f))
+            newFaceIds = expandedArray.length
+              ? selectedFaceIds.filter((f) => !expandedArray.includes(f))
               : selectedFaceIds;
           } else if (esCtrl) {
             // Ctrl+clic: AÑADE las caras nuevas a la selección.
-            newFaceIds = selected.length
-              ? [...new Set([...selectedFaceIds, ...selected])]
+            newFaceIds = expandedArray.length
+              ? [...new Set([...selectedFaceIds, ...expandedArray])]
               : selectedFaceIds;
-          } else if (!clicSimple && selected.length === 0) {
+          } else if (!clicSimple && expandedArray.length === 0) {
             // Área en el vacío: deselecciona todo.
             newFaceIds = [];
           } else {
-            newFaceIds = selected;
+            newFaceIds = expandedArray;
           }
           onFaceSelectionChangeRef.current?.(newFaceIds);
           selectedFaceIdsRef.current = newFaceIds;
@@ -8348,6 +9307,13 @@ export default function Viewer3D({
     renderer.domElement.addEventListener('pointermove', onPointerMove);
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
     window.addEventListener('pointerup', onPointerUp);
+    // Al salir del lienzo se limpia el resalte de hover y el cursor:
+    // el último elemento apuntado no se queda pintado sin ratón encima.
+    const onPointerLeaveCanvas = () => {
+      hoverElementRef.current = null;
+      renderer.domElement.style.cursor = '';
+    };
+    renderer.domElement.addEventListener('pointerleave', onPointerLeaveCanvas);
     // Rueda del ratón durante la grabación: OrbitControls acerca (dolly) y
     // este gesto también captura fotograma al quedar la vista quieta.
     const onRuedaGrabacion = () => gestoZoomGrabacion();
@@ -8374,6 +9340,7 @@ export default function Viewer3D({
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('pointerup', onPointerUp);
+      renderer.domElement.removeEventListener('pointerleave', onPointerLeaveCanvas);
       renderer.domElement.removeEventListener('wheel', onRuedaGrabacion);
       renderer.domElement.removeEventListener('wheel', handleWheelPlano);
       if (recZoomTimerRef.current) clearTimeout(recZoomTimerRef.current);
@@ -10472,6 +11439,38 @@ uniform vec3 sombraFocoPos[8];`
     const ground = groundRef.current;
     if (!ground) return;
      const material = ground.material as THREE.MeshPhysicalMaterial;
+    // Ventanas 2D: el suelo lleva el MeshBasicMaterial del modo plano
+    // (aplicarModoPlano). Con él SOLO pintura plana (map+color): ni
+    // envMap ni bumpMap — el shader de basic no los compila
+    // (envmap_fragment/ENV_WORLDPOS usa el `normal` que el fragmento de
+    // basic no declara) y refreshUniformsCommon revienta buscando sus
+    // uniformes («Cannot set properties of undefined»). El remontaje al
+    // volver a '3d' restaura el material físico y su envMap.
+    if (material instanceof THREE.MeshBasicMaterial) {
+      if (groundTextureParams) {
+        material.map = null;
+        material.color.set(groundTextureParams.color);
+        material.needsUpdate = true;
+      } else if (groundTexture) {
+        const loader = new THREE.TextureLoader();
+        loader.load(groundTexture, (texture) => {
+          const repeatY = groundTextureRepeatY ?? groundTextureRepeat;
+          texture.wrapS = THREE.RepeatWrapping;
+          texture.wrapT = THREE.RepeatWrapping;
+          texture.colorSpace = THREE.SRGBColorSpace;
+          texture.anisotropy = 4;
+          texture.repeat.set(groundTextureRepeat, repeatY);
+          material.map = texture;
+          material.color.set(0xffffff);
+          material.needsUpdate = true;
+        });
+      } else {
+        material.map = null;
+        material.color.set(0x1a1a2e);
+        material.needsUpdate = true;
+      }
+      return;
+    }
     if (groundTextureParams) {
       // Textura creada: material PURO, idéntico a la vista previa — el PNG
       // del mosaico no se usa ni como mapa ni como relieve.
@@ -10849,7 +11848,14 @@ uniform vec3 sombraFocoPos[8];`
       (objectsRef.current ?? []).find(
         (o) => o.id === selectedObjectIdRef.current
       )?.frozen === true;
-    g.visible = showGizmo && !congelado && (mesh.vertices.length > 0 || esCamara);
+    // En modo de sub-selección el gizmo de objetos NO interviene (sus
+    // gestos se los lleva la selección): se esconde y solo queda el gizmo
+    // de la sub-selección.
+    g.visible =
+      showGizmo &&
+      !(faceSelectMode ?? false) &&
+      !congelado &&
+      (mesh.vertices.length > 0 || esCamara);
      // Filtra las asas del manipulador según los modos activos: si el
      // usuario desactivó 'move', 'rotate' o 'scale', esas asas desaparecen.
       const activeModes = gizmoModes ?? ['move', 'rotate', 'scale'];
@@ -10920,7 +11926,7 @@ uniform vec3 sombraFocoPos[8];`
       Math.abs(transform.sz)
     );
     applyScale(Math.min(Math.max(r * 0.9 * objectScale, 0.35), 8));
-   }, [showGizmo, showRotate, mesh.vertices, transform, gizmoModes, gizmoColorOverride, gizmoOffset, flat2D, objects]);
+   }, [showGizmo, showRotate, mesh.vertices, transform, gizmoModes, gizmoColorOverride, gizmoOffset, flat2D, objects, faceSelectMode]);
 
   // Captura el texto 3D como PNG con fondo transparente (solo la malla).
   // Si el suavizado está activo, la captura usa una COPIA suavizada de la
@@ -10942,6 +11948,14 @@ uniform vec3 sombraFocoPos[8];`
     if (gridGroup) gridGroup.visible = false;
     if (vertexGroup) vertexGroup.visible = false;
     if (gizmoGroup) gizmoGroup.visible = false;
+    // El gizmo de la sub-selección y el resaltado por hover también son
+    // ayudas de edición: fuera de la imagen.
+    const selectionGizmoGroup = selectionGizmoGroupRef.current;
+    const hoverOverlayCap = faceHoverOverlayRef.current;
+    const prevSelectionGizmoVisible = selectionGizmoGroup?.visible ?? false;
+    const prevHoverOverlayVisible = hoverOverlayCap?.visible ?? false;
+    if (selectionGizmoGroup) selectionGizmoGroup.visible = false;
+    if (hoverOverlayCap) hoverOverlayCap.visible = false;
     // Los focos (cono, aros y bola de dirección) y su gizmo también son
     // ayudas de edición: fuera de la imagen capturada.
     const lightHelpersGroup = lightHelpersGroupRef.current;
@@ -11353,20 +12367,25 @@ uniform vec3 sombraFocoPos[8];`
           >
             <Grid3x3 className="w-3.5 h-3.5" />
           </ToggleButton>
-          <label
-            className="flex items-center gap-1 text-[10px] text-muted-foreground"
-            title="Tamaño de la base de trabajo"
-          >
-            Base
-            <Slider
-              min={1}
-              max={5}
-              step={0.5}
-              value={[gridScale]}
-              onValueChange={([v]) => setGridScale(v)}
-              className="w-16"
-            />
-          </label>
+          {/* Tamaño de la base de trabajo: solo en 3D libre; en las
+              ventanas 2D la rejilla es del lienzo (CSS) y este control
+              no se usa. */}
+          {!flat2D && (
+            <label
+              className="flex items-center gap-1 text-[10px] text-muted-foreground"
+              title="Tamaño de la base de trabajo"
+            >
+              Base
+              <Slider
+                min={1}
+                max={5}
+                step={0.5}
+                value={[gridScale]}
+                onValueChange={([v]) => setGridScale(v)}
+                className="w-16"
+              />
+            </label>
+          )}
           <ToggleButton
             active={autoRotate}
             onClick={() => setAutoRotate(!autoRotate)}
@@ -11413,13 +12432,14 @@ uniform vec3 sombraFocoPos[8];`
                     <select
                       value={faceSelectionTool}
                       onChange={(e) => onFaceSelectionToolChangeRef.current?.(e.target.value as any)}
-                      title="Rectángulo, círculo y polígono solo tocan lo COMPLETAMENTE dentro. Polígono: clic por cada vértice, ciérralo con un clic cerca del primer punto (clic derecho cancela)"
+                      title="Rectángulo, círculo y polígono solo tocan lo COMPLETAMENTE dentro. Polígono: clic por cada vértice, ciérralo con un clic cerca del primer punto (clic derecho cancela). Directo: el clic elige el elemento bajo el cursor (lo fijan los botones Polígono/Aristas/Puntos)"
                       className="px-1.5 py-0.5 text-xs bg-white/10 rounded border border-white/20 text-white"
                     >
                       <option value="rectangle">Rectángulo</option>
                       <option value="circle">Círculo</option>
                       <option value="line">Línea</option>
                       <option value="poligono">Polígono</option>
+                      <option value="directo">Directo (clic)</option>
                     </select>
                   </>
                 )}

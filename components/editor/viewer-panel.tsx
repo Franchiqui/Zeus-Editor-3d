@@ -56,7 +56,7 @@ interface ViewerPanelProps {
     selectionMode?: boolean;
     onSelectionModeChange?: (active: boolean) => void;
     faceSelectMode?: boolean;
-    faceSelectionTool?: 'rectangle' | 'circle' | 'line' | 'poligono';
+    faceSelectionTool?: 'rectangle' | 'circle' | 'line' | 'poligono' | 'directo';
     faceSelectionTarget?: 'cara' | 'vertice' | 'segmento';
     faceSelectVisibleOnly?: boolean;
     wireframeOffSignal?: number;

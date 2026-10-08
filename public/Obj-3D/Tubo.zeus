@@ -1,7 +1,7 @@
 {
   "type": "editor3d",
   "version": 3,
-  "mode": "lathe",
+  "mode": "scene",
   "views": {
     "front": [],
     "side": [],
@@ -46,24 +46,7 @@
   "textureRepeat": 1,
   "textureRepeatY": null,
   "editedVertices": null,
-  "latheProfile": [
-    {
-      "x": 0.375,
-      "y": 0
-    },
-    {
-      "x": 0.6875,
-      "y": 0
-    },
-    {
-      "x": 0.6875,
-      "y": 1.25
-    },
-    {
-      "x": 0.375,
-      "y": 1.25
-    }
-  ],
+  "latheProfile": [],
   "latheTexture": null,
   "latheOpacity": 1,
   "latheSegments": 32,
@@ -83,12 +66,11 @@
   },
   "sceneObjects": [
     {
-      "id": "object-1791462003386",
+      "id": "object-1791475994009",
       "name": "Objeto 1",
-      "mode": "lathe",
       "transform": {
         "px": 0,
-        "py": -0.05011982803501802,
+        "py": -0.6981964925299106,
         "pz": 0,
         "rx": 0,
         "ry": 0,
@@ -43134,86 +43116,11 @@
       },
       "smooth": true,
       "textureProjection": "planar",
-      "config": {
-        "views": {
-          "front": [],
-          "side": [],
-          "top": []
-        },
-        "resolution": 32,
-        "meshStyle": "suave",
-        "text": "",
-        "fontCss": "'Textura', sans-serif",
-        "textDepth": 48,
-        "hollowText": false,
-        "greedyMesh": true,
-        "textRes": 144,
-        "textOpacity": 0.85,
-        "viewsOpacity": 1,
-        "extrudeDepth": 0.5,
-        "extrudeHoleDepths": {},
-        "extrudeHoles": [],
-        "textMode": "smooth",
-        "useFontColor": true,
-        "baseColor": "#e8e8e8",
-        "figureColor": "#121ca7",
-        "texture": null,
-        "bumpTexture": null,
-        "bumpTextureRepeat": null,
-        "bumpTextureRepeatY": null,
-        "textureProjection": "planar",
-        "textureFinish": "glossy",
-        "textureRelief": 0.25,
-        "textureRepeat": 1,
-        "textureRepeatY": null,
-        "textureHelper": false,
-        "textureHelperTransform": {
-          "px": 0,
-          "py": 0,
-          "pz": 0,
-          "rx": 0,
-          "ry": 0,
-          "rz": 0,
-          "sx": 1,
-          "sy": 1,
-          "sz": 1,
-          "o": 1
-        },
-        "editedVertices": null,
-        "meshSilhouette": [],
-        "meshSections": [],
-        "meshSilhouetteView": "both",
-        "meshSideView": [],
-        "meshOpacity": 1,
-        "latheProfile": [
-          {
-            "x": 0.375,
-            "y": 0
-          },
-          {
-            "x": 0.6875,
-            "y": 0
-          },
-          {
-            "x": 0.6875,
-            "y": 1.25
-          },
-          {
-            "x": 0.375,
-            "y": 1.25
-          }
-        ],
-        "latheTexture": null,
-        "latheOpacity": 1,
-        "latheSegments": 32,
-        "latheClamp": true,
-        "latheFigureColor": "#121ca7",
-        "polylines": {}
-      }
+      "mode": "lathe"
     }
   ],
-  "configObjectId": "object-1791462003386",
-  "selectedObjectId": "object-1791462003386",
+  "configObjectId": null,
+  "selectedObjectId": "object-1791475994009",
   "groups": [],
   "editorGridResolution": 32,
   "editorCanvasZoom": 1,
@@ -43248,11 +43155,11 @@
       "rotationY": 1.5707963267948966
     },
     "3d": {
-      "zoom": 1.1999999999999988,
+      "zoom": 1.2,
       "offsetX": 0,
       "offsetY": 0,
-      "rotationX": 0.8000845739316285,
-      "rotationY": 1.5301857042284839
+      "rotationX": 0.5235987755982987,
+      "rotationY": -0.7853981633974482
     }
   },
   "panelViews": {

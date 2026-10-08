@@ -15,7 +15,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   
   // --- Filesystem APIs ---
+  // --- Filesystem APIs ---
+  // getFilePath: File del renderer → ruta nativa (p. ej. «Mejorar
+  // calidad» necesita el inputPath real del vídeo cargado). Si el
+  // File no está respaldado por disco (p.eg. un pegado), null.
+  getFilePath: (file) => {
+    try {
+      return webUtils.getPathForFile(file);
+    } catch {
+      return null;
+    }
+  },
   selectFolder: () => ipcRenderer.invoke('fs:selectFolder'),
+  openFileDialog: (opts) => ipcRenderer.invoke('fs:openFileDialog', opts),
   fsListDirectory: (folderPath, category) => ipcRenderer.invoke('fs:listDirectory', folderPath, category),
   fsReadFile: (filePath, encoding) => ipcRenderer.invoke('fs:readFile', filePath, encoding),
   fsReadFileBuffer: (filePath) => ipcRenderer.invoke('fs:readFileBuffer', filePath),
@@ -28,6 +40,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   fsSaveLocalPaths: (paths) => ipcRenderer.invoke('fs:saveLocalPaths', paths),
   fsReadProject: (projectPath) => ipcRenderer.invoke('fs:readProject', projectPath),
   fsSaveProject: (projectPath, data) => ipcRenderer.invoke('fs:saveProject', projectPath, data),
+  getTempDir: () => ipcRenderer.invoke('fs:getTempDir'),
   getMediaUrl: (filePath) => 'media://file?path=' + encodeURIComponent(filePath),
   
   // --- Clipboard APIs ---
@@ -58,6 +71,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // --- Screen APIs ---
   getDesktopSources: (types) => ipcRenderer.invoke('screen:getSources', types),
   saveCapture: (opts) => ipcRenderer.invoke('screen:saveCapture', opts),
+  cropVideo: (opts) => ipcRenderer.invoke('screen:cropVideo', opts),
+  onCropVideoProgress: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('screen:cropVideo-progress', listener);
+    return () => ipcRenderer.removeListener('screen:cropVideo-progress', listener);
+  },
   setCaptureOverlay: (opts) => ipcRenderer.send('capture:overlay', opts),
   
   // --- Audio APIs ---

@@ -3807,7 +3807,7 @@ export default function Home({
   const [renameDraft, setRenameDraft] = useState('');
    const [selectionMode, setSelectionMode] = useState(false);
    const [faceSelectMode, setFaceSelectMode] = useState(false);
-   const [faceSelectionTool, setFaceSelectionTool] = useState<'rectangle' | 'circle' | 'line' | 'poligono'>('rectangle');
+   const [faceSelectionTool, setFaceSelectionTool] = useState<'rectangle' | 'circle' | 'line' | 'poligono' | 'directo'>('rectangle');
    const [faceSelectionTarget, setFaceSelectionTarget] = useState<'cara' | 'vertice' | 'segmento'>('cara');
    // Solo capturar lo visible (caras de frente, no lo que está detrás).
    const [faceSelectVisibleOnly, setFaceSelectVisibleOnly] = useState(true);
@@ -8050,6 +8050,42 @@ pluginTracks,
       return () => window.removeEventListener('keydown', deseleccionar);
     }, [faceSelectMode]);
 
+    // Botones Polígono / Aristas / Puntos de la barra superior: activan el
+    // modo de sub-selección con UN objetivo fijo. El mismo botón vuelve a
+    // pulsarse → se sale del modo y se limpia la selección (los overlays
+    // del visor se retiran al apagarse el modo).
+    const toggleSubSelectTarget = useCallback((tg: 'cara' | 'vertice' | 'segmento') => {
+      setFaceSelectMode((prevMode) => {
+        const salir = prevMode && faceSelectionTarget === tg;
+        if (salir) {
+          setSelectedFaceIds([]);
+          setSelectedVertexIds([]);
+          setSelectedEdgeIds([]);
+          // Al salir, la barra clásica vuelve a su marco por defecto.
+          setFaceSelectionTool('rectangle');
+          return false;
+        }
+        // Cambiar de objetivo o entrar: nueva selección (cada objetivo
+        // lleva la suya, como al conmutar de objetivo en el visor).
+        setSelectedFaceIds([]);
+        setSelectedVertexIds([]);
+        setSelectedEdgeIds([]);
+        setFaceSelectionTarget(tg);
+        return true;
+      });
+      // Herramienta DIRECTA: el clic elige el elemento bajo el cursor
+      // (sin marco — el marco es la barra clásica, no estos botones).
+      setFaceSelectionTool('directo');
+    }, [faceSelectionTarget]);
+
+    // La sub-selección es del objeto activo: al cambiar de objeto se
+    // limpia (índices rancos inofensivos, pero mejor sin basura visual).
+    useEffect(() => {
+      setSelectedFaceIds((prev) => (prev.length > 0 ? [] : prev));
+      setSelectedVertexIds((prev) => (prev.length > 0 ? [] : prev));
+      setSelectedEdgeIds((prev) => (prev.length > 0 ? [] : prev));
+    }, [selectedObjectId, configObjectId]);
+
     const handleFaceTextureFile = useCallback((file: File | null) => {
       if (!file || !file.type.startsWith('image/')) return;
       const reader = new FileReader();
@@ -12016,6 +12052,45 @@ pluginTracks,
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {/* Botones de sub-selección: caras/polígonos, aristas y puntos.
+              Cuadrados, solo icono: el nombre aparece en el tooltip al pasar
+              el ratón. El activo se sale al pulsarlo de nuevo; en el modo, el
+              visor ilumina lo apuntado y el gizmo edita la selección. */}
+          {([['cara', 'subSelFacesTitle', 'Poligonos'],
+             ['segmento', 'subSelEdgesTitle', 'Aristas'],
+             ['vertice', 'subSelVerticesTitle', 'Puntos']] as const).map(
+            ([tg, titleKey, icono]) => {
+              const activo = faceSelectMode && faceSelectionTarget === tg;
+              return (
+                <button
+                  key={tg}
+                  title={activo ? t('editor3D.subSelBtnOffTitle') : t(`editor3D.${titleKey}`)}
+                  data-testid={`subselect-${tg}`}
+                  data-activo={activo ? '1' : '0'}
+                  disabled={viewerMesh.vertices.length === 0}
+                  onClick={() => toggleSubSelectTarget(tg)}
+                  className={`flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border disabled:opacity-40 disabled:cursor-not-allowed ${
+                    activo
+                      ? 'bg-gray-700 border-cyan-300 ring-2 ring-cyan-300 shadow-[0_0_5px_1px_rgba(34,211,238,0.9),0_0_16px_6px_rgba(34,211,238,0.4)] hover:bg-gray-600'
+                      : 'bg-gray-400 hover:bg-gray-300 border-gray-500'
+                  }`}
+                >
+                  {/* PNG del usuario: mejor que .ico (ese es para favicon).
+                      Fondo gris claro en reposo para que el trazo negro del
+                      icono no se pierda en el header oscuro. Al activarse se
+                      enciende el perímetro (borde + ring + halo cian) y el
+                      fondo pasa a gris oscuro, distinguiéndolo de los
+                      inactivos. */}
+                  <img
+                    src={`/icons/${icono}.png`}
+                    alt=""
+                    draggable={false}
+                    className="h-full w-full object-contain"
+                  />
+                </button>
+              );
+            }
+          )}
           {/* Dropdown: Nuevo proyecto, Eliminar objeto, Sustraer forma, Objeto 3D, Guardar, Luces */}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>

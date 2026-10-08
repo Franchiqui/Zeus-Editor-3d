@@ -131,6 +131,22 @@ ipcMain.handle('fs:selectFolder', async () => {
   return result.canceled ? null : result.filePaths[0];
 });
 
+// Abre el explorador de archivos nativo para ELEGIR un .zeus, arrancando
+// en la carpeta configurada — así no hay que listar la carpeta entera
+// con miniaturas solo para escoger un archivo.
+ipcMain.handle('fs:openFileDialog', async (_, opts) => {
+  const win = BrowserWindow.getFocusedWindow();
+  if (!win) return null;
+  const options = (typeof opts === 'object' && opts !== null) ? opts : {};
+  const result = await dialog.showOpenDialog(win, {
+    title: options.title || 'Seleccionar archivo .zeus',
+    defaultPath: options.defaultPath || undefined,
+    properties: ['openFile'],
+    filters: [{ name: 'Objetos y proyectos 3D (.zeus)', extensions: ['zeus'] }],
+  });
+  return result.canceled ? null : result.filePaths[0];
+});
+
 ipcMain.handle('fs:listDirectory', async (_, folderPath, category) => {
   try {
     if (!folderPath || !fs.existsSync(folderPath)) return { files: [], error: 'Ruta no existe' };
@@ -321,6 +337,16 @@ ipcMain.handle('fs:saveLocalPaths', async (_, paths) => {
   }
 });
 
+// Carpeta temporal del sistema (para los puentes del editor, p. ej. los
+// temporales de «Mejorar calidad»): la pide el renderer por getTempDir.
+ipcMain.handle('fs:getTempDir', async () => {
+  try {
+    return { success: true, path: app.getPath('temp') };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
 // Captura de pantalla: enumerar fuentes (pantallas enteras y ventanas) con desktopCapturer.
 // Devuelve [{id, name, display_id, thumbnail}] para que el renderer muestre un selector.
 ipcMain.handle('screen:getSources', async (_event, types) => {
@@ -369,6 +395,82 @@ ipcMain.handle('screen:saveCapture', async (_event, opts) => {
   } catch (e) {
     return { success: false, error: e.message };
   }
+});
+
+// Recortar un vídeo grabado (captura de ventana/pantalla) con ffmpeg: aplica un recorte
+// según un rectángulo NORMALIZADO (0..1) sobre el frame y reencodifica a MP4 (H.264).
+// Los valores en expresiones iw/ih se ponen pares con trunc(*n/2)*2 para que
+// libx264 yuv420p no rechace dimensiones impares.
+// opts = { inputPath, crop:{x,y,w,h}, } con crop valores 0..1 relativos al frame.
+ipcMain.handle('screen:cropVideo', async (_event, opts) => {
+  const inputPath = opts && opts.inputPath;
+  const crop = opts && opts.crop;
+  if (!inputPath || !fs.existsSync(inputPath)) {
+    return { success: false, error: 'Archivo de entrada no encontrado' };
+  }
+  if (!crop || ['x', 'y', 'w', 'h'].some((k) => typeof crop[k] !== 'number' || !isFinite(crop[k]))) {
+    return { success: false, error: 'Falta el rectángulo de recorte' };
+  }
+
+  const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
+  // w/h mínimo 2% para evitar recortes degenerados; x/y + w/h dentro del frame.
+  const w = clamp(crop.w, 0.02, 1);
+  const h = clamp(crop.h, 0.02, 1);
+  const x = clamp(crop.x, 0, 1 - w);
+  const y = clamp(crop.y, 0, 1 - h);
+
+  const vf = `crop=w='trunc(iw*${w.toFixed(6)}/2)*2':h='trunc(ih*${h.toFixed(6)}/2)*2':x='trunc(iw*${x.toFixed(6)}/2)*2':y='trunc(ih*${y.toFixed(6)}/2)*2'`;
+
+  const dir = path.dirname(inputPath);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const outputPath = path.join(dir, `zeus_captura_recorte_${stamp}.mp4`);
+
+  const sendProgress = (percent) => {
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('screen:cropVideo-progress', { inputPath, percent });
+      }
+    } catch {}
+  };
+
+  // Duración del entrada para un porcentaje fiable (el WebM suele carecer de metadata clara).
+  let inputDuration = 0;
+  try {
+    inputDuration = await new Promise((res) => {
+      ffmpeg.ffprobe(inputPath, (err, meta) => {
+        if (err || !meta || !meta.format || !meta.format.duration) return res(0);
+        res(parseFloat(meta.format.duration) || 0);
+      });
+    });
+  } catch {}
+
+  return new Promise((resolve) => {
+    ffmpeg(inputPath)
+      .outputOptions([
+        '-vf', vf,
+        '-c:v libx264',
+        '-preset veryfast',
+        '-crf 16',
+        '-pix_fmt yuv420p',
+        '-movflags +faststart',
+        '-c:a aac',
+        '-b:a 192k'
+      ])
+      .output(outputPath)
+      .on('progress', (progress) => {
+        let percent = (typeof progress.percent === 'number' && progress.percent >= 0) ? progress.percent : null;
+        if (percent === null && progress.timemark && inputDuration > 0) {
+          const parts = String(progress.timemark).split(':').map(Number);
+          const seconds = (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
+          percent = (seconds / inputDuration) * 100;
+        }
+        if (percent === null) { sendProgress(-1); return; }
+        sendProgress(Math.max(0, Math.min(100, percent)));
+      })
+      .on('end', () => resolve({ success: true, outputPath }))
+      .on('error', (err) => resolve({ success: false, error: err.message }))
+      .run();
+  });
 });
 
 // Overlay icon de la barra de tareas (Windows): marca el icono de la app con un
@@ -605,8 +707,9 @@ ipcMain.handle('video:html-to-mp4', async (_, opts) => {
     const duration = Math.max(0.5, parseFloat(opts && opts.duration) || 6);
     const speed = Math.max(0.05, parseFloat(opts && opts.speed) || 1);
     const fps = Math.max(1, Math.min(60, parseInt(opts && opts.fps, 10) || 30));
-    const width = Math.max(16, parseInt(opts && opts.width, 10) || 1920);
-    const height = Math.max(16, parseInt(opts && opts.height, 10) || 1080);
+    // Dimensiones PARES: la captura/libx264 no aceptan anchos/altos impares.
+    const width = Math.max(16, (parseInt(opts && opts.width, 10) || 1920) & ~1);
+    const height = Math.max(16, (parseInt(opts && opts.height, 10) || 1080) & ~1);
     const outputPath = opts && opts.outputPath;
     if (!outputPath) return { success: false, error: 'Falta la ruta de salida.' };
 
@@ -690,7 +793,10 @@ ipcMain.handle('video:html-to-mp4', async (_, opts) => {
       execFile(ffmpegPath, [
         '-y', '-framerate', String(fps),
         '-i', path.join(framesDir, 'frame_%05d.png'),
-        '-filter:v', `setpts=${setpts}*PTS`,
+        // Ajusta a dimensiones PARES: capturePage puede devolver el tamaño real
+        // del contenido (p.ej. 4095x2052) y libx264 + yuv420p exige ancho/alto
+        // divisibles entre 2 ("width not divisible by 2").
+        '-filter:v', `setpts=${setpts}*PTS, scale=trunc(iw/2)*2:trunc(ih/2)*2`,
         '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
         '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
         outputPath,
