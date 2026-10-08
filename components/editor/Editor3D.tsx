@@ -123,7 +123,6 @@ import {
   type ObjetivoSeleccion,
 } from '@/lib/extrusion-seleccion';
 import { resolveLatheProfile, resampleLatheProfile, LATHE_PRESET_NAMES } from '@/lib/lathe-profiles';
-import { extractObj3dMesh, decimateMesh } from '@/lib/obj3d-thumbnails';
 import { buildViewsMesh, buildExtrudeMesh, buildExtrudeMeshes, polylineToPolygon } from '@/lib/views-mesh';
 import { sanitizePolylinesByCanvas, newPolylineId } from '@/lib/polylines';
 import type { PolylinesByCanvas, Polyline, CanvasTool } from '@/lib/polylines';
@@ -183,7 +182,7 @@ import Object3DPreview, {
 import {
   isElectron,
   getLocalPaths,
-  listDirectory,
+  openFileDialog,
   readProject,
   saveProject,
 } from '@/lib/electron-fs';
@@ -3725,6 +3724,9 @@ export default function Home({
        * listado; para los archivos locales se lee aparte). undefined =
        * leyendo, null = sin figura */
       mesh?: Mesh | null;
+      /** Foto del objeto (public/Obj-3D/<nombre>.png, si existe): la
+       * tarjeta la muestra en vez de la miniatura 3D */
+      png?: string;
     }>
   >([]);
   const [obj3dLoading, setObj3dLoading] = useState(false);
@@ -3744,11 +3746,14 @@ export default function Home({
   // Figuras ya leídas del modal Objeto 3D (clave "origen/nombre"), para
   // no releer el archivo al volver a pasar el ratón por él
   const obj3dMeshCacheRef = useRef<Map<string, Mesh>>(new Map());
-  // Datos COMPLETOS de los archivos (promesas, clave "origen/nombre"): se
-  // precargan al pasar el ratón por una tarjeta para que pinchar sea
-  // instantáneo — la miniatura del listado está diezmada, pero para crear
-  // el objeto o abrir el editor se necesita el archivo entero.
-  const obj3dDataCacheRef = useRef<Map<string, Promise<unknown>>>(new Map());
+  // Datos COMPLETOS de los archivos (clave "origen/nombre"): la promesa y
+  // el tamaño del archivo según el listado, para que cambiar el archivo en
+  // disco (re-guardarlo y volver a copiarlo a public/Obj-3D, por ejemplo)
+  // invalide la caché sin recargar la página — antes la sesión entera
+  // seguía usando el contenido viejo.
+  const obj3dDataCacheRef = useRef<
+    Map<string, { size: number | null; promise: Promise<unknown> }>
+  >(new Map());
 
   // Input oculto para seleccionar un archivo .zeus desde el navegador
   const obj3dFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -8818,18 +8823,16 @@ pluginTracks,
     [importMode, importPieces]
   );
 
-  // Abre el modal "Objeto 3D": lista los .zeus de public/Obj-3D y los de la
-  // carpeta local donde guarda el botón Guardar (la carpeta local solo
-  // existe en la app de escritorio). El listado del servidor ya trae la
-  // miniatura diezmada de cada figura pública, así que las tarjetas se ven
-  // en una sola petición — antes cada tarjeta se bajaba su .zeus entero
-  // (megas) una a una, y el spinner tapaba la lista hasta terminar.
+  // Abre el modal "Objeto 3D": lista SOLO los .zeus de public/Obj-3D (la
+  // petición del servidor ya trae las miniaturas diezmadas, así que las
+  // tarjetas se ven en una sola llamada). Los .zeus de las carpetas locales
+  // (objetos y proyectos) NO se listan: leerlos todos para sus miniaturas
+  // tardaba mucho con carpetas llenas — se eligen con el explorador de
+  // archivos desde los dos botones del modal.
   const openObj3dModal = useCallback(async () => {
     setObj3dMsg(null);
-    setObj3dFiles([]);
     setObj3dPreview(null);
     setObj3dModalOpen(true);
-    setObj3dLoading(true);
     try {
       const files: Array<{
         name: string;
@@ -8837,76 +8840,28 @@ pluginTracks,
         path?: string;
         size?: number;
         mesh?: Mesh | null;
+        png?: string;
       }> = [];
-      // public/Obj-3D (se crea en la escena al pinchar): miniaturas incluidas
       try {
         const res = await fetch('/api/objetos-3d', { cache: 'no-store' });
         const data = await res.json();
         for (const f of Array.isArray(data.files) ? data.files : []) {
           if (f && typeof f.name === 'string') {
-            files.push({ name: f.name, source: 'public', size: f.size, mesh: f.mesh ?? null });
+            files.push({
+            name: f.name,
+            source: 'public',
+            size: f.size,
+            mesh: f.mesh ?? null,
+            png: typeof f.png === 'string' ? f.png : undefined,
+          });
           }
         }
       } catch {
-        // Si no se puede leer public/Obj-3D: se sigue con la carpeta local
+        // Sin lista pública el modal queda vacío: los botones del
+        // explorador (app de escritorio) siguen funcionando.
       }
 
-       // Carpeta local de Objetos 3D (se carga en el editor al pinchar):
-       // primero solo los nombres, las miniaturas se leen en paralelo.
-       if (isElectron()) {
-         try {
-           const paths = await getLocalPaths();
-           const folder = paths?.objetos_3d;
-           if (folder) {
-             const localFiles = await listDirectory(folder);
-             for (const f of localFiles || []) {
-               if (
-                 f &&
-                 !f.isDirectory &&
-                 /\.zeus$/i.test(f.name || '') &&
-                 !files.some((x) => x.source === 'local' && x.name === f.name)
-               ) {
-                 files.push({
-                   name: f.name,
-                   source: 'local',
-                   path: f.path,
-                 });
-               }
-             }
-           }
-         } catch {
-           // Sin carpeta local la sección se queda vacía
-         }
-
-         // Carpeta local de Proyectos 3D (se carga en el editor al pinchar):
-         // igual que los objetos, con su propia sección en el modal.
-         try {
-           const paths = await getLocalPaths();
-           const folder = paths?.proyectos_3d;
-           if (folder) {
-             const projectFiles = await listDirectory(folder);
-             for (const f of projectFiles || []) {
-               if (
-                 f &&
-                 !f.isDirectory &&
-                 /\.zeus$/i.test(f.name || '') &&
-                 !files.some((x) => x.source === 'project' && x.name === f.name)
-               ) {
-                 files.push({
-                   name: f.name,
-                   source: 'project',
-                   path: f.path,
-                 });
-               }
-             }
-           }
-         } catch {
-           // Sin carpeta local la sección se queda vacía
-         }
-       }
-
-      // La lista se ve ya: el spinner solo cubre el listado. Las miniaturas
-      // que faltan (carpeta local) se rellenan en cuanto llegan.
+      // La lista se ve ya: el spinner solo cubre el listado.
       setObj3dFiles(files);
       setObj3dLoading(false);
 
@@ -8917,59 +8872,54 @@ pluginTracks,
       for (const f of files) {
         if (f.source !== 'public') continue;
         const cacheKey = `public/${f.name}`;
-        if (obj3dDataCacheRef.current.has(cacheKey)) continue;
+        const cached = obj3dDataCacheRef.current.get(cacheKey);
+        // Sin caché, o el archivo cambió desde la precarga (otro tamaño:
+        // el usuario lo re-guardó y lo volvió a copiar aquí) → re-pedir
+        if (cached && cached.size === (f.size ?? null)) continue;
         const estimated = f.size ?? 0;
         if (prefetchedBytes + estimated > 64 * 1024 * 1024) continue;
         prefetchedBytes += estimated;
-        obj3dDataCacheRef.current.set(
-          cacheKey,
-          getObj3dFileData({ ...f }).catch(() => null)
-        );
+        obj3dDataCacheRef.current.set(cacheKey, {
+          size: f.size ?? null,
+          promise: getObj3dFileData({ ...f }).catch(() => null),
+        });
       }
-
-      // Miniaturas de la carpeta local (objetos y proyectos): en paralelo
-      // (antes una detrás de otra) y cacheadas entre aperturas del modal.
-      const localFiles = files.filter(
-        (f) => (f.source === 'local' || f.source === 'project') && f.path
-      );
-      await Promise.all(
-        localFiles.map(async (f) => {
-          const cacheKey = `${f.source}/${f.name}`;
-          let mesh = obj3dMeshCacheRef.current.get(cacheKey) ?? null;
-            if (!mesh) {
-              try {
-                const fileData = await readProject(f.path!);
-                // El archivo completo ya está aquí: se precacha para que
-                // pinchar esta tarjeta no tenga que volver a leerlo.
-                obj3dDataCacheRef.current.set(
-                  cacheKey,
-                  Promise.resolve(fileData)
-                );
-                const source = extractObj3dMesh(fileData);
-                if (source) {
-                  mesh = decimateMesh(source.mesh);
-                  obj3dMeshCacheRef.current.set(cacheKey, mesh);
-                }
-              } catch {
-                // Sin miniatura si el archivo no se puede leer: la tarjeta
-                // sigue funcionando igual para abrir el objeto
-              }
-            }
-            if (mesh) {
-              setObj3dFiles((prev) =>
-                prev.map((x) =>
-                  x.source === f.source && x.name === f.name
-                    ? { ...x, mesh }
-                    : x
-                )
-              );
-            }
-          })
-      );
     } finally {
       setObj3dLoading(false);
     }
   }, []);
+
+  // Botones del modal (app de escritorio): abren el explorador de archivos
+  // nativo arrancando en la carpeta configurada (objetos o proyectos) para
+  // elegir el .zeus directamente. Así no se lee la carpeta entera para
+  // hacer miniaturas — el único archivo que se lee es el elegido.
+  const openObj3dExplorer = useCallback(
+    async (kind: 'objeto' | 'proyecto') => {
+      if (!isElectron()) return;
+      try {
+        const paths = await getLocalPaths();
+        const folder =
+          kind === 'objeto' ? paths?.objetos_3d : paths?.proyectos_3d;
+        const title =
+          kind === 'objeto'
+            ? t('editor3D.your3dFolder')
+            : t('editor3D.your3dProjectsFolder');
+        const picked = await openFileDialog({
+          defaultPath: folder || undefined,
+          title,
+        });
+        if (!picked) return; // Cancelado en el explorador
+        const name = picked.split(/[\\/]/).pop() || picked;
+        await loadObject({ name, path: picked });
+      } catch (e: unknown) {
+        setObj3dMsg({
+          ok: false,
+          text: e instanceof Error ? e.message : t('editor3D.errorLoading'),
+        });
+      }
+    },
+    [loadObject, t]
+  );
 
   // Datos completos de un archivo del modal (clave "origen/nombre"):
   // si el ratón ya pasó por su tarjeta estará precargado (hover) y pinchar
@@ -8980,11 +8930,12 @@ pluginTracks,
       name: string;
       source: 'public' | 'local' | 'project';
       path?: string;
+      size?: number;
     }) => {
       const cacheKey = `${file.source}/${file.name}`;
       const cached = obj3dDataCacheRef.current.get(cacheKey);
-      if (cached) {
-        const data = await cached.catch(() => null);
+      if (cached && cached.size === (file.size ?? null)) {
+        const data = await cached.promise.catch(() => null);
         if (data) return data;
         obj3dDataCacheRef.current.delete(cacheKey);
       }
@@ -8994,15 +8945,21 @@ pluginTracks,
           : fetch(`/Obj-3D/${encodeURIComponent(file.name)}`, {
               cache: 'no-store',
             }).then((res) => (res.ok ? res.json() : Promise.reject(res)));
-      obj3dDataCacheRef.current.set(cacheKey, promise);
+      obj3dDataCacheRef.current.set(cacheKey, {
+        size: file.size ?? null,
+        promise,
+      });
       return promise;
     },
     []
   );
 
-  // Crea en la escena actual el objeto guardado pinchado en el modal: la
-  // figura guardada entra como objeto nuevo de ESTA pestaña (igual que
-  // pegar desde otra pestaña), sin tocar la configuración del editor.
+  // Crea en la escena actual el objeto guardado pinchado en el modal. Trae
+  // TODO lo que el archivo guarda de cada figura —su transformada (posición,
+  // giro, escala), su nombre y las DEMÁS piezas del archivo (copias inclui-
+  // das)—, igual que al abrirlo desde la carpeta local. Antes solo se
+  // estampaba la figura del dueño en posición por defecto y ahí se perdían
+  // sus cambios (mover, escalar, girar, otras piezas del archivo…).
   const createObj3dFromFile = useCallback(
     async (file: { name: string }) => {
       if (obj3dCreating) return;
@@ -9020,59 +8977,16 @@ pluginTracks,
             t('editor3D.notA3dObject', { name: file.name })
           );
         }
-        // Figura a crear: la del dueño de la configuración guardada (o la
-        // primera con malla que traiga el archivo).
-        const source = extractObj3dMesh(data);
-        if (!source) {
-          throw new Error(t('editor3D.noSavedShape', { name: file.name }));
-        }
-        const current = sceneObjects.find(
-          (object) => object.id === selectedObjectId
-        );
-        const newId = `object-${Date.now()}`;
+        // "En escena nueva" vacía primero la escena (y suelta grupos y la
+        // configuración del dueño anterior); "Abrir en escena" añade sin
+        // tocar nada. Ambos caen en la misma creación que usa la carpeta
+        // local: cada figura del archivo con SU transformada guardada.
         if (importMode === 'new') {
-          setSceneObjects([
-            {
-              id: newId,
-              name: t('editor3D.copyOf', { name: source.name ?? t('editor3D.defaultObjectName') }),
-              mode, // Solo visible en esta pestaña
-              transform: {
-                ...(current?.transform ?? IDENTITY_TRANSFORM),
-                px: (current?.transform.px ?? 0) + 1.5,
-              },
-              mesh: structuredClone(source.mesh),
-              smooth: source.smooth,
-              textureProjection: source.textureProjection,
-            },
-          ]);
-          setSelectedObjectId(newId);
-          setConfigObjectId(null);
+          setSceneObjects([]);
           setGroups([]);
-          setObj3dModalOpen(false);
-        } else {
-          // Abrir en escena: añadir a la escena actual sin tocar la
-          // configuración
-          setSceneObjects((objects) => [
-            ...objects,
-            {
-              id: newId,
-              name: t('editor3D.copyOf', { name: source.name ?? t('editor3D.defaultObjectName') }),
-              mode, // Solo visible en esta pestaña
-              transform: {
-                ...(current?.transform ?? IDENTITY_TRANSFORM),
-                px: (current?.transform.px ?? 0) + 1.5,
-              },
-              mesh: structuredClone(source.mesh),
-              smooth: source.smooth,
-              textureProjection: source.textureProjection,
-            },
-          ]);
-          // Seleccionar el objeto nuevo: el visor solo dibuja las copias de
-          // escena cuando hay un objeto activo, así que sin selección el
-          // objeto recién creado quedaba invisible.
-          setSelectedObjectId(newId);
-          setObj3dModalOpen(false);
+          setConfigObjectId(null);
         }
+        await createObjectsFromZeusData(file.name, data);
       } catch (e: unknown) {
         setObj3dMsg({
           ok: false,
@@ -9082,7 +8996,7 @@ pluginTracks,
         setObj3dCreating(false);
       }
     },
-    [obj3dCreating, getObj3dFileData, mode, sceneObjects, selectedObjectId, importMode, t]
+    [obj3dCreating, getObj3dFileData, importMode, createObjectsFromZeusData, t]
   );
 
   // Pasa el ratón por una tarjeta del modal: su figura se ve girando en la
@@ -9094,6 +9008,7 @@ pluginTracks,
       name: string;
       source: 'public' | 'local' | 'project';
       path?: string;
+      size?: number;
       mesh?: Mesh | null;
     }) => {
       const cacheKey = `${file.source}/${file.name}`;
@@ -9102,12 +9017,17 @@ pluginTracks,
           ? file.mesh
           : obj3dMeshCacheRef.current.get(cacheKey);
       if (mesh) setObj3dPreview({ name: file.name, mesh });
-      // Precarga del archivo que se apunta (una sola vez, promesa cacheada)
-      if (!obj3dDataCacheRef.current.has(cacheKey)) {
-        obj3dDataCacheRef.current.set(
-          cacheKey,
-          getObj3dFileData(file).catch(() => null)
-        );
+      // Precarga del archivo que se apunta. Si ya estaba precargado con
+      // OTRO tamaño (el archivo cambió en disco), se re-pide
+      const cached = obj3dDataCacheRef.current.get(cacheKey);
+      if (
+        !cached ||
+        (cached.size !== null && cached.size !== (file.size ?? null))
+      ) {
+        obj3dDataCacheRef.current.set(cacheKey, {
+          size: file.size ?? null,
+          promise: getObj3dFileData(file).catch(() => null),
+        });
       }
     },
     [getObj3dFileData]
@@ -16866,6 +16786,33 @@ pluginTracks,
             </div>
           </div>
 
+          {/* Carpetas locales (app de escritorio): el explorador de
+              archivos nativo arranca en la carpeta configurada y el
+              .zeus elegido se carga en el editor — sin leer la carpeta
+              entera para miniaturas, que era lo que tardaba. */}
+          {isElectron() && (
+            <div className="grid grid-cols-2 gap-2 pb-1">
+              <button
+                onClick={() => openObj3dExplorer('objeto')}
+                data-testid="obj3d-explorer-objetos"
+                disabled={obj3dCreating}
+                className="flex items-center justify-center gap-2 px-3 py-2 rounded-md text-sm font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 transition-colors disabled:opacity-50"
+              >
+                <FolderOpen className="w-4 h-4" />
+                {t('editor3D.your3dFolder')}
+              </button>
+              <button
+                onClick={() => openObj3dExplorer('proyecto')}
+                data-testid="obj3d-explorer-proyectos"
+                disabled={obj3dCreating}
+                className="flex items-center justify-center gap-2 px-3 py-2 rounded-md text-sm font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 transition-colors disabled:opacity-50"
+              >
+                <FolderOpen className="w-4 h-4" />
+                {t('editor3D.your3dProjectsFolder')}
+              </button>
+            </div>
+          )}
+
           {!isElectron() && (
             <div className="space-y-2">
               <button
@@ -16894,7 +16841,7 @@ pluginTracks,
           {obj3dLoading ? (
             <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
               <Loader2 className="w-4 h-4 animate-spin" />
-              Leyendo las carpetas…
+              Leyendo los objetos públicos…
             </div>
           ) : obj3dFiles.length === 0 ? (
             <p className="text-sm text-muted-foreground py-4 text-center">
@@ -16919,120 +16866,24 @@ pluginTracks,
                 </p>
               </div>
 
-              {/* Miniaturas: la figura de cada archivo dibujada en 3D,
-                  como las miniaturas de texturas. La carpeta local solo
-                  existe en la app de escritorio. */}
+              {/* Miniaturas: la figura de cada archivo dibujada en 3D.
+                  Solo los objetos de public/Obj-3D: los de las carpetas
+                  locales se eligen con los dos botones del explorador. */}
               <div className="max-h-72 overflow-y-auto pr-1 modal-scrollbar space-y-3">
-                {obj3dFiles.some((f) => f.source === 'local') && (
-                  <div>
-                    <div className="flex items-center justify-between mb-1.5">
-                      <h4 className="text-xs font-bold text-foreground">
-                        {t('editor3D.your3dFolder')}
-                      </h4>
-                      <span className="text-[10px] text-muted-foreground/70">
-                        {t('editor3D.clickToLoadInEditor')}
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-3 gap-2">
-                      {obj3dFiles
-                        .filter((f) => f.source === 'local')
-                        .map((f) => (
-                          <button
-                            key={`local-${f.name}`}
-                            data-testid={`obj3d-card-${f.source}`}
-                            onClick={() =>
-                              loadObject({
-                                ...f,
-                                // Precargado al pasar el ratón: promesa o nada
-                                data: obj3dDataCacheRef.current.get(
-                                  `local/${f.name}`
-                                ),
-                              })
-                            }
-                            onMouseEnter={() => loadObj3dPreview(f)}
-                            disabled={obj3dCreating}
-                            className="group relative aspect-square rounded-md overflow-hidden border border-white/10 bg-black/20 hover:border-green-500/50 transition-all disabled:opacity-50"
-                            title={t('editor3D.loadInEditor', { name: f.name.replace(/\.zeus$/i, '') })}
-                          >
-                            <Object3DThumbnail mesh={f.mesh} />
-                            {(obj3dCreating || obj3dOpeningName === f.name) && (
-                              <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
-                                <Loader2 className="w-5 h-5 animate-spin text-green-400" />
-                              </div>
-                            )}
-                            <div className="absolute bottom-0 left-0 right-0 p-1 bg-gradient-to-t from-black/80 to-transparent">
-                              <span className="text-[9px] text-white truncate block">
-                                {f.name.replace(/\.zeus$/i, '')}
-                              </span>
-                            </div>
-                          </button>
-                        ))}
-                    </div>
-                  </div>
-                )}
-
-                 {obj3dFiles.some((f) => f.source === 'project') && (
-                   <div>
-                     <div className="flex items-center justify-between mb-1.5">
-                       <h4 className="text-xs font-bold text-foreground">
-                         {t('editor3D.your3dProjectsFolder')}
-                       </h4>
-                       <span className="text-[10px] text-muted-foreground/70">
-                         {t('editor3D.clickToLoadInEditor')}
-                       </span>
-                     </div>
-                     <div className="grid grid-cols-3 gap-2">
-                       {obj3dFiles
-                         .filter((f) => f.source === 'project')
-                         .map((f) => (
-                           <button
-                             key={`project-${f.name}`}
-                             data-testid={`obj3d-card-${f.source}`}
-                             onClick={() =>
-                               loadObject({
-                                 ...f,
-                                 // Precargado al pasar el ratón: promesa o nada
-                                 data: obj3dDataCacheRef.current.get(
-                                   `project/${f.name}`
-                                 ),
-                               })
-                             }
-                             onMouseEnter={() => loadObj3dPreview(f)}
-                             disabled={obj3dCreating}
-                             className="group relative aspect-square rounded-md overflow-hidden border border-white/10 bg-black/20 hover:border-emerald-500/50 transition-all disabled:opacity-50"
-                             title={t('editor3D.loadInEditor', { name: f.name.replace(/\.zeus$/i, '') })}
-                           >
-                             <Object3DThumbnail mesh={f.mesh} />
-                             {(obj3dCreating || obj3dOpeningName === f.name) && (
-                               <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
-                                 <Loader2 className="w-5 h-5 animate-spin text-green-400" />
-                               </div>
-                             )}
-                             <div className="absolute bottom-0 left-0 right-0 p-1 bg-gradient-to-t from-black/80 to-transparent">
-                               <span className="text-[9px] text-white truncate block">
-                                 {f.name.replace(/\.zeus$/i, '')}
-                               </span>
-                             </div>
-                           </button>
-                         ))}
-                     </div>
-
-                     {/* Offset actual del gizmo con botón de reset. */}
-                     <div className="flex items-center gap-1 mt-1">
-                       <span className="text-[9px] text-muted-foreground/60 font-mono">
-                         {t('editor3D.gizmoOffset')} {Math.round(gizmoOffset.px * 10) / 10}, {Math.round(gizmoOffset.py * 10) / 10}, {Math.round(gizmoOffset.pz * 10) / 10}
-                       </span>
-                       <button
-                         onClick={() => setGizmoOffset(structuredClone(IDENTITY_TRANSFORM))}
-                         data-testid="gizmo-reset-offset"
-                         title={t('editor3D.gizmoResetOffset')}
-                         className="ml-auto px-1.5 py-0.5 rounded text-[10px] text-muted-foreground/60 hover:text-foreground hover:bg-white/5 border border-white/10 transition-colors"
-                       >
-                         ↺
-                       </button>
-                     </div>
-                   </div>
-                 )}
+                {/* Offset actual del gizmo con botón de reset. */}
+                <div className="flex items-center gap-1 mt-1">
+                  <span className="text-[9px] text-muted-foreground/60 font-mono">
+                    {t('editor3D.gizmoOffset')} {Math.round(gizmoOffset.px * 10) / 10}, {Math.round(gizmoOffset.py * 10) / 10}, {Math.round(gizmoOffset.pz * 10) / 10}
+                  </span>
+                  <button
+                    onClick={() => setGizmoOffset(structuredClone(IDENTITY_TRANSFORM))}
+                    data-testid="gizmo-reset-offset"
+                    title={t('editor3D.gizmoResetOffset')}
+                    className="ml-auto px-1.5 py-0.5 rounded text-[10px] text-muted-foreground/60 hover:text-foreground hover:bg-white/5 border border-white/10 transition-colors"
+                  >
+                    ↺
+                  </button>
+                </div>
 
                  {obj3dFiles.some((f) => f.source === 'public') && (
                   <div>
@@ -17057,7 +16908,20 @@ pluginTracks,
                             className="group relative aspect-square rounded-md overflow-hidden border border-white/10 bg-black/20 hover:border-green-500/50 transition-all disabled:opacity-50"
                             title={t('editor3D.createInScene', { name: f.name.replace(/\.zeus$/i, '') })}
                           >
-                            <Object3DThumbnail mesh={f.mesh} />
+                    {/* La foto del objeto (su .png en public/Obj-3D, mismo
+                        nombre que el .zeus) se ve mejor que la figura
+                        dibujada en 3D: se usa cuando existe */}
+                            {f.png ? (
+                              /* eslint-disable-next-line @next/next/no-img-element */
+                              <img
+                                src={`/Obj-3D/${encodeURIComponent(f.png)}`}
+                                alt={f.name.replace(/\.zeus$/i, '')}
+                                className="absolute inset-0 w-full h-full object-contain"
+                                draggable={false}
+                              />
+                            ) : (
+                              <Object3DThumbnail mesh={f.mesh} />
+                            )}
                             {obj3dCreating && (
                               <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
                                 <Loader2 className="w-5 h-5 animate-spin text-green-400" />

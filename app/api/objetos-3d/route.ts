@@ -67,12 +67,22 @@ export async function GET() {
   try {
     await loadDiskCache();
     const entries = await fs.readdir(OBJETOS_DIR, { withFileTypes: true });
+    // PNGs de la carpeta: cada objeto .zeus puede llevar al lado una foto
+    // suya (mismo nombre, .png) para su tarjeta del modal.
+    const pngNames = new Set(
+      entries
+        .filter((entry) => entry.isFile() && /\.png$/i.test(entry.name))
+        .map((entry) => entry.name.toLowerCase())
+    );
     const files = await Promise.all(
       entries
         .filter((entry) => entry.isFile() && /\.zeus$/i.test(entry.name))
         .map(async (entry) => {
           let mesh = null;
           let size = 0;
+          // Foto del objeto: <nombre>.png junto al .zeus (undefined si no hay)
+          const pngName = entry.name.replace(/\.zeus$/i, '') + '.png';
+          const png = pngNames.has(pngName.toLowerCase()) ? pngName : undefined;
           try {
             const fullPath = path.join(OBJETOS_DIR, entry.name);
             const stats = await fs.stat(fullPath);
@@ -94,7 +104,7 @@ export async function GET() {
           } catch {
             // Archivo ilegible: se lista igualmente, solo sin miniatura
           }
-          return { name: entry.name, size, mesh };
+          return { name: entry.name, size, mesh, png };
         })
     );
     saveDiskCache();
