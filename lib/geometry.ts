@@ -986,6 +986,60 @@ export const DEFAULT_VIEWS: Views = {
 };
 
 /**
+ * Detecta si el perfil del torno cierra el contorno consigo mismo (un anillo,
+ * un toroide…). El lienzo DIBUJA la figura cerrada (une el último punto con
+ * el primero con la forma y el relleno) pero no guarda esa unión: la banda
+ * de superficie que va del último punto del perfil hasta el primero no llega
+ * a existir — en un toroide (círculo insertado como forma, que empieza arriba
+ * y acaba un paso antes de volver a subir) queda un hueco justo en la parte
+ * superior. Devuelve la polilínea y si cierra o no, con tolerancia relativa
+ * al tamaño del perfil. Solo se recorta el último punto cuando es un
+ * DUPLICADO exacto del primero (cierre dibujado de verdad): en el círculo de
+ * la forma, ese último punto es un vértice real de la silueta y recortarlo
+ * cortaría la esquina. Los perfiles abiertos clásicos (botella, vasija…)
+ * acaban lejos del inicio: sus extremos ya los cierran las tapas del eje.
+ */
+export function latheProfileLoop(
+  poly: Polygon,
+): { points: Polygon; closed: boolean } {
+  const points: Polygon = poly.map((p) => ({ x: p.x, y: p.y }));
+  if (points.length <= 2) return { points, closed: false };
+  const first = points[0];
+  const last = points[points.length - 1];
+  let minX = first.x;
+  let maxX = first.x;
+  let minY = first.y;
+  let maxY = first.y;
+  for (const p of points) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  // El contorno se DIBUJA cerrado: la cuerda de cierre (último → primero)
+  // es una arista más de la figura. En un anillo su longitud apena (≈ una
+  // arista cualquiera, círculo de 32 puntos u octógono da igual), mientras
+  // que en un perfil abierto de vasija cruza toda la pieza (2 unidades
+  // contra aristas de décimas). Se cierra cuando la cuerda de cierre es del
+  // orden de las aristas de la propia figura (3× la media como tope).
+  let perimeter = 0;
+  for (let i = 1; i < points.length; i++) {
+    perimeter += Math.hypot(
+      points[i].x - points[i - 1].x,
+      points[i].y - points[i - 1].y
+    );
+  }
+  const avgEdge = Math.max(perimeter / (points.length - 1), 1e-12);
+  const seam = Math.hypot(last.x - first.x, last.y - first.y);
+  if (seam <= avgEdge * 3) {
+    // Cierre exacto: el último punto repite al primero y sobra.
+    if (last.x === first.x && last.y === first.y) points.pop();
+    return { points, closed: true };
+  }
+  return { points, closed: false };
+}
+
+/**
  * Genera un mesh de revolución a partir de un perfil
  * @param profile - Puntos del perfil (x = distancia al eje, y = altura)
  * @param segments - Número de segmentos de rotación
@@ -1007,14 +1061,9 @@ export function buildLatheMesh(
   // El perfil del torno es una polilínea de sección radial. Hay que conservar
   // el orden dibujado: una "L" necesita que su segundo tramo genere la pared
   // interior del vaso, no que los puntos se reordenen por altura.
-  const normalized = [...profile];
-  if (
-    normalized.length > 1 &&
-    normalized[0].x === normalized[normalized.length - 1].x &&
-    normalized[0].y === normalized[normalized.length - 1].y
-  ) {
-    normalized.pop();
-  }
+  const profileLoop = latheProfileLoop(profile);
+  const normalized = profileLoop.points;
+  const closedLoop = profileLoop.closed;
 
   const curvedProfile: Point2D[] = [];
   const curveSteps = 16;
@@ -1039,6 +1088,33 @@ export function buildLatheMesh(
           3 * inverse * inverse * t * c1.y +
           3 * inverse * t * t * c2.y +
           t * t * t * next.y,
+      });
+    }
+  }
+
+  // Contorno cerrado: submuestrar también el tramo de cierre (último punto
+  // → primero, respetando sus asas de curva) para que la costura del anillo
+  // siga la misma curvatura que el resto del perfil. El paso final (t = 1)
+  // coincide con la primera fila y lo generan las caras de cierre.
+  if (closedLoop && normalized.length >= 2) {
+    const first = normalized[0];
+    const last = normalized[normalized.length - 1];
+    const c1 = last.hOut ?? last;
+    const c2 = first.hIn ?? first;
+    for (let step = 1; step < curveSteps; step++) {
+      const t = step / curveSteps;
+      const inverse = 1 - t;
+      curvedProfile.push({
+        x:
+          inverse * inverse * inverse * last.x +
+          3 * inverse * inverse * t * c1.x +
+          3 * inverse * t * t * c2.x +
+          t * t * t * first.x,
+        y:
+          inverse * inverse * inverse * last.y +
+          3 * inverse * inverse * t * c1.y +
+          3 * inverse * t * t * c2.y +
+          t * t * t * first.y,
       });
     }
   }
@@ -1082,13 +1158,31 @@ export function buildLatheMesh(
     }
   }
 
+  if (closedLoop) {
+    // Contorno cerrado: la última banda de superficie, que vuelve de la
+    // última fila del perfil a la primera (la costura del anillo). Con el
+    // mismo patrón de aristas que las bandas anteriores, el winding queda
+    // igual que el resto del objeto.
+    const lastRow = (safeProfile.length - 1) * safeSegments;
+    for (let j = 0; j < safeSegments; j++) {
+      const jNext = (j + 1) % safeSegments;
+      const idx = lastRow + j;
+      const idxNext = lastRow + jNext;
+      faces.push([idx, idxNext, j]);
+      faces.push([idxNext, jNext, j]);
+    }
+  }
+
   // Cerrar extremos (tapas)
   const axisEpsilon = 0.06;
   const topProfile = safeProfile[safeProfile.length - 1];
   const bottomProfile = safeProfile[0];
 
-  if (clamp && topProfile.x <= axisEpsilon) {
+  if (clamp && !closedLoop && topProfile.x <= axisEpsilon) {
     // Solo cerrar si el extremo del perfil realmente toca el eje.
+    // Con contorno cerrado no se toca: la última fila del perfil es la
+    // MISMA que la primera (el anillo se cierra sobre sí), así que una tapa
+    // ahí duplicaría la de abajo en el mismo punto (parpadeo en el polo).
     const topIdx = (safeProfile.length - 1) * safeSegments;
     const centerTopIdx = vertices.length;
     vertices.push({ x: 0, y: topProfile.y, z: 0 });

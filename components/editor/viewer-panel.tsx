@@ -425,7 +425,10 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
             </div>,
             document.body
           )}
-        {camarasObjeto && camarasObjeto.length > 0 && (
+        {/* Cámara-objeto y REC solo en la vista 3D libre: el manejo y la
+            grabación recorren pose con FOV de perspectiva, sin sentido en
+            una vista plana ortográfica. El valor elegido se conserva. */}
+        {vk === '3d' && camarasObjeto && camarasObjeto.length > 0 && (
           <select
             value={camaraObjetoId ?? ''}
             onChange={(e) => onCamaraObjetoChange?.(e.target.value || null)}
@@ -441,7 +444,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
             ))}
           </select>
         )}
-        {camaraObjetoId && (
+        {vk === '3d' && camaraObjetoId && (
           <button
             onClick={() => onGrabacionToggle?.()}
             title={grabacionActiva ? t('editor3D.recStop') : t('editor3D.rec')}
@@ -467,14 +470,16 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
         onRotateLeft={() => orbit3D(viewName, 'left', -15)}
         onRotateRight={() => orbit3D(viewName, 'left', 15)}
         onEdit={() => onSetEditing(!editingState)}
-        showRotate
+        // En las ventanas 2D (estilo plano) la orientación es fija: sin
+        // botones de rotación (el clic izquierdo queda para la selección).
+        showRotate={vk === '3d'}
         isEditing={editingState}
         viewName={viewName}
       />
     </div>
      <div className="flex-1 min-h-0">
        <Viewer3D
-         key={`${viewName}-${editingState}`}
+         key={`${viewName}-${editingState}-${vk}`}
          mesh={viewerMesh}
          objects={visibleSceneObjects}
          configObjectId={configObjectId}
@@ -547,6 +552,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
          onFxChange={(fx) => setFxConfig((prev) => ({ ...prev, ...fx }))}
          onLightConfigChange={setLightConfig}
          camera3D={panelCameras[viewName]}
+         flat2D={vk !== '3d'}
          frameToken={frameToken}
          onCameraChange={(cam) => handleCameraChange(viewName, cam)}
          activeCamera={activeCamera}

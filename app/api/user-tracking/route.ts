@@ -12,7 +12,10 @@ function getClientIP(request: Request): string {
   return '';
 }
 
+let adminPb: PocketBase | null = null;
+
 async function getAdminPb() {
+  if (adminPb) return adminPb;
   const url =
     process.env.NEXT_PUBLIC_POCKETBASE_URL ||
     process.env.POCKETBASE_URL ||
@@ -23,6 +26,7 @@ async function getAdminPb() {
   if (email && password) {
     await pb.admins.authWithPassword(email, password);
   }
+  adminPb = pb;
   return pb;
 }
 

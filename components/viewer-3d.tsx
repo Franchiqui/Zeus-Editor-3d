@@ -226,6 +226,12 @@ const IDENTITY_CAMERA3D: Camera3D = {
   rotationY: 0,
 };
 
+/** Medio-alto del frustum ortográfico de las ventanas 2D con zoom 1:
+ *  iguala el encuadre de la perspectiva a distancia 5.5 con FOV 45°
+ *  (5.5 · tan(22.5°) ≈ 2.278). El zoom del estado Camera3D escala este
+ *  frustum (a mayor zoom, frustum menor = más cerca). */
+const ALTURA_BASE_PLANO = 2.2779;
+
 /**
  * Posición a la que apunta un foco. Si está vinculado a un objeto
  * (`targetObjectId`), devuelve la del objeto según su transform actual de la
@@ -347,6 +353,10 @@ interface Viewer3DProps {
   onRegisterSelectionMove?: (fn: (dx: number, dy: number, dz: number) => void) => void;
   showVerticesDefault?: boolean;
   camera3D?: Camera3D;
+  /** Modo 2D (estilo dibujo técnico): cámara ORTOGRÁFICA fijada a la
+   *  dirección de la vista (Frente/Superior/Costado...), sin rotación
+   *  posible y materiales planos sin sombreado. La '3d' libre no lo usa. */
+  flat2D?: boolean;
   /** Al incrementarse, encuadra (ajusta el zoom/centro) la figura y los
    *  objetos de la escena para que entren completos en esta ventana. */
   frameToken?: number;
@@ -559,12 +569,35 @@ export function isIdentityTransform(t: ObjectTransform): boolean {
 }
 
 function applyCamera(
-  camera: THREE.PerspectiveCamera,
+  camera: THREE.PerspectiveCamera | THREE.OrthographicCamera,
   controls: OrbitControls,
   cam: Camera3D
 ) {
+  // Cámara ortográfica (ventanas 2D): la distancia NO cambia el tamaño
+  // en pantalla (solo el frustum lo hace, vía ALTURA_BASE_PLANO/cam.zoom),
+  // pero se conserva baseDistance/cam.zoom como distancia de posición
+  // para que el eco de handleControlsChange reconstruya el MISMO zoom a
+  // partir de baseDistance/dist.
+  const esOrto = camera instanceof THREE.OrthographicCamera;
   const baseDistance = 5.5;
   const distance = baseDistance / cam.zoom;
+  // Frustum orto: medio-alto = ALTURA_BASE_PLANO/zoom; el ancho sale del
+  // aspecto real del lienzo (de su propio canvas, vía el domElement de los
+  // controles) para no deformar al redimensionar.
+  if (esOrto) {
+    const dom = controls.domElement as HTMLElement | null;
+    const aspecto =
+      dom && dom.clientHeight > 0 ? dom.clientWidth / dom.clientHeight : 1;
+    const alto = ALTURA_BASE_PLANO / Math.max(0.1, Math.min(5, cam.zoom));
+    camera.left = -alto * aspecto;
+    camera.right = alto * aspecto;
+    camera.top = alto;
+    camera.bottom = -alto;
+    camera.zoom = 1;
+    camera.near = 0.1;
+    camera.far = Math.max(100, distance * 2 + 10);
+    camera.updateProjectionMatrix();
+  }
   const rotY = cam.rotationY;
   const rotX = cam.rotationX;
 
@@ -599,11 +632,18 @@ function applyCamera(
     camera.position.set(cam.offsetX, -distance, cam.offsetY);
     controls.target.set(cam.offsetX, 0, cam.offsetY);
   } else {
-    const x = distance * Math.cos(rotX) * Math.sin(rotY);
-    const y = distance * Math.sin(rotX);
-    const z = distance * Math.cos(rotX) * Math.cos(rotY);
-    camera.position.set(x + cam.offsetX, y + cam.offsetY, z);
-    controls.target.set(cam.offsetX, cam.offsetY, 0);
+    if (esOrto) {
+      // En modo 2D la rotación está bloqueada en un preset: esta rama
+      // genérica no debería alcanzarse; se cubre con la vista frontal.
+      camera.position.set(cam.offsetX, cam.offsetY, distance);
+      controls.target.set(cam.offsetX, cam.offsetY, 0);
+    } else {
+      const x = distance * Math.cos(rotX) * Math.sin(rotY);
+      const y = distance * Math.sin(rotX);
+      const z = distance * Math.cos(rotX) * Math.cos(rotY);
+      camera.position.set(x + cam.offsetX, y + cam.offsetY, z);
+      controls.target.set(cam.offsetX, cam.offsetY, 0);
+    }
   }
 
   // Reset internal delta state so controls.update() in the animation loop
@@ -613,6 +653,97 @@ function applyCamera(
   (controls as any)._panOffset.set(0, 0, 0);
   (controls as any)._scale = 1;
   controls.update();
+}
+
+/** Materiales originales guardados antes del modo plano (clave por objeto). */
+const MATERIALES_ORIGINALES = new WeakMap<
+  THREE.Mesh,
+  THREE.Material | THREE.Material[]
+>();
+
+/** Convierte los materiales de la escena en MeshBasicMaterial (sin luces:
+ *  color plano tipo lámina, sin sombreado ni sombras) para el estilo
+ *  dibujo técnico de las ventanas 2D. Idempotente: los meshes con la
+ *  marca `__plano` en userData se dejan tal cual, así el paso es barato
+ *  por frame y cubre las mallas reconstruidas un frame después.
+ *  El revert no existe: el remontaje del visor (al volver la ventana a
+ *  '3d') reconstruye la escena con sus materiales físicos de fábrica. */
+function aplicarModoPlano(raiz: THREE.Object3D): void {
+  raiz.traverse((o) => {
+    if (!(o instanceof THREE.Mesh)) return;
+    if ((o.userData as Record<string, unknown>).__plano) return;
+    const or = o.material;
+    MATERIALES_ORIGINALES.set(o, or);
+    const base = Array.isArray(or) ? or : [or];
+    const planos = base.map((m) =>
+      m instanceof THREE.MeshStandardMaterial ||
+      m instanceof THREE.MeshPhysicalMaterial ||
+      m instanceof THREE.MeshPhongMaterial ||
+      m instanceof THREE.MeshLambertMaterial
+        ? new THREE.MeshBasicMaterial({
+            color: m.color.clone(),
+            map: m.map ?? null,
+            vertexColors: m.vertexColors,
+            transparent: m.transparent,
+            opacity: m.opacity,
+            alphaTest: m.alphaTest,
+            side: m.side,
+            depthWrite: m.depthWrite,
+            fog: m.fog,
+          })
+        : m
+    );
+    // Se conserva la FORMA original (single ↔ array): hay accesos tipo
+    // `(mesh.material as MeshBasicMaterial).color` en códigos externos
+    // (skybox) y `dispose()` en handles que revientan si pasa a array.
+    o.material = Array.isArray(or) ? planos : planos[0];
+    (o.userData as Record<string, unknown>).__plano = true;
+  });
+}
+
+/** Convierte una pose (posición cámara + foco target) en el estado
+ *  Camera3D de una vista de panel, con las ramas cenital/lateral cuyas
+ *  firmas reconoce applyCamera (isTopView/isSideView/...). La emisión
+ *  simple con rotX clampada a ±(π/2−0.01) dejaba OUT de tolerancia las
+ *  vistas superior/inferior/costados y se perdía el reconocimiento. */
+function poseACamera3D(
+  pos: THREE.Vector3,
+  tgt: THREE.Vector3,
+  baseDistance = 5.5
+): Camera3D {
+  const dist = pos.distanceTo(tgt);
+  const zoom = Math.max(0.1, Math.min(5, dist > 0 ? baseDistance / dist : 1));
+  const dir = pos.clone().sub(tgt).normalize();
+  const rotX = Math.asin(Math.max(-1, Math.min(1, dir.y)));
+  const rotY = Math.atan2(dir.x, dir.z);
+  if (Math.abs(dir.y) > Math.cos(0.01)) {
+    return {
+      zoom,
+      offsetX: tgt.x,
+      offsetY: tgt.z,
+      rotationX: dir.y > 0 ? Math.PI / 2 : -Math.PI / 2,
+      rotationY: 0,
+    };
+  }
+  if (Math.abs(dir.x) > Math.cos(0.01)) {
+    return {
+      zoom,
+      offsetX: tgt.z,
+      offsetY: tgt.y,
+      rotationX: rotX,
+      rotationY: dir.x > 0 ? Math.PI / 2 : -Math.PI / 2,
+    };
+  }
+  return {
+    zoom,
+    offsetX: tgt.x,
+    offsetY: tgt.y,
+    rotationX: Math.max(
+      -Math.PI / 2 + 0.01,
+      Math.min(Math.PI / 2 - 0.01, rotX)
+    ),
+    rotationY: rotY,
+  };
 }
 
 function disposeMaterial(material: THREE.Material | THREE.Material[]): void {
@@ -744,7 +875,8 @@ export function buildSnapshotObjectVisual(
   projection: LatheTextureProjection,
   textureFinishOverride?: 'glossy' | 'semi-matte' | 'matte' | 'mirror' | 'metallic',
   textureRepeat?: number,
-  textureRepeatY?: number
+  textureRepeatY?: number,
+  envMap?: THREE.Texture | null
 ): THREE.Group {
   const group = new THREE.Group();
   if (!mesh.vertices.length || !mesh.faces.length) return group;
@@ -862,6 +994,10 @@ export function buildSnapshotObjectVisual(
     // Textura CREADA: mismo material físico que la vista previa.
     if (mesh.textureMaterialParams) {
       aplicarMaterialCreado(material, mesh.textureMaterialParams);
+      // Igual que en la malla principal: el env brillante propio. Sin él
+      // el refrato (cristal/agua) de un objeto NO seleccionado sale negro —
+      // el scene.environment del visor es el cubo-RT oscuro del editor.
+      if (envMap) material.envMap = envMap;
     }
     // Texturas por cara: material extra por textura distinta + grupos de
     // índices por tramo contiguo (mismo esquema que la malla principal).
@@ -957,7 +1093,7 @@ export function buildSnapshotObjectVisual(
            // textura normal (ahora mucho más marcado).
            material.bumpMap = mesh.bumpTexture ? null : texture;
            material.bumpScale = (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP;
-           material.color.set(0xffffff);
+           material.color.set(mesh.textureColor ?? 0xffffff);
            material.needsUpdate = true;
            aplicarTexturaRelieve(material, mesh, repeat, repeatY);
         },
@@ -1179,6 +1315,42 @@ const GIZMO_AXIS_DIR: Record<GizmoAxis, THREE.Vector3> = {
  * raycast. Todo con depthTest off para verse SIEMPRE por delante del
  * objeto, como los gizmos de los editores 3D.
  */
+/**
+ * Firma barata de TODO lo que el duplicado del objeto dibuja (figura +
+ * material): la usa el bucle de escena para decidir si el duplicado sigue
+ * al día. Cambia con cualquier ajuste visual del objeto — textura, acabado,
+ * opacidad, relieve, tinte, texturas/colores por cara — hecho SIN
+ * seleccionarlo. Antes el duplicado se montaba una sola vez y esos ajustes
+ * no se veían hasta que el objeto pasaba a ser la malla principal.
+ */
+function firmaVisualObjeto(
+  object: NonNullable<Viewer3DProps['objects']>[number]
+): string {
+  const m = object.mesh;
+  if (!m) return object.id;
+  return JSON.stringify([
+    object.smooth ?? null,
+    object.textureProjection ?? null,
+    m.vertices.length,
+    m.faces.length,
+    m.uvs?.length ?? 0,
+    m.texture ?? null,
+    m.textureFinish ?? null,
+    m.textureColor ?? null,
+    m.textureRelief ?? null,
+    m.textureRepeat ?? null,
+    m.textureRepeatY ?? null,
+    m.bumpTexture ?? null,
+    m.bumpTextureRepeat ?? null,
+    m.bumpTextureRepeatY ?? null,
+    m.opacity ?? null,
+    m.textureMaterialParams ?? null,
+    m.faceColors ?? null,
+    m.faceTextures ?? null,
+    m.faceOpacities ?? null,
+  ]);
+}
+
 function buildGizmoHandles(group: THREE.Group): THREE.Mesh[] {
   const handles: THREE.Mesh[] = [];
   // Cubo central: escala uniforme en X, Y y Z a la vez.
@@ -2428,6 +2600,7 @@ export default function Viewer3D({
     onGizmoOffsetChange,
    objectTransform,
    camera3D,
+   flat2D,
    frameToken,
     onCameraChange,
      onObjectTransform,
@@ -2474,6 +2647,9 @@ export default function Viewer3D({
        onExportComplete,
     }: Viewer3DProps) {
   const mountRef = useRef<HTMLDivElement>(null);
+  // Modo 2D (dibujo técnico): espejo para los cierres del efecto de setup.
+  const flat2DRef = useRef(flat2D);
+  flat2DRef.current = !!flat2D;
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
@@ -2958,6 +3134,13 @@ export default function Viewer3D({
   // efectos de partículas (lluvia, humo) para saber el volumen a cubrir.
   const meshBoxRef = useRef<THREE.Box3 | null>(null);
    const gridGroupRef = useRef<THREE.Group | null>(null);
+   // Cuadros de las ventanas 2D: rejilla de lienzo EN EL ESPACIO (mismas
+   // líneas y colores que la rejilla del suelo) sobre el plano de la
+   // vista; escala con el zoom porque son geometría, no CSS.
+  const flatGridRef = useRef<THREE.GridHelper | null>(null);
+  // Línea de base de las ventanas 2D (frente, espalda y costados): una
+  // franja horizontal al nivel del suelo que marca dónde apoya la base.
+  const flatBaseRef = useRef<THREE.Mesh | null>(null);
    const groundRef = useRef<THREE.Mesh | null>(null);
    const skyboxRef = useRef<THREE.Mesh | null>(null);
   // Color base del fondo (cielo) sin luces: permite atenuarlo/realzarlo.
@@ -3128,6 +3311,9 @@ export default function Viewer3D({
   const onTextureHelperTransformRef = useRef(onTextureHelperTransform);
   onTextureHelperTransformRef.current = onTextureHelperTransform;
   const [showGizmo, setShowGizmo] = useState(gizmo);
+  // Los aros de rotación se pueden apagar aparte (checkbox «Círculos»):
+  // así solo quedan flechas de mover y puntos de escala.
+  const [showRotate, setShowRotate] = useState(true);
   useEffect(() => setShowGizmo(gizmo), [gizmo]);
    const gizmoOnRef = useRef(showGizmo);
    gizmoOnRef.current = showGizmo;
@@ -3275,6 +3461,19 @@ export default function Viewer3D({
     }
     full(vertexHelpersRef.current, true);
      full(gizmoGroupRef.current, false);
+     // Ventanas 2D: el gizmo NO hereda la rotación del objeto. Cuando
+     // un objeto ya está girado, el aro de la cámara se pintaba
+     // inclinado y el arrastre rotaba sobre ese eje inclinado (la
+     // figura tumbeaba en 3D y se perdía el dibujo técnico). Con el
+     // gizmo alineado a los ejes del mundo, el override de arrastre
+     // (que sale del cuaternión del gizmo) apunta SIEMPRE a un eje del
+     // mundo: la rotación en 2D es de pantalla y mover/escalar sigue
+     // ejes del mundo. El offset (modo configuración) se aplica después
+     // sobre esta pose.
+     if (flat2DRef.current) {
+       const gizFlat = gizmoGroupRef.current;
+       if (gizFlat) gizFlat.rotation.set(0, 0, 0);
+     }
      // Si hay un offset del gizmo, aplicarlo SOBRE la pose del objeto:
      // el gizmo se desplaza/gira respecto al centro del objeto sin
      // tocar la figura (modo configuración).
@@ -3406,6 +3605,9 @@ export default function Viewer3D({
       gestoZoomGrabacion();
       return;
     }
+    // Vista del panel siempre espejo del estado aplicado (el pan por
+    // botones del padre no pasa por handleControlsChange).
+    vistaPanelRef.current = camera3D;
     applyCamera(camera, controls, camera3D);
   }, [camera3D, gestoZoomGrabacion]);
 
@@ -3415,16 +3617,28 @@ export default function Viewer3D({
 
     const scene = new THREE.Scene();
     // Fondo del lienzo: el mismo azul oscuro de la interfaz
-    // (paneles bg-[hsl(224_50%_7%)])
-    scene.background = new THREE.Color('hsl(224, 50%, 7%)');
+    // (paneles bg-[hsl(224_50%_7%)]). En modo 2D el canvas queda
+    // TRANSPARENTE: la cuadrícula tipo lienzo la pinta el CSS del div
+    // contenedor (mismo estilo que el lienzo 2D del editor).
+    if (!flat2DRef.current) {
+      scene.background = new THREE.Color('hsl(224, 50%, 7%)');
+    }
     sceneRef.current = scene;
 
-    const camera = new THREE.PerspectiveCamera(
-      45,
-      mount.clientWidth / mount.clientHeight,
-      0.1,
-      100
-    );
+    // Cámara de la ventana: ORTOGRÁFICA en modo 2D (dibujo técnico, la
+    // vista se fija con applyCamera a su dirección y a distancia fija) y
+    // perspectiva en la '3d' libre. El cast mantiene el tipo declarado
+    // (fov/aspect solo se tocan en el modo '3d', que no usa orto).
+    const camera = (
+      flat2D
+        ? new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 100)
+        : new THREE.PerspectiveCamera(
+            45,
+            mount.clientWidth / mount.clientHeight,
+            0.1,
+            100
+          )
+    ) as THREE.PerspectiveCamera;
     camera.position.set(3, 2.5, 4);
     cameraRef.current = camera;
 
@@ -3448,6 +3662,14 @@ export default function Viewer3D({
     controls.enableDamping = false;
     controls.dampingFactor = 0.08;
     controls.autoRotateSpeed = 1.5;
+    // Modo 2D: la orientación es FIJA (vista de la ventana). Sin rotación
+    // (el clic queda para la selección) y sin zoom de OrbitControls (el
+    // zoom va por el estado Camera3D vía applyCamera, escalando el
+    // frustum). El pan (botón central/derecho) sigue activo.
+    if (flat2DRef.current) {
+      controls.enableRotate = false;
+      controls.enableZoom = false;
+    }
     controlsRef.current = controls;
 
     // Sincronizar el estado de la cámara con el padre cuando el usuario
@@ -3514,6 +3736,25 @@ export default function Viewer3D({
       onCamChange(camState);
     };
     controls.addEventListener('change', handleControlsChange);
+
+    // Rueda en modo 2D: el zoom va por el ESTADO (Camera3D.zoom → frustum
+    // de applyCamera), no por dolly de OrbitControls (que está fuera en
+    // orto). Se re-aplica la cámara: los ecos derivan el mismo zoom vía
+    // baseDistance/dist y la única fuente de verdad sigue siendo el padre.
+    const handleWheelPlano = (e: WheelEvent) => {
+      if (!flat2DRef.current) return;
+      e.preventDefault();
+      const vista = vistaPanelRef.current ?? camera3D ?? IDENTITY_CAMERA3D;
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const zoomNuevo = Math.max(
+        0.1,
+        Math.min(5, vista.zoom * factor)
+      );
+      applyCamera(camera, controls, { ...vista, zoom: zoomNuevo });
+    };
+    renderer.domElement.addEventListener('wheel', handleWheelPlano, {
+      passive: false,
+    });
 
     // --- Gizmo de ejes (esquina inferior izquierda) ---
     // Escena aparte con tres flechas X/Y/Z y sus letras. Se dibuja encima
@@ -3854,6 +4095,38 @@ export default function Viewer3D({
      gridGroup.add(gridAxes);
      scene.add(gridGroup);
      gridGroupRef.current = gridGroup;
+
+    // Cuadros de las ventanas 2D: MISMA rejilla que la del suelo (celda
+    // de 0.25 y mismos colores) pero más grande (8 unidades) y colocada
+    // en el plano de la vista, para que los cuadros escalen con el zoom
+    // (son geometría, no píxeles). La orientación/posición/visibilidad
+    // las pone el effect de visibilidad de la rejilla; el raycast va
+    // anulado para no chocar con las selecciones.
+    if (flat2DRef.current) {
+      const flatGrid = new THREE.GridHelper(8, 32, 0x8fb0cc, 0x44506a);
+      (flatGrid.material as THREE.LineBasicMaterial).opacity = 0.3;
+      (flatGrid.material as THREE.LineBasicMaterial).transparent = true;
+      flatGrid.raycast = () => {};
+      // «lado» del cuadrado cubierto: el effect de visibilidad lo crece
+      // reconstruyendo cuando el zoom descubre más allá.
+      flatGrid.userData = { lado: 8 };
+      scene.add(flatGrid);
+      flatGridRef.current = flatGrid;
+
+      // Línea de BASE (franja horizontal al nivel de la rejilla del
+      // suelo): se orienta/posiciona en el effect junto a los cuadros.
+      const flatBase = new THREE.Mesh(
+        new THREE.BoxGeometry(1, 0.015, 0.015),
+        new THREE.MeshBasicMaterial({
+          color: 0x8fb0cc,
+          transparent: true,
+          opacity: 0.55,
+        })
+      );
+      flatBase.raycast = () => {};
+      scene.add(flatBase);
+      flatBaseRef.current = flatBase;
+    }
 
      // Ground plane: a large flat surface below the object that receives
      // shadows, giving the illusion of a real ground.
@@ -4457,7 +4730,8 @@ export default function Viewer3D({
               obj?.textureProjection ?? 'planar',
               undefined,
               resultado.textureRepeat ?? 1,
-              resultado.textureRepeatY
+              resultado.textureRepeatY,
+              envCreadaRef.current
             );
             if (visual.children.length === 0) continue;
             if (oid === selId) {
@@ -5096,6 +5370,10 @@ export default function Viewer3D({
           faceSelectionPointsRef.current.length = 0;
           poligonoCerradaRef.current = null;
         }
+       // Modo 2D (dibujo técnico): materiales planos sin sombreado. Se
+       // repasa cada frame para cubrir las mallas reconstruidas; es
+       // idempotente (los meshes ya convertidos quedan marcados).
+       if (flat2DRef.current) aplicarModoPlano(scene);
        renderer.render(scene, camera);
 
        // Gizmo de ejes: se pinta en un viewport pequeño de la esquina
@@ -5321,8 +5599,16 @@ export default function Viewer3D({
 
     const handleResize = () => {
       if (!mount) return;
-      camera.aspect = mount.clientWidth / mount.clientHeight;
-      camera.updateProjectionMatrix();
+      // Cámara orto (modo 2D): el frustum deriva del aspecto actual → se
+      // re-aplica el último estado del panel; con perspectiva basta aspect.
+      if (camera instanceof THREE.OrthographicCamera) {
+        const estado =
+          vistaPanelRef.current ?? camera3D ?? IDENTITY_CAMERA3D;
+        applyCamera(camera, controls, estado);
+      } else {
+        camera.aspect = mount.clientWidth / mount.clientHeight;
+        camera.updateProjectionMatrix();
+      }
       renderer.setSize(mount.clientWidth, mount.clientHeight);
     };
     window.addEventListener('resize', handleResize);
@@ -5337,6 +5623,9 @@ export default function Viewer3D({
     if (mountResizeObserver) mountResizeObserver.observe(mount);
 
     if (camera3D) {
+      // El estado de montaje ES la vista del panel: lo fija como referencia
+      // (vía de arranque para el pan/zoom en modo 2D antes del primer eco).
+      vistaPanelRef.current = camera3D;
       applyCamera(camera, controls, camera3D);
     }
 
@@ -6038,7 +6327,7 @@ export default function Viewer3D({
            : [];
       const helperHandles =
         textureHelperOnRef.current && textureHelperGizmoGroupRef.current?.visible
-          ? textureHelperHandlesRef.current
+          ? textureHelperHandlesRef.current.filter((h) => h.visible)
           : [];
       if (
         (hoverHandles.length > 0 || helperHandles.length > 0) &&
@@ -6286,7 +6575,22 @@ export default function Viewer3D({
           .clone()
           .sub(axisWorld.clone().multiplyScalar(camDir.dot(axisWorld)));
         if (basisU.lengthSq() < 1e-6) {
-          basisU = new THREE.Vector3(1, 0, 0);
+          // Cámara mirando justo por el eje: camDir no deja componente
+          // sobre el plano. Se toma un eje MUNDO perpendicular al eje del
+          // aro (el fallback fijo podía quedar paralelo al aro y dejar
+          // basisV de longitud cero: el ángulo moría y el drag no rotaba).
+          basisU =
+            Math.abs(axisWorld.x) < 0.5
+              ? new THREE.Vector3(1, 0, 0)
+              : new THREE.Vector3(0, 1, 0);
+          // Se proyecta al plano por si el aro está inclinado.
+          basisU.sub(axisWorld.clone().multiplyScalar(axisWorld.dot(basisU)));
+          if (basisU.lengthSq() < 1e-6) {
+            basisU =
+              Math.abs(axisWorld.y) < 0.5
+                ? new THREE.Vector3(0, 1, 0)
+                : new THREE.Vector3(0, 0, 1);
+          }
         }
         basisU.normalize();
         const basisV = new THREE.Vector3().crossVectors(axisWorld, basisU);
@@ -6897,15 +7201,6 @@ export default function Viewer3D({
             );
             const objectPos = new THREE.Vector3(objT.px, objT.py, objT.pz);
 
-            const hitHandle = hits[0].object;
-            const handleWorldPos = new THREE.Vector3();
-            hitHandle.getWorldPosition(handleWorldPos);
-            console.log('[GIZMO HIT]', {
-              axis: ud.axis, mode: ud.mode,
-              handleWorldDir: handleWorldPos.clone().sub(gizmoWorldPos).normalize().toArray(),
-              computedAxisWorld: axisWorldOverride.toArray(),
-            });
-
             const drag = makeGizmoDrag(
               ud,
               gizmoOffsetRef.current,
@@ -6998,7 +7293,7 @@ export default function Viewer3D({
         pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
         raycasterRef.current.setFromCamera(pointerRef.current, camera);
         const hits = raycasterRef.current.intersectObjects(
-          textureHelperHandlesRef.current,
+          textureHelperHandlesRef.current.filter((h) => h.visible),
           false
         );
         if (hits.length > 0) {
@@ -8080,16 +8375,19 @@ export default function Viewer3D({
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('pointerup', onPointerUp);
       renderer.domElement.removeEventListener('wheel', onRuedaGrabacion);
+      renderer.domElement.removeEventListener('wheel', handleWheelPlano);
       if (recZoomTimerRef.current) clearTimeout(recZoomTimerRef.current);
       controls.dispose();
       for (const h of gizmoHandlesRef.current) {
         h.geometry.dispose();
-        (h.material as THREE.Material).dispose();
+        const mats = Array.isArray(h.material) ? h.material : [h.material];
+        for (const m of mats) (m as THREE.Material)?.dispose?.();
       }
       gizmoHandlesRef.current = [];
       for (const h of textureHelperHandlesRef.current) {
         h.geometry.dispose();
-        (h.material as THREE.Material).dispose();
+        const mats = Array.isArray(h.material) ? h.material : [h.material];
+        for (const m of mats) (m as THREE.Material)?.dispose?.();
       }
       textureHelperHandlesRef.current = [];
       gizmoDragRef.current = null;
@@ -9131,6 +9429,56 @@ export default function Viewer3D({
     );
   }, [textureHelper, mesh.vertices, transform]);
 
+  // Ventanas 2D: mismas reglas de visibilidad que el gizmo principal para
+  // las asas del manipulador de textura — el eje que apunta a la cámara se
+  // retira (su drag muere sin avisar en orto: closestPointOnAxis da null)
+  // y solo queda un aro de rotación en plano de pantalla. Diferencia: el
+  // gizmo de textura cuelga del grupo de la malla, así que sus ejes son
+  // LOCALES al objeto — la dirección de la cámara se convierte a ese
+  // espacio antes de clasificar el eje (con un objeto girado, el asa que
+  // sobra es la de SU eje profundo, no siempre la del eje del mundo).
+  useEffect(() => {
+    const giz = textureHelperGizmoGroupRef.current;
+    if (!giz) return;
+    const on = !!textureHelper && mesh.vertices.length > 0;
+    let flatAxis: GizmoAxis | undefined;
+    if (on && flat2DRef.current && cameraRef.current) {
+      const meshGroup = meshGroupRef.current;
+      if (meshGroup) {
+        meshGroup.updateWorldMatrix(true, false);
+        const invRot = meshGroup
+          .getWorldQuaternion(new THREE.Quaternion())
+          .invert();
+        const dir = cameraRef.current
+          .getWorldDirection(new THREE.Vector3())
+          .applyQuaternion(invRot);
+        flatAxis =
+          Math.abs(dir.x) >= Math.abs(dir.y) && Math.abs(dir.x) >= Math.abs(dir.z)
+            ? 'x'
+            : Math.abs(dir.y) >= Math.abs(dir.z)
+              ? 'y'
+              : 'z';
+      }
+    }
+    for (const h of textureHelperHandlesRef.current) {
+      const ud = h.userData as { mode: string; axis?: GizmoAxis };
+      const m = ud.mode;
+      h.visible =
+        (flatAxis === undefined
+          ? true
+          : m === 'rotate'
+            ? ud.axis === flatAxis
+            : m === 'planar-scale'
+              ? ud.axis === flatAxis
+              : m === 'uniform-scale'
+                ? true
+                : ud.axis !== flatAxis) &&
+        // Checkbox «Círculos»: también gobierna los aros del gizmo de
+        // textura (misma casilla para ambos manipuladores).
+        (m === 'rotate' ? showRotate : true);
+    }
+  }, [textureHelper, mesh.vertices, transform, flat2D, showRotate]);
+
   // Clona el material del cortador para el preview boolean (no mutar el original)
   const cloneAndStyleToolMaterial = (original: THREE.Material): THREE.Material => {
     const clone = original.clone();
@@ -9295,6 +9643,20 @@ export default function Viewer3D({
          (child) => child.userData.sceneObjectDuplicate && child.userData.sceneObjectId === object.id
        ) as THREE.Group | undefined;
 
+       // Config cambió SIN seleccionar el objeto (p. ej. tex/acabado/opacidad
+       // escritos en su malla desde Escena o por el agente): el duplicado que
+       // había dibujaba el material viejo — se rehace desde su instantánea.
+       const firma = firmaVisualObjeto(object);
+       if (duplicate && duplicate.userData.sceneObjectFirma !== firma) {
+         meshGroup.remove(duplicate);
+         duplicate.traverse((item) => {
+           const childMesh = item as THREE.Mesh;
+           childMesh.geometry?.dispose();
+           if (childMesh.material) disposeMaterial(childMesh.material);
+         });
+         duplicate = undefined;
+       }
+
        // Handle hidden objects: remove existing duplicate
        if (object.hidden) {
          if (duplicate) {
@@ -9308,6 +9670,7 @@ export default function Viewer3D({
         duplicate = new THREE.Group();
         duplicate.userData.sceneObjectId = object.id;
         duplicate.userData.sceneObjectDuplicate = true;
+        duplicate.userData.sceneObjectFirma = firma;
         // Cada objeto muestra SU propia instantánea congelada, sea o no
         // el dueño de la configuración: la figura de un objeto no puede
         // mutar porque cambie la pestaña activa del editor (el dueño se
@@ -9324,7 +9687,8 @@ export default function Viewer3D({
               object.textureProjection ?? 'planar',
               undefined,
               object.mesh.textureRepeat ?? 1,
-              object.mesh.textureRepeatY
+              object.mesh.textureRepeatY,
+              envCreadaRef.current
             )
           );
         } else if (
@@ -9337,7 +9701,10 @@ export default function Viewer3D({
               configMesh ?? mesh,
               configSmooth ?? smoothShading,
               configProjection ?? textureProjection,
-              (configMesh ?? mesh).textureFinish ?? 'semi-matte'
+              (configMesh ?? mesh).textureFinish ?? 'semi-matte',
+              undefined,
+              undefined,
+              envCreadaRef.current
             )
           );
         } else if (object.kind === 'camera') {
@@ -10085,13 +10452,17 @@ uniform vec3 sombraFocoPos[8];`
         material.map = texture;
         material.needsUpdate = true;
       });
-      skybox.visible = true;
+      skybox.visible = !!skyboxImage && !flat2DRef.current;
       scene.background = null;
     } else {
       material.map = null;
       material.needsUpdate = true;
+      // En ventanas 2D el fondo lo lleva el CSS del contenedor: sin
+      // skybox y sin color de fondo escena (canvas transparente).
       skybox.visible = false;
-      scene.background = skyBaseColorRef.current.clone();
+      scene.background = flat2DRef.current
+        ? null
+        : skyBaseColorRef.current.clone();
     }
     applySkyLighting();
   }, [skyboxImage]);
@@ -10294,8 +10665,147 @@ uniform vec3 sombraFocoPos[8];`
 
    useEffect(() => {
      const gridGroup = gridGroupRef.current;
-     if (gridGroup) gridGroup.visible = gridValue;
-   }, [gridValue]);
+    // Ventanas 2D: la rejilla del suelo se ve de canto (una línea suelta);
+    // en su lugar están los CUADROS (flatGridRef, geometría ⇒ escalan con
+    // el zoom). La rejilla normal solo vive en la ventana '3d'.
+    const camera = cameraRef.current;
+    const flat = flat2DRef.current && camera !== null;
+    if (gridGroup) gridGroup.visible = !flat && gridValue;
+    const fg = flatGridRef.current;
+    if (!flat || !fg) return;
+    if (!camera) {
+      fg.visible = false;
+      return;
+    }
+    fg.visible = gridValue;
+    const fb = flatBaseRef.current;
+    if (!gridValue || !(camera instanceof THREE.OrthographicCamera)) {
+      if (fb) fb.visible = false;
+      return;
+    }
+    const dir = camera.getWorldDirection(new THREE.Vector3());
+    // Orientación: plano ⟂ a la mirada. Superior/inferior → plano X-Z
+    // (el natural del GridHelper); frente/espalda → plano X-Y (girado
+    // 90° en X); costados → plano Z-Y (girado 90° en Z). La vista
+    // vertical se comprueba PRIMERO: en cenital dir.x ≈ dir.z ≈ 0 y una
+    // comparación entre ambos daría falso positivo (rejilla de canto).
+    let eje: 'x' | 'y' | 'z';
+    if (
+      Math.abs(dir.y) >= Math.abs(dir.x) &&
+      Math.abs(dir.y) >= Math.abs(dir.z)
+    ) {
+      fg.rotation.set(0, 0, 0);
+      eje = 'y';
+    } else if (Math.abs(dir.z) >= Math.abs(dir.x)) {
+      fg.rotation.set(Math.PI / 2, 0, 0);
+      eje = 'z';
+    } else {
+      fg.rotation.set(0, 0, Math.PI / 2);
+      eje = 'x';
+    }
+    // SIN LÍMITE: la retícula cubre SIEMPRE la vista. Centro = target de
+    // la órbita (sigue el pan) ajustado a la retícula (celda de 0.25,
+    // la misma de la rejilla del suelo) — al ajustarlo a la retícula los
+    // cuadros quedan pegados a las mismas posiciones del mundo aunque
+    // la rejilla se desplace; solo se RECONSTRUYE cuando hay que crecer.
+    const controls = controlsRef.current;
+    const centroVista = controls
+      ? controls.target.clone()
+      : new THREE.Vector3();
+    const CELLA = 0.25;
+    const ajusta = (v: number) => Math.round(v / CELLA) * CELLA;
+    // Coordenadas EN PLANO del centro de la vista, ajustadas a la
+    // retícula: eje 'z' → plano X-Y, 'x' → plano Z-Y, 'y' → plano X-Z.
+    const px =
+      eje === 'z'
+        ? ajusta(centroVista.x)
+        : ajusta(centroVista.y);
+    const py =
+      eje === 'z'
+        ? ajusta(centroVista.y)
+        : ajusta(centroVista.z);
+    // Radio visible (semidiagonal del frustum orto) + margen.
+    const radio =
+      Math.hypot((camera.right - camera.left) / 2, (camera.top - camera.bottom) / 2) + 0.6;
+    // Detrás del modelo a lo largo de la vista (el centro de su caja
+    // más media profundidad + margen): las líneas no tapan nunca.
+    const box = new THREE.Box3();
+    for (const v of mesh.vertices) {
+      box.expandByPoint(new THREE.Vector3(v.x, v.y, v.z));
+    }
+    if (!box.isEmpty()) {
+      const meshGroup = meshGroupRef.current;
+      if (meshGroup) {
+        meshGroup.updateWorldMatrix(true, false);
+        box.applyMatrix4(meshGroup.matrixWorld);
+      }
+    }
+    const centroM = box.isEmpty()
+      ? centroVista
+      : box.getCenter(new THREE.Vector3());
+    const mitad = box.isEmpty()
+      ? new THREE.Vector3(radio, radio, radio)
+      : box.getSize(new THREE.Vector3()).multiplyScalar(0.5);
+    const profundo =
+      Math.abs(dir.x) * mitad.x +
+      Math.abs(dir.y) * mitad.y +
+      Math.abs(dir.z) * mitad.z;
+    const pos = new THREE.Vector3();
+    if (eje === 'z') {
+      pos.set(px, py, centroM.z + dir.z * (profundo + 0.03));
+    } else if (eje === 'x') {
+      pos.set(centroM.x + dir.x * (profundo + 0.03), px, py);
+    } else {
+      pos.set(px, centroM.y + dir.y * (profundo + 0.03), py);
+    }
+    // Crecer SOLO si la vista ya no cabe: si cabe, basta mover la
+    // rejilla (el desplazamiento en plano es múltiplo de la celda, así
+    // que la retícula sigue pegada al mundo).
+    const lado = (fg.userData as { lado?: number }).lado ?? 0;
+    const necesita = radio * 2;
+    if (lado < necesita) {
+      const escena = sceneRef.current;
+      if (!escena) return;
+      const ladoNuevo = Math.ceil(necesita / 4) * 4; // múltiplo de 2 unidades, con aire
+      const nuevo = new THREE.GridHelper(
+        ladoNuevo,
+        Math.round(ladoNuevo / CELLA),
+        0x8fb0cc,
+        0x44506a
+      );
+      (nuevo.material as THREE.LineBasicMaterial).opacity = 0.3;
+      (nuevo.material as THREE.LineBasicMaterial).transparent = true;
+      nuevo.raycast = () => {};
+      nuevo.userData = { lado: ladoNuevo };
+      nuevo.rotation.copy(fg.rotation);
+      nuevo.position.copy(pos);
+      escena.add(nuevo);
+      fg.geometry.dispose();
+      (fg.material as THREE.Material).dispose?.();
+      escena.remove(fg);
+      flatGridRef.current = nuevo;
+    } else {
+      fg.position.copy(pos);
+    }
+    // Línea de BASE: solo frente/espalda/costados (en superior/inferior
+    // el suelo se ve como superficie, no como línea). Franja horizontal
+    // al nivel de la rejilla (y = -1.05), siguiendo la vista (sin
+    // límite) y a la misma profundidad que los cuadros.
+    const Y_BASE = -1.05;
+    if (fb) {
+      fb.visible = eje !== 'y';
+      if (fb.visible) {
+        // Costados: la franja larga (eje X local) va a lo largo de Z.
+        fb.rotation.set(0, eje === 'x' ? Math.PI / 2 : 0, 0);
+        fb.scale.set(radio * 2 + 1, 1, 1);
+        if (eje === 'z') {
+          fb.position.set(centroVista.x, Y_BASE, pos.z);
+        } else {
+          fb.position.set(pos.x, Y_BASE, centroVista.z);
+        }
+      }
+    }
+   }, [gridValue, transform, mesh.vertices, camera3D]);
 
   useEffect(() => {
     // La base se amplía solo sobre el suelo: su altura no cambia.
@@ -10343,15 +10853,49 @@ uniform vec3 sombraFocoPos[8];`
      // Filtra las asas del manipulador según los modos activos: si el
      // usuario desactivó 'move', 'rotate' o 'scale', esas asas desaparecen.
       const activeModes = gizmoModes ?? ['move', 'rotate', 'scale'];
+      // En ventanas 2D (orto) el eje que apunta a la cámara se retira:
+      // solo queda el aro de rotación de ESE eje (gira en plano de
+      // pantalla; única rotación que respeta la proyección) y se ocultan
+      // las asas de mover/escalar de ese eje (un gesto en profundidad no
+      // se ve en orto y su drag muere sin avisar).
+      let flatAxis: GizmoAxis | undefined;
+      if (flat2DRef.current && cameraRef.current) {
+        const dir = cameraRef.current.getWorldDirection(new THREE.Vector3());
+        flatAxis =
+          Math.abs(dir.x) >= Math.abs(dir.y) && Math.abs(dir.x) >= Math.abs(dir.z)
+            ? 'x'
+            : Math.abs(dir.y) >= Math.abs(dir.z)
+              ? 'y'
+              : 'z';
+      }
       for (const h of gizmoHandlesRef.current) {
-        const ud = h.userData as { mode: string; originalColor?: number };
-        const m = ud.mode as GizmoMode;
+        const ud = h.userData as {
+          mode: string;
+          axis?: GizmoAxis;
+          originalColor?: number;
+        };
+        // ud.mode también trae 'uniform-scale'/'planar-scale' (los modos
+        // internos de GizmoDrag), así que se compara como string y el
+        // cast a GizmoMode solo entra al mirar activeModes.
+        const m = ud.mode;
+        const porModo =
+          m === 'uniform-scale' || m === 'planar-scale'
+            ? activeModes.includes('scale')
+            : activeModes.includes(m as GizmoMode);
         const enabled =
-          m === 'move'
-            ? activeModes.includes('move')
+          (flatAxis === undefined
+            ? porModo
             : m === 'rotate'
-              ? activeModes.includes('rotate')
-              : activeModes.includes('scale');
+              ? porModo && ud.axis === flatAxis
+              : m === 'planar-scale'
+                ? porModo && ud.axis === flatAxis // plano de pantalla: solo top/bottom
+                : m === 'uniform-scale'
+                  ? porModo // cubo blanco: escala los 3 ejes, seguro en 2D
+                  : porModo && ud.axis !== flatAxis) &&
+          // Checkbox «Círculos»: apaga TODOS los aros de rotación (los
+          // que sobrevivan al filtro del eje de cámara) en una sola
+          // casilla, para el gizmo normal.
+          (m === 'rotate' ? showRotate : true);
         h.visible = enabled;
         const mat = h.material as THREE.MeshBasicMaterial;
         if (!mat.color) continue;
@@ -10376,7 +10920,7 @@ uniform vec3 sombraFocoPos[8];`
       Math.abs(transform.sz)
     );
     applyScale(Math.min(Math.max(r * 0.9 * objectScale, 0.35), 8));
-   }, [showGizmo, mesh.vertices, transform, gizmoModes, gizmoColorOverride, gizmoOffset, objects]);
+   }, [showGizmo, showRotate, mesh.vertices, transform, gizmoModes, gizmoColorOverride, gizmoOffset, flat2D, objects]);
 
   // Captura el texto 3D como PNG con fondo transparente (solo la malla).
   // Si el suavizado está activo, la captura usa una COPIA suavizada de la
@@ -10585,20 +11129,7 @@ uniform vec3 sombraFocoPos[8];`
 
     const onCamChange = onCameraChangeRef.current;
     if (onCamChange) {
-      const pos = cam.position;
-      const tgt = ctrl.target;
-      const dist = pos.distanceTo(tgt);
-      const zoom = Math.max(0.1, Math.min(5, dist > 0 ? baseDistance / dist : 1));
-      const dir = pos.clone().sub(tgt).normalize();
-      const rotX = Math.asin(Math.max(-1, Math.min(1, dir.y)));
-      const rotY = Math.atan2(dir.x, dir.z);
-      onCamChange({
-        zoom,
-        offsetX: tgt.x,
-        offsetY: tgt.y,
-        rotationX: Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, rotX)),
-        rotationY: rotY,
-      });
+      onCamChange(poseACamera3D(cam.position, ctrl.target, baseDistance));
     }
   }, [camera3D]);
 
@@ -10626,17 +11157,7 @@ uniform vec3 sombraFocoPos[8];`
 
     const onCamChange = onCameraChangeRef.current;
     if (onCamChange) {
-      const pos = cam.position;
-      const dist = pos.distanceTo(ctrl.target);
-      const rotX = Math.asin(Math.max(-1, Math.min(1, dir.y)));
-      const rotY = Math.atan2(dir.x, dir.z);
-      onCamChange({
-        zoom: Math.max(0.1, Math.min(5, dist > 0 ? baseDistance / dist : 1)),
-        offsetX: 0,
-        offsetY: 0,
-        rotationX: Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, rotX)),
-        rotationY: rotY,
-      });
+      onCamChange(poseACamera3D(cam.position, ctrl.target, baseDistance));
     }
   }, []);
 
@@ -10673,11 +11194,6 @@ uniform vec3 sombraFocoPos[8];`
 
     const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3());
-    const radius = Math.max(size.x, size.y, size.z, 0.001) * 0.5;
-    const fov = (cam.fov * Math.PI) / 180;
-    const fitDist = (radius / Math.max(Math.sin(fov / 2), 0.05)) * 1.2;
-    const baseDistance = 5.5;
-    const zoom = Math.max(0.1, Math.min(5, baseDistance / Math.max(fitDist, 0.0001)));
 
     const rotX = camera3D?.rotationX ?? 0;
     const rotY = camera3D?.rotationY ?? 0;
@@ -10688,6 +11204,51 @@ uniform vec3 sombraFocoPos[8];`
       (Math.abs(rotY - Math.PI / 2) < 0.01 ||
         Math.abs(rotY + Math.PI / 2) < 0.01) &&
       Math.abs(rotX) < 0.01;
+
+    // Cámara ORTO (modo 2D): el zoom ES el frustum. La altura necesaria
+    // cubre las extensiones visibles de ESTA vista (frente: X·Y, superior:
+    // X·Z, costado: Z·Y) más un margen; el ancho depende del aspecto.
+    if (cam instanceof THREE.OrthographicCamera) {
+      let extU: number, extV: number;
+      if (isTop || isBottom) {
+        extU = size.x;
+        extV = size.z;
+      } else if (isSide) {
+        extU = size.z;
+        extV = size.y;
+      } else {
+        extU = size.x;
+        extV = size.y;
+      }
+      const dom = ctrl.domElement as HTMLElement | null;
+      const aspecto =
+        dom && dom.clientHeight > 0 ? dom.clientWidth / dom.clientHeight : 1;
+      const hNecesaria = (Math.max(extV, extU / aspecto) / 2) * 1.2;
+      const zoomOrto = Math.max(
+        0.1,
+        Math.min(5, ALTURA_BASE_PLANO / Math.max(hNecesaria, 0.0001))
+      );
+      let offsetX = center.x;
+      let offsetY = center.y;
+      if (isTop || isBottom) {
+        offsetX = center.x;
+        offsetY = center.z;
+      } else if (isSide) {
+        offsetX = center.z;
+        offsetY = center.y;
+      }
+      const onCamChange = onCameraChangeRef.current;
+      if (onCamChange) {
+        onCamChange({ zoom: zoomOrto, offsetX, offsetY, rotationX: rotX, rotationY: rotY });
+      }
+      return;
+    }
+
+    const radius = Math.max(size.x, size.y, size.z, 0.001) * 0.5;
+    const fov = (cam.fov * Math.PI) / 180;
+    const fitDist = (radius / Math.max(Math.sin(fov / 2), 0.05)) * 1.2;
+    const baseDistance = 5.5;
+    const zoom = Math.max(0.1, Math.min(5, baseDistance / Math.max(fitDist, 0.0001)));
 
     let offsetX = center.x;
     let offsetY = center.y;
@@ -10762,6 +11323,20 @@ uniform vec3 sombraFocoPos[8];`
             />
             <span className="text-[10px] font-medium text-muted-foreground">
               Flechas XYZ
+            </span>
+          </label>
+          <label
+            className="flex items-center gap-1 px-1 cursor-pointer select-none"
+            title="Círculos de rotación del gizmo: desmárcalo para ocultar SOLO los aros (quedan las flechas de mover y los puntos de escala). Vale para el gizmo del objeto y para el de la ayuda de textura"
+          >
+            <input
+              type="checkbox"
+              checked={showRotate}
+              onChange={(e) => setShowRotate(e.target.checked)}
+              className="w-3 h-3 accent-green-500 cursor-pointer"
+            />
+            <span className="text-[10px] font-medium text-muted-foreground">
+              Círculos
             </span>
           </label>
           <ToggleButton
@@ -11019,6 +11594,9 @@ uniform vec3 sombraFocoPos[8];`
         data-testid="viewer-container"
         className="relative flex-1 min-h-0"
         style={{
+          // Ventanas 2D: mismo gradiente azul oscuro que el lienzo; los
+          // CUADROS los dibuja la escena (GridHelper en el plano de la
+          // vista), así escalan con el zoom y el botón Rejilla los rige.
           background:
             'radial-gradient(ellipse at 50% 40%, hsl(224 45% 16%) 0%, hsl(224 50% 7%) 80%)',
         }}

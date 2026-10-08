@@ -355,3 +355,219 @@ export function mergeMeshes(
 
   return result;
 }
+
+/** Nombre seguro para «o <name>» de OBJ / name de nodo GLB. */
+function nombreSeguro(name: string, i: number): string {
+  return (
+    (name || `objeto-${i + 1}`)
+      .replace(/[\r\n\t]+/g, ' ')
+      .replace(/[\\/:*?"<>|]+/g, '')
+      .trim()
+      .replace(/\s+/g, '-') || `objeto-${i + 1}`
+  );
+}
+
+/**
+ * OBJ con VARIOS objetos en un solo archivo: cada figura es un grupo
+ * `o <nombre>` con sus vértices y caras. Las mallas deben venir YA
+ * transformadas (se exportan tal cual). Si algún objeto trae colores de
+ * cara, se genera un .mtl común con un material por color.
+ */
+export function exportOBJGroup(
+  items: Array<{ mesh: Mesh; name?: string }>,
+  baseName: string
+) {
+  const colorKeys: string[] = [];
+  const lines: string[] = ['# Zeus Media Studio 3D'];
+  // Primera pasada: recolectar los colores de todos los objetos (el .mtl
+  // es común al archivo entero y sus índices van al inicio).
+  for (const { mesh } of items) {
+    if (!hasFaceColors(mesh)) continue;
+    for (const { faceIdx } of validTriangles(mesh)) {
+      const hex = mesh.faceColors![faceIdx] ?? '#9ca3af';
+      if (!colorKeys.includes(hex)) colorKeys.push(hex);
+    }
+  }
+  if (colorKeys.length > 0) lines.push(`mtllib ${baseName}.mtl`);
+  // En OBJ los índices de caras son GLOBALES al archivo (siguen contando
+  // de un objeto a otro), así que cada objeto desplaza su cuenta con el
+  // nº de vértices ya escritos. Sin este ajuste, las caras del segundo
+  // objeto en adelante apuntarían a vértices del primero → geometría
+  // inventada.
+  let offsetVertices = 0;
+  items.forEach(({ mesh, name }, index) => {
+    const tris = validTriangles(mesh);
+    lines.push(`o ${nombreSeguro(name ?? '', index)}`);
+    for (const v of mesh.vertices) {
+      lines.push(`v ${f(v.x)} ${f(v.y)} ${f(v.z)}`);
+    }
+    const conColores = hasFaceColors(mesh);
+    let current = -1;
+    for (const { tri, faceIdx } of tris) {
+      if (conColores) {
+        const hex = mesh.faceColors![faceIdx] ?? '#9ca3af';
+        const idx = colorKeys.indexOf(hex);
+        if (idx !== current) {
+          current = idx;
+          lines.push(`usemtl c${idx}`);
+        }
+      }
+      lines.push(
+        `f ${tri[0] + 1 + offsetVertices} ${tri[1] + 1 + offsetVertices} ${
+          tri[2] + 1 + offsetVertices
+        }`
+      );
+    }
+    offsetVertices += mesh.vertices.length;
+  });
+  downloadBlob(
+    new Blob([lines.join('\n') + '\n'], { type: 'model/obj' }),
+    `${baseName}.obj`
+  );
+  if (colorKeys.length > 0) {
+    const mtl =
+      '# Zeus Media Studio 3D\n' +
+      colorKeys
+        .map((hex, i) => {
+          const [r, g, b] = hexToRgb01(hex);
+          return `newmtl c${i}\nKd ${f(r)} ${f(g)} ${f(b)}`;
+        })
+        .join('\n') +
+      '\n';
+    downloadBlob(new Blob([mtl], { type: 'text/plain' }), `${baseName}.mtl`);
+  }
+}
+
+/**
+ * GLB con VARIOS objetos: cada figura es un NODO con nombre en la escena
+ * glTF (así los programas distinguen las piezas). Todas las cajas de
+ * datos van en el mismo buffer BIN. Las mallas deben venir YA
+ * transformadas. Sin objetos que exportar, no baja nada.
+ */
+export function exportGLBGroup(
+  items: Array<{ mesh: Mesh; name?: string }>,
+  baseName: string
+) {
+  const utiles = items.filter((it) => validTriangles(it.mesh).length > 0);
+  if (utiles.length === 0) return;
+
+  const chunks: ArrayBuffer[] = [];
+  const bufferViews: Array<Record<string, unknown>> = [];
+  const accessors: Array<Record<string, unknown>> = [];
+  const gltfMeshes: Array<Record<string, unknown>> = [];
+  const gltfNodos: Array<Record<string, unknown>> = [];
+  let binLength = 0;
+
+  utiles.forEach(({ mesh, name }, i) => {
+    const tris = validTriangles(mesh);
+    const colored = hasFaceColors(mesh);
+    const vertCount = tris.length * 3;
+    const positions = new Float32Array(vertCount * 3);
+    const colors = colored ? new Float32Array(vertCount * 3) : null;
+    const min = [Infinity, Infinity, Infinity];
+    const max = [-Infinity, -Infinity, -Infinity];
+    let p = 0;
+    for (const { tri, faceIdx } of tris) {
+      for (const vi of tri) {
+        const v = mesh.vertices[vi]!;
+        positions[p] = v.x;
+        positions[p + 1] = v.y;
+        positions[p + 2] = v.z;
+        for (let a = 0; a < 3; a++) {
+          const c = (a as 0 | 1 | 2) === 0 ? v.x : a === 1 ? v.y : v.z;
+          if (c < min[a]) min[a] = c;
+          if (c > max[a]) max[a] = c;
+        }
+        if (colored) {
+          const [r, g, b] = hexToRgb01(mesh.faceColors![faceIdx] ?? '#9ca3af');
+          colors![p] = r;
+          colors![p + 1] = g;
+          colors![p + 2] = b;
+        }
+        p += 3;
+      }
+    }
+    chunks.push(positions.buffer);
+    bufferViews.push({
+      buffer: 0,
+      byteOffset: binLength,
+      byteLength: positions.byteLength,
+      target: 34962,
+    });
+    binLength += positions.byteLength;
+    accessors.push({
+      bufferView: bufferViews.length - 1,
+      componentType: 5126,
+      count: vertCount,
+      type: 'VEC3',
+      min,
+      max,
+    });
+    const attributes: Record<string, number> = { POSITION: accessors.length - 1 };
+    if (colored && colors) {
+      chunks.push(colors.buffer);
+      bufferViews.push({
+        buffer: 0,
+        byteOffset: binLength,
+        byteLength: colors.byteLength,
+        target: 34962,
+      });
+      binLength += colors.byteLength;
+      accessors.push({
+        bufferView: bufferViews.length - 1,
+        componentType: 5126,
+        count: vertCount,
+        type: 'VEC3',
+      });
+      attributes.COLOR_0 = accessors.length - 1;
+    }
+    gltfMeshes.push({ primitives: [{ attributes, material: 0, mode: 4 }] });
+    gltfNodos.push({ mesh: i, name: nombreSeguro(name ?? '', i) });
+  });
+
+  const gltf = {
+    asset: { version: '2.0', generator: 'Zeus Media Studio 3D' },
+    scene: 0,
+    scenes: [{ nodes: gltfNodos.map((_, i) => i) }],
+    nodes: gltfNodos,
+    meshes: gltfMeshes,
+    materials: [
+      {
+        pbrMetallicRoughness: { metallicFactor: 0, roughnessFactor: 0.9 },
+        doubleSided: true,
+      },
+    ],
+    accessors,
+    bufferViews,
+    buffers: [{ byteLength: binLength }],
+  };
+
+  // Contenedor GLB: cabecera + JSON (relleno de espacios) + BIN (relleno
+  // de ceros), ambos alineados a 4 bytes.
+  const jsonBytes = new TextEncoder().encode(JSON.stringify(gltf));
+  const jsonPad = (4 - (jsonBytes.byteLength % 4)) % 4;
+  const binPad = (4 - (binLength % 4)) % 4;
+  const total = 12 + 8 + jsonBytes.byteLength + jsonPad + 8 + binLength + binPad;
+  const glb = new ArrayBuffer(total);
+  const dv = new DataView(glb);
+  const u8 = new Uint8Array(glb);
+  dv.setUint32(0, 0x46546c67, true); // 'glTF'
+  dv.setUint32(4, 2, true);
+  dv.setUint32(8, total, true);
+  dv.setUint32(12, jsonBytes.byteLength + jsonPad, true);
+  dv.setUint32(16, 0x4e4f534a, true); // 'JSON'
+  u8.set(jsonBytes, 20);
+  for (let i = 0; i < jsonPad; i++) u8[20 + jsonBytes.byteLength + i] = 0x20;
+  let at = 20 + jsonBytes.byteLength + jsonPad;
+  dv.setUint32(at, binLength + binPad, true);
+  dv.setUint32(at + 4, 0x004e4942, true); // 'BIN'
+  at += 8;
+  for (const c of chunks) {
+    u8.set(new Uint8Array(c), at);
+    at += c.byteLength;
+  }
+  downloadBlob(
+    new Blob([glb], { type: 'model/gltf-binary' }),
+    `${baseName}.glb`
+  );
+}

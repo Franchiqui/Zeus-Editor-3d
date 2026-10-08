@@ -15,6 +15,7 @@
  */
 
 import type { Polygon, Point2D } from './geometry';
+import { latheProfileLoop } from './geometry';
 
 export type LathePresetName =
   | 'botella'
@@ -262,4 +263,133 @@ export function resolveLatheProfile(request: LatheProfileRequest): Polygon {
     'Indica un "preset" (botella, jarron, taza, cuenco, copa, cono, cilindro, esfera) ' +
       'o una lista "points" de coordenadas [radio, altura] normalizadas 0..1.',
   );
+}
+
+/** Subdivide un tramo recto (o curvo con asas Bézier) en `steps` pasos. */
+function bezierSteps(
+  from: Point2D,
+  c1: Point2D,
+  c2: Point2D,
+  to: Point2D,
+  steps: number,
+): Point2D[] {
+  const out: Point2D[] = [];
+  for (let step = 1; step < steps; step++) {
+    const t = step / steps;
+    const inverse = 1 - t;
+    out.push({
+      x:
+        inverse * inverse * inverse * from.x +
+        3 * inverse * inverse * t * c1.x +
+        3 * inverse * t * t * c2.x +
+        t * t * t * to.x,
+      y:
+        inverse * inverse * inverse * from.y +
+        3 * inverse * inverse * t * c1.y +
+        3 * inverse * t * t * c2.y +
+        t * t * t * to.y,
+    });
+  }
+  return out;
+}
+
+/** Punto sobre la polilínea densa a la distancia s (longitud de arco acumulada en cum). */
+function pointAtArc(poly: Point2D[], cum: number[], s: number, total: number): Point2D {
+  const clamped = Math.max(0, Math.min(total, s));
+  let lo = 0;
+  let hi = cum.length - 1;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1;
+    if (cum[mid] <= clamped) lo = mid;
+    else hi = mid;
+  }
+  const a = poly[lo];
+  const b = poly[lo + 1] ?? poly[lo];
+  const segSpan = cum[lo + 1] - cum[lo];
+  const t = segSpan > 1e-12 ? (clamped - cum[lo]) / segSpan : 0;
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+  };
+}
+
+/**
+ * Remuestrea el PERFIL DEL TORNO a `n` vértices uniformes por longitud de
+ * arco (control «Vértices del perfil» del torno: las figuras de un clic
+ * traen un número de puntos fijo y este ajusta la densidad, por ejemplo el
+ * círculo de un toroide). Sigue las CURVAS del perfil (asas Bézier), así
+ * los vértices nuevos caen sobre la silueta y la figura no cambia de
+ * forma; el primer vértice se conserva como ancla y en perfiles abiertos
+ * los dos extremos tal cual. Al cambiar el número, las asas de curva se
+ * cuecen en los vértices (el contorno resultante es la misma silueta en
+ * polilínea). Si el número ya es el de la figura, la devuelve tal cual.
+ */
+export function resampleLatheProfile(poly: Polygon, n: number): Polygon {
+  const target = Math.max(3, Math.round(Number.isFinite(n) ? n : poly.length));
+  const clone = poly.map((p) => ({
+    x: p.x,
+    y: p.y,
+    ...(p.hIn ? { hIn: p.hIn } : {}),
+    ...(p.hOut ? { hOut: p.hOut } : {}),
+  }));
+  if (poly.length < 2 || target === clone.length) return clone;
+  const { points, closed } = latheProfileLoop(poly);
+
+  // Contorno aplanado siguiendo sus curvas (16 pasos por tramo como hace
+  // buildLatheMesh): la longitud de arco se mide sobre la curva real.
+  const curveSteps = 16;
+  const dense: Point2D[] = [];
+  const cum: number[] = [];
+  const push = (p: Point2D) => {
+    const prev = dense[dense.length - 1];
+    const start = dense.length === 0 ? 0 : cum[cum.length - 1] + Math.hypot(p.x - prev.x, p.y - prev.y);
+    dense.push({ x: p.x, y: p.y });
+    cum.push(start);
+  };
+  push(points[0]);
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+    const c1 = a.hOut ?? a;
+    const c2 = b.hIn ?? b;
+    for (const mid of bezierSteps(a, c1, c2, b, curveSteps)) push(mid);
+    push(b);
+  }
+  // En el anillo cerrado, el tramo de cierre (último → primero) se aplana
+  // igual que los demás y añade su punto final: el contorno denso queda con
+  // el anillo completo y la longitud de arco lo cuenta entero.
+  let total = cum[cum.length - 1];
+  if (closed) {
+    const first = points[0];
+    const last = points[points.length - 1];
+    const c1 = last.hOut ?? last;
+    const c2 = first.hIn ?? first;
+    for (const mid of bezierSteps(last, c1, c2, first, curveSteps)) push(mid);
+    push(first);
+    total = cum[cum.length - 1];
+  }
+
+  // Muestrear `target` posiciones en el bucle (o la polilínea abierta con
+  // extremos fijos) y quitar puntos repetidos por imán/pasillos cortos.
+  const raw: Point2D[] = [];
+  if (closed) {
+    for (let k = 0; k < target; k++) {
+      raw.push(pointAtArc(dense, cum, (k / target) * total, total));
+    }
+  } else {
+    for (let k = 0; k < target - 1; k++) {
+      raw.push(pointAtArc(dense, cum, (k / (target - 1)) * total, total));
+    }
+    const lastDense = dense[dense.length - 1];
+    raw.push({ x: lastDense.x, y: lastDense.y });
+  }
+  const out: Point2D[] = [];
+  for (const p of raw) {
+    const prev = out[out.length - 1];
+    if (prev && Math.hypot(p.x - prev.x, p.y - prev.y) < 1e-6) continue;
+    out.push({ x: Math.round(p.x * 1e6) / 1e6, y: Math.round(p.y * 1e6) / 1e6 });
+  }
+  // Figura enana (tramos demasiado cortos para `target` puntos): devuelve
+  // los puntos útiles que haya; remuestrear más partiría el contorno.
+  return out;
 }

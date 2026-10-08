@@ -122,7 +122,7 @@ import {
   aristasDeMalla,
   type ObjetivoSeleccion,
 } from '@/lib/extrusion-seleccion';
-import { resolveLatheProfile, LATHE_PRESET_NAMES } from '@/lib/lathe-profiles';
+import { resolveLatheProfile, resampleLatheProfile, LATHE_PRESET_NAMES } from '@/lib/lathe-profiles';
 import { extractObj3dMesh, decimateMesh } from '@/lib/obj3d-thumbnails';
 import { buildViewsMesh, buildExtrudeMesh, buildExtrudeMeshes, polylineToPolygon } from '@/lib/views-mesh';
 import { sanitizePolylinesByCanvas, newPolylineId } from '@/lib/polylines';
@@ -165,7 +165,7 @@ import {
   type FontOption,
 } from '@/lib/text-voxel';
 import { buildSmoothTextMesh } from '@/lib/text-outline';
-import { exportSTL, exportOBJ, exportPLY, exportGLB, mergeMeshes } from '@/lib/mesh-export';
+import { exportSTL, exportOBJ, exportPLY, exportGLB, exportOBJGroup, exportGLBGroup, mergeMeshes } from '@/lib/mesh-export';
 import { importModelFile, getFormatFromExtension, IMPORT_FORMATS, normalizeAndCenterMeshes } from '@/lib/mesh-import';
 import { Modal } from '@/components/ui/modal';
 import { Slider } from '@/components/ui/slider';
@@ -1857,7 +1857,16 @@ export default function Home({
   // Muestra/oculta el plano de suelo bajo el objeto
   const [showGround, setShowGround] = useState(false);
   // Muestra/oculta la rejilla del suelo
-  const [showGrid, setShowGrid] = useState(true);
+  // Rejilla POR VENTANA: el botón de cada ventana la muestra/esconde solo
+  // ahí (antes era una global compartida por las cuatro). Viaja con el
+  // proyecto en el .zeus; los proyectos viejos traen un booleano (se
+  // expande a las cuatro ventanas al cargar).
+  const [showGrid, setShowGrid] = useState<Record<PanelSlot, boolean>>({
+    front: true,
+    top: true,
+    side: true,
+    '3d': true,
+  });
   // Estado de efectos visuales (brillo, chispas, fuego)
   const [fxConfig, setFxConfig] = useState<FxConfig>({ ...DEFAULT_FX_CONFIG });
 
@@ -1950,6 +1959,17 @@ export default function Home({
   const [latheProfile, setLatheProfile] = useState<Polygon>(
     DEFAULT_LATHE_PROFILE
   );
+  // Figura ORIGINAL del perfil antes de cualquier remuestreo del slider
+  // «Vértices del perfil»: remuestrear en cascada (la salida de un tick
+  // del slider es la entrada del siguiente) acumula la caída de las
+  // cuerdas y al BAJAR el número el círculo se deforma en gota.
+  // Remuestrear SIEMPRE desde esta figura lo evita; cada edición real
+  // del perfil (formas, lienzo, IA, plantillas, restaurar) la repone.
+  const latheProfileSourceRef = useRef<Polygon>([]);
+  const setLatheProfileConOrigen = useCallback((poly: Polygon) => {
+    latheProfileSourceRef.current = poly;
+    setLatheProfile(poly);
+  }, []);
   const [latheTexture, setLatheTexture] = useState<string | null>(null);
   const [latheTextureFileName, setLatheTextureFileName] = useState('');
   const [latheOpacity, setLatheOpacity] = useState(1);
@@ -3735,6 +3755,13 @@ export default function Home({
   // Modo de apertura/imports: 'merge' = "Abrir en escena" (añadir a la
   // escena actual), 'new' = "En escena nueva" (reemplazar la escena actual)
   const [importMode, setImportMode] = useState<'merge' | 'new'>('new');
+  // Cómo entran las PIEZAS de un modelo 3D cuando el archivo trae varias:
+  // «several» crea un objeto por pieza (como siempre); «single» une todo
+  // en UN solo objeto.
+  const [importPieces, setImportPieces] = useState<'several' | 'single'>('several');
+  // Cómo EXPORTA la pestaña Escena con varios objetos: «single» une todo
+  // en un archivo (como siempre); «separate» descarga uno por objeto.
+  const [exportStyle, setExportStyle] = useState<'single' | 'separate' | 'grouped'>('single');
 
   // Input oculto para importar modelos 3D (.obj, .glb, etc.)
   const modelFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -4611,7 +4638,7 @@ export default function Home({
                };
              }
              setMode('lathe');
-             setLatheProfile(polygon);
+             setLatheProfileConOrigen(polygon);
              if (typeof params.segments === 'number') setLatheSegments(params.segments);
              if (typeof params.clamp === 'boolean') setLatheClamp(params.clamp);
              if (typeof params.opacity === 'number') setLatheOpacity(params.opacity);
@@ -4667,7 +4694,7 @@ export default function Home({
              }
 
              setMode('lathe');
-             setLatheProfile(polygon);
+             setLatheProfileConOrigen(polygon);
              setLatheSegments(segments);
              setLatheClamp(clamp);
              setLatheOpacity(opacity);
@@ -5699,7 +5726,7 @@ pluginTracks,
     setMeshSilhouetteView(state.meshSilhouetteView);
     setMeshSideView(state.meshSideView);
     setMeshOpacity(state.meshOpacity);
-    setLatheProfile(state.latheProfile);
+    setLatheProfileConOrigen(state.latheProfile);
     setLatheOpacity(state.latheOpacity);
     setLatheSegments(state.latheSegments);
     setLatheClamp(state.latheClamp);
@@ -6493,7 +6520,7 @@ pluginTracks,
             Array.from(new Set([...newHoles.map((l) => l.id)]))
           );
         } else if (mode === 'lathe') {
-         setLatheProfile(mainPoly);
+         setLatheProfileConOrigen(mainPoly);
        } else if (mode === 'mesh') {
          if (editingMeshProfile === 'silhouette') {
            setMeshSilhouette(mainPoly);
@@ -7081,7 +7108,7 @@ pluginTracks,
         name: t('editor3D.panelLabels.latheProfile'),
         polygon: latheProfile,
         apply: (poly: Polygon) => {
-          setLatheProfile(structuredClone(poly));
+          setLatheProfileConOrigen(structuredClone(poly));
           setEditedVertices(null);
         },
       };
@@ -7331,7 +7358,7 @@ pluginTracks,
     setMeshSilhouetteView(config.meshSilhouetteView);
     setMeshSideView(structuredClone(config.meshSideView));
     setMeshOpacity(config.meshOpacity);
-    setLatheProfile(structuredClone(config.latheProfile));
+    setLatheProfileConOrigen(structuredClone(config.latheProfile));
     setLatheTexture(config.latheTexture);
     setLatheTextureFileName(config.latheTexture ? 'textura-objeto' : '');
     setLatheOpacity(config.latheOpacity);
@@ -8292,7 +8319,7 @@ pluginTracks,
            setTextureRepeat(data.textureRepeat);
          setTextureRepeatY(typeof data.textureRepeatY === 'number' ? data.textureRepeatY : null);
         if (Array.isArray(data.latheProfile) && data.latheProfile.length >= 3) {
-          setLatheProfile(data.latheProfile);
+          setLatheProfileConOrigen(data.latheProfile);
         }
         if (typeof data.latheTexture === 'string') {
           setLatheTexture(data.latheTexture);
@@ -8479,8 +8506,17 @@ pluginTracks,
           if (typeof data.showLightHelpers === 'boolean') {
             setShowLightHelpers(data.showLightHelpers);
           }
+          // Rejilla por ventana: los proyectos nuevos guardan el registro
+          // {front/top/side/3d}; los viejos guardaban un booleano global
+          // (se expande a las cuatro ventanas).
           if (typeof data.showGrid === 'boolean') {
-            setShowGrid(data.showGrid);
+            setShowGrid((prev) =>
+              Object.fromEntries(
+                Object.keys(prev).map((k) => [k, data.showGrid])
+              ) as typeof showGrid
+            );
+          } else if (data.showGrid && typeof data.showGrid === 'object') {
+            setShowGrid((prev) => ({ ...prev, ...data.showGrid }));
           }
           if (data.panelCameras && typeof data.panelCameras === 'object') {
             setPanelCameras((prev) => ({ ...prev, ...data.panelCameras }));
@@ -8724,7 +8760,7 @@ pluginTracks,
           setModelImportMsg({ ok: false, text: t('editor3D.cannotExtractVertices') });
           return;
         }
-        const { meshes } = result;
+        let { meshes } = result;
         // Contamos el total de vértices entre todas las piezas
         let totalVertices = 0;
         for (const m of meshes) {
@@ -8740,6 +8776,18 @@ pluginTracks,
         }
         // Normalizamos y centramos todas las piezas juntas
         normalizeAndCenterMeshes(meshes);
+        // Opción «Un solo objeto»: si el archivo trae varias piezas, se
+        // unen en UNA sola malla (ya están normalizadas juntas, así que
+        // quedan igual dispuestas que se veían).
+        if (meshes.length > 1 && importPieces === 'single') {
+          const unida = mergeMeshes(
+            meshes.map((m) => ({
+              mesh: m,
+              transform: { px: 0, py: 0, pz: 0, sx: 1, sy: 1, sz: 1, rx: 0, ry: 0, rz: 0 },
+            }))
+          );
+          meshes = [unida];
+        }
         const baseId = `object-${Date.now()}`;
         const newObjects = meshes.map((mesh, i) => ({
           id: i === 0 ? baseId : `${baseId}-${i}`,
@@ -8767,7 +8815,7 @@ pluginTracks,
         });
       }
     },
-    [importMode]
+    [importMode, importPieces]
   );
 
   // Abre el modal "Objeto 3D": lista los .zeus de public/Obj-3D y los de la
@@ -9100,7 +9148,7 @@ pluginTracks,
    // En la pestaña Escena se unen TODOS los objetos visibles en un único
    // archivo (aplicando su transformada a los vértices), no solo el
    // seleccionado.
-   const exportModel = useCallback(
+     const exportModel = useCallback(
      (format: 'stl' | 'obj' | 'ply' | 'glb') => {
        // En Escena: unir todos los objetos visibles con malla.
        if (mode === 'scene') {
@@ -9108,6 +9156,49 @@ pluginTracks,
            (o) => !o.hidden && o.mesh && o.mesh.vertices.length > 0
          );
          if (visibleWithMesh.length === 0) return;
+         // Opción «Un archivo por objeto»: cada objeto baja en SU propio
+         // archivo con la transformada aplicada (igual que se ve en la
+         // escena). Las descargas van espaciadas: los navegadores
+         // bloquean varias seguidas sin pausa.
+         if (exportStyle === 'separate' && visibleWithMesh.length > 1) {
+           visibleWithMesh.forEach((o, i) => {
+             const pieza = mergeMeshes([
+               { mesh: o.mesh!, transform: o.transform },
+             ]);
+             const seguro =
+               (o.name || 'objeto')
+                 .replace(/[\\/:*?"<>|]+/g, '')
+                 .trim()
+                 .replace(/\s+/g, '-') || 'objeto';
+             setTimeout(() => {
+               if (format === 'stl') exportSTL(pieza, `modelo-3d-${seguro}`);
+               else if (format === 'obj') exportOBJ(pieza, `modelo-3d-${seguro}`);
+               else if (format === 'ply') exportPLY(pieza, `modelo-3d-${seguro}`);
+               else exportGLB(pieza, `modelo-3d-${seguro}`);
+             }, i * 400);
+           });
+           return;
+         }
+         // Opción «un archivo, objetos separados»: TODO baja en UN solo
+         // archivo pero cada figura queda distinguible dentro (OBJ: grupos
+         // `o`; GLB: nodos con nombre). STL y PLY no guardan la noción de
+         // varios objetos, así que ahí baja con todo unido (igual que
+         // «un archivo unido»).
+         if (exportStyle === 'grouped' && visibleWithMesh.length > 1) {
+           const items = visibleWithMesh.map((o) => ({
+             mesh: mergeMeshes([{ mesh: o.mesh!, transform: o.transform }]),
+             name: o.name,
+           }));
+           if (format === 'obj') {
+             exportOBJGroup(items, 'modelo-3d');
+             return;
+           }
+           if (format === 'glb') {
+             exportGLBGroup(items, 'modelo-3d');
+             return;
+           }
+           // STL/PLY: sin soporte de varios objetos → cae al caso unido.
+         }
          const meshToExport =
            visibleWithMesh.length === 1
              ? visibleWithMesh[0].mesh!
@@ -9140,7 +9231,7 @@ pluginTracks,
        else if (format === 'ply') exportPLY(meshToExport, name);
        else exportGLB(meshToExport, name);
      },
-     [triMesh, frozenSelected, mode, sceneObjects]
+     [triMesh, frozenSelected, mode, sceneObjects, exportStyle]
    );
 
   // En la pestaña neutra no se construye ninguna figura: no hay nada
@@ -10604,6 +10695,9 @@ pluginTracks,
   // al final del recorrido, para que al parar se muestre el último kf.
   const iniciarGrabacion = useCallback(
     (vista: 'front' | 'top' | 'side' | '3d', camaraId: string) => {
+      // Cinturón: la grabación recorre cámara-objeto con FOV de
+      // perspectiva — solo válida en la vista 3D libre, no en 2D.
+      if ((panelViews[vista] ?? vista) !== '3d') return;
       setPlaying(false);
       const cam = sceneObjectsPlaybackRef.current.find(
         (o) => o.id === camaraId && o.kind === 'camera' && o.camera
@@ -10614,7 +10708,7 @@ pluginTracks,
       }
       setGrabacion({ vista, camaraId });
     },
-    []
+    [panelViews]
   );
 
   // Apaga la grabación. Los fotogramas capturados quedan en la cámara.
@@ -10785,8 +10879,13 @@ pluginTracks,
     : 0;
 
   // Cámara-objeto activa de UNA ventana: SU pose maneja ese visor.
+  // Solo tiene sentido en la vista 3D libre: en las ventanas 2D (dibujo
+  // técnico) se devuelve null para que el manejo no pise la vista fija;
+  // el valor elegido (panelCamerasObjeto) se conserva y reaparece al
+  // volver la ventana a '3d'.
   const camaraObjetoDeVista = useCallback(
     (viewName: 'front' | 'top' | 'side' | '3d') => {
+      if ((panelViews[viewName] ?? viewName) !== '3d') return null;
       const id = panelCamerasObjeto[viewName];
       if (!id) return null;
       const o = sceneObjects.find(
@@ -10795,7 +10894,7 @@ pluginTracks,
       if (!o?.camera) return null;
       return { id: o.id, keyframes: o.camera.keyframes, fov: o.camera.fov };
     },
-    [panelCamerasObjeto, sceneObjects]
+    [panelViews, panelCamerasObjeto, sceneObjects]
   );
 
   // Lista de cámaras-objeto para los selectores de las ventanas (por número).
@@ -11383,6 +11482,11 @@ pluginTracks,
   // ventana y recoloca su cámara al preset de esa vista.
   const handlePanelViewChange = (slot: PanelSlot, view: PanelViewKind) => {
     if (panelViews[slot] === view) return;
+    // Si esta ventana estaba grabando su cámara-objeto y pasa a una vista
+    // 2D, se corta la grabación (recorre pose con FOV de perspectiva).
+    if (grabacionRef.current?.vista === slot && view !== '3d') {
+      setGrabacion(null);
+    }
     setPanelViews((prev) => ({ ...prev, [slot]: view }));
     const presets: Record<
       PanelViewKind,
@@ -11711,7 +11815,7 @@ pluginTracks,
         if (v.side) setViews((prev) => ({ ...prev, side: structuredClone(v.side as Point2D[]) }));
         if (v.top) setViews((prev) => ({ ...prev, top: structuredClone(v.top as Point2D[]) }));
       } else if (tpl.type === 'lathe' && data.latheProfile) {
-        setLatheProfile(structuredClone(data.latheProfile as Point2D[]));
+        setLatheProfileConOrigen(structuredClone(data.latheProfile as Point2D[]));
       } else if (tpl.type === 'mesh') {
         if (data.meshSilhouette) setMeshSilhouette(structuredClone(data.meshSilhouette as Point2D[]));
         if (data.meshSections) setMeshSections(structuredClone(data.meshSections as Array<{ id: number; polygon: Polygon; y: number }>));
@@ -11941,8 +12045,10 @@ pluginTracks,
       skyboxImage={skyboxImage}
       booleanToolObjectId={booleanPreview ? booleanToolObjectId : undefined}
       forceUpdate={booleanPreviewLive ? booleanPreviewTick + viewRefreshTick : viewRefreshTick || undefined}
-      showGrid={showGrid}
-      setShowGrid={setShowGrid}
+      showGrid={showGrid[viewName]}
+      setShowGrid={(v: boolean) =>
+        setShowGrid((prev) => ({ ...prev, [viewName]: v }))
+      }
       fxConfig={fxConfig}
       setFxConfig={setFxConfig}
       setLightConfig={setLightConfig}
@@ -12549,6 +12655,45 @@ pluginTracks,
                   className="cursor-default p-2 flex flex-col items-start gap-1"
                 >
                   <span className="text-xs font-medium text-gray-400">
+                    {t('editor3D.exportModeLabel')}
+                  </span>
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => setExportStyle('single')}
+                      className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                        exportStyle === 'single'
+                          ? 'bg-green-600 text-white'
+                          : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                      }`}
+                    >
+                      {t('editor3D.exportSingle')}
+                    </button>
+                    <button
+                      onClick={() => setExportStyle('separate')}
+                      className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                        exportStyle === 'separate'
+                          ? 'bg-green-600 text-white'
+                          : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                      }`}
+                    >
+                      {t('editor3D.exportSeparate')}
+                    </button>
+                    <button
+                      onClick={() => setExportStyle('grouped')}
+                      className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                        exportStyle === 'grouped'
+                          ? 'bg-green-600 text-white'
+                          : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                      }`}
+                    >
+                      {t('editor3D.exportGrouped')}
+                    </button>
+                  </div>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="cursor-default p-2 flex flex-col items-start gap-1"
+                >
+                  <span className="text-xs font-medium text-gray-400">
                     {t('editor3D.importModeLabel')}
                   </span>
                   <div className="flex gap-1">
@@ -12571,6 +12716,35 @@ pluginTracks,
                       }`}
                     >
                       {t('editor3D.inSceneNew')}
+                    </button>
+                  </div>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="cursor-default p-2 flex flex-col items-start gap-1"
+                >
+                  <span className="text-xs font-medium text-gray-400">
+                    {t('editor3D.piecesLabel')}
+                  </span>
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => setImportPieces('several')}
+                      className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                        importPieces === 'several'
+                          ? 'bg-green-600 text-white'
+                          : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                      }`}
+                    >
+                      {t('editor3D.importSeveral')}
+                    </button>
+                    <button
+                      onClick={() => setImportPieces('single')}
+                      className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                        importPieces === 'single'
+                          ? 'bg-green-600 text-white'
+                          : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                      }`}
+                    >
+                      {t('editor3D.importOne')}
                     </button>
                   </div>
                 </DropdownMenuItem>
@@ -15502,7 +15676,7 @@ pluginTracks,
                   label={t('editor3D.panelLabels.profile')}
                   axisLabel="X·Y"
                   polygon={latheProfile}
-                  onChange={setLatheProfile}
+                  onChange={setLatheProfileConOrigen}
                   resolution={resolution}
                   showAxis={true}
                   axisVertical={true}
@@ -15530,6 +15704,34 @@ pluginTracks,
                   />
                   <p className="text-[10px] text-muted-foreground/60">
                     Más segmentos = más suave, pero más pesado
+                  </p>
+                </div>
+
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex items-center justify-between">
+                    <span>{t('editor3D.profileVertices')}</span>
+                    <span className="font-mono text-green-400">
+                      {latheProfile.length}
+                    </span>
+                  </label>
+                  <Slider
+                    min={3}
+                    max={96}
+                    value={[latheProfile.length]}
+                    onValueChange={([v]) =>
+                      setLatheProfile((prev) => {
+                        // Remuestrear desde la figura ORIGINAL, no del
+                        // resultado del tick anterior (la cascada deforma)
+                        const src = latheProfileSourceRef.current;
+                        const base = src.length >= 3 ? src : prev;
+                        latheProfileSourceRef.current = base;
+                        return resampleLatheProfile(base, v);
+                      })
+                    }
+                    className="w-full"
+                  />
+                  <p className="text-[10px] text-muted-foreground/60">
+                    {t('editor3D.profileVerticesHint')}
                   </p>
                 </div>
 
@@ -15644,7 +15846,7 @@ pluginTracks,
                 axisLabel="X·Y"
                 polygon={latheProfile}
                 onChange={(poly: Polygon) => {
-                  setLatheProfile(poly);
+                  setLatheProfileConOrigen(poly);
                   setEditedVertices(null);
                 }}
                 resolution={editorGridResolution}
