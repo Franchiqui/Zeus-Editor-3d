@@ -2,6 +2,9 @@ declare global {
   interface Window {
     electronAPI?: {
       selectFolder: () => Promise<string | null>;
+      openFileDialog: (
+        opts?: { defaultPath?: string; title?: string }
+      ) => Promise<string | null>;
       fsListDirectory: (folderPath: string, category?: string) => Promise<{ files: any[]; error?: string }>;
       fsReadFile: (filePath: string, encoding?: string) => Promise<{ data?: string; error?: string }>;
       fsReadFileBuffer: (filePath: string) => Promise<{ data?: number[]; error?: string }>;
@@ -63,6 +66,19 @@ export function isElectron(): boolean {
 export async function selectFolder(): Promise<string | null> {
   if (!isElectron()) return null;
   return window.electronAPI!.selectFolder();
+}
+
+// Explorador de archivos nativo para elegir UN archivo (no una carpeta),
+// arrancando en defaultPath si esa carpeta existe.
+export async function openFileDialog(
+  opts?: { defaultPath?: string; title?: string }
+): Promise<string | null> {
+  if (!isElectron()) return null;
+  try {
+    return await window.electronAPI!.openFileDialog(opts);
+  } catch {
+    return null;
+  }
 }
 
 export async function listDirectory(folderPath: string, category?: string): Promise<any[]> {
