@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import Viewer3D, { type ObjectTransform, type GizmoMode } from '@/components/viewer-3d';
+import Viewer3D, { type ObjectTransform, type GizmoMode, type ExtrusionCtrlSubSel } from '@/components/viewer-3d';
 import type { TextureMaterialParams } from '@/lib/geometry';
 import type { EfectoObjeto } from '@/lib/efectos-objeto';
 import { PanelButtons } from '@/components/editor/Editor3D';
@@ -58,6 +58,11 @@ interface ViewerPanelProps {
     faceSelectMode?: boolean;
     faceSelectionTool?: 'rectangle' | 'circle' | 'line' | 'poligono' | 'directo';
     faceSelectionTarget?: 'cara' | 'vertice' | 'segmento';
+    /** Modo ANILLOS de caras (botón junto a Mover/Extrudir). */
+    anillosCaras?: boolean;
+    /** Ctrl + arrastre de ESCALA en la sub-selección = extrudir la copia
+     *  (anillos vecinos intactos); null si no se puede. */
+    onCtrlEscalarSubSel?: () => ExtrusionCtrlSubSel | null;
     faceSelectVisibleOnly?: boolean;
     wireframeOffSignal?: number;
     selectedFaceIds?: number[];
@@ -84,6 +89,14 @@ interface ViewerPanelProps {
    gizmoOffset?: ObjectTransform;
    /** Notifica al padre del nuevo offset del gizmo (modo configuración). */
    onGizmoOffsetChange?: (t: ObjectTransform) => void;
+   /** Gizmo de la sub-selección: interactivo (false = configuración). */
+   selGizmoInteractive?: boolean;
+   /** Color de sustitución de sus asas (gris en modo configuración). */
+   selGizmoColorOverride?: number;
+   /** Offset de sitio (mundo) que el usuario le puso al gizmo. */
+   selGizmoOffset?: { x: number; y: number; z: number };
+   /** Notifica al padre el offset de sitio del gizmo de la sub-selección. */
+   onSelGizmoOffsetChange?: (o: { x: number; y: number; z: number }) => void;
    handleObjectTransform: (transform: any) => void;
    handleVerticesChange: (vertices: any) => void;
    showLatheAxis: boolean;
@@ -207,6 +220,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
     faceSelectMode,
     faceSelectionTool,
     faceSelectionTarget,
+    anillosCaras,
     faceSelectVisibleOnly,
     wireframeOffSignal,
     selectedFaceIds,
@@ -229,8 +243,13 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
    gizmoColorOverride,
    gizmoOffset,
    onGizmoOffsetChange,
+   selGizmoInteractive = true,
+   selGizmoColorOverride,
+   selGizmoOffset,
+   onSelGizmoOffsetChange,
    handleObjectTransform,
   handleVerticesChange,
+  onCtrlEscalarSubSel,
   showLatheAxis,
    viewerProjection,
    textureHelper,
@@ -496,6 +515,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
            faceSelectMode={faceSelectMode}
            faceSelectionTool={faceSelectionTool}
            faceSelectionTarget={faceSelectionTarget}
+           anillosCaras={anillosCaras}
            faceSelectVisibleOnly={faceSelectVisibleOnly}
            wireframeOffSignal={wireframeOffSignal}
            selectedFaceIds={selectedFaceIds}
@@ -518,6 +538,10 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
             gizmoColorOverride={gizmoColorOverride}
             gizmoOffset={gizmoOffset}
             onGizmoOffsetChange={onGizmoOffsetChange}
+            selGizmoInteractive={selGizmoInteractive}
+            selGizmoColorOverride={selGizmoColorOverride}
+            selGizmoOffset={selGizmoOffset}
+            onSelGizmoOffsetChange={onSelGizmoOffsetChange}
            booleanToolObjectId={booleanToolObjectId}
            forceObjectsUpdate={forceUpdate}
           objectTransform={
@@ -525,6 +549,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
          }
          onObjectTransform={handleObjectTransform}
          onVerticesChange={handleVerticesChange}
+         onCtrlEscalarSubSel={onCtrlEscalarSubSel}
          showVerticesDefault={false}
          showLatheAxis={showLatheAxis}
          textureProjection={viewerProjection}

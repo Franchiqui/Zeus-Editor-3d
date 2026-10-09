@@ -68,6 +68,7 @@ import CalculatedCopiesModal, {
 import WindowLayoutModal, { type WindowLayout } from './WindowLayoutModal';
 import { MotionEditor } from './MotionEditor';
 import { ObjectTransformFields } from './object-transform-fields';
+import { ObjectPrimitiveFields } from './object-primitive-fields';
 import { AxisHeader } from './axis-header';
 import { cloneMesh } from '@/lib/plugins/clone';
 import { performCSGOperation, type BooleanOperationType } from '@/lib/csg-mesh';
@@ -78,6 +79,7 @@ import { buildLoftMesh } from '@/lib/loft-mesh';
 import { buildSweepMesh, type SweepNode } from '@/lib/sweep-mesh';
 import PathCanvas from './path-canvas';
 import type { ObjectTransform, Camera3D, GizmoMode } from '@/components/viewer-3d';
+import type { ExtrusionCtrlSubSel } from '@/components/viewer-3d';
 import {
   IDENTITY_TRANSFORM,
   isIdentityTransform,
@@ -116,6 +118,11 @@ type LatheTextureProjection,
   nuevoGrupoTextura,
 } from '@/lib/geometry';
 import { creadaComoParams, type CreatedTexture } from '@/lib/texture-generator';
+import {
+  construirMallaPrimitiva,
+  paramsDeArchivo,
+  type PrimitiveParams,
+} from '@/lib/primitivas-parametricas';
 import {
   regionSegunObjetivo,
   extrudeRegionMesh,
@@ -321,6 +328,7 @@ function construirCopiasCalculadas(
     mesh: Mesh;
     efectos?: EfectoObjeto[];
     pluginEdit?: SceneObject['pluginEdit'];
+    primitiveParams?: PrimitiveParams;
     transform: ObjectTransform;
   }>,
   params: CalculatedCopiesParams,
@@ -406,6 +414,7 @@ function construirCopiasCalculadas(
         config: fuente.config,
         efectos: fuente.efectos,
         pluginEdit: fuente.pluginEdit,
+        primitiveParams: fuente.primitiveParams,
       });
     });
   }
@@ -688,6 +697,14 @@ type SceneObject = {
      baseMesh?: Mesh;
      baseVacia?: boolean;
    };
+   /**
+    * Parámetros de la primitiva de galería que generó la malla (modal
+    * «Objeto 3D»): permiten re-editarla y regenerarla desde la pestaña
+    * Escena, como pluginEdit. Ausente = objeto sin panel de propiedades
+    * (proyectos viejos, Bezier/Estrella o mallas ajenas). Viaja con el
+    * objeto en los .zeus.
+    */
+   primitiveParams?: PrimitiveParams;
    /**
     * Efectos visuales del objeto (lluvia, humo, fuego, chispas,
     * estrellas, brillo) con sus parámetros y focos. Viajan con el
@@ -1822,6 +1839,13 @@ export default function Home({
   const [gizmoOffset, setGizmoOffset] = useState<ObjectTransform>(
     structuredClone(IDENTITY_TRANSFORM)
   );
+  // Configuración del gizmo de la SUB-selección (caras/aristas/vértices),
+  // igual que la del gizmo de objetos: en modo configuración el gizmo se
+  // pinta en gris y arrastrar sus asas lo mueve a ÉL, no la selección.
+  const [selGizmoConfigMode, setSelGizmoConfigMode] = useState(false);
+  // Su offset de sitio (mundo). Se resetea al cambiar la selección, el
+  // objetivo o el modo (el gizmo vuelve a anclarse a la nueva selección).
+  const [selGizmoOffset, setSelGizmoOffset] = useState({ x: 0, y: 0, z: 0 });
   // Guarda el estado showGizmo previo a la configuración para restaurarlo.
   const prevGizmoVisibleRef = useRef<boolean>(false);
   const [fontVersion, setFontVersion] = useState(0);
@@ -3811,6 +3835,9 @@ export default function Home({
    const [faceSelectionTarget, setFaceSelectionTarget] = useState<'cara' | 'vertice' | 'segmento'>('cara');
    // Solo capturar lo visible (caras de frente, no lo que está detrás).
    const [faceSelectVisibleOnly, setFaceSelectVisibleOnly] = useState(true);
+   // Modo ANILLOS de caras: el hover/clic agrupa el anillo completo de
+   // caras por el borde apuntado (botón junto a Mover/Extrudir).
+   const [anillosCaras, setAnillosCaras] = useState(false);
    // Señal para que el visor apague la vista de alambre (tras asignar textura).
    const [wireframeOffSignal, setWireframeOffSignal] = useState(0);
    const [selectedFaceIds, setSelectedFaceIds] = useState<number[]>([]);
@@ -7950,6 +7977,74 @@ pluginTracks,
       moveSelDelta,
     ]);
 
+    // ---- Extrusión al ESCALAR con Ctrl (estilo Blender) ---------------
+    // El usuario lo pidió: al escalar un anillo se estiraban los anillos
+    // vecinos (los vértices del borde son compartidos). Con Ctrl el visor
+    // pide esta extrusión de delta casi nulo ANTES del gesto: se duplica
+    // la selección con sus paredes y la escala opera sobre la COPIA —
+    // anillos de arriba/abajo/lados intactos. Devuelve el resultado para
+    // que el visor arme el arrastre sobre los duplicados, o null si la
+    // escala sigue siendo la clásica.
+    const handleCtrlEscalarSubSel = useCallback((): ExtrusionCtrlSubSel | null => {
+      const id = selectedObjectId ?? configObjectId;
+      if (!id || faceSelectionTarget !== 'cara') return null;
+      const object = sceneObjects.find((o) => o.id === id);
+      if (!object?.mesh || object.mesh.vertices.length === 0) return null;
+      const mesh = object.mesh;
+      if (mesh.faces.length !== (id === configObjectId ? triMesh : object.mesh).faces.length) {
+        return null; // Solo con la malla vista = malla del objeto (modo escena).
+      }
+      const region = selectedFaceIds.filter((f) => f >= 0 && f < mesh.faces.length);
+      if (region.length === 0) return null;
+      // Delta mínimo a lo largo de la normal media de la región: separa la
+      // copia de la base para que no se solapen (z-fighting) si el usuario
+      // suelta sin mover. 0.002 = lo justo en unidades de la escena.
+      let nx = 0, ny = 0, nz = 0, cuenta = 0;
+      for (const idx of region) {
+        const cara = mesh.faces[idx];
+        if (!cara || cara.length < 3) continue;
+        const a = mesh.vertices[cara[0]];
+        const b = mesh.vertices[cara[1]];
+        const c = mesh.vertices[cara[2]];
+        if (!a || !b || !c) continue;
+        const ux = b.x - a.x, uy = b.y - a.y, uz = b.z - a.z;
+        const vx = c.x - a.x, vy = c.y - a.y, vz = c.z - a.z;
+        const cx = uy * vz - uz * vy;
+        const cy = uz * vx - ux * vz;
+        const cz = ux * vy - uy * vx;
+        const l = Math.hypot(cx, cy, cz);
+        if (l < 1e-12) continue;
+        nx += cx / l; ny += cy / l; nz += cz / l; cuenta++;
+      }
+      let delta: Vertex3D;
+      if (cuenta > 0 && Math.hypot(nx, ny, nz) > 1e-9) {
+        const largo = Math.hypot(nx, ny, nz);
+        delta = { x: (nx / largo) * 0.002, y: (ny / largo) * 0.002, z: (nz / largo) * 0.002 };
+      } else {
+        delta = { x: 0, y: 0.002, z: 0 };
+      }
+      const res = extrudeRegionMesh(mesh, region, delta);
+      if (!res || res.haciaDentro) return null;
+      setSceneObjects((current) =>
+        current.map((o) => (o.id === id ? { ...o, mesh: res.mesh } : o)),
+      );
+      // La selección sigue a la copia (los índices originales se quedan
+      // con la base), como hace el botón Extrudir.
+      setSelectedFaceIds(res.carasNuevas);
+      if (selectedVertexIds.length > 0) setSelectedVertexIds([]);
+      if (selectedEdgeIds.length > 0) setSelectedEdgeIds([]);
+      return { mesh: res.mesh, vmap: res.vmap, carasNuevas: res.carasNuevas };
+    }, [
+      selectedObjectId,
+      configObjectId,
+      sceneObjects,
+      triMesh,
+      faceSelectionTarget,
+      selectedFaceIds,
+      selectedVertexIds,
+      selectedEdgeIds,
+    ]);
+
     // ---- Resalte por textura automática -------------------------------
     // El usuario lo pidió así: las caras seleccionadas se pintan con una
     // textura de color (cian, cualquier color no blanco vale). Al dejar
@@ -8174,6 +8269,11 @@ pluginTracks,
         throw new Error(t('editor3D.noSavedShape', { name: fileName }));
       }
       const baseId = `object-${Date.now()}`;
+      // Los .zeus de la galería no guardan parámetros de primitiva: se
+      // pegan aquí según el archivo cargado, para que el panel de la
+      // escena los deje reeditar (regeneración de malla). Bezier/
+      // Estrella y archivos ajenos vuelven null = sin panel.
+      const paramsGaleria = paramsDeArchivo(fileName);
       const newObjects: SceneObject[] = valid.map((obj: Partial<SceneObject>, i: number) => ({
         id: i === 0 ? baseId : `${baseId}-${i}`,
         name: obj.name ?? t('editor3D.copyOf', { name: fileName.replace(/\.zeus$/i, '') }),
@@ -8186,6 +8286,7 @@ pluginTracks,
         camera: obj.camera ? structuredClone(obj.camera) : undefined,
         hidden: obj.hidden,
         frozen: obj.frozen,
+        primitiveParams: obj.kind === 'camera' ? undefined : paramsGaleria ?? undefined,
       }));
       setSceneObjects((objects) => [...objects, ...newObjects]);
       setSelectedObjectId(baseId);
@@ -9980,6 +10081,9 @@ pluginTracks,
           pluginEdit: obj.pluginEdit
             ? structuredClone(obj.pluginEdit)
             : undefined,
+          primitiveParams: obj.primitiveParams
+            ? structuredClone(obj.primitiveParams)
+            : undefined,
           nombre: obj.name || t('editor3D.defaultObjectName'),
           mode: obj.mode ?? mode,
           transform: { ...obj.transform },
@@ -10111,6 +10215,9 @@ pluginTracks,
           efectos: obj.efectos ? structuredClone(obj.efectos) : undefined,
           pluginEdit: obj.pluginEdit
             ? structuredClone(obj.pluginEdit)
+            : undefined,
+          primitiveParams: obj.primitiveParams
+            ? structuredClone(obj.primitiveParams)
             : undefined,
           transform: { ...obj.transform },
         };
@@ -11428,6 +11535,26 @@ pluginTracks,
     []
   );
 
+  /*
+   * Regenera la malla de una primitiva de galería al cambiar sus
+   * parámetros en la pestaña Escena (mismo patrón que handleApplyPlugin:
+   * spread conserva transform/material/efectos/smooth; el historial lo
+   * captura el snapshot global con debounce). Ojo: la malla nueva
+   * sustituye la anterior COMPLETA, así que las ediciones de vértices
+   * previas se pierden — el panel avisa de ello.
+   */
+  const handlePrimitiveParamsChange = useCallback(
+    (objectId: string, next: PrimitiveParams) => {
+      setSceneObjects((current) =>
+        current.map((o) =>
+          o.id === objectId
+            ? { ...o, primitiveParams: next, mesh: construirMallaPrimitiva(next) }
+            : o
+        )
+      );
+    },
+    []
+  );
   // Las 4 ventanas (Frente, Superior, Costado y 3D) son las mismas para
   // todas las herramientas: siempre muestran la escena completa (objeto
   // seleccionado en vivo + resto congelado). Solo el panel lateral cambia
@@ -11918,20 +12045,38 @@ pluginTracks,
       faceSelectMode={faceSelectMode}
       faceSelectionTool={faceSelectionTool}
       faceSelectionTarget={faceSelectionTarget}
+      anillosCaras={anillosCaras}
+      onCtrlEscalarSubSel={handleCtrlEscalarSubSel}
       faceSelectVisibleOnly={faceSelectVisibleOnly}
       wireframeOffSignal={wireframeOffSignal}
       selectedFaceIds={selectedFaceIds}
-      onFaceSelectionChange={setSelectedFaceIds}
+      onFaceSelectionChange={(ids) => {
+        setSelectedFaceIds(ids);
+        // La selección cambia: el offset de sitio del gizmo vuelve a cero
+        // (y sale de configuración) al re-anclarse a la nueva selección.
+        setSelGizmoConfigMode(false);
+        setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+      }}
       selectedVertexIds={selectedVertexIds}
-      onVertexSelectionChange={setSelectedVertexIds}
+      onVertexSelectionChange={(ids) => {
+        setSelectedVertexIds(ids);
+        setSelGizmoConfigMode(false);
+        setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+      }}
       selectedEdgeIds={selectedEdgeIds}
-      onEdgeSelectionChange={setSelectedEdgeIds}
+      onEdgeSelectionChange={(ids) => {
+        setSelectedEdgeIds(ids);
+        setSelGizmoConfigMode(false);
+        setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+      }}
       onFaceSelectionModeChange={(v) => {
         setFaceSelectMode(v);
         if (!v) {
           setSelectedFaceIds([]);
           setSelectedVertexIds([]);
           setSelectedEdgeIds([]);
+          setSelGizmoConfigMode(false);
+          setSelGizmoOffset({ x: 0, y: 0, z: 0 });
         }
       }}
       onFaceSelectionToolChange={setFaceSelectionTool}
@@ -11941,6 +12086,8 @@ pluginTracks,
         setSelectedFaceIds([]);
         setSelectedVertexIds([]);
         setSelectedEdgeIds([]);
+        setSelGizmoConfigMode(false);
+        setSelGizmoOffset({ x: 0, y: 0, z: 0 });
       }}
       onRegisterSelectionMove={(fn) => {
         moveSelectionFnRef.current = fn;
@@ -11951,6 +12098,10 @@ pluginTracks,
       gizmoColorOverride={gizmoConfigMode ? 0x888888 : undefined}
        gizmoOffset={gizmoOffset}
        onGizmoOffsetChange={gizmoConfigMode ? setGizmoOffset : undefined}
+      selGizmoInteractive={!selGizmoConfigMode}
+      selGizmoColorOverride={selGizmoConfigMode ? 0x888888 : undefined}
+      selGizmoOffset={selGizmoOffset}
+      onSelGizmoOffsetChange={setSelGizmoOffset}
       handleObjectTransform={handleObjectTransform}
       activeCamera={camaraObjetoDeVista(viewName)}
       exportCamera={activeCameraValue}
@@ -12072,15 +12223,15 @@ pluginTracks,
                   className={`flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border disabled:opacity-40 disabled:cursor-not-allowed ${
                     activo
                       ? 'bg-gray-700 border-cyan-300 ring-2 ring-cyan-300 shadow-[0_0_5px_1px_rgba(34,211,238,0.9),0_0_16px_6px_rgba(34,211,238,0.4)] hover:bg-gray-600'
-                      : 'bg-gray-400 hover:bg-gray-300 border-gray-500'
+                      : 'bg-gray-700 hover:bg-gray-600 border-gray-500'
                   }`}
                 >
                   {/* PNG del usuario: mejor que .ico (ese es para favicon).
-                      Fondo gris claro en reposo para que el trazo negro del
-                      icono no se pierda en el header oscuro. Al activarse se
-                      enciende el perímetro (borde + ring + halo cian) y el
-                      fondo pasa a gris oscuro, distinguiéndolo de los
-                      inactivos. */}
+                      El fondo del botón es SIEMPRE oscuro (el mismo gris
+                      oscuro del estado activo) con borde gris; el trazo
+                      blanco del icono y su cara roja resaltan sobre él. Sólo
+                      cuando el modo actúa se enciende el perímetro (borde +
+                      ring + halo cian). */}
                   <img
                     src={`/icons/${icono}.png`}
                     alt=""
@@ -15124,6 +15275,26 @@ pluginTracks,
                   />
                 </div>
               )}
+              {selectedObjectIds.length <= 1 &&
+                selectedSceneObject?.primitiveParams && (
+                <div
+                  className="shrink-0 px-3 py-2 border-b border-white/5 space-y-1.5"
+                  data-testid="object-primitive-panel"
+                >
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      {t('editor3D.primitiveTitle')}
+                    </h3>
+                  </div>
+                  <ObjectPrimitiveFields
+                    params={selectedSceneObject.primitiveParams}
+                    onChange={(next) =>
+                      handlePrimitiveParamsChange(selectedSceneObject.id, next)
+                    }
+                    t={t}
+                  />
+                </div>
+              )}
               <div
                 className="shrink-0 overflow-y-auto custom-scrollbar max-h-[320px] px-2 py-2 space-y-1"
                 data-testid="scene-object-list"
@@ -16374,6 +16545,24 @@ pluginTracks,
                     ? t('editor3D.faceSelVertices', { n: selectedVertexIds.length })
                     : t('editor3D.faceSelEdges', { n: selectedEdgeIds.length })}
               </span>
+              {/* Modo ANILLOS: con caras, el hover/clic agrupa el anillo
+                  completo de caras por el borde apuntado (objetos curvos:
+                  anillos horizontales/verticales). Visible SIEMPRE que el
+                  objetivo sea caras: se activa antes de seleccionar. */}
+              {faceSelectionTarget === 'cara' && (
+                <button
+                  data-testid="sel-anillos-btn"
+                  onClick={() => setAnillosCaras((v) => !v)}
+                  className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors shrink-0 ${
+                    anillosCaras
+                      ? 'bg-cyan-500/20 text-cyan-100 border border-cyan-500/40'
+                      : 'bg-black/40 text-muted-foreground hover:text-foreground border border-white/10'
+                  }`}
+                  title={t('editor3D.ringsSelTitle')}
+                >
+                  {t('editor3D.ringsSel')}
+                </button>
+              )}
               {/* Campos numéricos: desplazar la selección por eje */}
               {(faceSelectionTarget === 'cara'
                 ? selectedFaceIds.length
@@ -16426,6 +16615,38 @@ pluginTracks,
                   >
                     {t('editor3D.faceExtrude')}
                   </button>
+                  {/* Configuración del gizmo de la sub-selección (como la del
+                      gizmo de objetos): gris + sus asas lo mueven a él. */}
+                  <button
+                    data-testid="sel-gizmo-config-btn"
+                    onClick={() => {
+                      if (selGizmoConfigMode) {
+                        setSelGizmoConfigMode(false);
+                      } else {
+                        setSelGizmoConfigMode(true);
+                      }
+                    }}
+                    className={`px-2 py-1 rounded-md text-xs font-medium transition-colors shrink-0 ${
+                      selGizmoConfigMode
+                        ? 'bg-green-500/20 text-green-200 border border-green-500/40'
+                        : 'bg-black/40 text-muted-foreground hover:text-foreground border border-white/10'
+                    }`}
+                    title={selGizmoConfigMode
+                      ? t('editor3D.gizmoApply')
+                      : t('editor3D.gizmoConfigure')}
+                  >
+                    {selGizmoConfigMode ? <Check className="w-3.5 h-3.5" /> : '⚙'}
+                  </button>
+                  {selGizmoConfigMode && (
+                    <button
+                      data-testid="sel-gizmo-center-btn"
+                      onClick={() => setSelGizmoOffset({ x: 0, y: 0, z: 0 })}
+                      className="px-2 py-1 rounded-md text-xs font-medium bg-black/40 text-muted-foreground hover:text-foreground border border-white/10 transition-colors shrink-0"
+                      title={t('editor3D.gizmoCenterOnObject')}
+                    >
+                      <Target className="w-3.5 h-3.5" />
+                    </button>
+                  )}
                 </div>
               )}
               <input

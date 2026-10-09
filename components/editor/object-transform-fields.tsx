@@ -38,9 +38,10 @@ function round(n: number, digits = 2): number {
  * Campo numérico con buffer local de texto. Mantener el texto editado
  * mientras el input está enfocado evita que el valor controlado (que se
  * reformatea en cada render) "robe" el punto decimal o los ceros que el
- * usuario está escribiendo.
+ * usuario está escribiendo. Exportado para reutilizarlo en el panel de
+ * parámetros de primitiva (object-primitive-fields).
  */
-function NumberInput({
+export function NumberInput({
   value,
   step,
   onCommit,

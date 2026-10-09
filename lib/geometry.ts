@@ -944,6 +944,386 @@ export function voxelsToBoxMesh(
   return { vertices, faces };
 }
 
+// ==================== ANILLOS DE CARAS ====================
+//
+// Los objetos del editor (esfera, toroide, tubo, cubo...) se guardan como
+// mallas TRIANGULADAS y sin índices compartidos: cada triángulo trae sus
+// propios 3 vértices, repetidos en las caras vecinas. Para agrupar
+// «anillos» (bandas completas de caras — los meridianos y paralelos de una
+// esfera, por ejemplo) se reconstruye primero la TOPOLOGÍA LÓGICA uniendo
+// los vértices por posición, después se forman las celdas cuadriláteras —
+// pareando triángulos vecinos (.zeus triangulados) o tomando la cara de 4
+// lados entera (primitivas de la app) — y por último se recorre la tira de
+// celdas que pasa por el borde apuntado.
+
+/** Celda cuadrilátera: dos triángulos pareados por su diagonal, o una cara
+ *  de 4 lados entera (mallas con índices compartidos). */
+export interface CeldaAnillo {
+  /** Caras de la malla que forman la celda (1 o 2). */
+  tris: number[];
+  /** Bordes lógicos del contorno de la celda (claves «a-b» unificadas). */
+  bordes: string[];
+  /** Los dos pares de bordes opuestos. El anillo NO cruza los bordes de
+   *  su clase bloqueada y sí cruza los de la otra. */
+  clases: [string[], string[]];
+}
+
+/** Topología de anillos de una malla (ver `construirAnillos`). */
+export interface AnillosMalla {
+  /** Celda de cada cara (-1 = suelto: casquete de polo, resto). */
+  faceACelda: Int32Array;
+  celdas: CeldaAnillo[];
+  /** Borde lógico → caras que lo tocan (para cruzar de celda en celda). */
+  bordeAFaces: Map<string, number[]>;
+  /** Posición representativa de cada vértice lógico (para proyectar). */
+  canonPos: Vertex3D[];
+}
+
+const claveVertAnillo = (v: Vertex3D): string =>
+  `${Math.round(v.x * 1e5)}|${Math.round(v.y * 1e5)}|${Math.round(v.z * 1e5)}`;
+
+const claveBordeAnillo = (a: number, b: number): string =>
+  a < b ? `${a}-${b}` : `${b}-${a}`;
+
+/**
+ * Construye la topología de anillos de la malla: unifica vértices por
+ * posición, empareja triángulos vecinos en cuadriláteros y prepara los
+ * mapas para recorrer tiras de celdas. Barato (O(n caras)) — se puede
+ * llamar en cada revision de hover.
+ */
+export function construirAnillos(mesh: Mesh): AnillosMalla | null {
+  const nFaces = mesh.faces.length;
+  if (nFaces === 0) return null;
+
+  // 1. Vértices lógicos: unificar por posición (malla sin índices compartidos).
+  const canonDe = new Int32Array(mesh.vertices.length).fill(-1);
+  const canonPos: Vertex3D[] = [];
+  const canonPorClave = new Map<string, number>();
+  for (let i = 0; i < mesh.vertices.length; i++) {
+    const v = mesh.vertices[i];
+    if (!v) continue;
+    const clave = claveVertAnillo(v);
+    let cid = canonPorClave.get(clave);
+    if (cid === undefined) {
+      cid = canonPos.length;
+      canonPorClave.set(clave, cid);
+      canonPos.push({ x: v.x, y: v.y, z: v.z });
+    }
+    canonDe[i] = cid;
+  }
+
+  // 2. Bordes lógicos → caras que los tocan (solo triángulos pareables).
+  const bordeAFacesConTri = new Map<string, number[]>();
+  const esTri = new Uint8Array(nFaces);
+  for (let i = 0; i < nFaces; i++) {
+    const face = mesh.faces[i];
+    if (!face || face.length !== 3) continue;
+    const a = canonDe[face[0]];
+    const b = canonDe[face[1]];
+    const c = canonDe[face[2]];
+    if (a < 0 || b < 0 || c < 0) continue;
+    esTri[i] = 1;
+    const aristas = [
+      [a, b],
+      [b, c],
+      [c, a],
+    ];
+    for (const [p, q] of aristas) {
+      if (p === q) continue;
+      const key = claveBordeAnillo(p, q);
+      const lista = bordeAFacesConTri.get(key);
+      if (lista) lista.push(i);
+      else bordeAFacesConTri.set(key, [i]);
+    }
+  }
+
+  // 3. Pareo voraz de triángulos: entre los vecinos por cada borde se
+  //    prefiere el de normal más parecida (las dos mitades de la MISMA
+  //    celda son casi coplanares; las de celdas contiguas ya curvan) y, a
+  //    igualdad, el borde compartido más largo (la diagonal de la celda).
+  //    Bordes que tocan un vértice de MUCHAS caras (polos de abanico)
+  //    no se tratan de diagonal para no encadenar casquetes.
+  const incidentes = new Map<number, Set<string>>();
+  for (const key of bordeAFacesConTri.keys()) {
+    const [pa, qa] = key.split('-').map(Number);
+    if (!incidentes.has(pa)) incidentes.set(pa, new Set());
+    if (!incidentes.has(qa)) incidentes.set(qa, new Set());
+    incidentes.get(pa)!.add(key);
+    incidentes.get(qa)!.add(key);
+  }
+
+  const normalDe = (fi: number): number[] | null => {
+    const face = mesh.faces[fi];
+    const a = mesh.vertices[face[0]];
+    const b = mesh.vertices[face[1]];
+    const c = mesh.vertices[face[2]];
+    if (!a || !b || !c) return null;
+    const u = [b.x - a.x, b.y - a.y, b.z - a.z];
+    const w = [c.x - a.x, c.y - a.y, c.z - a.z];
+    const n = [
+      u[1] * w[2] - u[2] * w[1],
+      u[2] * w[0] - u[0] * w[2],
+      u[0] * w[1] - u[1] * w[0],
+    ];
+    const len = Math.hypot(n[0], n[1], n[2]) || 1;
+    return [n[0] / len, n[1] / len, n[2] / len];
+  };
+
+  type Candidato = { t1: number; t2: number; dot: number; len: number };
+  const candidatos: Candidato[] = [];
+  for (const [key, faces] of bordeAFacesConTri) {
+    if (faces.length !== 2) continue;
+    const [f1, f2] = faces;
+    if (!esTri[f1] || !esTri[f2]) continue;
+    const n1 = normalDe(f1);
+    const n2 = normalDe(f2);
+    if (!n1 || !n2) continue;
+    const [pa, qa] = key.split('-').map(Number);
+    // Guarda de abanicos: un diagonal real no toca vértices con muchas caras.
+    if ((incidentes.get(pa)?.size ?? 0) > 8) continue;
+    if ((incidentes.get(qa)?.size ?? 0) > 8) continue;
+    const A = canonPos[pa];
+    const B = canonPos[qa];
+    const len = Math.hypot(A.x - B.x, A.y - B.y, A.z - B.z);
+    const dot = n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2];
+    candidatos.push({ t1: f1, t2: f2, dot, len });
+  }
+
+  // 3a. Vecino por el borde MÁS LARGO de cada triángulo: en un cuadrilátero
+  //     la diagonal es el borde más largo de sus dos triángulos (triángulo-
+  //     inecuación), así que «el vecino por el borde más largo» se eligen
+  //     MUTUAMENTE en la celda real. Resuelve las superficies en regla
+  //     (cono, cilindro) donde las normales a lo largo del meridiano son
+  //     idénticas y engañan al criterio de coplanaridad.
+  const vecinoMasLargo = new Int32Array(nFaces).fill(-1);
+  const vecinoMasLargoLen = new Float64Array(nFaces).fill(-1);
+  for (const cand of candidatos) {
+    if (cand.len > vecinoMasLargoLen[cand.t1]) {
+      vecinoMasLargoLen[cand.t1] = cand.len;
+      vecinoMasLargo[cand.t1] = cand.t2;
+    }
+    if (cand.len > vecinoMasLargoLen[cand.t2]) {
+      vecinoMasLargoLen[cand.t2] = cand.len;
+      vecinoMasLargo[cand.t2] = cand.t1;
+    }
+  }
+
+  const pareja = new Int32Array(nFaces).fill(-1);
+
+  // 3b. Pareo mutuo primero (la celda real elegida por su diagonal).
+  for (let fi = 0; fi < nFaces; fi++) {
+    const n = vecinoMasLargo[fi];
+    if (n < 0 || n <= fi) continue;
+    if (vecinoMasLargo[n] === fi && pareja[fi] < 0 && pareja[n] < 0) {
+      pareja[fi] = n;
+      pareja[n] = fi;
+    }
+  }
+
+  // 3c. Resto: voraz por normales más parecidas y, a igualdad, el borde
+  //     compartido más largo (la diagonal de la celda).
+  candidatos.sort((x, y) => (y.dot !== x.dot ? y.dot - x.dot : y.len - x.len));
+  for (const cand of candidatos) {
+    if (pareja[cand.t1] < 0 && pareja[cand.t2] < 0) {
+      pareja[cand.t1] = cand.t2;
+      pareja[cand.t2] = cand.t1;
+    }
+  }
+
+  // 4. Celdas: contorno (bordes lógicos) y sus dos clases de bordes
+  //    opuestos. Hay celdas de dos clases de origen: pares de triángulos
+  //    (mallas .zeus trianguladas) y caras de 4 lados enteras (las primitivas
+  //    viven de la app ya llegan cuadranguladas, esfera = [a, a+1, b+1, b]).
+  const faceACelda = new Int32Array(nFaces).fill(-1);
+  const celdas: CeldaAnillo[] = [];
+
+  const extremosDe = (key: string): Set<number> => {
+    const [p, q] = key.split('-').map(Number);
+    return new Set([p, q]);
+  };
+  // Clases: parear cada borde con el (los) que NO comparte puntas. Debe
+  // quedar 2+2; con otro reparto (cuadriláteros degenerados de polo que
+  // pierden la arista p-p) la celda no sirve y la cara queda suelta — el
+  // anillo la toca pero no la atraviesa, igual que los casquetes .zeus.
+  const clasesDe = (bordes: string[]): [string[], string[]] | null => {
+    if (bordes.length !== 4) return null;
+    const usados = new Set<number>();
+    const clases: [string[], string[]] = [[], []];
+    let idxClase = 0;
+    for (let i0 = 0; i0 < bordes.length; i0++) {
+      if (usados.has(i0)) continue;
+      const ext = extremosDe(bordes[i0]);
+      usados.add(i0);
+      clases[idxClase].push(bordes[i0]);
+      for (let j0 = i0 + 1; j0 < bordes.length; j0++) {
+        if (usados.has(j0)) continue;
+        const ext2 = extremosDe(bordes[j0]);
+        let comparten = false;
+        for (const eVal of ext2) if (ext.has(eVal)) { comparten = true; break; }
+        if (!comparten) {
+          clases[idxClase].push(bordes[j0]);
+          usados.add(j0);
+          break;
+        }
+      }
+      idxClase++;
+      if (idxClase === 2) break;
+    }
+    if (clases[0].length === 0 || clases[1].length === 0) return null;
+    return clases;
+  };
+  // Bordes lógicos de una cara (dedupe de degenerados «p-p»).
+  const bordesDeCara = (fi: number): string[] => {
+    const face = mesh.faces[fi];
+    const out: string[] = [];
+    for (let j = 0; j < face.length; j++) {
+      const p = canonDe[face[j]];
+      const q = canonDe[face[(j + 1) % face.length]];
+      if (p < 0 || q < 0 || p === q) continue;
+      out.push(claveBordeAnillo(p, q));
+    }
+    return out;
+  };
+
+  // 4a. Pares de triángulos.
+  for (let fi = 0; fi < nFaces; fi++) {
+    if (pareja[fi] < 0 || pareja[fi] < fi) continue; // cada par una vez
+    const fj = pareja[fi];
+    const c1 = mesh.faces[fi];
+    const c2 = mesh.faces[fj];
+    const m1 = new Set(c1.map((v) => canonDe[v]));
+    // Bordes de cada triángulo que NO son el compartido.
+    const bordesDe = (face: number[]): Array<[number, number]> => {
+      const out: Array<[number, number]> = [];
+      for (let j = 0; j < 3; j++) {
+        const p = canonDe[face[j]];
+        const q = canonDe[face[(j + 1) % 3]];
+        if (m1.has(p) && m1.has(q) && bordeAFacesConTri.has(claveBordeAnillo(p, q))) {
+          const lista = bordeAFacesConTri.get(claveBordeAnillo(p, q))!;
+          if (lista.includes(fi) && lista.includes(fj)) continue; // diagonal compartida
+        }
+        out.push([p, q]);
+      }
+      return out;
+    };
+    const b1 = bordesDe(c1);
+    const b2 = bordesDe(c2);
+    if (b1.length !== 2 || b2.length !== 2) continue;
+    const todos = [
+      ...b1.map((e) => claveBordeAnillo(e[0], e[1])),
+      ...b2.map((e) => claveBordeAnillo(e[0], e[1])),
+    ];
+    const clases = clasesDe(todos);
+    if (!clases || clases[0].length !== 2 || clases[1].length !== 2) continue;
+    const celda = celdas.length;
+    celdas.push({ tris: [fi, fj], bordes: todos, clases });
+    faceACelda[fi] = celda;
+    faceACelda[fj] = celda;
+  }
+
+  // 4b. Caras cuadrilaterales enteras (mallas de la app con índices
+  //     compartidos): cada quad es su propia celda. Los bordes que unen dos
+  //     vértices en la MISMA posición (la arista degenerada de los polos de
+  //     la esfera) no existen topológicamente y no entran.
+  for (let fi = 0; fi < nFaces; fi++) {
+    if (faceACelda[fi] >= 0) continue;
+    const face = mesh.faces[fi];
+    if (!face || face.length !== 4) continue;
+    const todos = Array.from(new Set(bordesDeCara(fi)));
+    const clases = clasesDe(todos);
+    if (!clases || clases[0].length !== 2 || clases[1].length !== 2) continue;
+    const celda = celdas.length;
+    celdas.push({ tris: [fi], bordes: todos, clases });
+    faceACelda[fi] = celda;
+  }
+
+  // Borde → caras (todas, no solo triángulos) para cruzar en el recorrido.
+  const bordeAFaces = new Map<string, number[]>();
+  for (let i = 0; i < nFaces; i++) {
+    const face = mesh.faces[i];
+    if (!face || face.length < 3) continue;
+    const canon = face.map((v) => canonDe[v]);
+    if (canon.some((v) => v < 0)) continue;
+    for (let j = 0; j < face.length; j++) {
+      const va = canon[j];
+      const vb = canon[(j + 1) % face.length];
+      if (va === vb) continue;
+      const key = claveBordeAnillo(va, vb);
+      const lista = bordeAFaces.get(key);
+      if (lista) lista.push(i);
+      else bordeAFaces.set(key, [i]);
+    }
+  }
+
+  return { faceACelda, celdas, bordeAFaces, canonPos };
+}
+
+/**
+ * Caras del ANILLO que pasa por la celda de `faceIdx`, sin cruzar los
+ * bordes de la clase bloqueada (0/1). Los triángulos sueltos que toca el
+ * anillo (casquetes de polo) entran pero no se atraviesan.
+ */
+export function carasAnilloDe(
+  malla: AnillosMalla,
+  faceIdx: number,
+  claseBloqueo: 0 | 1
+): number[] | null {
+  const celda0 = malla.faceACelda[faceIdx];
+  if (celda0 < 0) return null;
+  const celdas = malla.celdas;
+  const visitadas = new Set<number>([celda0]);
+  const caras = new Set<number>();
+  for (const t of celdas[celda0].tris) caras.add(t);
+  const cola: Array<{ celda: number; clase: 0 | 1 }> = [
+    { celda: celda0, clase: claseBloqueo },
+  ];
+  while (cola.length > 0) {
+    const { celda, clase } = cola.pop()!;
+    const celdaAct = celdas[celda];
+    const bloqueadas = celdaAct.clases[clase];
+    for (const borde of celdaAct.bordes) {
+      if (bloqueadas.includes(borde)) continue;
+      const faces = malla.bordeAFaces.get(borde) || [];
+      for (const f of faces) {
+        if (caras.has(f)) continue;
+        const tc = malla.faceACelda[f];
+        if (tc === celda) continue;
+        if (tc >= 0) {
+          if (!visitadas.has(tc)) {
+            visitadas.add(tc);
+            const c2 = celdas[tc];
+            for (const t of c2.tris) caras.add(t);
+            cola.push({
+              celda: tc,
+              // La clase BLOQUEADA de la celda vecina es la OPUESTA al borde
+              // de entrada: lo que se cruzó (el borde de entrada) es justamente
+              // lo que hay que seguir cruzando para avanzar por el anillo.
+              clase: c2.clases[0].includes(borde) ? 1 : 0,
+            });
+          }
+        } else {
+          // Triángulo suelto (casquete del polo, remate): entra en el
+          // anillo pero no se sigue cruzando a través de él.
+          caras.add(f);
+        }
+      }
+    }
+  }
+  return caras.size > 0 ? Array.from(caras).sort((a, b) => a - b) : null;
+}
+
+/** Extremos (posición lógica) de un borde «a-b» de la topología de anillos. */
+export function extremosBordeAnillo(
+  malla: AnillosMalla,
+  borde: string
+): [Vertex3D, Vertex3D] | null {
+  const [pa, qa] = borde.split('-').map(Number);
+  const A = malla.canonPos[pa];
+  const B = malla.canonPos[qa];
+  if (!A || !B) return null;
+  return [A, B];
+}
+
 export function meshToTriangles(mesh: Mesh): Mesh {
   const faces: number[][] = [];
   // faceColors viene 1:1 con las caras ORIGINALES: al partir cada
