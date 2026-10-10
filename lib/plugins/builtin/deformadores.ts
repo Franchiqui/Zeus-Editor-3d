@@ -58,9 +58,17 @@ const ejeDe = (params: PluginParams, id: string, porDefecto: Eje): Eje => {
 };
 
 /**
- * Doblar (como el modificador Bend): el eje elegido se curva en un arco
- * de radio constante. El ángulo es el giro TOTAL entre la base y la
- * cima del objeto.
+ * Doblar (como el modificador Bend, en versión «abanico»): el eje
+ * elegido se curva en un arco de radio constante. El ángulo es el giro
+ * TOTAL entre la base y la cima del objeto. Con suficiente segmentación
+ * alcanza desde un pequeño vuelco hasta el arco de medio punto
+ * (180°) o un círculo entero (360°).
+ *
+ * DIÁMETRO: 0 = automático (el arco gasta exactamente la longitud del
+ * objeto, sin estirar — como el Bend clásico). Con un valor, el arco
+ * adopta ESE diámetro (en % de la longitud del objeto) y el objeto se
+ * estira o encoge along-the-arc (factor k = R·θ/L) para seguirlo:
+ * medio punto pide ≈64% y un círculo ≈32%.
  */
 const doblar: ZeusPlugin = {
   id: 'doblar',
@@ -72,11 +80,23 @@ const doblar: ZeusPlugin = {
       tipo: 'slider',
       id: 'angulo',
       etiqueta: 'Ángulo total',
-      min: -360,
-      max: 360,
+      min: -720,
+      max: 720,
       paso: 1,
       valor: 45,
       unidad: '°',
+    },
+    {
+      tipo: 'slider',
+      id: 'diametro',
+      etiqueta: 'Diámetro de la curva',
+      min: 0,
+      max: 500,
+      paso: 5,
+      valor: 0,
+      unidad: '%',
+      descripcion:
+        '0 = automático (el propio objeto manda). Si lo tocas, el arco usa ESE diámetro (% de la longitud del objeto) y el objeto se estira o encoge para seguirlo: medio punto ≈ 64, círculo entero ≈ 32.',
     },
     {
       tipo: 'select',
@@ -97,19 +117,32 @@ const doblar: ZeusPlugin = {
 
     const [e1] = ejesTransversales(eje);
     const extent = cajaEje.max - cajaEje.min;
-    const R = extent / theta; // radio del arco
+    const diametroPct = num(params, 'diametro', 0);
+    // Radio AUTOMÁTICO: R = L/θ (el arco gasta la longitud exacta —
+    // sin estirar). Manual: R = diámetro/2, en % de la longitud L.
+    const R =
+      diametroPct > 0 ? (diametroPct / 200) * extent : extent / theta;
+    // Estiramiento a lo largo del arco para calar en el radio pedido:
+    // k = R·θ/L. Automático → k = 1 (comportamiento clásico).
+    const k = (R * theta) / extent;
+    if (!Number.isFinite(R) || R < 1e-9) return mesh;
     const centroTransversal = caja(mesh, e1).centro;
 
     const vertices = mesh.vertices.map((v) => {
-      // s: avance del vértice por el eje (0 en la base); d: separación
-      // del vértice respecto al «lomo» de la curva en el eje transversal.
-      const s = leerEje(v, eje) - cajaEje.min;
+      // s: avance del vértice por el arco desde la base (0 abajo), ya
+      // reescalado por k; d: separación respecto al eje de curvatura en
+      // el eje transversal — se vuelve RADIAL (radio R − d: los puntos
+      // de +e1 quedan más cerca del centro del arco).
+      const s = (leerEje(v, eje) - cajaEje.min) * k;
       const d = leerEje(v, e1) - centroTransversal;
       const phi = s / R;
-      // Rotación del punto (d, s) alrededor del centro de curvatura,
-      // situado a distancia R bajo la base en el plano (eje, e1).
-      const d2 = d * Math.cos(phi) + (s + R) * Math.sin(phi);
-      const h2 = -d * Math.sin(phi) + (s + R) * Math.cos(phi) - R;
+      // Arco de curvatura con la BASE FIJA: la cruz de la base no se
+      // mueve; el objeto se alza como un abanico curvándose hacia +e1.
+      // d2/h2: punto (d, s) envuelto en el círculo de radio R cuyo
+      // centro queda al nivel de la base, a distancia R hacia +e1.
+      const radial = R - d;
+      const d2 = R - radial * Math.cos(phi);
+      const h2 = radial * Math.sin(phi);
       let nuevo = conEje(v, eje, cajaEje.min + h2);
       nuevo = conEje(nuevo, e1, centroTransversal + d2);
       return nuevo;

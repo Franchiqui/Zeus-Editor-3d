@@ -69,6 +69,13 @@ import WindowLayoutModal, { type WindowLayout } from './WindowLayoutModal';
 import { MotionEditor } from './MotionEditor';
 import { ObjectTransformFields } from './object-transform-fields';
 import { ObjectPrimitiveFields } from './object-primitive-fields';
+import { DeformFields } from './deform-fields';
+import {
+  DEFORMADORES_DIRECTOS,
+  aplicarDeformador,
+  deformadorPorId,
+  type DeformadorDirecto,
+} from '@/lib/deformadores';
 import { AxisHeader } from './axis-header';
 import { cloneMesh } from '@/lib/plugins/clone';
 import { performCSGOperation, type BooleanOperationType } from '@/lib/csg-mesh';
@@ -80,6 +87,37 @@ import { buildSweepMesh, type SweepNode } from '@/lib/sweep-mesh';
 import PathCanvas from './path-canvas';
 import type { ObjectTransform, Camera3D, GizmoMode } from '@/components/viewer-3d';
 import type { ExtrusionCtrlSubSel } from '@/components/viewer-3d';
+import type { VistaModo } from '@/components/viewer-3d';
+
+/**
+ * Suelo REAL del visor en coordenadas LOCALES del objeto: el plano de los
+ * puntos locales cuya y-mundo es SUELO_MUNDO, transformados con la inversa
+ * del transform del objeto. Va como params OCULTOS al deformador Romper
+ * para que los pedazos caigan al suelo que se ve, aunque el objeto esté
+ * girado, escalado o flotando por encima de la rejilla.
+ */
+function paramsSueloLocal(t: ObjectTransform): PluginParams {
+  const SUELO_MUNDO = -1.05; // rejilla del visor (viewer-3d: grid.position.y)
+  const mat = new THREE.Matrix4().compose(
+    new THREE.Vector3(t.px, t.py, t.pz),
+    new THREE.Quaternion().setFromEuler(new THREE.Euler(t.rx, t.ry, t.rz)),
+    new THREE.Vector3(t.sx, t.sy, t.sz)
+  );
+  const p0 = new THREE.Vector3(0, SUELO_MUNDO, 0).applyMatrix4(
+    mat.clone().invert()
+  );
+  // El plano del suelo en local tiene normal g = Lᵀ·ĵ (L = parte lineal:
+  // rotación·escala): los puntos con p·g = c tienen y-mundo constante.
+  // En column-major, la fila 2 de la parte lineal es (e[1], e[5], e[9]).
+  // OJO: el truco secante Minv·(0,1,0) da L⁻¹·ĵ, que SOLO coincide con g
+  // si la escala es uniforme — con escala no uniforme el plano salía
+  // torcido y algunos pedazos quedaban en el aire.
+  const e = mat.elements;
+  const u = new THREE.Vector3(e[1], e[5], e[9]);
+  if (u.lengthSq() < 1e-12) return {};
+  u.normalize();
+  return { sueloUx: u.x, sueloUy: u.y, sueloUz: u.z, sueloD: u.dot(p0) };
+}
 import {
   IDENTITY_TRANSFORM,
   isIdentityTransform,
@@ -3835,11 +3873,26 @@ export default function Home({
    const [faceSelectionTarget, setFaceSelectionTarget] = useState<'cara' | 'vertice' | 'segmento'>('cara');
    // Solo capturar lo visible (caras de frente, no lo que está detrás).
    const [faceSelectVisibleOnly, setFaceSelectVisibleOnly] = useState(true);
-   // Modo ANILLOS de caras: el hover/clic agrupa el anillo completo de
-   // caras por el borde apuntado (botón junto a Mover/Extrudir).
+   // Modo ANILLOS de caras/aristas: en caras, el hover/clic agrupa el
+   // anillo completo de caras por el borde apuntado; en aristas, el bucle
+   // entero de aristas en cadena (botón junto a Mover/Extrudir).
    const [anillosCaras, setAnillosCaras] = useState(false);
+   // Modo DEFORMADOR directo (botones junto a Polígono/Aristas/Puntos):
+   // gris compartido con la sub-selección, contorno cage alrededor del
+   // objeto y campos numéricos en la pestaña Escena con vista previa EN
+   // VIVO. Aplicar escribe la malla deformada en el objeto; Cancelar solo
+   // apaga el modo (deshacer queda cubierto por el historial global).
+   const [deformadorId, setDeformadorId] = useState<string | null>(null);
+   const [deformParams, setDeformParams] = useState<PluginParams>({});
+   // Sube en cada re-activación del mismo deformador: fuerza el repintado
+   // aunque params y caja no cambien.
+   const [deformTick, setDeformTick] = useState(0);
    // Señal para que el visor apague la vista de alambre (tras asignar textura).
    const [wireframeOffSignal, setWireframeOffSignal] = useState(0);
+   // Modo de visualización GLOBAL de las ventanas 3D: textura (normal),
+   // alambre (segmentos) o gris con aristas (aspecto del lavado del
+   // deformador, más los segmentos en negro). Las 4 ventanas lo comparten.
+   const [vistaModo, setVistaModo] = useState<VistaModo>('textura');
    const [selectedFaceIds, setSelectedFaceIds] = useState<number[]>([]);
    const [selectedVertexIds, setSelectedVertexIds] = useState<number[]>([]);
    const [selectedEdgeIds, setSelectedEdgeIds] = useState<string[]>([]);
@@ -6993,22 +7046,70 @@ pluginTracks,
   // Estilo de visualización de la pestaña Escena: la figura REAL nunca
   // cambia — voxeles solo revoxeliza la superficie para el visor y suave
   // solo activa el sombreado suave.
+  //
+  // VISTA PREVIA EN VIVO del deformador: la malla que ve el visor es la
+  // original deformada con los params actuales (identidad nueva → repintan
+  // las 4 ventanas). Solo en modo escena con objeto propio: la figura de
+  // la pestaña y los lienzos no se tocan.
   const viewerMesh = useMemo(() => {
+    let base = viewerMeshRaw;
+    if (deformadorId && mode === 'scene' && frozenSelected && base.vertices.length > 0) {
+      base = aplicarDeformador(deformadorId, base, {
+        ...deformParams,
+        // Suelo real del visor en coords locales (params ocultos; Romper
+        // cae al suelo que se ve, no a la base del objeto).
+        ...paramsSueloLocal(frozenSelected.transform),
+      });
+    }
     if (
       mode !== 'scene' ||
       !frozenSelected ||
       sceneMeshStyle === 'fusionada' ||
-      viewerMeshRaw.vertices.length === 0
+      base.vertices.length === 0
     ) {
-      return viewerMeshRaw;
+      return base;
     }
     if (sceneMeshStyle === 'voxeles') {
-      const solid = meshToVoxels(viewerMeshRaw, 24);
-      if (!solid.resolution) return viewerMeshRaw;
+      const solid = meshToVoxels(base, 24);
+      if (!solid.resolution) return base;
       return voxelsToBoxMesh(solid.voxels, solid.resolution, false, [-1, 1]);
     }
-    return viewerMeshRaw;
-  }, [mode, frozenSelected, sceneMeshStyle, viewerMeshRaw]);
+    return base;
+    // deformTick: re-memo aunque params/caja repitan valores (re-activar
+    // el mismo deformador debe repintar).
+  }, [mode, frozenSelected, sceneMeshStyle, viewerMeshRaw, deformadorId, deformParams, deformTick, paramsSueloLocal]);
+
+  // Caja envolvente de la malla SIN deformar: la cage del contorno se
+  // construye sobre ella y se deforma con el mismo deformador, así
+  // envuelve al objeto ya deformado (la malla del visor llega deformada).
+  const deformadorCaja = useMemo(() => {
+    const vs = viewerMeshRaw.vertices;
+    if (!deformadorId || vs.length === 0) return null;
+    let minx = Infinity, miny = Infinity, minz = Infinity;
+    let maxx = -Infinity, maxy = -Infinity, maxz = -Infinity;
+    for (const v of vs) {
+      if (v.x < minx) minx = v.x;
+      if (v.y < miny) miny = v.y;
+      if (v.z < minz) minz = v.z;
+      if (v.x > maxx) maxx = v.x;
+      if (v.y > maxy) maxy = v.y;
+      if (v.z > maxz) maxz = v.z;
+    }
+    return { min: { x: minx, y: miny, z: minz }, max: { x: maxx, y: maxy, z: maxz } };
+  }, [deformadorId, viewerMeshRaw]);
+
+  const deformadorActivo = useMemo(
+    () =>
+      deformadorId
+        ? {
+            tipo: deformadorId,
+            params: deformParams,
+            tick: deformTick,
+            caja: deformadorCaja,
+          }
+        : null,
+    [deformadorId, deformParams, deformTick, deformadorCaja]
+  );
   const viewerSmooth = frozenSelected
     ? (mode === 'scene' && sceneMeshStyle === 'suave'
         ? true
@@ -8150,6 +8251,11 @@ pluginTracks,
     // pulsarse → se sale del modo y se limpia la selección (los overlays
     // del visor se retiran al apagarse el modo).
     const toggleSubSelectTarget = useCallback((tg: 'cara' | 'vertice' | 'segmento') => {
+      // Exclusividad de modos: entrar en sub-selección apaga el deformador
+      // (comparten lavado gris; los overlays de caras no conviven con la
+      // cage del contorno).
+      setDeformadorId(null);
+      setDeformParams({});
       setFaceSelectMode((prevMode) => {
         const salir = prevMode && faceSelectionTarget === tg;
         if (salir) {
@@ -8173,12 +8279,47 @@ pluginTracks,
       setFaceSelectionTool('directo');
     }, [faceSelectionTarget]);
 
+    /**
+     * ENTRA/SUBE en un deformador directo. Si el mismo está activo, lo
+     * apaga (re-pulsar = salir). Al entrar fija sus params por defecto.
+     */
+    const toggleDeformador = useCallback((id: string) => {
+      // Exclusividad: el deformador apaga la sub-selección.
+      setFaceSelectMode(false);
+      setSelectedFaceIds([]);
+      setSelectedVertexIds([]);
+      setSelectedEdgeIds([]);
+      setSelGizmoConfigMode(false);
+      setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+      if (deformadorId === id) {
+        // Re-pulsar el mismo: salir.
+        setDeformParams({});
+        setDeformadorId(null);
+        return;
+      }
+      const def = deformadorPorId(id);
+      const iniciales: PluginParams = {};
+      for (const p of def?.params ?? []) iniciales[p.id] = p.valor;
+      setDeformParams(iniciales);
+      setDeformTick((n) => n + 1);
+      setDeformadorId(id);
+    }, [deformadorId]);
+
+    /** Cancela el modo deformador: la malla no se toca. */
+    const salirModoDeformador = useCallback(() => {
+      setDeformadorId(null);
+      setDeformParams({});
+    }, []);
+
     // La sub-selección es del objeto activo: al cambiar de objeto se
     // limpia (índices rancos inofensivos, pero mejor sin basura visual).
+    // El deformador activo también es del objeto activo: fuera.
     useEffect(() => {
       setSelectedFaceIds((prev) => (prev.length > 0 ? [] : prev));
       setSelectedVertexIds((prev) => (prev.length > 0 ? [] : prev));
       setSelectedEdgeIds((prev) => (prev.length > 0 ? [] : prev));
+      setDeformadorId((prev) => (prev ? null : prev));
+      setDeformParams((prev) => (Object.keys(prev).length > 0 ? {} : prev));
     }, [selectedObjectId, configObjectId]);
 
     const handleFaceTextureFile = useCallback((file: File | null) => {
@@ -11555,6 +11696,38 @@ pluginTracks,
     },
     []
   );
+
+  /**
+   * APLICAR el deformador activo: escribe la malla deformada en el objeto
+   * dueño de la vista previa (mismo patrón que handlePrimitiveParamsChange;
+   * el historial global la captura) y apaga el modo. La deformación es
+   * destructiva: sustituye la malla COMPLETA, pero se deshace con el
+   * historial.
+   */
+  const handleDeformAplicar = useCallback(() => {
+    const objectId = frozenSelected?.id ?? selectedObjectId;
+    if (!deformadorId || !objectId) return;
+    const objeto = sceneObjectsRef.current.find((o) => o.id === objectId);
+    const base = objeto?.mesh;
+    if (!base || base.vertices.length === 0) return;
+    const deformada = aplicarDeformador(deformadorId, base, {
+      ...deformParams,
+      ...paramsSueloLocal(objeto.transform),
+    });
+    setSceneObjects((current) =>
+      current.map((o) =>
+        o.id === objectId ? { ...o, mesh: deformada } : o
+      )
+    );
+    setDeformParams({});
+    setDeformadorId(null);
+  }, [deformadorId, deformParams, frozenSelectedId, selectedObjectId, paramsSueloLocal]);
+
+  /** Cancelar: solo apaga el modo; la malla queda intacta. */
+  const handleDeformCancelar = useCallback(() => {
+    setDeformParams({});
+    setDeformadorId(null);
+  }, []);
   // Las 4 ventanas (Frente, Superior, Costado y 3D) son las mismas para
   // todas las herramientas: siempre muestran la escena completa (objeto
   // seleccionado en vivo + resto congelado). Solo el panel lateral cambia
@@ -12046,9 +12219,12 @@ pluginTracks,
       faceSelectionTool={faceSelectionTool}
       faceSelectionTarget={faceSelectionTarget}
       anillosCaras={anillosCaras}
+      deformadorActivo={deformadorActivo}
       onCtrlEscalarSubSel={handleCtrlEscalarSubSel}
       faceSelectVisibleOnly={faceSelectVisibleOnly}
       wireframeOffSignal={wireframeOffSignal}
+      vistaModo={vistaModo}
+      onVistaModoChange={setVistaModo}
       selectedFaceIds={selectedFaceIds}
       onFaceSelectionChange={(ids) => {
         setSelectedFaceIds(ids);
@@ -12070,6 +12246,11 @@ pluginTracks,
         setSelGizmoOffset({ x: 0, y: 0, z: 0 });
       }}
       onFaceSelectionModeChange={(v) => {
+        if (v) {
+          // Exclusividad de modos: entrar en sub-selección apaga el deformador.
+          setDeformadorId(null);
+          setDeformParams({});
+        }
         setFaceSelectMode(v);
         if (!v) {
           setSelectedFaceIds([]);
@@ -12242,6 +12423,48 @@ pluginTracks,
               );
             }
           )}
+          {/* Deformadores directos: 8 botones con icono — el usuario coloca
+              su PNG en /icons/<Nombre>.png (igual que Poligonos.png); si
+              falta el icono se ve la inicial. Activo = vista previa en vivo
+              (gris + cage contorno) + panel Escena; pulsar de nuevo apaga. */}
+          {DEFORMADORES_DIRECTOS.map((def) => {
+            const activo = deformadorId === def.id;
+            return (
+              <button
+                key={def.id}
+                title={`${t('editor3D.deformadorBtnTitle')}: ${def.nombre}`}
+                data-testid={`deformador-${def.id}`}
+                data-activo={activo ? '1' : '0'}
+                disabled={viewerMesh.vertices.length === 0}
+                onClick={() => toggleDeformador(def.id)}
+                className={`relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border disabled:opacity-40 disabled:cursor-not-allowed ${
+                  activo
+                    ? 'bg-gray-700 border-cyan-300 ring-2 ring-cyan-300 shadow-[0_0_5px_1px_rgba(34,211,238,0.9),0_0_16px_6px_rgba(34,211,238,0.4)] hover:bg-gray-600'
+                    : 'bg-gray-700 hover:bg-gray-600 border-gray-500'
+                }`}
+              >
+                <span
+                  data-letra
+                  className="hidden text-[10px] font-bold text-gray-300 select-none"
+                >
+                  {def.nombre.charAt(0)}
+                </span>
+                <img
+                  src={def.icono}
+                  alt=""
+                  draggable={false}
+                  onError={(e) => {
+                    // Sin icono en /icons/<Nombre>.png: se retira la imagen
+                    // y SOLO entonces asoma la inicial de reserva.
+                    const letra = e.currentTarget.parentElement?.querySelector('[data-letra]');
+                    if (letra) letra.classList.remove('hidden');
+                    e.currentTarget.style.display = 'none';
+                  }}
+                  className="h-full w-full object-contain"
+                />
+              </button>
+            );
+          })}
           {/* Dropdown: Nuevo proyecto, Eliminar objeto, Sustraer forma, Objeto 3D, Guardar, Luces */}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -15295,6 +15518,29 @@ pluginTracks,
                   />
                 </div>
               )}
+              {/* Panel del deformador directo activo: campos en vivo +
+                  Aplicar/Cancelar. Debe haber objeto propiamente dicho
+                  (no figura de pestaña) al que escribir la malla. */}
+              {deformadorId &&
+                mode === 'scene' &&
+                (frozenSelectedId ?? selectedObjectId) && (() => {
+                  const def = deformadorPorId(deformadorId);
+                  if (!def) return null;
+                  return (
+                    <div className="shrink-0 px-3 py-2 border-b border-white/5" key="deform-panel-wrap">
+                      <div className="px-0 pb-1">
+                        <DeformFields
+                          deformador={def}
+                          params={deformParams}
+                          onParams={setDeformParams}
+                          onAplicar={handleDeformAplicar}
+                          onCancelar={handleDeformCancelar}
+                          t={t}
+                        />
+                      </div>
+                    </div>
+                  );
+                })()}
               <div
                 className="shrink-0 overflow-y-auto custom-scrollbar max-h-[320px] px-2 py-2 space-y-1"
                 data-testid="scene-object-list"
@@ -16547,9 +16793,12 @@ pluginTracks,
               </span>
               {/* Modo ANILLOS: con caras, el hover/clic agrupa el anillo
                   completo de caras por el borde apuntado (objetos curvos:
-                  anillos horizontales/verticales). Visible SIEMPRE que el
-                  objetivo sea caras: se activa antes de seleccionar. */}
-              {faceSelectionTarget === 'cara' && (
+                  anillos horizontales/verticales). Con ARISTAS: el bucle
+                  entero de aristas en cadena (circunferencia o meridiano).
+                  Visible SIEMPRE que el objetivo sea caras o aristas: se
+                  activa antes de seleccionar. */}
+              {(faceSelectionTarget === 'cara' ||
+                faceSelectionTarget === 'segmento') && (
                 <button
                   data-testid="sel-anillos-btn"
                   onClick={() => setAnillosCaras((v) => !v)}
@@ -16558,7 +16807,11 @@ pluginTracks,
                       ? 'bg-cyan-500/20 text-cyan-100 border border-cyan-500/40'
                       : 'bg-black/40 text-muted-foreground hover:text-foreground border border-white/10'
                   }`}
-                  title={t('editor3D.ringsSelTitle')}
+                  title={
+                    faceSelectionTarget === 'cara'
+                      ? t('editor3D.ringsSelTitle')
+                      : t('editor3D.ringsSelEdgesTitle')
+                  }
                 >
                   {t('editor3D.ringsSel')}
                 </button>

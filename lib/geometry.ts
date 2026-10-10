@@ -975,6 +975,9 @@ export interface AnillosMalla {
   celdas: CeldaAnillo[];
   /** Borde lógico → caras que lo tocan (para cruzar de celda en celda). */
   bordeAFaces: Map<string, number[]>;
+  /** Índice lógico de cada vértice ORIGINAL (los duplicados por posición
+   *  comparten el mismo índice). Para mapear la arista apuntada al canon. */
+  canonDe: Int32Array;
   /** Posición representativa de cada vértice lógico (para proyectar). */
   canonPos: Vertex3D[];
 }
@@ -1255,7 +1258,96 @@ export function construirAnillos(mesh: Mesh): AnillosMalla | null {
     }
   }
 
-  return { faceACelda, celdas, bordeAFaces, canonPos };
+  return { faceACelda, celdas, bordeAFaces, canonDe, canonPos };
+}
+
+/**
+ * Bordes del BUCLE de aristas que pasa por `bordeCanon` (clave lógica
+ * «p-q») dentro de la topología de anillos: es el mismo recorrido de banda
+ * que `carasAnilloDe` pero coleccionando, en cada celda visitada, las
+ * aristas de su CLASE BLOQUEADA — el anillo de aristas paralelas al borde
+ * apuntado. Apuntar a un borde horizontal da la circunferencia completa de
+ * ese nivel; a uno vertical, el meridiano entero. Devuelve claves lógicas
+ * «a-b»; si el bucle de la partida solo contiene una arista (borde suelto,
+ * casquete de polo) no hay anillo útil y devuelve null.
+ */
+export function bordesAnilloDe(
+  malla: AnillosMalla,
+  bordeCanon: string,
+  claseBloqueo: 0 | 1
+): string[] | null {
+  // Celda de arranque: una cuyo contorno incluya el borde en la CLASE
+  // bloqueada dada (los vecinos comparten la misma clase; si ninguna celda
+  // lo trae ahí, el borde no pertenece a ninguna banda).
+  let celda0 = -1;
+  for (const f of malla.bordeAFaces.get(bordeCanon) || []) {
+    const c = malla.faceACelda[f];
+    if (c >= 0 && malla.celdas[c].clases[claseBloqueo].includes(bordeCanon)) {
+      celda0 = c;
+      break;
+    }
+  }
+  if (celda0 < 0) return null;
+
+  const celdas = malla.celdas;
+  const visitadas = new Set<number>([celda0]);
+  const bordes = new Set<string>([bordeCanon]);
+  const cola: Array<{ celda: number; clase: 0 | 1 }> = [
+    { celda: celda0, clase: claseBloqueo },
+  ];
+  while (cola.length > 0) {
+    const { celda, clase } = cola.pop()!;
+    const celdaAct = celdas[celda];
+    for (const borde of celdaAct.clases[clase]) bordes.add(borde);
+    for (const borde of celdaAct.bordes) {
+      if (celdaAct.clases[clase].includes(borde)) continue;
+      const faces = malla.bordeAFaces.get(borde) || [];
+      for (const f of faces) {
+        const tc = malla.faceACelda[f];
+        if (tc === celda) continue;
+        if (tc >= 0 && !visitadas.has(tc)) {
+          visitadas.add(tc);
+          const c2 = celdas[tc];
+          cola.push({
+            celda: tc,
+            // La clase bloqueada de la celda vecina es la opuesta al borde
+            // de entrada (mismo criterio que `carasAnilloDe`).
+            clase: c2.clases[0].includes(borde) ? 1 : 0,
+          });
+        }
+      }
+    }
+  }
+
+  // Cada círculo de la banda por separado: la cadena conectada (por
+  // vértices lógicos compartidos) que contiene el borde de partida.
+  const vecinos = new Map<number, string[]>();
+  for (const borde of bordes) {
+    const [p, q] = borde.split('-').map(Number);
+    const lp = vecinos.get(p);
+    if (lp) lp.push(borde);
+    else vecinos.set(p, [borde]);
+    const lq = vecinos.get(q);
+    if (lq) lq.push(borde);
+    else vecinos.set(q, [borde]);
+  }
+  const cadena: string[] = [];
+  const visitadosB = new Set<string>([bordeCanon]);
+  const pila = [bordeCanon];
+  while (pila.length > 0) {
+    const b = pila.pop()!;
+    cadena.push(b);
+    const [p, q] = b.split('-').map(Number);
+    for (const pu of [p, q]) {
+      for (const nb of vecinos.get(pu) || []) {
+        if (!visitadosB.has(nb)) {
+          visitadosB.add(nb);
+          pila.push(nb);
+        }
+      }
+    }
+  }
+  return cadena.length > 1 ? cadena.sort() : null;
 }
 
 /**

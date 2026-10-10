@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import Viewer3D, { type ObjectTransform, type GizmoMode, type ExtrusionCtrlSubSel } from '@/components/viewer-3d';
+import Viewer3D, { type ObjectTransform, type GizmoMode, type ExtrusionCtrlSubSel, type VistaModo } from '@/components/viewer-3d';
 import type { TextureMaterialParams } from '@/lib/geometry';
 import type { EfectoObjeto } from '@/lib/efectos-objeto';
 import { PanelButtons } from '@/components/editor/Editor3D';
@@ -60,11 +60,25 @@ interface ViewerPanelProps {
     faceSelectionTarget?: 'cara' | 'vertice' | 'segmento';
     /** Modo ANILLOS de caras (botón junto a Mover/Extrudir). */
     anillosCaras?: boolean;
+    /** Deformador directo en VISTA PREVIA (lavado gris + contorno cage). */
+    deformadorActivo?: {
+      tipo: string;
+      params: Record<string, number | string | boolean>;
+      tick?: number;
+      caja?: {
+        min: { x: number; y: number; z: number };
+        max: { x: number; y: number; z: number };
+      } | null;
+    } | null;
     /** Ctrl + arrastre de ESCALA en la sub-selección = extrudir la copia
      *  (anillos vecinos intactos); null si no se puede. */
     onCtrlEscalarSubSel?: () => ExtrusionCtrlSubSel | null;
     faceSelectVisibleOnly?: boolean;
     wireframeOffSignal?: number;
+    /** Modo de visualización GLOBAL de las ventanas 3D (compartido por las cuatro). */
+    vistaModo?: VistaModo;
+    /** Cambia el modo de visualización global. */
+    onVistaModoChange?: (m: VistaModo) => void;
     selectedFaceIds?: number[];
     onFaceSelectionChange?: (faceIds: number[]) => void;
     selectedVertexIds?: number[];
@@ -221,8 +235,11 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
     faceSelectionTool,
     faceSelectionTarget,
     anillosCaras,
+    deformadorActivo,
     faceSelectVisibleOnly,
     wireframeOffSignal,
+    vistaModo,
+    onVistaModoChange,
     selectedFaceIds,
     onFaceSelectionChange,
     selectedVertexIds,
@@ -482,6 +499,19 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
             REC
           </button>
         )}
+        {vk === '3d' && vistaModo && (
+          <select
+            value={vistaModo}
+            onChange={(e) => onVistaModoChange?.(e.target.value as VistaModo)}
+            title={t('editor3D.vistaModoTitle')}
+            data-testid={`vista-modo-${viewName}`}
+            className="px-1 py-0.5 rounded bg-black/40 border border-white/10 text-[10px] text-foreground cursor-pointer"
+          >
+            <option value="textura">{t('editor3D.vistaModoTextura')}</option>
+            <option value="alambre">{t('editor3D.vistaModoAlambre')}</option>
+            <option value="gris">{t('editor3D.vistaModoGris')}</option>
+          </select>
+        )}
       </div>
       <PanelButtons
         onPan={(dx: number, dy: number) => pan3D(viewName, dx * 0.02, dy * 0.02)}
@@ -516,8 +546,10 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
            faceSelectionTool={faceSelectionTool}
            faceSelectionTarget={faceSelectionTarget}
            anillosCaras={anillosCaras}
+           deformadorActivo={deformadorActivo}
            faceSelectVisibleOnly={faceSelectVisibleOnly}
            wireframeOffSignal={wireframeOffSignal}
+           vistaModo={vistaModo}
            selectedFaceIds={selectedFaceIds}
            onFaceSelectionChange={onFaceSelectionChange}
            selectedVertexIds={selectedVertexIds}

@@ -32,7 +32,9 @@ import {
   construirAnillos,
   carasAnilloDe,
   extremosBordeAnillo,
+  bordesAnilloDe,
 } from '@/lib/geometry';
+import { aplicarDeformador } from '@/lib/deformadores';
 import { aplicarMaterialCreado, limpiarExtrasCreados } from '@/lib/texture-generator';
 import {
    evaluateCameraKeyframes,
@@ -72,7 +74,6 @@ import {
   Box,
   Grid3x3,
   Crosshair,
-  Spline,
   Camera,
   Sparkles,
   Sparkle,
@@ -350,10 +351,28 @@ interface Viewer3DProps {
      *  anillo completo de caras que pasa por el borde apuntado (los botones
      *  junto a Mover/Extrudir lo conmutan). */
     anillosCaras?: boolean;
+    /** Deformador directo en VISTA PREVIA: el objeto se grisáceo (lavado
+     *  compartido con el modo sub-selección), la malla llega ya deformada
+     *  (el editor la envuelve con aplicarDeformador) y alrededor aparece
+     *  el contorno de líneas de la caja deformada. */
+    deformadorActivo?: {
+      tipo: string;
+      params: PluginParams;
+      /** Nº que cambia aunque los params y la caja no (reconstruir). */
+      tick?: number;
+      /** Caja envolvente de la malla SIN deformar (para la cage del
+       *  contorno). Ausente = se deduce de la malla actual. */
+      caja?: {
+        min: { x: number; y: number; z: number };
+        max: { x: number; y: number; z: number };
+      } | null;
+    } | null;
     /** Solo capturar lo visible (caras frontales, no lo que está detrás) */
     faceSelectVisibleOnly?: boolean;
     /** Al incrementarse, apaga la vista de alambre (fin del ciclo de textura por caras) */
     wireframeOffSignal?: number;
+    /** Modo de visualización compartido por TODAS las ventanas 3D (el panel lo manda igual a las cuatro). */
+    vistaModo?: VistaModo;
     /** Índices de caras seleccionadas en el modo de selección de caras */
     selectedFaceIds?: number[];
     /** Notifica al padre del cambio en la selección de caras */
@@ -722,6 +741,15 @@ function aplicarModoPlano(raiz: THREE.Object3D): void {
     if (!(o instanceof THREE.Mesh)) return;
     if ((o.userData as Record<string, unknown>).__plano) return;
     const or = o.material;
+    // [zeus-debug] TEMPORAL v2: qué material se aplana en cada ventana 2D.
+    const matPrueba: THREE.MeshStandardMaterial | undefined = Array.isArray(or)
+      ? (or[0] as THREE.MeshStandardMaterial)
+      : (or as THREE.MeshStandardMaterial);
+    console.log('[zeus-debug] aplano:', JSON.stringify({
+      color: matPrueba?.color?.getHexString?.() ?? '(n/d)',
+      vertexColors: matPrueba?.vertexColors ?? null,
+      hayMap: !!matPrueba?.map,
+    }));
     MATERIALES_ORIGINALES.set(o, or);
     const base = Array.isArray(or) ? or : [or];
     const planos = base.map((m) =>
@@ -748,6 +776,185 @@ function aplicarModoPlano(raiz: THREE.Object3D): void {
     o.material = Array.isArray(or) ? planos : planos[0];
     (o.userData as Record<string, unknown>).__plano = true;
   });
+}
+
+/** LAVADO GRIS compartido del modo sub-selección y del deformador en
+ *  vista previa: TODA la escena pasa a gris liso, sin textura — cada
+ *  objeto pierde su color para que hover/selección/contorno se lean
+ *  limpios. Además la superficie se empuja una pizca hacia atrás
+ *  (polygonOffset) para que los resaltes coplanares ganen el test de
+ *  profundidad. La apariencia original queda guardada en userData
+ *  (`__ovApariencia`) y `restaurarGrises` la recupera al salir. */
+function lavadoGrises(
+  raiz: THREE.Object3D,
+  objetivo: string,
+  incluirDuplicados = false
+): void {
+  raiz.traverse((o) => {
+    if (!(o instanceof THREE.Mesh)) return;
+    if (o.renderOrder >= 990) return; // overlays/guías: jamás
+    if (o.userData?.cameraBodyActive) return;
+    // Los duplicados de escena se grisán solo cuando el modo de vista
+    // global «gris con aristas» lo pide (incluirDuplicados).
+    if (!incluirDuplicados && o.userData?.sceneObjectDuplicate) return;
+    let padre: THREE.Object3D | null = o.parent;
+    while (padre && padre !== raiz) {
+      if (padre.userData?.cameraBodyActive) return;
+      if (!incluirDuplicados && padre.userData?.sceneObjectDuplicate) return;
+      padre = padre.parent;
+    }
+    const matsW = Array.isArray(o.material) ? o.material : [o.material];
+    for (const mat of matsW) {
+      const matU = mat as THREE.MeshStandardMaterial & {
+        userData: Record<string, unknown>; polygonOffset: boolean;
+      };
+      if (!matU || !matU.userData) continue;
+      if (matU.userData.__ovPO !== true) {
+        if (!matU.userData.__ovApariencia) {
+          // Primera vez en el modo: guardar la apariencia.
+          matU.userData.__ovApariencia = {
+            map: 'map' in matU ? matU.map : undefined,
+            color: 'color' in matU && matU.color ? matU.color.getHex() : null,
+          };
+        }
+        if ('map' in matU && matU.map) {
+          matU.map = null;
+          matU.needsUpdate = true;
+        }
+        if ('color' in matU && matU.color) matU.color.setHex(0xd9d9d9);
+        matU.needsUpdate = true;
+      }
+      matU.polygonOffset = true;
+      // Con segmentos el resalte coplanar pierde el test de
+      // profundidad con empuje mínimo: más empuje en ambos.
+      matU.polygonOffsetFactor = objetivo === 'segmento' ? 3 : 1;
+      matU.polygonOffsetUnits = objetivo === 'segmento' ? 4 : 1;
+      matU.userData.__ovPO = true;
+    }
+  });
+}
+
+/** Restaura la apariencia guardada por `lavadoGrises` (gris +
+ *  polygonOffset; en esos modos se grisaron todas). */
+function restaurarGrises(raiz: THREE.Object3D): void {
+  raiz.traverse((o) => {
+    if (!(o instanceof THREE.Mesh) || !o.material) return;
+    const matsPO = Array.isArray(o.material) ? o.material : [o.material];
+    for (const mat of matsPO) {
+      const matU = mat as THREE.MeshStandardMaterial & { userData: Record<string, unknown>; polygonOffset: boolean };
+      if (!matU || !matU.userData || matU.userData.__ovPO !== true) continue;
+      const guardado = matU.userData.__ovApariencia as { map?: THREE.Texture | null; color?: number | null } | undefined;
+      if (guardado) {
+        if (matU.map !== guardado.map) { matU.map = guardado.map ?? null; matU.needsUpdate = true; }
+        if (matU.color && typeof guardado.color === 'number') matU.color.setHex(guardado.color);
+      }
+      matU.polygonOffset = false;
+      delete matU.userData.__ovPO;
+      delete matU.userData.__ovApariencia;
+    }
+  });
+}
+
+/** ARISTAS NEGRAS del modo de vista «gris con aristas»: un LineSegments
+ *  hijo de cada malla (hereda su transformada). Las líneas NO son `Mesh`,
+ *  así que lavadoGrises/restaurarGrises las saltan solas; renderOrder 990
+ *  las deja por encima de las mallas lavadas y bajo los resaltes (992+),
+ *  con depthTest ON para que las aristas ocultas no se trasluzcan.
+ *  Idempotente: solo añade donde aún no hay arista marcada — se
+ *  auto-repara cada fotograma (malla principal, duplicados y
+ *  reconstrucciones nuevas).
+ *
+ *  Para dibujar TODOS los segmentos (no solo pliegues/silueta, que es lo
+ *  que EdgesGeometry filtra) prefiere las CARAS LÓGICAS de la malla: la
+ *  del objeto principal (mallaLogica) o la que viaja en
+ *  `userData.__zeusMalla` de los duplicados (la deja buildSnapshotObjectVisual).
+ *  Sin malla lógica: fallback WireframeGeometry (todas las aristas del
+ *  triángulos). */
+function aristasDeMallaLogica(malla: Mesh): THREE.BufferGeometry {
+  // Duplicado por POSICIÓN (las mallas .zeus no comparten índices): las
+  // aristas coincidentes se dibujan una sola vez.
+  const canon = new Map<string, { i: number; v: Vertex3D }>();
+  const canonDe = (v: Vertex3D) => {
+    const k = `${Math.round(v.x * 1e5)}|${Math.round(v.y * 1e5)}|${Math.round(v.z * 1e5)}`;
+    let c = canon.get(k);
+    if (!c) {
+      c = { i: canon.size, v };
+      canon.set(k, c);
+    }
+    return c.i;
+  };
+  const vistas = new Set<string>();
+  const puntos: number[] = [];
+  for (const face of malla.faces) {
+    if (face.length < 2) continue;
+    for (let i = 0; i < face.length; i++) {
+      const va = malla.vertices[face[i]];
+      const vb = malla.vertices[face[(i + 1) % face.length]];
+      if (!va || !vb) continue;
+      if (va.x === vb.x && va.y === vb.y && va.z === vb.z) continue;
+      const ia = canonDe(va);
+      const ib = canonDe(vb);
+      if (ia === ib) continue;
+      const key = ia < ib ? `${ia}-${ib}` : `${ib}-${ia}`;
+      if (vistas.has(key)) continue;
+      vistas.add(key);
+      puntos.push(va.x, va.y, va.z, vb.x, vb.y, vb.z);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(puntos), 3));
+  return geo;
+}
+
+function aplicarAristasGris(
+  raiz: THREE.Object3D,
+  mallaLogica?: Mesh | null,
+  meshPrincipal?: THREE.Object3D | null
+): void {
+  raiz.traverse((o) => {
+    if (!(o instanceof THREE.Mesh)) return;
+    if (o.renderOrder >= 990) return;
+    if (o.userData?.cameraBodyActive) return;
+    let padre: THREE.Object3D | null = o.parent;
+    let malla: Mesh | null | undefined = null;
+    while (padre && padre !== raiz) {
+      if (padre.userData?.cameraBodyActive) return;
+      if (malla == null && padre.userData?.__zeusMalla) {
+        malla = padre.userData.__zeusMalla as Mesh;
+      }
+      padre = padre.parent;
+    }
+    if (malla == null && o === meshPrincipal) malla = mallaLogica ?? null;
+    // Ya tiene sus aristas del modo: nada que hacer.
+    if (o.children.some((c) => c.userData?.__aristasVistaGris)) return;
+    const geo =
+      malla && malla.faces.length > 0 && malla.vertices.length > 0
+        ? aristasDeMallaLogica(malla)
+        : new THREE.WireframeGeometry(o.geometry);
+    const lineas = new THREE.LineSegments(
+      geo,
+      new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.9 })
+    );
+    lineas.userData.__aristasVistaGris = true;
+    lineas.renderOrder = 990;
+    // Las líneas no participan del raycast: la selección sigue leyendo la malla.
+    lineas.raycast = () => {};
+    o.add(lineas); // hijo de la malla: hereda posición/giro/escala
+  });
+}
+
+/** Quita (con dispose) todas las aristas marcadas del modo «gris». */
+function quitarAristasGris(raiz: THREE.Object3D): void {
+  const victimas: THREE.Object3D[] = [];
+  raiz.traverse((o) => {
+    if (o.userData?.__aristasVistaGris) victimas.push(o);
+  });
+  for (const v of victimas) {
+    v.parent?.remove(v);
+    const ls = v as THREE.LineSegments;
+    ls.geometry?.dispose();
+    (ls.material as THREE.Material | undefined)?.dispose?.();
+  }
 }
 
 /** Convierte una pose (posición cámara + foco target) en el estado
@@ -929,6 +1136,10 @@ export function buildSnapshotObjectVisual(
 ): THREE.Group {
   const group = new THREE.Group();
   if (!mesh.vertices.length || !mesh.faces.length) return group;
+  // La malla lógica viaja en userData: el barrido de aristas del modo
+  // «gris con aristas» la usa para dibujar TODOS los segmentos (caras
+  // lógicas, no solo pliegues de silueta).
+  group.userData.__zeusMalla = mesh;
 
   const faceColors = mesh.faceColors;
   const useFaceColors =
@@ -1295,6 +1506,11 @@ export function buildSnapshotObjectVisual(
 type GizmoAxis = 'x' | 'y' | 'z';
 
 export type GizmoMode = 'move' | 'rotate' | 'scale';
+
+/** Modo de visualización GLOBAL de las ventanas 3D: textura (normal),
+ *  alambre (segmentos) o gris con aristas (aspecto del lavado del
+ *  deformador, más los segmentos en negro). */
+export type VistaModo = 'textura' | 'alambre' | 'gris';
 
 type GizmoDrag = {
   /** Qué transform arrastra: el del objeto, el de la textura o el offset del gizmo */
@@ -2614,7 +2830,12 @@ function pickSubElemento(
   target: 'cara' | 'vertice' | 'segmento',
   visibleOnly: boolean,
   modoAnillos = false
-): { t: 'cara' | 'vertice' | 'segmento'; id: number | string; anillos?: number[] } | null {
+): {
+  t: 'cara' | 'vertice' | 'segmento';
+  id: number | string;
+  anillos?: number[];
+  anillosAristas?: string[];
+} | null {
   const raycasterPick = new THREE.Raycaster();
   const ndc = new THREE.Vector2(
     ((clientX - canvasRect.left) / canvasRect.width) * 2 - 1,
@@ -2797,6 +3018,50 @@ function pickSubElemento(
       clientX, clientY, pA.x, pA.y, pB.x, pB.y
     );
     if (dist < mejorEd) { mejorEd = dist; mejorKey = edge.key; }
+  }
+  // Modo anillos en ARISTAS (mismo criterio que el de caras): el BUCLE
+  // completo de la familia del borde apuntado — la topología de anillos
+  // recorre la banda cruzando la clase contraria y devuelve la cadena
+  // conectada de aristas de la clase del borde. Borde horizontal →
+  // circunferencia entera de su nivel; borde vertical → meridiano entero.
+  // Sin bucle (borde suelto, casquete de polo): la arista sola de siempre.
+  if (modoAnillos && mejorKey) {
+    const datosAnillos = construirAnillos(m);
+    const [paQ, qaQ] = mejorKey.split('-').map(Number);
+    const canonA = datosAnillos ? datosAnillos.canonDe[paQ] : -1;
+    const canonB = datosAnillos ? datosAnillos.canonDe[qaQ] : -1;
+    if (datosAnillos && canonA >= 0 && canonB >= 0 && canonA !== canonB) {
+      const claveCanon = canonA < canonB ? `${canonA}-${canonB}` : `${canonB}-${canonA}`;
+      let bucleCanon: string[] | null = null;
+      for (const clase of [0, 1] as const) {
+        bucleCanon = bordesAnilloDe(datosAnillos, claveCanon, clase);
+        if (bucleCanon) break;
+      }
+      if (bucleCanon) {
+        // Del bucle LÓGICO a las claves de selección del editor (índices
+        // ORIGINALES): cada arista de la malla cuyo par lógico esté en el
+        // bucle — mallas sin índices compartidos repiten vértices y la
+        // misma arista sale con claves varias.
+        const bucleSet = new Set(bucleCanon);
+        const claves: string[] = [];
+        for (const cara of m.faces) {
+          for (let j = 0; j < cara.length; j++) {
+            const va = cara[j];
+            const vb = cara[(j + 1) % cara.length];
+            const ca = datosAnillos.canonDe[va];
+            const cb = datosAnillos.canonDe[vb];
+            if (ca < 0 || cb < 0 || ca === cb) continue;
+            const kc = ca < cb ? `${ca}-${cb}` : `${cb}-${ca}`;
+            if (!bucleSet.has(kc)) continue;
+            const ko = va < vb ? `${va}-${vb}` : `${vb}-${va}`;
+            if (!claves.includes(ko)) claves.push(ko);
+          }
+        }
+        if (claves.length > 1) {
+          return { t: 'segmento', id: mejorKey, anillosAristas: claves };
+        }
+      }
+    }
   }
   return mejorKey ? { t: 'segmento', id: mejorKey } : null;
 }
@@ -3153,8 +3418,10 @@ export default function Viewer3D({
     faceSelectionTool,
     faceSelectionTarget,
     anillosCaras,
+    deformadorActivo,
     faceSelectVisibleOnly,
     wireframeOffSignal,
+    vistaModo,
     selectedFaceIds,
     onFaceSelectionChange,
     selectedVertexIds,
@@ -3420,6 +3687,10 @@ export default function Viewer3D({
     // Modo ANILLOS de caras (botón junto a Mover/Extrudir).
     const faceAnillosRef = useRef(anillosCaras ?? false);
     faceAnillosRef.current = anillosCaras ?? false;
+    // Deformador directo activo (comparte el lavado gris con el modo
+    // sub-selección; exclusividad de modos la garantiza el editor).
+    const deformadorActivoRef = useRef(deformadorActivo ?? null);
+    deformadorActivoRef.current = deformadorActivo ?? null;
     // Solo capturar elementos VISIBLES (caras frontales; vértices y
     // segmentos de caras frontales): sin esto un rectángulo atraviesa el
     // objeto y selecciona también lo que está detrás.
@@ -3473,6 +3744,10 @@ export default function Viewer3D({
       mesh: null,
       target: '',
     });
+    // Contorno de líneas del DEFORMADOR en vista previa (hijo de
+    // meshGroup: sigue el transform del objeto). renderOrder 992:
+    // sobrevive al lavado gris y al modo plano de las ventanas 2D.
+    const deformContornoRef = useRef<THREE.Group | null>(null);
     // Espejo de showLightHelpers para el bucle animate (ocultar/restaurar
     // los ayudantes de luz durante la exportación de vídeo).
     const showLightHelpersRef = useRef(showLightHelpers);
@@ -3674,16 +3949,25 @@ export default function Viewer3D({
      }
    }, [showGridProp, onShowGridChange, showGridInternal]);
   const [gridScale, setGridScale] = useState(1);
-  const [wireframe, setWireframe] = useState(false);
+  // Alambre LOCAL (herencia de la máquina antigua: ya nadie lo enciende a
+  // mano — el botón Spline pasó a ser el selector global del editor) O el
+  // modo global del selector: cualquiera de los dos manda.
+  const [wireframeLocal, setWireframeLocal] = useState(false);
   // (Ya NO se fuerza alambre ni vértices al entrar en el modo de
   // sub-selección: petición del usuario — el objeto se ve NORMAL y en gris
   // por el lavado del modo, sin vista de alambre ni puntos.)
-  // Señal externa para apagar el alambre (p. ej., tras asignar una textura
-  // por caras): sin ella, la textura asignada no se ve hasta pulsar a mano
-  // el botón «Vista de alambre».
+  // Señal externa para apagar el alambre local (p. ej., tras asignar una
+  // textura por caras): sin ella, la textura asignada no se ve hasta
+  // cambiar el modo de vista.
   useEffect(() => {
-    if (wireframeOffSignal) setWireframe(false);
+    if (wireframeOffSignal) setWireframeLocal(false);
   }, [wireframeOffSignal]);
+  // El modo de vista solo manda en ventanas 3D: las planas (modo plano)
+  // conservan su material básico de 2D.
+  const vistaModoEfectivo: VistaModo = flat2D ? 'textura' : vistaModo ?? 'textura';
+  const vistaModoRef = useRef<VistaModo>(vistaModoEfectivo);
+  vistaModoRef.current = vistaModoEfectivo;
+  const wireframe = wireframeLocal || vistaModoEfectivo === 'alambre';
   const [autoRotate, setAutoRotate] = useState(false);
   /** Firma del último estado de cámara que este visor EMITIÓ al padre.
    *  Sirve para no re-aplicar nuestro propio eco: applyCamera llama
@@ -3917,6 +4201,7 @@ export default function Viewer3D({
     t: 'cara' | 'vertice' | 'segmento';
     id: number | string;
     anillos?: number[];
+    anillosAristas?: string[];
   } | null>(null);
   const hoverKeyRef = useRef(''); // reconstruir el overlay solo al cambiar
   const lastHoverCheckRef = useRef(0); // throttle ~40 ms
@@ -4893,6 +5178,12 @@ export default function Viewer3D({
     meshGroup.add(faceGuideGroup);
     faceGuideRef.current = faceGuideGroup;
 
+    // Contorno del deformador en vista previa: también hijo de meshGroup.
+    const deformContornoGroup = new THREE.Group();
+    deformContornoGroup.visible = false;
+    meshGroup.add(deformContornoGroup);
+    deformContornoRef.current = deformContornoGroup;
+
     const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
     planeRef.current = plane;
 
@@ -5851,55 +6142,29 @@ export default function Viewer3D({
         // El cuerpo de la cámara-objeto no es una malla editable: ignora
         // cualquier hijo llamado 'mesh' que no lo sea de verdad.
         const meshObj = findMainMesh(meshGroupRef.current);
-        if (faceSelectModeRef.current && m && meshObj) {
-          // MODO SUB-SELECCIÓN (petición del usuario): TODA la escena pasa a
-          // gris liso, sin textura — cada objeto pierde su color y así el
-          // hover/selección se leen limpios sobre cualquier figura. Además la
-          // superficie se empuja una pizca hacia atrás (polygonOffset) para
-          // que los resaltes coplanares ganen el test de profundidad. Al
-          // salir se restaura todo.
+        // LAVADO GRIS compartido: sub-selección, deformador en vista
+        // previa (exclusividad de modos la garantiza el editor) o el
+        // modo de vista global «gris con aristas».
+        const modoLavado =
+          faceSelectModeRef.current ||
+          !!deformadorActivoRef.current ||
+          vistaModoRef.current === 'gris';
+        if (modoLavado && m && meshObj) {
           const raizWash = meshGroupRef.current;
           if (raizWash) {
-            const objetivo = faceSelectionTargetRef.current;
-            raizWash.traverse((o) => {
-              if (!(o instanceof THREE.Mesh)) return;
-              if (o.renderOrder >= 990) return; // overlays/guías: jamás
-              if (o.userData?.sceneObjectDuplicate || o.userData?.cameraBodyActive) return;
-              let padre: THREE.Object3D | null = o.parent;
-              while (padre && padre !== raizWash) {
-                if (padre.userData?.sceneObjectDuplicate || padre.userData?.cameraBodyActive) return;
-                padre = padre.parent;
-              }
-              const matsW = Array.isArray(o.material) ? o.material : [o.material];
-              for (const mat of matsW) {
-                const matU = mat as THREE.MeshStandardMaterial & {
-                  userData: Record<string, unknown>; polygonOffset: boolean;
-                };
-                if (!matU || !matU.userData) continue;
-                if (matU.userData.__ovPO !== true) {
-                  if (!matU.userData.__ovApariencia) {
-                    // Primera vez en el modo: guardar la apariencia.
-                    matU.userData.__ovApariencia = {
-                      map: 'map' in matU ? matU.map : undefined,
-                      color: 'color' in matU && matU.color ? matU.color.getHex() : null,
-                    };
-                  }
-                  if ('map' in matU && matU.map) {
-                    matU.map = null;
-                    matU.needsUpdate = true;
-                  }
-                  if ('color' in matU && matU.color) matU.color.setHex(0xd9d9d9);
-                  matU.needsUpdate = true;
-                }
-                matU.polygonOffset = true;
-                // Con segmentos el resalte coplanar pierde el test de
-                // profundidad con empuje mínimo: más empuje en ambos.
-                matU.polygonOffsetFactor = objetivo === 'segmento' ? 3 : 1;
-                matU.polygonOffsetUnits = objetivo === 'segmento' ? 4 : 1;
-                matU.userData.__ovPO = true;
-              }
-            });
+            // El modo gris global incluye a los duplicados de escena y
+            // cuelga las aristas negras sobre cada malla (la principal
+            // usa la malla lógica: todos sus segmentos visibles).
+            const lavarDuplicados = vistaModoRef.current === 'gris';
+            lavadoGrises(raizWash, faceSelectionTargetRef.current, lavarDuplicados);
+            if (lavarDuplicados) aplicarAristasGris(raizWash, m, meshObj);
           }
+          // El contorno del deformador vive DENTRO del grupo de la malla
+          // actual: un remontaje puede dejarlo huérfano (re-adesar).
+          const contorno = deformContornoRef.current;
+          if (contorno && contorno.parent !== meshObj) meshObj.add(contorno);
+        }
+        if (faceSelectModeRef.current && m && meshObj) {
           const worldMatrix = meshObj.matrixWorld;
           const target = faceSelectionTargetRef.current;
 
@@ -5991,10 +6256,13 @@ export default function Viewer3D({
                 : hoverElementRef.current;
             // La firma del hover incluye el anillo (si el modo lo agrupa):
             // apuntar a OTRO borde de la misma cara cambia de anillo y el
-            // resalte tiene que reconstruirse.
+            // resalte tiene que reconstruirse. Igual con el bucle de
+            // aristas (modo anillos en el objetivo segmentos).
             const hovKey = hover
               ? `${hover.t}|${String(hover.id)}|${
                   'anillos' in hover && hover.anillos ? hover.anillos.join(',') : ''
+                }|${
+                  'anillosAristas' in hover && hover.anillosAristas ? hover.anillosAristas.join(',') : ''
                 }`
               : ''
             if (hovKey !== hoverKeyRef.current) {
@@ -6033,7 +6301,14 @@ export default function Viewer3D({
                   );
                   if (overlay) hovGr.add(overlay);
                 } else {
-                  const edgeGroup = getEdgeGroup(m, String(hover.id));
+                  // Modo anillos: resaltar el BUCLE completo que el pick
+                  // ya devolvió agrupado; si no viene, la línea de coplanares.
+                  const edgeGroup =
+                    'anillosAristas' in hover &&
+                    hover.anillosAristas &&
+                    hover.anillosAristas.length > 0
+                      ? hover.anillosAristas
+                      : getEdgeGroup(m, String(hover.id));
                   const overlay = buildEdgeSelectionOverlay(
                     m,
                     new Set(edgeGroup),
@@ -6110,24 +6385,19 @@ export default function Viewer3D({
 
           // Restaurar la apariencia de TODAS las mallas de la escena (gris +
           // polygonOffset del modo selección; en modo se grisaron todas).
+          // Con el deformador activo el gris se queda puesto: su lavado
+          // comparte las marcas __ovPO y el restore solo procede cuando
+          // NI UNO de los tres modos sigue activo (selección, deformador,
+          // modo de vista gris global) — y entonces también se quitan las
+          // aristas negras del modo gris.
           const raizOff = meshGroupRef.current;
-          if (raizOff) {
-            raizOff.traverse((o) => {
-              if (!(o instanceof THREE.Mesh) || !o.material) return;
-              const matsPO = Array.isArray(o.material) ? o.material : [o.material];
-              for (const mat of matsPO) {
-                const matU = mat as THREE.MeshStandardMaterial & { userData: Record<string, unknown>; polygonOffset: boolean };
-                if (!matU || !matU.userData || matU.userData.__ovPO !== true) continue;
-                const guardado = matU.userData.__ovApariencia as { map?: THREE.Texture | null; color?: number | null } | undefined;
-                if (guardado) {
-                  if (matU.map !== guardado.map) { matU.map = guardado.map ?? null; matU.needsUpdate = true; }
-                  if (matU.color && typeof guardado.color === 'number') matU.color.setHex(guardado.color);
-                }
-                matU.polygonOffset = false;
-                delete matU.userData.__ovPO;
-                delete matU.userData.__ovApariencia;
-              }
-            });
+          if (
+            raizOff &&
+            !deformadorActivoRef.current &&
+            vistaModoRef.current !== 'gris'
+          ) {
+            restaurarGrises(raizOff);
+            quitarAristasGris(raizOff);
           }
           // Only hide 3D overlay when NOT in face select mode
           if (faceSelectionOverlayRef.current) {
@@ -7314,6 +7584,7 @@ export default function Viewer3D({
             t: 'cara' | 'vertice' | 'segmento';
             id: number | string;
             anillos?: number[];
+            anillosAristas?: string[];
           } | null = null;
           if (mHover && meshObjHover && mHover.vertices.length > 0) {
             hoverNuevo = pickSubElemento(
@@ -8094,7 +8365,12 @@ export default function Viewer3D({
                 selectedVertexIdsRef.current = nuevos;
               } else {
                 const prev = selectedEdgeIdsRef.current ?? [];
-                const edgeGroup = getEdgeGroup(mDir!, String(elegido.id));
+                // Modo anillos: el clic elige el BUCLE completo que el
+                // hover ya señala; sin anillos, la línea de coplanares.
+                const edgeGroup =
+                  elegido.anillosAristas && elegido.anillosAristas.length > 0
+                    ? elegido.anillosAristas
+                    : getEdgeGroup(mDir!, String(elegido.id));
                 const yaEstaba = edgeGroup.some(e => prev.includes(e));
                 const nuevos = toggle
                   ? yaEstaba
@@ -9790,6 +10066,17 @@ export default function Viewer3D({
     // Busca esta parte donde se maneja mesh.texture y reemplázala:
     let cancelled = false;
 
+    // [zeus-debug] TEMPORAL (diagnóstico color tras editar polígonos):
+    // qué malla y qué rama de render entra en cada reconstrucción.
+    console.log('[zeus-debug] reconstrucción:', JSON.stringify({
+      caras: mesh.faces.length, verts: mesh.vertices.length,
+      faceColors: mesh.faceColors ? Array.from(new Set((mesh.faceColors as (string | null)[]).filter(Boolean) as string[])) : null,
+      numFaceColores: (mesh.faceColors ?? []).filter(Boolean).length,
+      texturasPorCara: (mesh.faceTextures ?? []).filter(Boolean).length,
+      gruposTextura: (mesh.faceTextureGroups ?? []).filter(Boolean).length,
+      texture: !!mesh.texture, bump: !!mesh.bumpTexture, smoothShading, flat2D,
+    }));
+
     // --- SI HAY TEXTURA, CONSTRUIR MALLA CON TEXTURA ---
     // También entra aquí una malla sin textura general pero con texturas
     // por cara (faceTextures): el material base queda sin mapa. Las texturas
@@ -9804,6 +10091,7 @@ export default function Viewer3D({
         tieneTexturasPorCara) &&
       !wireframe
     ) {
+      console.log('[zeus-debug] rama: textura');
       // Limpiar grupo
       for (const child of [...meshGroup.children]) {
         if (
@@ -10216,6 +10504,7 @@ export default function Viewer3D({
     // quedan con el último color escrito, imperceptible en letras
     // monocromas (todo del mismo color) y en emojis (regiones grandes).
     if (smoothShading) {
+      console.log('[zeus-debug] rama: suave');
       const positions: number[] = [];
       const index: number[] = [];
       const uvs: number[] = [];
@@ -10516,9 +10805,28 @@ export default function Viewer3D({
           }
         }
       }
+      // [zeus-debug] TEMPORAL: material y colorAttribute que quedaron en la
+      // escena tras las ramas textura/suave (ambas salen por este return). v2
+      const principal = findMainMesh(meshGroup);
+      if (principal) {
+        const materialPrincipal: THREE.MeshStandardMaterial | undefined = Array.isArray(
+          principal.material,
+        )
+          ? (principal.material[0] as THREE.MeshStandardMaterial)
+          : (principal.material as THREE.MeshStandardMaterial);
+        console.log('[zeus-debug] fin:', JSON.stringify({
+          colorMat: materialPrincipal?.color?.getHexString?.() ?? '(n/d)',
+          vertexColors: materialPrincipal?.vertexColors ?? null,
+          hayAttrColor: !!principal.geometry?.getAttribute('color'),
+          flat2D,
+        }));
+      } else {
+        console.log('[zeus-debug] fin: (sin malla principal)');
+      }
       return;
     }
 
+    console.log('[zeus-debug] rama: plana');
     const positions: number[] = [];
     const normals: number[] = [];
     const colorAttr: number[] = [];
@@ -10643,6 +10951,24 @@ export default function Viewer3D({
       });
       const wireOverlay = new THREE.LineSegments(edges, lineMat);
       meshGroup.add(wireOverlay);
+    }
+
+    // [zeus-debug] TEMPORAL: material y colorAttribute que quedaron en la
+    // escena tras esta reconstrucción v2.
+    const principal = findMainMesh(meshGroup);
+    if (principal) {
+      const materialPrincipal: THREE.MeshStandardMaterial | undefined = Array.isArray(
+        principal.material,
+      )
+        ? (principal.material[0] as THREE.MeshStandardMaterial)
+        : (principal.material as THREE.MeshStandardMaterial);
+      console.log('[zeus-debug] fin:', JSON.stringify({
+        colorMat: materialPrincipal?.color?.getHexString?.() ?? '(n/d)',
+        vertexColors: materialPrincipal?.vertexColors ?? null,
+        hayAttrColor: !!principal.geometry?.getAttribute('color'),
+      }));
+    } else {
+      console.log('[zeus-debug] fin: (sin malla principal)');
     }
   }, [
     mesh,
@@ -10997,6 +11323,15 @@ export default function Viewer3D({
         // instantánea ni figura viva el duplicado queda vacío: ya no se
         // clona la figura principal como "fantasma".
         if (object.mesh && object.mesh.vertices.length > 0) {
+          // [zeus-debug] TEMPORAL: qué objeto entra como duplicado y con qué
+          // colores por cara. v2
+          console.log('[zeus-debug] duplicado:', JSON.stringify({
+            id: object.id,
+            caras: object.mesh.faces.length,
+            faceColors: object.mesh.faceColors ? Array.from(new Set((object.mesh.faceColors as (string | null)[]).filter(Boolean) as string[])) : null,
+            numFaceColores: (object.mesh.faceColors ?? []).filter(Boolean).length,
+            smooth: object.smooth ?? false,
+          }));
           duplicate.add(
             buildSnapshotObjectVisual(
               object.mesh,
@@ -11164,6 +11499,126 @@ export default function Viewer3D({
     smoothShading,
     textureProjection,
     ]);
+
+  // --- Contorno del DEFORMADOR en vista previa -----------------------
+  // Caja envolvente ORIGINAL (16 esquinas → 12 aristas muestreadas)
+  // deformada con el MISMO deformador que la malla: sus polilíneas
+  // «cage» envuelven al objeto ya deformado. renderOrder 992: el lavado
+  // gris y el modo plano de las ventanas 2D no la tocan.
+  const contornoParamsClave = deformadorActivo
+    ? JSON.stringify(deformadorActivo.params)
+    : '';
+  useEffect(() => {
+    const grupo = deformContornoRef.current;
+    if (!grupo) return;
+    const activo = deformadorActivoRef.current;
+    while (grupo.children.length) {
+      const hijo = grupo.children[0] as THREE.LineSegments;
+      grupo.remove(hijo);
+      hijo.geometry?.dispose?.();
+      (hijo.material as THREE.Material)?.dispose?.();
+    }
+    if (!activo) {
+      grupo.visible = false;
+      return;
+    }
+    // Caja ORIGINAL: la manda el editor (bbox de la malla sin deformar).
+    // Sin caja, la caja se deduce de la malla actual y se muestra recta.
+    const cajaIn = activo.caja;
+    const base = meshRef.current;
+    let minx = Infinity; let miny = Infinity; let minz = Infinity;
+    let maxx = -Infinity; let maxy = -Infinity; let maxz = -Infinity;
+    if (cajaIn) {
+      minx = cajaIn.min.x; miny = cajaIn.min.y; minz = cajaIn.min.z;
+      maxx = cajaIn.max.x; maxy = cajaIn.max.y; maxz = cajaIn.max.z;
+    } else {
+      for (const v of base.vertices) {
+        if (v.x < minx) minx = v.x;
+        if (v.y < miny) miny = v.y;
+        if (v.z < minz) minz = v.z;
+        if (v.x > maxx) maxx = v.x;
+        if (v.y > maxy) maxy = v.y;
+        if (v.z > maxz) maxz = v.z;
+      }
+    }
+    if (!Number.isFinite(minx) || !Number.isFinite(maxy)) {
+      grupo.visible = false;
+      return;
+    }
+    const margenX = (maxx - minx) * 0.03 || 0.01;
+    const margenY = (maxy - miny) * 0.03 || 0.01;
+    const margenZ = (maxz - minz) * 0.03 || 0.01;
+    const x0 = minx - margenX, x1 = maxx + margenX;
+    const y0 = miny - margenY, y1 = maxy + margenY;
+    const z0 = minz - margenZ, z1 = maxz + margenZ;
+    // 12 aristas x 24 muestras.
+    const MUESTRAS = 24;
+    const esquinas: [{ x: number; y: number; z: number }, { x: number; y: number; z: number }][] = [
+      [{ x: x0, y: y0, z: z0 }, { x: x1, y: y0, z: z0 }],
+      [{ x: x0, y: y0, z: z1 }, { x: x1, y: y0, z: z1 }],
+      [{ x: x0, y: y1, z: z0 }, { x: x1, y: y1, z: z0 }],
+      [{ x: x0, y: y1, z: z1 }, { x: x1, y: y1, z: z1 }],
+      [{ x: x0, y: y0, z: z0 }, { x: x0, y: y0, z: z1 }],
+      [{ x: x1, y: y0, z: z0 }, { x: x1, y: y0, z: z1 }],
+      [{ x: x0, y: y1, z: z0 }, { x: x0, y: y1, z: z1 }],
+      [{ x: x1, y: y1, z: z0 }, { x: x1, y: y1, z: z1 }],
+      [{ x: x0, y: y0, z: z0 }, { x: x0, y: y1, z: z0 }],
+      [{ x: x1, y: y0, z: z0 }, { x: x1, y: y1, z: z0 }],
+      [{ x: x0, y: y0, z: z1 }, { x: x0, y: y1, z: z1 }],
+      [{ x: x1, y: y0, z: z1 }, { x: x1, y: y1, z: z1 }],
+    ];
+    const muestras: Vertex3D[] = [];
+    const rangos: Array<[number, number]> = [];
+    for (const [A, B] of esquinas) {
+      const ini = muestras.length;
+      for (let i = 0; i < MUESTRAS; i++) {
+        const t = i / (MUESTRAS - 1);
+        muestras.push({
+          x: A.x + (B.x - A.x) * t,
+          y: A.y + (B.y - A.y) * t,
+          z: A.z + (B.z - A.z) * t,
+        });
+      }
+      rangos.push([ini, muestras.length - 1]);
+    }
+    // Deformar la cage con el MISMO deformador (así la caja curvada de
+    // «Doblar» envuelve al objeto curvado). Si el deformador cambia el
+    // número de vértices (no debería con faces: []) o no existe, queda
+    // la caja recta.
+    let deformadas = muestras;
+    try {
+      const prueba = aplicarDeformador(activo.tipo, { vertices: muestras, faces: [] }, activo.params);
+      if (prueba.vertices.length === muestras.length) deformadas = prueba.vertices;
+    } catch { /* caja recta como reserva */ }
+    const pares: number[] = [];
+    for (const [ini, fin] of rangos) {
+      for (let i = ini; i < fin; i++) {
+        pares.push(deformadas[i].x, deformadas[i].y, deformadas[i].z);
+        pares.push(deformadas[i + 1].x, deformadas[i + 1].y, deformadas[i + 1].z);
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pares, 3));
+    const mat = new THREE.LineBasicMaterial({
+      color: 0xffd34d,
+      toneMapped: false,
+      depthWrite: false,
+    });
+    const lineas = new THREE.LineSegments(geo, mat);
+    lineas.renderOrder = 992;
+    lineas.frustumCulled = false;
+    grupo.add(lineas);
+    grupo.visible = true;
+    // Si meshGroup se reconstruyó (remontaje del visor), re-adosar.
+    const raiz = meshGroupRef.current;
+    if (raiz && grupo.parent !== raiz) raiz.add(grupo);
+  }, [
+    deformadorActivo?.tipo,
+    deformadorActivo?.tick,
+    contornoParamsClave,
+    deformadorActivo?.caja,
+    mesh,
+  ]);
 
   // --- Exclusión de luces por objeto (luz ambiente y focos) ----------
   // Excluir un objeto de una luz NO puede hacerse con capas de three:
@@ -12336,6 +12791,7 @@ uniform vec3 sombraFocoPos[8];`
     const objectMotionPath = objectMotionPathRef.current;
     const faceSelectionOverlay = faceSelectionOverlayRef.current;
     const faceGuide = faceGuideRef.current;
+    const deformContorno = deformContornoRef.current;
     const textureHelperGroup = textureHelperGroupRef.current;
     const textureHelperGizmoGroup = textureHelperGizmoGroupRef.current;
     const latheAxis = latheAxisRef.current;
@@ -12343,6 +12799,7 @@ uniform vec3 sombraFocoPos[8];`
     const prevObjectMotionPathVisible = objectMotionPath?.group.visible ?? false;
     const prevFaceSelectionOverlayVisible = faceSelectionOverlay?.visible ?? false;
     const prevFaceGuideVisible = faceGuide?.visible ?? false;
+    const prevDeformContornoVisible = deformContorno?.visible ?? false;
     // Marcadores de focos de FX: ayudas de edición, fuera de la imagen.
     const anchorsFx = [...fxObjetosRef.current.values()].map((rt) => rt.anchorGroup);
     const prevAnchorsFxVisible = anchorsFx.map((g) => g.visible);
@@ -12353,6 +12810,7 @@ uniform vec3 sombraFocoPos[8];`
     if (objectMotionPath) objectMotionPath.group.visible = false;
     if (faceSelectionOverlay) faceSelectionOverlay.visible = false;
     if (faceGuide) faceGuide.visible = false;
+    if (deformContorno) deformContorno.visible = false;
     for (const g of anchorsFx) g.visible = false;
     if (textureHelperGroup) textureHelperGroup.visible = false;
     if (textureHelperGizmoGroup) textureHelperGizmoGroup.visible = false;
@@ -12363,6 +12821,9 @@ uniform vec3 sombraFocoPos[8];`
       smoothCapture &&
       !!meshGroup &&
       !wireframe &&
+      // El modo gris global se captura tal cual (cuerpo lavado + aristas
+      // negras): la reconstrucción suave lo sustituiría por la pieza lisa.
+      vistaModoRef.current !== 'gris' &&
       !currentMesh.texture &&
       currentMesh.vertices.length > 0;
 
@@ -12435,6 +12896,7 @@ uniform vec3 sombraFocoPos[8];`
     if (objectMotionPath) objectMotionPath.group.visible = prevObjectMotionPathVisible;
     if (faceSelectionOverlay) faceSelectionOverlay.visible = prevFaceSelectionOverlayVisible;
     if (faceGuide) faceGuide.visible = prevFaceGuideVisible;
+    if (deformContorno) deformContorno.visible = prevDeformContornoVisible;
     anchorsFx.forEach((g, i) => {
       g.visible = prevAnchorsFxVisible[i];
     });
@@ -12717,13 +13179,8 @@ uniform vec3 sombraFocoPos[8];`
               Círculos
             </span>
           </label>
-          <ToggleButton
-            active={wireframe}
-            onClick={() => setWireframe(!wireframe)}
-            title="Vista de alambre (segmentos)"
-          >
-            <Spline className="w-3.5 h-3.5" />
-</ToggleButton>
+          {/* La vista de alambre ahora vive en el selector global de modo
+              de vista de la cabecera del panel (Textura / Alambre / Gris). */}
           <ToggleButton
              active={gridValue}
              onClick={toggleGrid}
