@@ -96,6 +96,8 @@ import type {
      DeformadorTrack,
 } from '@/lib/animation';
 import { obtenerPlugin, type PluginParams } from '@/lib/plugins';
+import { muestrearSpline, type SplineEdicion, type SplineNode3D } from '@/lib/spline-3d';
+import { useI18n } from '@/lib/i18n';
 import { smoothVoxelMesh } from '@/lib/mesh-smooth';
 import { Slider } from '@/components/ui/slider';
 import {
@@ -417,6 +419,11 @@ interface Viewer3DProps {
        *  se ve normal, solo lleva el contorno alrededor). */
       soloContorno?: boolean;
     } | null;
+    /** Trazado SPLINE 3D en edición (botón Spline del editor): línea del
+     *  camino + marcadores de vértice arrastrables en las ventanas planas. */
+    splineEdicion?: SplineEdicion | null;
+    /** Malla EN VIVO del trazado spline: vista previa translúcida. */
+    splinePreview?: Mesh | null;
     /** Solo capturar lo visible (caras frontales, no lo que está detrás) */
     faceSelectVisibleOnly?: boolean;
     /** Al incrementarse, apaga la vista de alambre (fin del ciclo de textura por caras) */
@@ -794,15 +801,6 @@ function aplicarModoPlano(raiz: THREE.Object3D): void {
     if (!(o instanceof THREE.Mesh)) return;
     if ((o.userData as Record<string, unknown>).__plano) return;
     const or = o.material;
-    // [zeus-debug] TEMPORAL v2: qué material se aplana en cada ventana 2D.
-    const matPrueba: THREE.MeshStandardMaterial | undefined = Array.isArray(or)
-      ? (or[0] as THREE.MeshStandardMaterial)
-      : (or as THREE.MeshStandardMaterial);
-    console.log('[zeus-debug] aplano:', JSON.stringify({
-      color: matPrueba?.color?.getHexString?.() ?? '(n/d)',
-      vertexColors: matPrueba?.vertexColors ?? null,
-      hayMap: !!matPrueba?.map,
-    }));
     MATERIALES_ORIGINALES.set(o, or);
     const base = Array.isArray(or) ? or : [or];
     const planos = base.map((m) =>
@@ -3493,6 +3491,8 @@ export default function Viewer3D({
     faceSelectionTarget,
     anillosCaras,
     deformadorActivo,
+    splineEdicion = null,
+    splinePreview = null,
     faceSelectVisibleOnly,
     wireframeOffSignal,
     vistaModo,
@@ -3576,6 +3576,7 @@ export default function Viewer3D({
        onExportProgress,
        onExportComplete,
     }: Viewer3DProps) {
+  const { t } = useI18n();
   const mountRef = useRef<HTMLDivElement>(null);
   // Modo 2D (dibujo técnico): espejo para los cierres del efecto de setup.
   const flat2DRef = useRef(flat2D);
@@ -3768,6 +3769,26 @@ export default function Viewer3D({
     // sub-selección; exclusividad de modos la garantiza el editor).
     const deformadorActivoRef = useRef(deformadorActivo ?? null);
     deformadorActivoRef.current = deformadorActivo ?? null;
+    // Spline 3D en edición: refs para el overlay y el gestor de puntero
+    // (los gestos de clic/arrastre viven en listeners imperativos).
+    const splineEdicionRef = useRef(splineEdicion);
+    splineEdicionRef.current = splineEdicion;
+    const splinePreviewRef = useRef(splinePreview);
+    splinePreviewRef.current = splinePreview;
+    // Dibujo de la línea: BufferGeometry con las muestras del camino;
+    // preview: malla translúcida; marcadores: esferas por vértice.
+    const splineOverlayRef = useRef<{
+      group: THREE.Group;
+      line: THREE.Line;
+      markers: THREE.Group;
+    } | null>(null);
+    // Arrastre activo de un marcador del trazado: plano orto de la ventana
+    // (fijo en el eje que la vista no ve) + vértice arrastrado.
+    const splineDragRef = useRef<{
+      id: number;
+      plane: THREE.Plane;
+      eje: 'x' | 'y' | 'z';
+    } | null>(null);
     // Solo capturar elementos VISIBLES (caras frontales; vértices y
     // segmentos de caras frontales): sin esto un rectángulo atraviesa el
     // objeto y selecciona también lo que está detrás.
@@ -4039,9 +4060,11 @@ export default function Viewer3D({
   useEffect(() => {
     if (wireframeOffSignal) setWireframeLocal(false);
   }, [wireframeOffSignal]);
-  // El modo de vista solo manda en ventanas 3D: las planas (modo plano)
-  // conservan su material básico de 2D.
-  const vistaModoEfectivo: VistaModo = flat2D ? 'textura' : vistaModo ?? 'textura';
+  // El modo de vista manda en TODAS las ventanas: en las planas (modo
+  // plano) el gris es el mismo lavado (solo map/color, sin envMap/bumpMap
+  // — el material básico de 2D nunca los recibe) y el alambre es la
+  // propiedad wireframe del básico.
+  const vistaModoEfectivo: VistaModo = vistaModo ?? 'textura';
   const vistaModoRef = useRef<VistaModo>(vistaModoEfectivo);
   vistaModoRef.current = vistaModoEfectivo;
   const wireframe = wireframeLocal || vistaModoEfectivo === 'alambre';
@@ -5202,6 +5225,50 @@ export default function Viewer3D({
         group: objMotionPathGroup,
         tube: objMotionTube,
         handles: objMotionHandles,
+      };
+
+      // SPLINE 3D (editor): grupo persistente del trazado en edición —
+      // línea del camino (cian, siempre visible: depthTest false, como las
+      // asas del recorrido), marcadores-esfera por vértice (raycastables)
+      // y malla de vista previa translúcida. Materiales básicos también en
+      // las ventanas planas (aplicarModoPlano deja los marcados __plano).
+      const splineOverlayGroup = new THREE.Group();
+      splineOverlayGroup.name = 'splineEdicion';
+      splineOverlayGroup.visible = false;
+      scene.add(splineOverlayGroup);
+      const splineLine = new THREE.Line(
+        new THREE.BufferGeometry(),
+        new THREE.LineBasicMaterial({
+          color: 0x22d3ee,
+          transparent: true,
+          opacity: 0.95,
+          depthTest: false,
+          depthWrite: false,
+        })
+      );
+      splineLine.renderOrder = 995;
+      splineLine.raycast = () => {};
+      splineOverlayGroup.add(splineLine);
+      const splineMarkers = new THREE.Group();
+      splineOverlayGroup.add(splineMarkers);
+      const splinePreviewMesh = new THREE.Mesh(
+        new THREE.BufferGeometry(),
+        new THREE.MeshBasicMaterial({
+          color: 0x38bdf8,
+          transparent: true,
+          opacity: 0.32,
+          depthTest: false,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+        })
+      );
+      splinePreviewMesh.renderOrder = 990;
+      splinePreviewMesh.raycast = () => {};
+      splineOverlayGroup.add(splinePreviewMesh);
+      splineOverlayRef.current = {
+        group: splineOverlayGroup,
+        line: splineLine,
+        markers: splineMarkers,
       };
 
       const meshGroup = new THREE.Group();
@@ -6560,6 +6627,16 @@ export default function Viewer3D({
 
         // Update face selection overlay and HTML elements
         const m = meshRef.current;
+        // Modo 2D (dibujo técnico): materiales planos sin sombreado. Va
+        // ANTES del lavado gris para que el lavado (y su restaurar) se
+        // hagan SIEMPRE sobre los materiales básicos ya convertidos: si el
+        // gris lavara primero, aplicarModoPlano clonaría el material desde
+        // el estado ya gris (map=null, 0xd9d9d9) y la apariencia guardada
+        // quedaría atrapada en el material original — la ventana 2D
+        // jamás saldría del gris. Se repasa cada frame para cubrir las
+        // mallas reconstruidas; es idempotente (los meshes ya convertidos
+        // quedan marcados).
+        if (flat2DRef.current) aplicarModoPlano(scene);
         // El cuerpo de la cámara-objeto no es una malla editable: ignora
         // cualquier hijo llamado 'mesh' que no lo sea de verdad.
         const meshObj = findMainMesh(meshGroupRef.current);
@@ -6856,10 +6933,6 @@ export default function Viewer3D({
           faceSelectionPointsRef.current.length = 0;
           poligonoCerradaRef.current = null;
         }
-       // Modo 2D (dibujo técnico): materiales planos sin sombreado. Se
-       // repasa cada frame para cubrir las mallas reconstruidas; es
-       // idempotente (los meshes ya convertidos quedan marcados).
-       if (flat2DRef.current) aplicarModoPlano(scene);
        renderer.render(scene, camera);
 
        // Gizmo de ejes: se pinta en un viewport pequeño de la esquina
@@ -7343,6 +7416,32 @@ export default function Viewer3D({
        const rect = renderer.domElement.getBoundingClientRect();
        pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
        pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+      // SPLINE 3D: arrastre de un marcador del trazado. Solo toca los dos
+      // ejes de la ventana; el eje ausente queda fijo (su valor actual).
+      if (splineDragRef.current) {
+        const drag = splineDragRef.current;
+        raycasterRef.current.setFromCamera(pointerRef.current, camera);
+        const hit = new THREE.Vector3();
+        if (!raycasterRef.current.ray.intersectPlane(drag.plane, hit)) return;
+        const ed = splineEdicionRef.current;
+        const n = ed?.nodes.find((nn) => nn.id === drag.id);
+        if (ed?.onMove && n) {
+          const p = { x: n.p.x, y: n.p.y, z: n.p.z };
+          if (drag.eje === 'z') {
+            p.x = hit.x;
+            p.y = hit.y;
+          } else if (drag.eje === 'x') {
+            p.z = hit.z;
+            p.y = hit.y;
+          } else {
+            p.x = hit.x;
+            p.z = hit.z;
+          }
+          ed.onMove(drag.id, p);
+        }
+        return;
+      }
 
       // Modo grabación: marcar el arrastre como movimiento real (umbral
       // de 4 px) para no capturar un mero clic sin arrastre.
@@ -8376,6 +8475,66 @@ export default function Viewer3D({
       };
     };
 
+    // ─── SPLINE 3D: ayudantes de puntero ───────────────────────────────
+    // Raycast contra los marcadores del trazado. Devuelve id + posición.
+    const raycastSplineMarker = (
+      e: PointerEvent
+    ): { id: number; pos: THREE.Vector3 } | null => {
+      const overlay = splineOverlayRef.current;
+      if (!overlay || !overlay.group.visible) return null;
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      raycasterRef.current.setFromCamera(pointerRef.current, camera);
+      overlay.group.updateMatrixWorld(true);
+      const hits = raycasterRef.current.intersectObjects(
+        overlay.markers.children,
+        true
+      );
+      for (const h of hits) {
+        let obj: THREE.Object3D | null = h.object;
+        while (obj && obj.userData.splineNodeId === undefined) obj = obj.parent;
+        if (obj) {
+          return { id: obj.userData.splineNodeId as number, pos: h.point };
+        }
+      }
+      return null;
+    };
+    // Ventana orto: eje DOMINANTE de cámara→objetivo = el eje que la vista
+    // no ve (frente Z, costado X, arriba Y). El plano del trazado pasa por
+    // el objetivo con esa normal.
+    const splinePlanoVentana = (): {
+      normal: THREE.Vector3;
+      eje: 'x' | 'y' | 'z';
+    } => {
+      const dir = camera.position.clone().sub(controls.target);
+      const ax = Math.abs(dir.x);
+      const ay = Math.abs(dir.y);
+      const az = Math.abs(dir.z);
+      if (ax >= ay && ax >= az)
+        return { normal: new THREE.Vector3(1, 0, 0), eje: 'x' };
+      if (ay >= ax && ay >= az)
+        return { normal: new THREE.Vector3(0, 1, 0), eje: 'y' };
+      return { normal: new THREE.Vector3(0, 0, 1), eje: 'z' };
+    };
+    // Punto de MUNDO bajo el cursor en el plano del trazado de la ventana
+    // (el eje ausente nace en 0: frente z=0, costado x=0, arriba y=0).
+    const puntoSplineVentana = (): { x: number; y: number; z: number } | null => {
+      const info = splinePlanoVentana();
+      const plano = new THREE.Plane().setFromNormalAndCoplanarPoint(
+        info.normal,
+        new THREE.Vector3(0, 0, 0)
+      );
+      raycasterRef.current.setFromCamera(pointerRef.current, camera);
+      const hit = new THREE.Vector3();
+      if (!raycasterRef.current.ray.intersectPlane(plano, hit)) return null;
+      const p = { x: hit.x, y: hit.y, z: hit.z };
+      if (info.eje === 'x') p.x = 0;
+      else if (info.eje === 'y') p.y = 0;
+      else p.z = 0;
+      return p;
+    };
+
      const onPointerDown = (e: PointerEvent) => {
        if (placeTargetRef.current) {
          // Registrar el punto inicial: solo coloca si NO hubo arrastre
@@ -8383,6 +8542,42 @@ export default function Viewer3D({
          placeDownRef.current = { x: e.clientX, y: e.clientY };
          return;
        }
+
+      // SPLINE 3D: el gesto toca PRIMERO los marcadores del trazado
+      // (arrastrar un vértice) o, en ventanas planas, añade uno; así el
+      // gate se come el clic antes del raycast de objetos/gizmos y del
+      // manejo de cámara. En la ventana 3D libre sin marcador, el clic
+      // sigue su manejo normal (solo se selecciona/arrastra el trazado).
+      if (splineEdicionRef.current) {
+        const ed = splineEdicionRef.current;
+        const hit = raycastSplineMarker(e);
+        if (hit && e.button === 0) {
+          if (ed.onSelect && hit.id !== ed.activoId) ed.onSelect(hit.id);
+          // Arrastre sobre el plano orto de ESTA ventana: el eje que la
+          // vista no ve queda fijo en el del vértice (mover 2 ejes).
+          const info = splinePlanoVentana();
+          const punto = hit.pos.clone();
+          const normal = info.normal.clone();
+          const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
+            normal,
+            punto
+          );
+          splineDragRef.current = { id: hit.id, plane, eje: info.eje };
+          controls.enabled = false;
+          renderer.domElement.style.cursor = 'grabbing';
+          return;
+        }
+        if (flat2DRef.current) {
+          // Ventana plana SIN marcador: clic = añadir vértice en el plano
+          // de la vista (el eje ausente nace en 0).
+          if (e.button === 0 && ed.onAdd) {
+            const punto = puntoSplineVentana();
+            if (punto) ed.onAdd(punto);
+          }
+          return;
+        }
+        if (hit && e.button !== 0) return; // botón derecho sobre asa: pan
+      }
 
       // Modo grabación: armar el posible arrastre de cámara AL PRINCIPIO.
       // Los drags de gizmo, asas, textura, caras o vértices quedan excluidos
@@ -10125,6 +10320,14 @@ export default function Viewer3D({
         return;
       }
 
+      // Release spline marker drag (trazado 3D en edición)
+      if (splineDragRef.current) {
+        splineDragRef.current = null;
+        controls.enabled = true;
+        renderer.domElement.style.cursor = '';
+        return;
+      }
+
       // Release light gizmo drag (3-axis arrows)
       if (lightGizmoDragRef.current) {
         lightGizmoDragRef.current = null;
@@ -10373,6 +10576,18 @@ export default function Viewer3D({
       passive: true,
     });
 
+    // SPLINE 3D: doble clic sobre un marcador = ELIMINAR ese vértice.
+    const onDobleClicSpline = (e: MouseEvent) => {
+      const ed = splineEdicionRef.current;
+      if (!ed?.onRemove) return;
+      const p = raycastSplineMarker(e as unknown as PointerEvent);
+      if (p) {
+        e.preventDefault();
+        ed.onRemove(p.id);
+      }
+    };
+    renderer.domElement.addEventListener('dblclick', onDobleClicSpline);
+
     return () => {
       cancelAnimationFrame(animId);
     // Clean up face selection HTML overlays
@@ -10393,6 +10608,7 @@ export default function Viewer3D({
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('pointerup', onPointerUp);
       renderer.domElement.removeEventListener('pointerleave', onPointerLeaveCanvas);
+      renderer.domElement.removeEventListener('dblclick', onDobleClicSpline);
       renderer.domElement.removeEventListener('wheel', onRuedaGrabacion);
       renderer.domElement.removeEventListener('wheel', handleWheelPlano);
       if (recZoomTimerRef.current) clearTimeout(recZoomTimerRef.current);
@@ -10451,6 +10667,87 @@ export default function Viewer3D({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Overlay del trazado SPLINE en edición: línea del camino (muestras del
+  // mismo suavizado que usará el constructor), marcadores por vértice
+  // (raycastables, el activo en amarillo) y malla de vista previa
+  // translúcida. Material básico: se ve en las ventanas 2D también.
+  useEffect(() => {
+    const entry = splineOverlayRef.current;
+    if (!entry) return;
+    const { group, line, markers } = entry;
+    for (const h of [...markers.children]) {
+      markers.remove(h);
+      (h as THREE.Mesh).geometry?.dispose();
+    }
+    const ed = splineEdicion;
+    if (!ed || ed.nodes.length === 0 || splinePreview === null) {
+      group.visible = false;
+      return;
+    }
+    const muestras = muestrearSpline(ed.nodes, ed.closed, 8);
+    const pts = muestras.map(
+      (m) => new THREE.Vector3(m.pos.x, m.pos.y, m.pos.z)
+    );
+    line.geometry.dispose();
+    line.geometry =
+      pts.length >= 2
+        ? new THREE.BufferGeometry().setFromPoints(pts)
+        : new THREE.BufferGeometry();
+    const geo = new THREE.SphereGeometry(0.045, 10, 8);
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0x111827,
+      toneMapped: false,
+      depthTest: false,
+      depthWrite: false,
+      transparent: true,
+      opacity: 0.95,
+    });
+    const matActivo = new THREE.MeshBasicMaterial({
+      color: 0xfde047,
+      toneMapped: false,
+      depthTest: false,
+      depthWrite: false,
+      transparent: true,
+      opacity: 1,
+    });
+    for (const n of ed.nodes) {
+      const activo = n.id === ed.activoId;
+      const s = new THREE.Mesh(geo, activo ? matActivo : mat);
+      s.position.set(n.p.x, n.p.y, n.p.z);
+      if (activo) s.scale.setScalar(1.6);
+      s.userData.splineNodeId = n.id;
+      s.renderOrder = 996;
+      markers.add(s);
+    }
+    // Malla de vista previa (barrido en vivo del trazado).
+    const prev = splinePreview;
+    const pm = group.children.find((c) => (c as THREE.Mesh).isMesh) as
+      | THREE.Mesh
+      | undefined;
+    if (pm) {
+      const salida = new THREE.BufferGeometry();
+      const pos = new Float32Array(prev.vertices.length * 3);
+      for (let i = 0; i < prev.vertices.length; i++) {
+        const v = prev.vertices[i];
+        pos[i * 3] = v.x;
+        pos[i * 3 + 1] = v.y;
+        pos[i * 3 + 2] = v.z;
+      }
+      salida.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      const idx: number[] = [];
+      for (const f of prev.faces) {
+        if (f.length < 3) continue;
+        for (let i = 1; i + 1 < f.length; i++) idx.push(f[0], f[i], f[i + 1]);
+      }
+      salida.setIndex(idx);
+      pm.geometry.dispose();
+      pm.geometry = salida;
+    }
+    group.visible = true;
+    // Vuelta al manejo de cámara si un arrastre quedó a mitad (remontaje).
+    // El visor no necesita nada más aquí: el gate de puntero es el que arma.
+  }, [splineEdicion, splinePreview]);
+
   useEffect(() => {
     if (latheAxisRef.current) latheAxisRef.current.visible = showLatheAxis;
   }, [showLatheAxis]);
@@ -10492,17 +10789,6 @@ export default function Viewer3D({
     // Busca esta parte donde se maneja mesh.texture y reemplázala:
     let cancelled = false;
 
-    // [zeus-debug] TEMPORAL (diagnóstico color tras editar polígonos):
-    // qué malla y qué rama de render entra en cada reconstrucción.
-    console.log('[zeus-debug] reconstrucción:', JSON.stringify({
-      caras: mesh.faces.length, verts: mesh.vertices.length,
-      faceColors: mesh.faceColors ? Array.from(new Set((mesh.faceColors as (string | null)[]).filter(Boolean) as string[])) : null,
-      numFaceColores: (mesh.faceColors ?? []).filter(Boolean).length,
-      texturasPorCara: (mesh.faceTextures ?? []).filter(Boolean).length,
-      gruposTextura: (mesh.faceTextureGroups ?? []).filter(Boolean).length,
-      texture: !!mesh.texture, bump: !!mesh.bumpTexture, smoothShading, flat2D,
-    }));
-
     // --- SI HAY TEXTURA, CONSTRUIR MALLA CON TEXTURA ---
     // También entra aquí una malla sin textura general pero con texturas
     // por cara (faceTextures): el material base queda sin mapa. Las texturas
@@ -10517,7 +10803,6 @@ export default function Viewer3D({
         tieneTexturasPorCara) &&
       !wireframe
     ) {
-      console.log('[zeus-debug] rama: textura');
       // Limpiar grupo
       for (const child of [...meshGroup.children]) {
         if (
@@ -10932,7 +11217,6 @@ export default function Viewer3D({
     // quedan con el último color escrito, imperceptible en letras
     // monocromas (todo del mismo color) y en emojis (regiones grandes).
     if (smoothShading) {
-      console.log('[zeus-debug] rama: suave');
       const positions: number[] = [];
       const index: number[] = [];
       const uvs: number[] = [];
@@ -11233,28 +11517,9 @@ export default function Viewer3D({
           }
         }
       }
-      // [zeus-debug] TEMPORAL: material y colorAttribute que quedaron en la
-      // escena tras las ramas textura/suave (ambas salen por este return). v2
-      const principal = findMainMesh(meshGroup);
-      if (principal) {
-        const materialPrincipal: THREE.MeshStandardMaterial | undefined = Array.isArray(
-          principal.material,
-        )
-          ? (principal.material[0] as THREE.MeshStandardMaterial)
-          : (principal.material as THREE.MeshStandardMaterial);
-        console.log('[zeus-debug] fin:', JSON.stringify({
-          colorMat: materialPrincipal?.color?.getHexString?.() ?? '(n/d)',
-          vertexColors: materialPrincipal?.vertexColors ?? null,
-          hayAttrColor: !!principal.geometry?.getAttribute('color'),
-          flat2D,
-        }));
-      } else {
-        console.log('[zeus-debug] fin: (sin malla principal)');
-      }
       return;
     }
 
-    console.log('[zeus-debug] rama: plana');
     const positions: number[] = [];
     const normals: number[] = [];
     const colorAttr: number[] = [];
@@ -11383,24 +11648,6 @@ export default function Viewer3D({
       // negros» quedan con la malla original durante la animación.
       wireOverlay.userData.aristasDeMesh = true;
       meshGroup.add(wireOverlay);
-    }
-
-    // [zeus-debug] TEMPORAL: material y colorAttribute que quedaron en la
-    // escena tras esta reconstrucción v2.
-    const principal = findMainMesh(meshGroup);
-    if (principal) {
-      const materialPrincipal: THREE.MeshStandardMaterial | undefined = Array.isArray(
-        principal.material,
-      )
-        ? (principal.material[0] as THREE.MeshStandardMaterial)
-        : (principal.material as THREE.MeshStandardMaterial);
-      console.log('[zeus-debug] fin:', JSON.stringify({
-        colorMat: materialPrincipal?.color?.getHexString?.() ?? '(n/d)',
-        vertexColors: materialPrincipal?.vertexColors ?? null,
-        hayAttrColor: !!principal.geometry?.getAttribute('color'),
-      }));
-    } else {
-      console.log('[zeus-debug] fin: (sin malla principal)');
     }
   }, [
     mesh,
@@ -11755,15 +12002,6 @@ export default function Viewer3D({
         // instantánea ni figura viva el duplicado queda vacío: ya no se
         // clona la figura principal como "fantasma".
         if (object.mesh && object.mesh.vertices.length > 0) {
-          // [zeus-debug] TEMPORAL: qué objeto entra como duplicado y con qué
-          // colores por cara. v2
-          console.log('[zeus-debug] duplicado:', JSON.stringify({
-            id: object.id,
-            caras: object.mesh.faces.length,
-            faceColors: object.mesh.faceColors ? Array.from(new Set((object.mesh.faceColors as (string | null)[]).filter(Boolean) as string[])) : null,
-            numFaceColores: (object.mesh.faceColors ?? []).filter(Boolean).length,
-            smooth: object.smooth ?? false,
-          }));
           duplicate.add(
             buildSnapshotObjectVisual(
               object.mesh,
@@ -13647,7 +13885,7 @@ uniform vec3 sombraFocoPos[8];`
           )}
           <label
             className="flex items-center gap-1 px-1 cursor-pointer select-none"
-            title="Flechas de los ejes X/Y/Z sobre el objeto: arrastra la flecha o la bolita del color del eje para MOVERLO en esa dirección, la bolita amarilla para ESTIRARLO en esa dirección y el aro del color del eje para ROTARLO alrededor de ese eje"
+            title={t('editor3D.toolbarAxesHelp')}
           >
             <input
               type="checkbox"
@@ -13656,12 +13894,12 @@ uniform vec3 sombraFocoPos[8];`
               className="w-3 h-3 accent-green-500 cursor-pointer"
             />
             <span className="text-[10px] font-medium text-muted-foreground">
-              Flechas XYZ
+              {t('editor3D.toolbarAxes')}
             </span>
           </label>
           <label
             className="flex items-center gap-1 px-1 cursor-pointer select-none"
-            title="Círculos de rotación del gizmo: desmárcalo para ocultar SOLO los aros (quedan las flechas de mover y los puntos de escala). Vale para el gizmo del objeto y para el de la ayuda de textura"
+            title={t('editor3D.toolbarRotateCirclesHelp')}
           >
             <input
               type="checkbox"
@@ -13670,7 +13908,7 @@ uniform vec3 sombraFocoPos[8];`
               className="w-3 h-3 accent-green-500 cursor-pointer"
             />
             <span className="text-[10px] font-medium text-muted-foreground">
-              Círculos
+              {t('editor3D.toolbarRotateCircles')}
             </span>
           </label>
           {/* La vista de alambre ahora vive en el selector global de modo
@@ -13688,9 +13926,9 @@ uniform vec3 sombraFocoPos[8];`
           {!flat2D && (
             <label
               className="flex items-center gap-1 text-[10px] text-muted-foreground"
-              title="Tamaño de la base de trabajo"
+              title={t('editor3D.toolbarBaseHelp')}
             >
-              Base
+              {t('editor3D.toolbarBase')}
               <Slider
                 min={1}
                 max={5}

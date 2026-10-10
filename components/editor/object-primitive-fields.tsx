@@ -113,6 +113,14 @@ export function ObjectPrimitiveFields({ params, onChange, t }: Props) {
           { label: 'editor3D.primitiveRadioInterior', campo: 'radioInterior', valor: params.radioInterior, step: 0.05, min: 0 },
           { label: 'editor3D.primitiveSectores', campo: 'sectores', valor: params.sectores, step: 1, min: 3, entero: true },
         ];
+      case 'muelle':
+        return [
+          { label: 'editor3D.primitiveMuelleVueltas', campo: 'vueltas', valor: params.vueltas, step: 1, min: 1, entero: true },
+          { label: 'editor3D.primitiveMuelleVertices', campo: 'verticesPorVuelta', valor: params.verticesPorVuelta, step: 1, min: 6, entero: true },
+          { label: 'editor3D.primitiveMuelleSeparacion', campo: 'separacion', valor: params.separacion, step: 0.05, min: 0.01 },
+          { label: 'editor3D.primitiveMuelleRadio', campo: 'radioMuelle', valor: params.radioMuelle, step: 0.05, min: 0.001 },
+          { label: 'editor3D.primitiveMuelleRadioTubo', campo: 'radioTubo', valor: params.radioTubo, step: 0.02, min: 0.005 },
+        ];
     }
   })();
 

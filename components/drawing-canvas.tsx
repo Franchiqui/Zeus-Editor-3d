@@ -187,6 +187,7 @@ export default function DrawingCanvas({
             {onMaximize && (
               <button
                 onClick={onMaximize}
+                data-testid="canvas-maximize"
                 className="p-1 rounded-md text-muted-foreground hover:text-green-300 hover:bg-green-500/10 transition-colors"
                 title="Maximizar (ocupar todo el espacio)"
               >

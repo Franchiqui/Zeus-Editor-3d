@@ -694,7 +694,9 @@ function romper(mesh: Mesh, params: PluginParams): Mesh {
   const escala = Math.max(0.02, num(params, 'tamanoFinal', 100) / 100);
   const aleat = Math.min(100, Math.max(0, num(params, 'aleatoriedad', 50))) / 100;
   // Caída: 0% flotan donde explotan, 100% todos apoyados en el suelo.
-  const caida = Math.min(100, Math.max(0, num(params, 'caida', 100))) / 100;
+  // (0 por defecto: la fuerza del panel solo DISPERSA — que caigan lo
+  // decide este campo, no la fuerza.)
+  const caida = Math.min(100, Math.max(0, num(params, 'caida', 0))) / 100;
   const rnd = mulberryDeform(Math.round(num(params, 'semilla', 42)));
 
   // Centro de cada cara y del objeto entero.
@@ -1181,7 +1183,10 @@ export const DEFORMADORES_DIRECTOS: DeformadorDirecto[] = [
         min: 0,
         max: 100,
         paso: 1,
-        valor: 100,
+        // 0 por defecto: la FUERZA solo dispersa (explosión congelada);
+        // caer al suelo lo manda SU campo, Caída — antes con 100 de
+        // default CUALQUIER fuerza (hasta 1) tiraba todo al suelo.
+        valor: 0,
         unidad: '%',
         descripcion:
           '0% = los pedazos se quedan flotando por el aire, como una explosión congelada. 100% = caen al suelo y se tumban: TODOS quedan apoyados planos, ninguno flotando. Los intermedios caen y se tumban a medias.',

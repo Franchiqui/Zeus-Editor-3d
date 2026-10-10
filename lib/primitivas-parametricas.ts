@@ -1,4 +1,5 @@
 import type { Mesh, Vertex3D } from './geometry';
+import { buildRoscaMesh } from './spline-3d';
 
 /**
  * Primitivas paramétricas del modal "Objeto 3D" (public/Obj-3D).
@@ -31,7 +32,8 @@ export type PrimitiveKind =
   | 'plano'
   | 'piramide'
   | 'capsula'
-  | 'disco';
+  | 'disco'
+  | 'muelle';
 
 export type PrimitiveParams =
   | { kind: 'cubo'; ancho: number; alto: number; profundo: number; segX: number; segY: number; segZ: number }
@@ -58,7 +60,20 @@ export type PrimitiveParams =
       bandasCuerpo: number;
       bandasCasquete: number;
     }
-  | { kind: 'disco'; radio: number; radioInterior: number; sectores: number };
+  | { kind: 'disco'; radio: number; radioInterior: number; sectores: number }
+  /**
+   * Muelle (botón "Spline Rosca"): hélice con tubo redondo. La geometría la
+   * construye `buildRoscaMesh` de `lib/spline-3d.ts` (una sola fuente: es el
+   * mismo trazado que el botón Spline, con la hélice como camino).
+   */
+  | {
+      kind: 'muelle';
+      vueltas: number;
+      verticesPorVuelta: number;
+      separacion: number;
+      radioMuelle: number;
+      radioTubo: number;
+    };
 
 /**
  * Parámetros de galería por archivo (base del nombre, sin `.zeus`,
@@ -206,6 +221,16 @@ export function normalizarParams(p: PrimitiveParams): PrimitiveParams {
         sectores: entero(p.sectores, 33, 3, MAX_SEG),
       };
     }
+    case 'muelle':
+      return {
+        kind: 'muelle',
+        vueltas: entero(p.vueltas, 6, 1, 40),
+        verticesPorVuelta: entero(p.verticesPorVuelta, 16, 6, MAX_SEG),
+        separacion: positivo(p.separacion, 0.4),
+        radioMuelle: positivo(p.radioMuelle, 0.5),
+        // Como el toroide: el tubo no pasa del centro del propio muelle.
+        radioTubo: Math.min(positivo(p.radioTubo, 0.12), positivo(p.radioMuelle, 0.5) * 0.999),
+      };
   }
 }
 
@@ -627,5 +652,7 @@ export function construirMallaPrimitiva(params: PrimitiveParams): Mesh {
       return construirCapsula(p);
     case 'disco':
       return construirDisco(p);
+    case 'muelle':
+      return buildRoscaMesh(p);
   }
 }

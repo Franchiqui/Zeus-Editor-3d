@@ -5,6 +5,8 @@ import { createPortal } from 'react-dom';
 import Viewer3D, { type ObjectTransform, type GizmoMode, type ExtrusionCtrlSubSel, type VistaModo } from '@/components/viewer-3d';
 import type { TextureMaterialParams } from '@/lib/geometry';
 import type { EfectoObjeto } from '@/lib/efectos-objeto';
+import type { SplineEdicion } from '@/lib/spline-3d';
+import type { Mesh } from '@/lib/geometry';
 import { PanelButtons } from '@/components/editor/Editor3D';
 import { useI18n } from '@/lib/i18n';
 import type {
@@ -74,6 +76,11 @@ interface ViewerPanelProps {
     /** Ctrl + arrastre de ESCALA en la sub-selección = extrudir la copia
      *  (anillos vecinos intactos); null si no se puede. */
     onCtrlEscalarSubSel?: () => ExtrusionCtrlSubSel | null;
+    /** Trazado SPLINE 3D en edición: línea + marcadores de vértice en las
+     * ventanas planas (clic = vértice, arrastre = mover). */
+    splineEdicion?: SplineEdicion | null;
+    /** Malla EN VIVO del trazado spline (vista previa translúcida). */
+    splinePreview?: Mesh | null;
     faceSelectVisibleOnly?: boolean;
     wireframeOffSignal?: number;
     /** Modo de visualización GLOBAL de las ventanas 3D (compartido por las cuatro). */
@@ -239,6 +246,8 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
     faceSelectionTarget,
     anillosCaras,
     deformadorActivo,
+    splineEdicion,
+    splinePreview,
     faceSelectVisibleOnly,
     wireframeOffSignal,
     vistaModo,
@@ -503,7 +512,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
             REC
           </button>
         )}
-        {vk === '3d' && vistaModo && (
+        {vistaModo && (
           <select
             value={vistaModo}
             onChange={(e) => onVistaModoChange?.(e.target.value as VistaModo)}
@@ -551,6 +560,8 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
            faceSelectionTarget={faceSelectionTarget}
            anillosCaras={anillosCaras}
            deformadorActivo={deformadorActivo}
+           splineEdicion={splineEdicion}
+           splinePreview={splinePreview}
            faceSelectVisibleOnly={faceSelectVisibleOnly}
            wireframeOffSignal={wireframeOffSignal}
            vistaModo={vistaModo}

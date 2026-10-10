@@ -307,7 +307,7 @@ console.log('\n== Romper ==');
     faceOpacities: [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 1, 1],
     faceTextures: [null, 't', null, 't2', null, 't3', null, null, 't4', null, null, null],
   }));
-  const PARAMS = { fuerza: 150, giroVelocidad: 90, tamanoFinal: 100, aleatoriedad: 50, semilla: 42 };
+  const PARAMS = { fuerza: 150, caida: 100, giroVelocidad: 90, tamanoFinal: 100, aleatoriedad: 50, semilla: 42 };
 
   // — Neutro: fuerza 0 NO rompe.
   {
@@ -413,6 +413,19 @@ console.log('\n== Romper ==');
       revisar(
         pegados0 < flot.vertices.length,
         `romper caída 0%: sí queda algo por el aire (${flot.vertices.length - pegados0}/${flot.vertices.length} fuera del suelo)`
+      );
+      // Nuevo DEFAULT: SIN el campo caida, la fuerza solo DISPERSA
+      // (explosión congelada) — ningún vértice baja al plano base.
+      // (Antes el default era 100 y cualquier fuerza tiraba todo al suelo.)
+      const PARAMSsinDeform = { ...PARAMS };
+      delete PARAMSsinDeform.caida;
+      const explota = aplicarDeformador('romper', plana, PARAMSsinDeform);
+      const enSueloDef = explota.vertices.filter(
+        (v) => Math.abs(v.y - base) < 1e-6
+      ).length;
+      revisar(
+        enSueloDef === 0,
+        `romper sin campo caida (default 0): ${enSueloDef} vértices en el plano base (deben ser 0, TODO flota)`
       );
       // Y el reparto de pedazos no cambia con la caída (misma semilla):
       // la posición XZ de la nube de piezas al 0% difiere de la al 100%

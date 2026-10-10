@@ -91,6 +91,18 @@ import { toast } from 'sonner';
 import MeshEditor from './MeshEditor';
 import { buildLoftMesh } from '@/lib/loft-mesh';
 import { buildSweepMesh, type SweepNode } from '@/lib/sweep-mesh';
+import {
+  buildSpline3DMesh,
+  buildRoscaMesh,
+  construirMuestraHelix,
+  validarSplineDatos,
+  ROSCA_DEFECTO,
+  PLANTILLA_SPLINE_DEFECTO,
+  type SplineNode3D,
+  type SplineDatos,
+  type RoscaParams,
+} from '@/lib/spline-3d';
+import { espejarMesh } from '@/lib/espejo';
 import PathCanvas from './path-canvas';
 import type { ObjectTransform, Camera3D, GizmoMode } from '@/components/viewer-3d';
 import type { ExtrusionCtrlSubSel } from '@/components/viewer-3d';
@@ -138,6 +150,7 @@ type LatheTextureProjection,
 import { creadaComoParams, type CreatedTexture } from '@/lib/texture-generator';
 import {
   construirMallaPrimitiva,
+  normalizarParams,
   paramsDeArchivo,
   type PrimitiveParams,
 } from '@/lib/primitivas-parametricas';
@@ -216,10 +229,8 @@ import {
   Boxes,
   BoxSelect,
   FilePlus,
-  RefreshCw,
   AlertCircle,
   Info,
-  Download,
   Type,
   PenTool,
   Plus,
@@ -244,7 +255,6 @@ import {
    ChevronUp,
   ChevronDown,
   Copy,
-  ClipboardPaste,
   Trash2,
   Scissors,
   Expand,
@@ -347,6 +357,7 @@ function construirCopiasCalculadas(
     efectos?: EfectoObjeto[];
     pluginEdit?: SceneObject['pluginEdit'];
     primitiveParams?: PrimitiveParams;
+    spline?: SplineDatos;
     transform: ObjectTransform;
   }>,
   params: CalculatedCopiesParams,
@@ -433,6 +444,7 @@ function construirCopiasCalculadas(
         efectos: fuente.efectos,
         pluginEdit: fuente.pluginEdit,
         primitiveParams: fuente.primitiveParams,
+        spline: structuredClone(fuente.spline),
       });
     });
   }
@@ -724,6 +736,13 @@ type SceneObject = {
     */
    primitiveParams?: PrimitiveParams;
    /**
+    * Trazado 3D del botón «Spline»: vértices con plantilla (sección) por
+    * vértice que generan la malla como barrido 3D por el camino. Permite
+    * reabrir el trazado desde la pestaña Escena / el botón Spline. Viaja
+    * con el objeto en los .zeus.
+    */
+   spline?: SplineDatos;
+   /**
     * Efectos visuales del objeto (lluvia, humo, fuego, chispas,
     * estrellas, brillo) con sus parámetros y focos. Viajan con el
     * proyecto y puede animarlos el editor de movimiento con pistas
@@ -898,6 +917,22 @@ type HistoryState = {
     sweepSubdivisions: number;
     /** Recorrido (Extruir): vértice activo (selección). */
     sweepActiveId: number | null;
+    /** Spline 3D (botón Spline): borrador del trazado en curso. */
+    splineNodes: SplineNode3D[];
+    /** Spline 3D: ¿trazado cerrado? */
+    splineClosed: boolean;
+    /** Spline 3D: subdivisiones de suavizado del camino. */
+    splineSubdivisions: number;
+    /** Spline 3D: escala de las plantillas (0..1 canvas → mundo). */
+    splineEscala: number;
+    /** Spline 3D: marco radial (la plantilla gira con el enrollado). */
+    splineRadial: boolean;
+    /** Spline 3D: parámetros del muelle precargado (null = trazado normal). */
+    splineRosca: RoscaParams | null;
+    /** Spline 3D: vértice activo del borrador (selección). */
+    splineActivoId: number | null;
+    /** Spline 3D: objeto cuya spline se reedita (null = trazado nuevo). */
+    splineEditandoId: string | null;
   };
 
 // Comparación de dos fotos del editor (para saber si un cambio es real o
@@ -963,7 +998,15 @@ const isSameHistoryState = (a: HistoryState, b: HistoryState): boolean =>
   sameHistoryValue(a.sweepNodes ?? [], b.sweepNodes ?? []) &&
   (a.sweepClosed ?? false) === (b.sweepClosed ?? false) &&
   (a.sweepSubdivisions ?? 5) === (b.sweepSubdivisions ?? 5) &&
-  (a.sweepActiveId ?? null) === (b.sweepActiveId ?? null);
+  (a.sweepActiveId ?? null) === (b.sweepActiveId ?? null) &&
+  sameHistoryValue(a.splineNodes ?? [], b.splineNodes ?? []) &&
+  (a.splineClosed ?? false) === (b.splineClosed ?? false) &&
+  (a.splineSubdivisions ?? 5) === (b.splineSubdivisions ?? 5) &&
+  (a.splineEscala ?? 0.5) === (b.splineEscala ?? 0.5) &&
+  (a.splineRadial ?? false) === (b.splineRadial ?? false) &&
+  sameHistoryValue(a.splineRosca ?? null, b.splineRosca ?? null) &&
+  (a.splineActivoId ?? null) === (b.splineActivoId ?? null) &&
+  (a.splineEditandoId ?? null) === (b.splineEditandoId ?? null);
 
 // Plantillas por defecto: vacías. Los lienzos 2D arrancan en blanco
 // — el usuario dibuja desde cero o inserta una forma de un clic. El
@@ -1891,6 +1934,21 @@ export default function Home({
   // lienzo del Recorrido, girada según su inclinación.
   const [sweepEdgeTemplates, setSweepEdgeTemplates] = useState(false);
   const sweepIdRef = useRef(1);
+  // Spline 3D (botón Spline): borrador del trazado que se dibuja en las
+  // ventanas planas (clic = vértice) con plantilla por vértice; al aplicar
+  // se construye la malla como barrido 3D por el camino.
+  const [splineNodes, setSplineNodes] = useState<SplineNode3D[]>([]);
+  const [splineActivoId, setSplineActivoId] = useState<number | null>(null);
+  const [splineClosed, setSplineClosed] = useState(false);
+  const [splineSubdivisions, setSplineSubdivisions] = useState(5);
+  const [splineEscala, setSplineEscala] = useState(0.5);
+  /** Spline: la plantilla gira con el enrollado (marco radial, tornillo). */
+  const [splineRadial, setSplineRadial] = useState(false);
+  /** Spline: parámetros del muelle precargado (null = trazado normal). */
+  const [splineRosca, setSplineRosca] = useState<RoscaParams | null>(null);
+  // Objeto cuya spline se reedita (null = trazado nuevo).
+  const [splineEditandoId, setSplineEditandoId] = useState<string | null>(null);
+  const splineIdRef = useRef(1);
   // Escala uniforme de la figura 2D en Extruir (slider del toolbar).
   const [resizeScale, setResizeScale] = useState(1);
   const resizeBaseRef = useRef<Polygon | null>(null);
@@ -1989,6 +2047,10 @@ export default function Home({
   const [editingSweepCanvas, setEditingSweepCanvas] = useState<
     'path' | 'profile' | null
   >(null);
+  // Lienzo maximizado de la plantilla del vértice activo del SPLINE
+  // (botón Spline): ocupa el sitio de las cuatro ventanas, igual que la
+  // plantilla/Recorrido de Extruir. false = rejilla normal.
+  const [editingSplineCanvas, setEditingSplineCanvas] = useState(false);
 
   const [useFontColor, setUseFontColor] = useState(true);
   const [baseColor, setBaseColor] = useState('#e8e8e8');
@@ -3872,12 +3934,17 @@ export default function Home({
    // Sube en cada re-activación del mismo deformador: fuerza el repintado
    // aunque params y caja no cambien.
    const [deformTick, setDeformTick] = useState(0);
+   // Modo SPLINE 3D (botón «Spline» junto a los deformadores): dibujo /
+   // reedición del trazado con vértices en las ventanas planas y plantilla
+   // por vértice; al aplicar se construye la malla del objeto.
+   const [modoSpline, setModoSpline] = useState(false);
    // Señal para que el visor apague la vista de alambre (tras asignar textura).
    const [wireframeOffSignal, setWireframeOffSignal] = useState(0);
-   // Modo de visualización GLOBAL de las ventanas 3D: textura (normal),
+   // Modo de visualización INDIVIDUAL por ventana: textura (normal),
    // alambre (segmentos) o gris con aristas (aspecto del lavado del
-   // deformador, más los segmentos en negro). Las 4 ventanas lo comparten.
-   const [vistaModo, setVistaModo] = useState<VistaModo>('textura');
+   // deformador, más los segmentos en negro). Cada panel (front/top/
+   // side/3d) lleva el suyo; sin entrada = textura.
+   const [vistaModos, setVistaModos] = useState<Partial<Record<PanelSlot, VistaModo>>>({});
    const [selectedFaceIds, setSelectedFaceIds] = useState<number[]>([]);
    const [selectedVertexIds, setSelectedVertexIds] = useState<number[]>([]);
    const [selectedEdgeIds, setSelectedEdgeIds] = useState<string[]>([]);
@@ -5648,6 +5715,14 @@ export default function Home({
       sweepClosed,
       sweepSubdivisions,
       sweepActiveId,
+      splineNodes: structuredClone(splineNodes),
+      splineClosed,
+      splineSubdivisions,
+      splineEscala,
+      splineRadial,
+      splineRosca,
+      splineActivoId,
+      splineEditandoId,
       textMode,
       useFontColor,
       baseColor,
@@ -5731,6 +5806,14 @@ viewsOpacity,
       sweepClosed,
       sweepSubdivisions,
       sweepActiveId,
+      splineNodes,
+      splineClosed,
+      splineSubdivisions,
+      splineEscala,
+      splineRadial,
+      splineRosca,
+      splineActivoId,
+      splineEditandoId,
       textMode,
     useFontColor,
     baseColor,
@@ -5772,6 +5855,14 @@ pluginTracks,
       sweepClosed,
       sweepSubdivisions,
       sweepActiveId,
+      splineNodes,
+      splineClosed,
+      splineSubdivisions,
+      splineEscala,
+      splineRadial,
+      splineRosca,
+      splineActivoId,
+      splineEditandoId,
       isUndoRedo,
       commitHistorySnapshot,
     ]);
@@ -5845,6 +5936,16 @@ pluginTracks,
     setSweepClosed(state.sweepClosed ?? false);
     setSweepSubdivisions(state.sweepSubdivisions ?? 5);
     setSweepActiveId(state.sweepActiveId ?? null);
+    // Spline 3D: fotos antiguas sin borrador -> vacío (fuera del modo).
+    setSplineNodes(state.splineNodes ?? []);
+    setSplineClosed(state.splineClosed ?? false);
+    setSplineSubdivisions(state.splineSubdivisions ?? 5);
+    setSplineEscala(state.splineEscala ?? 0.5);
+    setSplineRadial(state.splineRadial ?? false);
+    setSplineRosca(state.splineRosca ?? null);
+    setSplineActivoId(state.splineActivoId ?? null);
+    setSplineEditandoId(state.splineEditandoId ?? null);
+    setModoSpline((state.splineNodes ?? []).length > 0 || !!state.splineEditandoId);
   }, []);
 
   const undo = useCallback(() => {
@@ -7040,7 +7141,8 @@ pluginTracks,
     editingMeshProfile !== null ||
     editingMesh ||
     editingMeshSide ||
-    editingSweepCanvas !== null;
+    editingSweepCanvas !== null ||
+    editingSplineCanvas;
   // El área de trabajo arranca vacío: la figura de la pestaña solo se
   // materializa en el visor si pertenece a un objeto (el dueño de la
   // configuración) o si hay un lienzo 2D abrierto dibujándola. Sin
@@ -7346,6 +7448,145 @@ pluginTracks,
       prev.map((n) => (n.id === id ? { ...n, tilt } : n))
     );
   }, []);
+
+  // --- Spline 3D (borrador) ---
+  const addSplineNode = useCallback((p: { x: number; y: number; z: number }) => {
+    const id = splineIdRef.current;
+    splineIdRef.current += 1;
+    setSplineNodes((prev) => [
+      ...prev,
+      { id, p, polygon: structuredClone(PLANTILLA_SPLINE_DEFECTO) },
+    ]);
+    setSplineActivoId(id);
+  }, []);
+
+  const moveSplineNode = useCallback(
+    (id: number, p: { x: number; y: number; z: number }) => {
+      setSplineNodes((prev) => prev.map((n) => (n.id === id ? { ...n, p } : n)));
+    },
+    []
+  );
+
+  const removeSplineNode = useCallback((id: number) => {
+    setSplineNodes((prev) => prev.filter((n) => n.id !== id));
+    setSplineActivoId((cur) => (cur === id ? null : cur));
+  }, []);
+
+  const updateSplineNodePolygon = useCallback((id: number, polygon: Polygon) => {
+    setSplineNodes((prev) =>
+      prev.map((n) => (n.id === id ? { ...n, polygon } : n))
+    );
+  }, []);
+
+  const toggleSplineEsquina = useCallback((id: number) => {
+    setSplineNodes((prev) =>
+      prev.map((n) =>
+        n.id === id ? { ...n, esquina: !n.esquina ? true : undefined } : n
+      )
+    );
+  }, []);
+
+  const setSplineNodeTilt = useCallback((id: number, tilt: number) => {
+    setSplineNodes((prev) =>
+      prev.map((n) => (n.id === id ? { ...n, tilt } : n))
+    );
+  }, []);
+
+  // Escala de la plantilla SOLO del vértice activo: el resto de vértices
+  // quedan con su propia escala (o la global si nunca la cambió).
+  const setSplineNodeEscala = useCallback((id: number, escala: number) => {
+    const v = Math.max(0.05, Math.min(8, escala));
+    setSplineNodes((prev) =>
+      prev.map((n) => (n.id === id ? { ...n, escala: v } : n))
+    );
+  }, []);
+
+  // Copia la plantilla del vértice ACTIVO a TODOS los vértices de golpe.
+  // Cada nodo lleva su PROPIO clon (nada de referencias compartidas: así,
+  // reeditar luego un vértice no arrastra al resto).
+  const aplicarPlantillaATodos = useCallback(() => {
+    setSplineNodes((prev) => {
+      const activo = prev.find((n) => n.id === splineActivoId);
+      if (!activo?.polygon || activo.polygon.length < 3) return prev;
+      return prev.map((n) => ({
+        ...n,
+        polygon: structuredClone(activo.polygon),
+      }));
+    });
+  }, [splineActivoId]);
+
+  // Editar un parámetro del muelle precargado: REHACE la hélice entera
+  // (posiciones y nº de vértices) conservando lo editado a mano — la
+  // plantilla/escala/tilt de cada índice que sobreviva; los vértices
+  // nuevos copian la última plantilla conocida.
+  const setSplineRoscaParams = useCallback((siguientes: RoscaParams) => {
+    const params: RoscaParams = {
+      vueltas: Math.max(1, Math.min(40, Math.round(siguientes.vueltas))),
+      verticesPorVuelta: Math.max(
+        6,
+        Math.min(128, Math.round(siguientes.verticesPorVuelta))
+      ),
+      separacion: Math.max(0.001, siguientes.separacion),
+      radioMuelle: Math.max(0.001, siguientes.radioMuelle),
+      radioTubo: Math.max(
+        0.005,
+        Math.min(siguientes.radioMuelle * 0.999, siguientes.radioTubo)
+      ),
+    };
+    const helix = construirMuestraHelix(params);
+    setSplineNodes((prev) =>
+      helix.map((n) => {
+        const viejo = prev.find((o) => o.id === n.id) ?? prev[n.id] ?? null;
+        if (viejo) {
+          return {
+            ...n,
+            polygon: viejo.polygon ? structuredClone(viejo.polygon) : n.polygon,
+            escala: viejo.escala,
+            tilt: viejo.tilt,
+          };
+        }
+        // Vértice de más: clona SU círculo (la muestra comparte un array).
+        return { ...n, polygon: n.polygon ? structuredClone(n.polygon) : n.polygon };
+      })
+    );
+    // La escala global sigue al radio del tubo (vértices nuevos coherentes).
+    setSplineEscala(params.radioTubo);
+    setSplineRosca(params);
+  }, []);
+
+  // Vista previa EN VIVO del trazado spline (botón Spline): la malla del
+  // barrido con el borrador actual, solo mientras el modo está activo y
+  // hay al menos 2 vértices con plantilla.
+  const splineVistaPrevia = useMemo(() => {
+    if (!modoSpline) return null;
+    if (splineNodes.filter((n) => (n.polygon ?? []).length >= 3).length < 2)
+      return null;
+    try {
+      return buildSpline3DMesh(splineNodes, {
+        closed: splineClosed,
+        subdivisions: splineSubdivisions,
+        escala: splineEscala,
+        orientacion: splineRadial ? 'radial' : undefined,
+      });
+    } catch {
+      return null;
+    }
+  }, [modoSpline, splineNodes, splineClosed, splineSubdivisions, splineEscala, splineRadial]);
+
+  // Overlay de edición del trazado para el visor (línea + marcadores de
+  // vértice), siguiendo el patrón de deformadorActivo.
+  const splineEdicion = useMemo(() => {
+    if (!modoSpline) return null;
+    return {
+      nodes: splineNodes,
+      closed: splineClosed,
+      activoId: splineActivoId,
+      onAdd: addSplineNode,
+      onMove: moveSplineNode,
+      onSelect: setSplineActivoId,
+      onRemove: removeSplineNode,
+    };
+  }, [modoSpline, splineNodes, splineClosed, splineActivoId, addSplineNode, moveSplineNode, removeSplineNode]);
 
   const activeSweepNode =
     mode === 'extrude'
@@ -8416,11 +8657,12 @@ pluginTracks,
      * apaga (re-pulsar = salir). Al entrar fija sus params por defecto.
      */
     const toggleDeformador = useCallback((id: string) => {
-      // Exclusividad: el deformador apaga la sub-selección.
+      // Exclusividad: el deformador apaga la sub-selección (y el spline).
       setFaceSelectMode(false);
       setSelectedFaceIds([]);
       setSelectedVertexIds([]);
       setSelectedEdgeIds([]);
+      setModoSpline(false);
       setSelGizmoConfigMode(false);
       setSelGizmoOffset({ x: 0, y: 0, z: 0 });
       if (deformadorId === id) {
@@ -8443,6 +8685,115 @@ pluginTracks,
       setDeformParams({});
     }, []);
 
+    // --- Modo Spline 3D ---
+    /** Cancela el modo spline: descarta el borrador sin tocar la escena. */
+    const salirModoSpline = useCallback(() => {
+      setModoSpline(false);
+      setSplineNodes([]);
+      setSplineActivoId(null);
+      setSplineEditandoId(null);
+      setSplineRadial(false);
+      setSplineRosca(null);
+      // Si el lienzo de plantilla estaba maximizado, devuelve la rejilla.
+      setEditingSplineCanvas(false);
+    }, []);
+
+    /**
+     * ENTRA/SUBE en el modo spline. Si hay un objeto seleccionado con
+     * spline lo carga clonado (reeditarlo); si no, arranca un trazado
+     * nuevo. Re-pulsar = salir (Cancelar: el Aplicar crea el objeto).
+     */
+    const toggleModoSpline = useCallback(() => {
+      // Exclusividad: el spline apaga la sub-selección y el deformador.
+      setFaceSelectMode(false);
+      setSelectedFaceIds([]);
+      setSelectedVertexIds([]);
+      setSelectedEdgeIds([]);
+      setSelGizmoConfigMode(false);
+      setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+      setDeformadorId(null);
+      setDeformParams({});
+      if (modoSpline) {
+        // Re-pulsar el mismo: salir.
+        salirModoSpline();
+        return;
+      }
+      const objeto = sceneObjectsRef.current.find(
+        (o) => o.id === selectedObjectId
+      );
+      if (objeto?.spline) {
+        // Reeditar el trazado del objeto seleccionado: copia clonada.
+        const clon = structuredClone(objeto.spline);
+        setSplineNodes(clon.nodes);
+        setSplineClosed(clon.closed);
+        setSplineSubdivisions(clon.subdivisions);
+        setSplineEscala(clon.escala);
+        setSplineRadial(clon.orientacion === 'radial');
+        setSplineRosca(clon.rosca ?? null);
+        setSplineActivoId(clon.nodes[clon.nodes.length - 1]?.id ?? null);
+        setSplineEditandoId(objeto.id);
+        const maxId = clon.nodes.reduce((m, n) => Math.max(m, n.id), 0);
+        splineIdRef.current = maxId + 1;
+      } else {
+        setSplineNodes([]);
+        setSplineClosed(false);
+        setSplineRadial(false);
+        setSplineRosca(null);
+        setSplineActivoId(null);
+        setSplineEditandoId(null);
+      }
+      setModoSpline(true);
+    }, [modoSpline, selectedObjectId, salirModoSpline]);
+
+    /**
+     * «Spline Rosca» (muelle): el MISMO modo spline, pero ARRANCANDO con
+     * el trazado de una hélice precargado (eje Y, centrado en el origen;
+     * la plantilla circular viaja en los vértices y la escala global pone
+     * el radio del tubo). Se edita luego como cualquier spline (añadir o
+     * mover vértices, plantillas por vértice, esquinas, tilt…) y el
+     * Aplicar hornea el objeto. Re-pulsar = salir (Cancelar).
+     */
+    const entrarSplineRosca = useCallback(() => {
+      // Exclusividad igual que el spline: apaga la sub-selección y el
+      // deformador.
+      setFaceSelectMode(false);
+      setSelectedFaceIds([]);
+      setSelectedVertexIds([]);
+      setSelectedEdgeIds([]);
+      setSelGizmoConfigMode(false);
+      setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+      setDeformadorId(null);
+      setDeformParams({});
+      if (modoSpline) {
+        // Re-pulsar el mismo: salir.
+        salirModoSpline();
+        return;
+      }
+      // La muestra de la hélice comparte UNA plantilla (el mismo círculo)
+      // entre todos los vértices: clonar por nodo, si no, editar la
+      // plantilla de un vértice cambiaría los 96 a la vez.
+      const helix = construirMuestraHelix(ROSCA_DEFECTO).map(
+        (n): SplineNode3D => ({
+          ...n,
+          polygon: n.polygon ? structuredClone(n.polygon) : n.polygon,
+        })
+      );
+      setSplineNodes(helix);
+      setSplineClosed(false);
+      setSplineSubdivisions(1); // el camino de la hélice ya es denso
+      // La global da la escala a los vértices NUEVOS que se añadan.
+      setSplineEscala(ROSCA_DEFECTO.radioTubo);
+      // El muelle nace con marco RADIAL: si el usuario sustituye la
+      // plantilla por un perfil de rosca (triángulo, sierra…), la
+      // esquina se mantiene mirando hacia fuera en TODAS las vueltas.
+      setSplineRadial(true);
+      setSplineRosca({ ...ROSCA_DEFECTO });
+      setSplineActivoId(helix[helix.length - 1]?.id ?? null);
+      setSplineEditandoId(null);
+      splineIdRef.current = helix[helix.length - 1]?.id ?? 0;
+      setModoSpline(true);
+    }, [modoSpline, salirModoSpline]);
+
     // La sub-selección es del objeto activo: al cambiar de objeto se
     // limpia (índices rancos inofensivos, pero mejor sin basura visual).
     // El deformador activo también es del objeto activo: fuera.
@@ -8452,6 +8803,8 @@ pluginTracks,
       setSelectedEdgeIds((prev) => (prev.length > 0 ? [] : prev));
       setDeformadorId((prev) => (prev ? null : prev));
       setDeformParams((prev) => (Object.keys(prev).length > 0 ? {} : prev));
+      // El borrador del spline también es del objeto activo: descartado.
+      setModoSpline((prev) => (prev ? false : prev));
     }, [selectedObjectId, configObjectId]);
 
     const handleFaceTextureFile = useCallback((file: File | null) => {
@@ -8560,6 +8913,7 @@ pluginTracks,
         hidden: obj.hidden,
         frozen: obj.frozen,
         primitiveParams: obj.kind === 'camera' ? undefined : paramsGaleria ?? undefined,
+        spline: validarSplineDatos((obj as Partial<SceneObject>).spline),
       }));
       setSceneObjects((objects) => [...objects, ...newObjects]);
       setSelectedObjectId(baseId);
@@ -8778,10 +9132,14 @@ pluginTracks,
             data.sceneObjects.map((obj: Partial<SceneObject>, i: number) => {
               const propios = validarEfectos((obj as Partial<SceneObject>).efectos);
               const efectos = propios ?? (obj.id ? efectosMigrados[obj.id] : undefined);
+              // Spline 3D: se sana (los trazados corruptos quedan sin
+              // spline, con su malla horneada intacta).
+              const spline = validarSplineDatos((obj as Partial<SceneObject>).spline);
               return {
                 ...obj,
                 name: obj.name ?? t('editor3D.objectN', { n: i + 1 }),
                 ...(efectos ? { efectos } : {}),
+                spline: (obj as Partial<SceneObject>).spline ? spline : undefined,
               };
             })
           );
@@ -10745,6 +11103,131 @@ pluginTracks,
     setConfigObjectId(id);
   }, [sceneObjects, selectedObjectId, mode]);
 
+  /**
+   * APLICAR el trazado del modo spline: crea un objeto nuevo (o actualiza
+   * el que se reeditaba) con la spline y su malla horneada (patrón de
+   * handlePrimitiveParamsChange). Sale del modo.
+   */
+  const handleSplineAplicar = useCallback(() => {
+    if (!modoSpline) return;
+    const datos: SplineDatos = {
+      nodes: splineNodes,
+      closed: splineClosed,
+      subdivisions: splineSubdivisions,
+      escala: splineEscala,
+      orientacion: splineRadial ? 'radial' : undefined,
+      rosca: splineRosca ? { ...splineRosca } : undefined,
+    };
+    const malla = buildSpline3DMesh(datos.nodes, datos);
+    if (malla.vertices.length === 0) return; // nada construido aún
+    const editando = splineEditandoId;
+    // Selección de la Escena (patrón de handleObjectSelect): el dueño
+    // anterior se congela y se libera. Si el objeto pasara a ser dueño
+    // del panel, el visor mostraría la figura viva de la pestaña (vacía
+    // en Escena) en su lugar y el spline «desaparecería».
+    const eraDueño = editando && configObjectId === editando;
+    if (configObjectId && !eraDueño) freezeObjectSnapshot(configObjectId);
+    let seleccionado = editando;
+    if (editando) {
+      setSceneObjects((current) =>
+        current.map((o) =>
+          o.id === editando
+            ? { ...o, spline: datos, mesh: malla, smooth: true }
+            : o
+        )
+      );
+    } else {
+      const id = `object-${Date.now()}`;
+      seleccionado = id;
+      setSceneObjects((objects) => [
+        ...objects,
+        {
+          id,
+          name: t('editor3D.splineObjectName'),
+          kind: 'figure',
+          transform: { ...IDENTITY_TRANSFORM },
+          mesh: malla,
+          spline: datos,
+          smooth: true,
+        },
+      ]);
+    }
+    if (!eraDueño) setConfigObjectId(null);
+    setSelectedObjectId(seleccionado);
+    setViewRefreshTick((v) => v + 1);
+    salirModoSpline();
+  }, [
+    modoSpline,
+    splineNodes,
+    splineClosed,
+    splineSubdivisions,
+    splineEscala,
+    splineRadial,
+    splineEditandoId,
+    configObjectId,
+    freezeObjectSnapshot,
+    t,
+    salirModoSpline,
+  ]);
+
+  /**
+   * ESPEJO: voltea la malla del objeto seleccionado según el eje elegido
+   * en el desplegable (X/Y/Z), respecto al centro de su propia caja. La
+   * malla se hornea (lib/espejo.ts recorre las caras al revés para no
+   * invertir el winding): una primitiva o spline queda como figura horneada
+   * — con primitiveParams/spline conservados, una regeneración posterior
+   * (editar sus parámetros o rehacer la spline) la reconstruiría SIN espejo,
+   * así que se retiran del objeto espejado (destruye la parametrización,
+   * como cualquier horneado).
+   */
+  const aplicarEspejo = useCallback(
+    (eje: 'x' | 'y' | 'z') => {
+      if (!selectedObjectId) {
+        toast.error(t('editor3D.espejoSinObjeto'));
+        return;
+      }
+      let espejado = false;
+      setSceneObjects((current) =>
+        current.map((o) => {
+          if (o.id !== selectedObjectId) return o;
+          if (!o.mesh || o.mesh.vertices.length === 0) return o;
+          espejado = true;
+          return {
+            ...o,
+            mesh: espejarMesh(o.mesh, eje),
+            primitiveParams: undefined,
+            spline: undefined,
+          };
+        })
+      );
+      if (espejado) setViewRefreshTick((v) => v + 1);
+      else toast.error(t('editor3D.espejoSinObjeto'));
+    },
+    [selectedObjectId, setSceneObjects, t]
+  );
+
+  /**
+   * Cambia la spline de un objeto desde la pestaña Escena (reediéndola con
+   * el botón aplicado): regenera la malla en vivo con los datos nuevos.
+   */
+  const handleSplineDatosChange = useCallback(
+    (objectId: string, datos: SplineDatos) => {
+      setSceneObjects((current) =>
+        current.map((o) =>
+          o.id === objectId
+            ? {
+                ...o,
+                spline: datos,
+                mesh: buildSpline3DMesh(datos.nodes, datos),
+                smooth: true,
+              }
+            : o
+        )
+      );
+    },
+    []
+  );
+
   // Detector de "está creando": vigila las señales de dibujo de la
   // pestaña-herramienta activa y, cuando el usuario cruza el umbral de
   // figura construible (el mismo que decide si triMesh está vacío) sin
@@ -12537,11 +13020,13 @@ pluginTracks,
       faceSelectionTarget={faceSelectionTarget}
       anillosCaras={anillosCaras}
       deformadorActivo={deformadorActivo ?? deformadorAnimado}
+      splineEdicion={splineEdicion}
+      splinePreview={splineVistaPrevia}
       onCtrlEscalarSubSel={handleCtrlEscalarSubSel}
       faceSelectVisibleOnly={faceSelectVisibleOnly}
       wireframeOffSignal={wireframeOffSignal}
-      vistaModo={vistaModo}
-      onVistaModoChange={setVistaModo}
+      vistaModo={vistaModos[viewName] ?? 'textura'}
+      onVistaModoChange={(m) => setVistaModos((prev) => ({ ...prev, [viewName]: m }))}
       selectedFaceIds={selectedFaceIds}
       onFaceSelectionChange={(ids) => {
         setSelectedFaceIds(ids);
@@ -12567,6 +13052,7 @@ pluginTracks,
           // Exclusividad de modos: entrar en sub-selección apaga el deformador.
           setDeformadorId(null);
           setDeformParams({});
+          setModoSpline(false);
         }
         setFaceSelectMode(v);
         if (!v) {
@@ -12783,6 +13269,124 @@ pluginTracks,
               </button>
             );
           })}
+          {/* SPLINE 3D: traza el camino con vértices en las ventanas planas
+              (clic = vértice, plantilla por vértice) y al aplicar genera la
+              malla como barrido 3D. SPLINE ROSCA: entra en el MISMO modo
+              pero precargando el trazado de una hélice (muelle) editable
+              como cualquier spline. Sin deshabilitar: no dependen del
+              visor. */}
+          <button
+            title={modoSpline ? t('editor3D.splineBtnOffTitle') : t('editor3D.splineBtnTitle')}
+            data-testid="boton-spline"
+            data-activo={modoSpline ? '1' : '0'}
+            onClick={toggleModoSpline}
+            className={`relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border ${
+              modoSpline
+                ? 'bg-gray-700 border-cyan-300 ring-2 ring-cyan-300 shadow-[0_0_5px_1px_rgba(34,211,238,0.9),0_0_16px_6px_rgba(34,211,238,0.4)] hover:bg-gray-600'
+                : 'bg-gray-700 hover:bg-gray-600 border-gray-500'
+            }`}
+          >
+            <span
+              data-letra
+              className="hidden text-[10px] font-bold text-gray-300 select-none"
+            >
+              S
+            </span>
+            <img
+              src="/icons/Spline.png"
+              alt=""
+              draggable={false}
+              onError={(e) => {
+                const letra = e.currentTarget.parentElement?.querySelector('[data-letra]');
+                if (letra) letra.classList.remove('hidden');
+                e.currentTarget.style.display = 'none';
+              }}
+              className="h-full w-full object-contain"
+            />
+          </button>
+          <button
+            title={t('editor3D.muelleBtnTitle')}
+            data-testid="boton-rosca"
+            data-activo={modoSpline ? '1' : '0'}
+            onClick={entrarSplineRosca}
+            className={`relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border ${
+              modoSpline
+                ? 'bg-gray-700 border-cyan-300 ring-2 ring-cyan-300 shadow-[0_0_5px_1px_rgba(34,211,238,0.9),0_0_16px_6px_rgba(34,211,238,0.4)] hover:bg-gray-600'
+                : 'bg-gray-700 hover:bg-gray-600 border-gray-500'
+            }`}
+          >
+            <span
+              data-letra
+              className="hidden text-[10px] font-bold text-gray-300 select-none"
+            >
+              M
+            </span>
+            <img
+              src="/icons/Spline Rosca.png"
+              alt=""
+              draggable={false}
+              onError={(e) => {
+                const letra = e.currentTarget.parentElement?.querySelector('[data-letra]');
+                if (letra) letra.classList.remove('hidden');
+                e.currentTarget.style.display = 'none';
+              }}
+              className="h-full w-full object-contain"
+            />
+          </button>
+          {/* ESPEJO: abre un desplegable con los 3 ejes; el elegido voltea
+              el objeto seleccionado respecto a ese eje (centro de su caja,
+              la malla queda horneada — lib/espejo.ts). Sin selección: aviso.
+              Icono /icons/Espejo.png (igual que los deformadores). */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                title={t('editor3D.espejoBtnTitle')}
+                data-testid="boton-espejo"
+                className="relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border bg-gray-700 hover:bg-gray-600 border-gray-500"
+              >
+                <span
+                  data-letra
+                  className="hidden text-[10px] font-bold text-gray-300 select-none"
+                >
+                  E
+                </span>
+                <img
+                  src="/icons/Espejo.png"
+                  alt=""
+                  draggable={false}
+                  onError={(e) => {
+                    const letra = e.currentTarget.parentElement?.querySelector('[data-letra]');
+                    if (letra) letra.classList.remove('hidden');
+                    e.currentTarget.style.display = 'none';
+                  }}
+                  className="h-full w-full object-contain"
+                />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="start"
+              className="bg-gray-900 border-gray-800 text-white min-w-[190px]"
+            >
+              <DropdownMenuItem
+                onClick={() => aplicarEspejo('x')}
+                data-testid="espejo-x"
+              >
+                {t('editor3D.espejoEjeX')}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => aplicarEspejo('y')}
+                data-testid="espejo-y"
+              >
+                {t('editor3D.espejoEjeY')}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => aplicarEspejo('z')}
+                data-testid="espejo-z"
+              >
+                {t('editor3D.espejoEjeZ')}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           {/* Dropdown: Nuevo proyecto, Eliminar objeto, Sustraer forma, Objeto 3D, Guardar, Luces */}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -13155,7 +13759,7 @@ pluginTracks,
             <button
              onClick={copyCurrentObject}
              data-testid="copy-object-btn"
-             className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground border border-white/10 transition-colors"
+             className="relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border bg-gray-700 hover:bg-gray-600 border-gray-500 cursor-pointer"
               title={
                 fullScreenCanvas
                   ? t('editor3D.copyShapeFullScreen', { name: fullScreenCanvas.name })
@@ -13164,8 +13768,23 @@ pluginTracks,
                     : t('editor3D.copyObjectConfig')
               }
           >
-             <Copy className="w-3.5 h-3.5" />
-             {t('editor3D.copy')}
+             <span
+               data-letra
+               className="hidden text-[10px] font-bold text-gray-300 select-none"
+             >
+               C
+             </span>
+             <img
+               src="/icons/Copiar.png"
+               alt=""
+               draggable={false}
+               onError={(e) => {
+                 const letra = e.currentTarget.parentElement?.querySelector('[data-letra]');
+                 if (letra) letra.classList.remove('hidden');
+                 e.currentTarget.style.display = 'none';
+               }}
+               className="h-full w-full object-contain"
+             />
           </button>
           <button
             onClick={pasteCurrentObject}
@@ -13175,7 +13794,7 @@ pluginTracks,
                   ? !polygonClipboard
                   : !editorClipboard && !multiObjectClipboard
               }
-            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground border border-white/10 transition-colors disabled:opacity-30 disabled:hover:bg-white/5"
+            className="relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border bg-gray-700 hover:bg-gray-600 border-gray-500 disabled:opacity-40 disabled:cursor-not-allowed"
               title={
                 fullScreenCanvas
                   ? polygonClipboard
@@ -13188,8 +13807,23 @@ pluginTracks,
                       : t('editor3D.pasteAsConfig')
               }
           >
-             <ClipboardPaste className="w-3.5 h-3.5" />
-             {t('editor3D.paste')}
+             <span
+               data-letra
+               className="hidden text-[10px] font-bold text-gray-300 select-none"
+             >
+               P
+             </span>
+             <img
+               src="/icons/Pegar.png"
+               alt=""
+               draggable={false}
+               onError={(e) => {
+                 const letra = e.currentTarget.parentElement?.querySelector('[data-letra]');
+                 if (letra) letra.classList.remove('hidden');
+                 e.currentTarget.style.display = 'none';
+               }}
+               className="h-full w-full object-contain"
+             />
           </button>
             {(mode === 'views' || mode === 'mesh' || mode === 'extrude') && (
             <>
@@ -13288,11 +13922,25 @@ pluginTracks,
                <button
                  disabled={mesh.vertices.length === 0}
                  title={t('editor3D.exportImportTitle')}
-                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 disabled:opacity-40 transition-colors"
+                 className="relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border bg-gray-700 hover:bg-gray-600 border-gray-500 disabled:opacity-40 disabled:cursor-not-allowed"
                >
-                 <Download className="w-3.5 h-3.5" />
-                  {t('editor3D.exportImport')}
-                  <ChevronDown className="w-3 h-3" />
+                 <span
+                   data-letra
+                   className="hidden text-[10px] font-bold text-gray-300 select-none"
+                 >
+                   I
+                 </span>
+                 <img
+                   src="/icons/Exportar-Importar.png"
+                   alt=""
+                   draggable={false}
+                   onError={(e) => {
+                     const letra = e.currentTarget.parentElement?.querySelector('[data-letra]');
+                     if (letra) letra.classList.remove('hidden');
+                     e.currentTarget.style.display = 'none';
+                   }}
+                   className="h-full w-full object-contain"
+                 />
                </button>
              </DropdownMenuTrigger>
              <DropdownMenuContent
@@ -13478,31 +14126,77 @@ pluginTracks,
 
           <button
             onClick={resetModel}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 transition-colors"
+            className="relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border bg-gray-700 hover:bg-gray-600 border-gray-500 cursor-pointer"
+            title={t('editor3D.reset')}
           >
-            <RefreshCw className="w-3.5 h-3.5" />
-            {t('editor3D.reset')}
+            <span
+              data-letra
+              className="hidden text-[10px] font-bold text-gray-300 select-none"
+            >
+              R
+            </span>
+            <img
+              src="/icons/Reset.png"
+              alt=""
+              draggable={false}
+              onError={(e) => {
+                const letra = e.currentTarget.parentElement?.querySelector('[data-letra]');
+                if (letra) letra.classList.remove('hidden');
+                e.currentTarget.style.display = 'none';
+              }}
+              className="h-full w-full object-contain"
+            />
           </button>
           <button
             onClick={undo}
             data-testid="undo-btn"
             disabled={historyIndex <= 0}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 disabled:opacity-40 transition-colors"
+            className="relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border bg-gray-700 hover:bg-gray-600 border-gray-500 disabled:opacity-40 disabled:cursor-not-allowed"
             title={t('editor3D.undoTitle')}
           >
-            <Undo2 className="w-3.5 h-3.5" />
-              {t('editor3D.undo')}
+            <span
+              data-letra
+              className="hidden text-[10px] font-bold text-gray-300 select-none"
+            >
+              U
+            </span>
+            <img
+              src="/icons/Deshacer.png"
+              alt=""
+              draggable={false}
+              onError={(e) => {
+                const letra = e.currentTarget.parentElement?.querySelector('[data-letra]');
+                if (letra) letra.classList.remove('hidden');
+                e.currentTarget.style.display = 'none';
+              }}
+              className="h-full w-full object-contain"
+            />
           </button>
 
           <button
             onClick={redo}
             data-testid="redo-btn"
             disabled={historyIndex >= history.length - 1}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 text-foreground border border-white/10 disabled:opacity-40 transition-colors"
+            className="relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border bg-gray-700 hover:bg-gray-600 border-gray-500 disabled:opacity-40 disabled:cursor-not-allowed"
             title={t('editor3D.redoTitle')}
           >
-            <Redo2 className="w-3.5 h-3.5" />
-              {t('editor3D.redo')}
+            <span
+              data-letra
+              className="hidden text-[10px] font-bold text-gray-300 select-none"
+            >
+              H
+            </span>
+            <img
+              src="/icons/Rehacer.png"
+              alt=""
+              draggable={false}
+              onError={(e) => {
+                const letra = e.currentTarget.parentElement?.querySelector('[data-letra]');
+                if (letra) letra.classList.remove('hidden');
+                e.currentTarget.style.display = 'none';
+              }}
+              className="h-full w-full object-contain"
+            />
           </button>
 
           <DropdownMenu>
@@ -15859,6 +16553,222 @@ pluginTracks,
                     </div>
                   );
                 })()}
+              {/* Panel del modo SPLINE 3D: estado del trazado en curso
+                  (lista de vértices, cerrado, suavizado, escala) + plantilla
+                  e inclinación del vértice activo + Aplicar/Cancelar. */}
+              {modoSpline && mode === 'scene' && (() => {
+                const activo = splineNodes.find((n) => n.id === splineActivoId) ?? null;
+                const activoIdx = activo
+                  ? splineNodes.findIndex((n) => n.id === activo.id) + 1
+                  : 0;
+                return (
+                  <div
+                    key="spline-panel-wrap"
+                    className="shrink-0 px-3 py-2 border-b border-white/5 space-y-1.5"
+                    data-testid="spline-panel"
+                  >
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                        {t('editor3D.splineTitle')}
+                      </h3>
+                      <span className="font-mono text-[10px] text-green-400">
+                        {splineNodes.length}
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-muted-foreground/60 flex items-start gap-1">
+                      <Info className="w-2.5 h-2.5 shrink-0 mt-0.5" />
+                      {t('editor3D.splineAxisHint')}
+                    </p>
+                    {splineNodes.length === 0 && (
+                      <p className="text-[11px] text-muted-foreground/60">
+                        {t('editor3D.splineEmptyHint')}
+                      </p>
+                    )}
+                    {splineNodes.length > 0 && (
+                      <div className="max-h-[96px] overflow-y-auto custom-scrollbar space-y-0.5">
+                        {splineNodes.map((n, i) => (
+                          <div
+                            key={n.id}
+                            className={`flex items-center gap-1 rounded px-1 py-0.5 text-[10px] cursor-pointer ${
+                              n.id === splineActivoId
+                                ? 'bg-green-500/10 border border-green-500/40'
+                                : 'border border-transparent hover:bg-white/5'
+                            }`}
+                            data-testid={`spline-vertex-${i}`}
+                            onClick={() => setSplineActivoId(n.id)}
+                          >
+                            <span className="flex-1 text-foreground/80">
+                              {t('editor3D.splineVertexN', { n: i + 1 })}{n.esquina ? ' ·▸' : ''}
+                            </span>
+                            {n.id === splineActivoId && (
+                              <>
+                                <button
+                                  type="button"
+                                  data-testid="spline-toggle-esquina"
+                                  onClick={() => toggleSplineEsquina(n.id)}
+                                  title={n.esquina ? t('editor3D.splineCornerOff') : t('editor3D.splineCornerBtn')}
+                                  className={`px-1 rounded border text-[9px] cursor-pointer ${
+                                    n.esquina
+                                      ? 'border-cyan-400/60 bg-cyan-500/20 text-cyan-200'
+                                      : 'border-white/15 bg-black/40 text-muted-foreground'
+                                  }`}
+                                >
+                                  {t('editor3D.splineCornerBtn').slice(0, 3)}
+                                </button>
+                                <button
+                                  type="button"
+                                  data-testid="spline-delete-vertex"
+                                  onClick={() => removeSplineNode(n.id)}
+                                  title={t('editor3D.splineDeleteVertex')}
+                                  className="px-1 rounded border border-white/15 bg-black/40 text-red-300 hover:bg-red-500/20 text-[9px] cursor-pointer"
+                                >
+                                  −
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {/* Muelle precargado (botón Spline Rosca): SUS mismas
+                        propiedades de primitiva dentro del panel del
+                        spline; editar una rehace la hélice conservando
+                        plantillas y tilt ya editadas (aviso visible). */}
+                    {splineRosca && (
+                      <ObjectPrimitiveFields
+                        params={{ kind: 'muelle', ...splineRosca }}
+                        onChange={(next) => {
+                          if (next.kind === 'muelle') setSplineRoscaParams(next);
+                        }}
+                        t={t}
+                      />
+                    )}
+                    <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground cursor-pointer">
+                      <input
+                        type="checkbox"
+                        data-testid="spline-closed"
+                        checked={splineClosed}
+                        disabled={splineNodes.length < 3}
+                        onChange={(e) => setSplineClosed(e.target.checked)}
+                        className="w-3 h-3 accent-green-500"
+                      />
+                      {t('editor3D.splineClosedToggle')}
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        data-testid="spline-radial"
+                        checked={splineRadial}
+                        onChange={(e) => setSplineRadial(e.target.checked)}
+                        className="w-3 h-3 accent-green-500 cursor-pointer"
+                      />
+                      {t('editor3D.splineRadialToggle')}
+                    </label>
+                    <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
+                      <span>{t('editor3D.splineSubdivisions')}</span>
+                      <span className="font-mono text-[10px] text-green-400">
+                        {splineSubdivisions}
+                      </span>
+                    </label>
+                    <Slider
+                      min={1}
+                      max={64}
+                      step={1}
+                      value={[splineSubdivisions]}
+                      onValueChange={([v]) => setSplineSubdivisions(v)}
+                      className="w-full"
+                      data-testid="spline-subdivisions"
+                    />
+                    {activo && (
+                      <div className="space-y-1.5 pt-1 border-t border-white/5">
+                        <div className="flex flex-wrap gap-1">
+                          {SHAPES.map((s) => (
+                            <button
+                              key={s.id}
+                              type="button"
+                              data-testid={`spline-shape-${s.id}`}
+                              onClick={() => updateSplineNodePolygon(activo.id, s.build())}
+                              className="px-1.5 py-0.5 rounded bg-black/40 border border-white/10 text-[9px] text-foreground/80 hover:bg-white/10 cursor-pointer"
+                            >
+                              {s.name}
+                            </button>
+                          ))}
+                        </div>
+                        <button
+                          type="button"
+                          data-testid="spline-plantilla-todos"
+                          onClick={aplicarPlantillaATodos}
+                          disabled={!activo?.polygon || activo.polygon.length < 3}
+                          className="w-full px-2 py-0.5 rounded bg-black/40 border border-white/10 text-[9px] text-foreground/80 hover:bg-white/10 disabled:opacity-40 cursor-pointer"
+                        >
+                          {t('editor3D.splineTemplateAll')}
+                        </button>
+                        {/* Altura fija: DrawingCanvas se estira con h-full /
+                            flex-1 sobre un contenedor absoluto — sin una
+                            celda alta colapsa a 0px (como en Extruir). */}
+                        <div className="h-56 shrink-0">
+                          <DrawingCanvas
+                            label={`${t('editor3D.splineTemplateLabel')} ${activoIdx ? `#${activoIdx}` : ''}`}
+                            axisLabel={t('editor3D.panelLabels.frontAxis')}
+                            polygon={activo.polygon ?? []}
+                            onChange={(poly) => updateSplineNodePolygon(activo.id, poly)}
+                            resolution={resolution}
+                            onMaximize={() => setEditingSplineCanvas(true)}
+                          />
+                        </div>
+                        <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
+                          <span>{t('editor3D.splineScale')}</span>
+                          <span className="font-mono text-[10px] text-green-400">
+                            {(activo.escala ?? splineEscala).toFixed(2)}
+                          </span>
+                        </label>
+                        <Slider
+                          min={0.05}
+                          max={2}
+                          step={0.05}
+                          value={[activo.escala ?? splineEscala]}
+                          onValueChange={([v]) => setSplineNodeEscala(activo.id, v)}
+                          className="w-full"
+                          data-testid="spline-escala"
+                        />
+                        <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
+                          <span>{t('editor3D.splineTilt')}</span>
+                          <span className="font-mono text-[10px] text-green-400">
+                            {Math.round(activo.tilt ?? 0)}°
+                          </span>
+                        </label>
+                        <Slider
+                          min={-180}
+                          max={180}
+                          step={5}
+                          value={[Math.round(activo.tilt ?? 0)]}
+                          onValueChange={([v]) => setSplineNodeTilt(activo.id, v)}
+                          className="w-full"
+                          data-testid="spline-tilt"
+                        />
+                      </div>
+                    )}
+                    <div className="flex gap-1.5 pt-0.5">
+                      <button
+                        type="button"
+                        data-testid="spline-aplicar"
+                        onClick={handleSplineAplicar}
+                        className="flex-1 px-2 py-1 rounded bg-green-600 hover:bg-green-500 text-white text-[11px] font-medium cursor-pointer"
+                      >
+                        {t('editor3D.deformAplicar')}
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="spline-cancelar"
+                        onClick={salirModoSpline}
+                        className="px-2 py-1 rounded bg-black/40 border border-white/10 text-[11px] text-muted-foreground hover:bg-white/10 cursor-pointer"
+                      >
+                        {t('editor3D.deformCancelar')}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
               <div
                 className="shrink-0 overflow-y-auto custom-scrollbar max-h-[320px] px-2 py-2 space-y-1"
                 data-testid="scene-object-list"
@@ -17053,6 +17963,41 @@ pluginTracks,
                     />
                   )}
                 </div>
+              ) : mode === 'scene' && editingSplineCanvas ? (
+                /* Lienzo maximizado de la plantilla del vértice ACTIVO del
+                    spline: igual que la plantilla de Extruir, sustituye a
+                    las cuatro ventanas. Si ya no hay vértice activo (se
+                    canceló el modo o se cambió de selección) vuelve la
+                    rejilla. */
+                (() => {
+                  const nodoSpline = splineNodes.find(
+                    (n) => n.id === splineActivoId
+                  ) ?? null;
+                  if (!nodoSpline) return renderWindowLayout();
+                  return (
+                    <div className="w-full h-full min-h-0">
+                      <EditorCanvasComponent
+                        label={`${t('editor3D.splineTemplateLabel')} ${(() => {
+                          const idxS = splineNodes.findIndex(
+                            (n) => n.id === nodoSpline.id
+                          );
+                          return idxS >= 0 ? `#${idxS + 1}` : '';
+                        })()}`}
+                        axisLabel={t('editor3D.panelLabels.frontAxis')}
+                        polygon={nodoSpline.polygon ?? []}
+                        onChange={(poly: Polygon) =>
+                          updateSplineNodePolygon(nodoSpline.id, poly)
+                        }
+                        resolution={editorGridResolution}
+                        onClose={() => setEditingSplineCanvas(false)}
+                        gridResolution={editorGridResolution}
+                        onGridResolutionChange={setEditorGridResolution}
+                        canvasZoom={editorCanvasZoom}
+                        onCanvasZoomChange={setEditorCanvasZoom}
+                      />
+                    </div>
+                  );
+                })()
               ) : editingPanel !== null ? (
               renderViewerPanel(editingPanel)
             ) : (

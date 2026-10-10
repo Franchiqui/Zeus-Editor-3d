@@ -1150,7 +1150,7 @@ function romper(mesh, params) {
   const giro = Math.max(0, num2(params, "giroVelocidad", 90));
   const escala = Math.max(0.02, num2(params, "tamanoFinal", 100) / 100);
   const aleat = Math.min(100, Math.max(0, num2(params, "aleatoriedad", 50))) / 100;
-  const caida = Math.min(100, Math.max(0, num2(params, "caida", 100))) / 100;
+  const caida = Math.min(100, Math.max(0, num2(params, "caida", 0))) / 100;
   const rnd = mulberryDeform(Math.round(num2(params, "semilla", 42)));
   const centCara = new Array(caras);
   let cxTotal = 0;
@@ -1573,7 +1573,10 @@ var DEFORMADORES_DIRECTOS = [
         min: 0,
         max: 100,
         paso: 1,
-        valor: 100,
+        // 0 por defecto: la FUERZA solo dispersa (explosión congelada);
+        // caer al suelo lo manda SU campo, Caída — antes con 100 de
+        // default CUALQUIER fuerza (hasta 1) tiraba todo al suelo.
+        valor: 0,
         unidad: "%",
         descripcion: "0% = los pedazos se quedan flotando por el aire, como una explosi\xF3n congelada. 100% = caen al suelo y se tumban: TODOS quedan apoyados planos, ninguno flotando. Los intermedios caen y se tumban a medias."
       },
