@@ -14,6 +14,7 @@ import type {
    TransformTrack,
    PluginParamTrack,
    EffectTrack,
+   DeformadorTrack,
 } from '@/lib/animation';
 
 /** Vista que puede mostrar una ventana (incluye los dos costados). */
@@ -156,6 +157,8 @@ interface ViewerPanelProps {
    pluginTracks?: PluginParamTrack[];
    /** Pistas de efectos visuales del editor de movimiento. */
    effectTracks?: EffectTrack[];
+  /** Pistas de deformadores del editor de movimiento (en cadena). */
+  deformadorTracks?: DeformadorTrack[];
   /** Malla base congelada por objectId para las pistas de plugin. */
   pluginBaseMeshes?: Record<string, unknown>;
   /** Reproducción o scrub del editor de movimiento activo: el visor aplica override. */
@@ -302,6 +305,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
    transformTracks,
    pluginTracks,
    effectTracks,
+  deformadorTracks,
   pluginBaseMeshes,
   motionPlaying,
    showMotionPath,
@@ -627,6 +631,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
          transformTracks={transformTracks}
           pluginTracks={pluginTracks}
           effectTracks={effectTracks}
+          deformadorTracks={deformadorTracks}
          pluginBaseMeshes={pluginBaseMeshes}
           motionPlaying={motionPlaying}
          showMotionPath={showMotionPath}

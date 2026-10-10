@@ -20,6 +20,39 @@ function componerMatrizTransforma(t: {
 
 let mp4ExportActive = false;
 
+/**
+ * Suelo REAL del visor en coordenadas LOCALES del objeto: el plano de los
+ * puntos locales cuya y-mundo es SUELO_MUNDO, transformados con la inversa
+ * del transform del objeto. Va como params OCULTOS al deformador Romper
+ * para que los pedazos caigan al suelo que se ve, aunque el objeto esté
+ * girado, escalado o flotando por encima de la rejilla ("transforma" puede
+ * venir de una pista evaluada: pasar SIEMPRE el transform completo).
+ */
+export function paramsSueloLocal(
+  t: {
+    px?: number; py?: number; pz?: number;
+    rx?: number; ry?: number; rz?: number;
+    sx?: number; sy?: number; sz?: number;
+  }
+): PluginParams {
+  const SUELO_MUNDO = -1.05; // rejilla del visor (grid.position.y)
+  const mat = componerMatrizTransforma(t);
+  const p0 = new THREE.Vector3(0, SUELO_MUNDO, 0).applyMatrix4(
+    mat.clone().invert()
+  );
+  // El plano del suelo en local tiene normal g = Lᵀ·ĵ (L = parte lineal:
+  // rotación·escala): los puntos con p·g = c tienen y-mundo constante.
+  // En column-major, la fila 2 de la parte lineal es (e[1], e[5], e[9]).
+  // OJO: el truco secante Minv·(0,1,0) da L⁻¹·ĵ, que SOLO coincide con g
+  // si la escala es uniforme — con escala no uniforme el plano salía
+  // torcido y algunos pedazos quedaban en el aire.
+  const e = mat.elements;
+  const u = new THREE.Vector3(e[1], e[5], e[9]);
+  if (u.lengthSq() < 1e-12) return {};
+  u.normalize();
+  return { sueloUx: u.x, sueloUy: u.y, sueloUz: u.z, sueloD: u.dot(p0) };
+}
+
 import { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
@@ -34,13 +67,19 @@ import {
   extremosBordeAnillo,
   bordesAnilloDe,
 } from '@/lib/geometry';
-import { aplicarDeformador } from '@/lib/deformadores';
+import {
+  aplicarDeformador,
+  deformadorPorId,
+  deformarGrupoCadena,
+  type MiembroGrupoDeformador,
+} from '@/lib/deformadores';
 import { aplicarMaterialCreado, limpiarExtrasCreados } from '@/lib/texture-generator';
 import {
    evaluateCameraKeyframes,
    evaluateTransformTrack,
    evaluatePluginParamTrack,
    evaluateEffectTrack,
+   evaluateDeformadorTrack,
 } from '@/lib/animation';
 import type {
    AnimationTrack,
@@ -54,6 +93,7 @@ import type {
      EffectTrack,
      EffectType,
      EffectProperty,
+     DeformadorTrack,
 } from '@/lib/animation';
 import { obtenerPlugin, type PluginParams } from '@/lib/plugins';
 import { smoothVoxelMesh } from '@/lib/mesh-smooth';
@@ -366,6 +406,16 @@ interface Viewer3DProps {
         min: { x: number; y: number; z: number };
         max: { x: number; y: number; z: number };
       } | null;
+      /** Cadena de deformadores ANIMADOS (pistas): la cage se deforma con
+       *  CADA uno en orden (igual que la cadena del playback). */
+      cadena?: { tipo: string; params: PluginParams }[];
+      /** Malla base SIN deformar del objeto animado: con ella la cage
+       *  sigue al deformador Romper (que necesita CARAS: se calcula el
+       *  desplazamiento de su pedazo de destino vértice-por-vértice). */
+      malla?: Mesh;
+      /** Cage SIN lavado gris (pistas de deformador animadas: el objeto
+       *  se ve normal, solo lleva el contorno alrededor). */
+      soloContorno?: boolean;
     } | null;
     /** Solo capturar lo visible (caras frontales, no lo que está detrás) */
     faceSelectVisibleOnly?: boolean;
@@ -539,6 +589,9 @@ interface Viewer3DProps {
     pluginTracks?: PluginParamTrack[];
     /** Pistas de efectos visuales del editor de movimiento. */
     effectTracks?: EffectTrack[];
+    /** Pistas de deformadores (editor de movimiento): se aplican EN CADENA
+     *  sobre el resultado del plugin (orden del array). */
+    deformadorTracks?: DeformadorTrack[];
     /** Malla base congelada por objectId para las pistas de plugin. */
     pluginBaseMeshes?: Record<string, unknown>;
     /** Reproducción o scrub del editor de movimiento: aplica override visual. */
@@ -1018,6 +1071,59 @@ function disposeMaterial(material: THREE.Material | THREE.Material[]): void {
 }
 
 /**
+ * Cache COMPARTIDO de texturas de imagen por URL (+ repetición). Los
+ * visuales reconstruidos en vuelo (duplicados y transplantes del editor de
+ * movimiento) crean cada vez un material NUEVO cuyo mapa carga ASÍNCRONO:
+ * durante la animación el visual siguiente descarta el material y su carga
+ * no llega a terminar jamás — los objetos NO seleccionados quedan sin
+ * textura mientras la malla principal (material superviviente) sí la
+ * muestra. Aquí la imagen se carga UNA vez por URL y el mapa se asigna en
+ * SINCRONO (el primer frame está en blanco hasta que la imagen entra; a
+ * partir de ahí todas las reconstrucciones la reutilizan al instante).
+ */
+const texturaBaseDe = new Map<string, THREE.Texture>();
+const texturaClonDe = new Map<string, THREE.Texture>();
+
+function texturaImagenCompartida(
+  url: string,
+  repeatX: number,
+  repeatY?: number
+): THREE.Texture {
+  const clave = `${url}|${repeatX}|${repeatY ?? repeatX}`;
+  const ya = texturaClonDe.get(clave);
+  if (ya) return ya;
+  let base = texturaBaseDe.get(url);
+  if (!base) {
+    base = new THREE.Texture();
+    base.colorSpace = THREE.SRGBColorSpace;
+    base.wrapS = THREE.RepeatWrapping;
+    base.wrapT = THREE.RepeatWrapping;
+    base.anisotropy = 4;
+    texturaBaseDe.set(url, base);
+    new THREE.TextureLoader().load(
+      url,
+      (cargada) => {
+        // La imagen entra al CONTENEDOR compartido: todos los clones que
+        // comparten su `.source` la muestran al subir needsUpdate.
+        base!.image = cargada.image;
+        base!.needsUpdate = true;
+      },
+      undefined,
+      () => {
+        // Sin imagen disponible: la textura queda vacía (material gris).
+      }
+    );
+  }
+  // Cada uso lleva SU repeat: el clon comparte la imagen (el propio
+  // `.source` de la base) pero guarda su transformación de UVs.
+  const clon = base.clone();
+  clon.repeat.set(repeatX, repeatY ?? repeatX);
+  clon.needsUpdate = true;
+  texturaClonDe.set(clave, clon);
+  return clon;
+}
+
+/**
  * Construye el visual de un objeto a partir de su instantánea de malla
  * (la copia que se guarda al pegarlo en otra pestaña). Reproduce los
  * mismos materiales que la malla principal: textura con su acabado y su
@@ -1265,29 +1371,10 @@ export function buildSnapshotObjectVisual(
     if (faceEntries.some((e) => e.tex)) {
       const texMatIndex = new Map<string, number>();
       const extraMaterials: THREE.MeshPhysicalMaterial[] = [];
-      const faceLoader = new THREE.TextureLoader();
-      const loadFaceTexture = (mat: THREE.MeshPhysicalMaterial, url: string) => {
-        faceLoader.load(
-          url,
-          (texture) => {
-            texture.colorSpace = THREE.SRGBColorSpace;
-            texture.anisotropy = 4;
-            texture.needsUpdate = true;
-            texture.wrapS = THREE.RepeatWrapping;
-            texture.wrapT = THREE.RepeatWrapping;
-            mat.map = texture;
-            mat.color.set(0xffffff);
-            mat.needsUpdate = true;
-          },
-          undefined,
-          () => {
-            // Sin imagen disponible: teñir la cara de rojo para que el
-            // fallo se note en vez de quedar invisible.
-            mat.color.set(0xff3333);
-            mat.needsUpdate = true;
-          }
-        );
-      };
+      // Textura COMPARTIDA: el mapa entra en sincrón desde el cache — la
+      // reconstrucción del frame siguiente ya no descarta una carga a medio
+      // terminar (antes la textura «nunca llegaba» al reconstruir a cada
+      // replantear el material con map null).
       for (const entry of faceEntries) {
         if (!entry.tex || texMatIndex.has(entry.tex)) continue;
         const faceMat = new THREE.MeshPhysicalMaterial({
@@ -1299,7 +1386,8 @@ export function buildSnapshotObjectVisual(
           metalness: material.metalness,
           roughness: material.roughness,
         });
-        loadFaceTexture(faceMat, entry.tex);
+        faceMat.map = texturaImagenCompartida(entry.tex, 1, 1);
+        faceMat.needsUpdate = true;
         texMatIndex.set(entry.tex, 1 + extraMaterials.length);
         extraMaterials.push(faceMat);
       }
@@ -1334,34 +1422,20 @@ export function buildSnapshotObjectVisual(
       material.color.set(mesh.textureMaterialParams.color);
       material.needsUpdate = true;
     } else if (mesh.texture) {
-      new THREE.TextureLoader().load(
-        mesh.texture,
-         (texture) => {
-           texture.colorSpace = THREE.SRGBColorSpace;
-           texture.anisotropy = 4;
-           texture.needsUpdate = true;
-            const repeat = mesh.textureRepeat ?? textureRepeat ?? 1;
-            // Vertical: el propio de la malla; si no, el del panel; si no,
-            // copia el horizontal.
-            const repeatY = mesh.textureRepeatY ?? textureRepeatY ?? repeat;
-            texture.repeat.set(repeat, repeatY);
-           texture.wrapS = THREE.RepeatWrapping;
-           texture.wrapT = THREE.RepeatWrapping;
-           material.map = texture;
-           // Textura de relieve dedicada: SOLO ella genera el relieve; la
-           // normal queda solo con el color. Sin ella el relieve sale de la
-           // textura normal (ahora mucho más marcado).
-           material.bumpMap = mesh.bumpTexture ? null : texture;
-           material.bumpScale = (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP;
-           material.color.set(mesh.textureColor ?? 0xffffff);
-           material.needsUpdate = true;
-           aplicarTexturaRelieve(material, mesh, repeat, repeatY);
-        },
-        undefined,
-        () => {
-          material.color.set(0xcccccc);
-        }
-      );
+      // Textura de imagen COMPARTIDA: el mapa entra en sincrón desde el
+      // cache (la carga asíncrona por material construía visuales que se
+      // descartaban antes de que la imagen llegara).
+      const repeat = mesh.textureRepeat ?? textureRepeat ?? 1;
+      const repeatY = mesh.textureRepeatY ?? textureRepeatY ?? repeat;
+      const mapa = texturaImagenCompartida(mesh.texture, repeat, repeatY);
+      material.map = mapa;
+      // Textura de relieve dedicada: SOLO ella genera el relieve; la
+      // normal queda solo con el color. Sin ella el relieve sale de la
+      // textura normal (ahora mucho más marcado).
+      material.bumpMap = mesh.bumpTexture ? null : mapa;
+      material.bumpScale = (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP;
+      material.color.set(mesh.textureColor ?? 0xffffff);
+      aplicarTexturaRelieve(material, mesh, repeat, repeatY);
     } else if (mesh.bumpTexture) {
       // Sin textura normal: solo color blanco + relieve dedicado.
       material.color.set(0xffffff);
@@ -3484,6 +3558,7 @@ export default function Viewer3D({
        transformTracks,
        pluginTracks,
        effectTracks,
+       deformadorTracks,
        pluginBaseMeshes,
        motionPlaying,
       showMotionPath,
@@ -3547,6 +3622,8 @@ export default function Viewer3D({
      pluginTracksRef.current = pluginTracks;
      const effectTracksRef = useRef<EffectTrack[] | undefined>(effectTracks);
      effectTracksRef.current = effectTracks;
+    const deformadorTracksRef = useRef<DeformadorTrack[] | undefined>(deformadorTracks);
+    deformadorTracksRef.current = deformadorTracks;
     const pluginBaseMeshesRef = useRef<Record<string, unknown> | undefined>(pluginBaseMeshes);
     pluginBaseMeshesRef.current = pluginBaseMeshes;
     // Recorrido editable del objeto seleccionado.
@@ -5368,6 +5445,35 @@ export default function Viewer3D({
     // estado de la escena: el visor aplica los valores evaluados sobre
     // sus grupos THREE cada frame y, al parar, restaura todo.
     const motionParamsCache = new Map<string, Record<string, number>>();
+    // Cache de parámetros evaluados de los DEFORMADORES (key
+    // `${oid}:${track.id}`): evita re-aplicar el deformador cuando sus
+    // valores no cambiaron (mismas tolerancias que los plugins).
+    const motionDeformParamsCache = new Map<string, Record<string, number | string | boolean>>();
+    // Último resultado del paso de plugins por objectId ({params, malla}):
+    // cuando el objeto también lleva deformadores en cadena, el paso de
+    // plugins produce SIN trasplantar y este cache alimenta la cadena.
+    // Último resultado del paso de plugins por objectId (malla de datos):
+    // cuando el objeto también lleva deformadores en cadena, el paso de
+    // plugins produce SIN trasplantar y este cache alimenta la cadena.
+    const motionPluginResultCache = new Map<string, Mesh>();
+    // Última ENTRADA usada por la cadena de deformadores (por objectId):
+    // si el paso 3 produjo un resultado NUEVO, hay transplante aunque los
+    // valores del deformador no hayan cambiado.
+    const motionDeformEntradaCache = new Map<string, Mesh>();
+    // Pistas de deformador de GRUPO: última COMPOSICIÓN de la unión por
+    // objectId (miembros + identidad de malla base); si cambia, hay
+    // deformación aunque los valores sigan en su tolerancia.
+    const motionGrupoEntradaClave = new Map<string, string>();
+    let mallaIdSiguiente = 1;
+    const mallaIdDe = new WeakMap<object, number>();
+    const idMalla = (m: Mesh): number => {
+      let id = mallaIdDe.get(m);
+      if (id === undefined) {
+        id = mallaIdSiguiente++;
+        mallaIdDe.set(m, id);
+      }
+      return id;
+    };
     // Geometría original del seleccionado (transplante de plugin) y la
     // geometría animada en curso (para disponerla al reemplazarla).
      const motionOrigGeometry: { mesh: THREE.Mesh | null; geo: THREE.BufferGeometry | null } = {
@@ -5435,6 +5541,10 @@ export default function Viewer3D({
       }
        motionOrigChildren.clear();
        motionParamsCache.clear();
+       motionDeformParamsCache.clear();
+       motionPluginResultCache.clear();
+       motionDeformEntradaCache.clear();
+       motionGrupoEntradaClave.clear();
        motionWarnedMissingBase.clear();
        // Restore effect systems to the objects' static state (effect
        // tracks may have activated effects independently of the objects).
@@ -5615,6 +5725,115 @@ export default function Viewer3D({
         }
       }
 
+      // Transplante COMPARTIDO del resultado (plugin o cadena de
+      // deformadores) al visual del objeto: geometría a la malla principal
+      // o hijos nuevos en el duplicado. Aviso diagnóstico limitado a 1/seg:
+      // cada camino silencioso aquí dejaba deformedo/cage SIN objeto.
+      let ultimoAvisoTransplante = 0;
+      const avisoTransplante = (mensaje: string) => {
+        const ahora = performance.now();
+        if (ahora - ultimoAvisoTransplante < 1000) return;
+        ultimoAvisoTransplante = ahora;
+        console.warn('[motion-deform]', mensaje);
+      };
+      const transplantarVisual = (oid: string, resultado: Mesh, obj?: { smooth?: boolean; textureProjection?: LatheTextureProjection }) => {
+        const visual = buildSnapshotObjectVisual(
+          resultado,
+          obj?.smooth ?? false,
+          obj?.textureProjection ?? 'planar',
+          undefined,
+          resultado.textureRepeat ?? 1,
+          resultado.textureRepeatY,
+          envCreadaRef.current
+        );
+        if (visual.children.length === 0) {
+          avisoTransplante(`Visual vacío al trasplantar ${oid} (resultado: ${resultado.vertices.length} vértices, ${resultado.faces.length} caras)`);
+          return;
+        }
+        if (oid === selId) {
+          // Transplante de geometría a la malla principal.
+          const main = findMainMesh(meshGroup);
+          const nuevaGeo = findMainMesh(visual)?.geometry;
+          if (!main) avisoTransplante(`Sin malla principal en meshGroup para ${oid}`);
+          if (main && !nuevaGeo) avisoTransplante(`El visual de ${oid} no trae malla principal`);
+          if (!main || !nuevaGeo) return;
+          if (motionOrigGeometry.mesh && motionOrigGeometry.mesh !== main) {
+            // La selección cambió durante la reproducción: devolver
+            // la geometría original a la malla anterior y empezar
+            // de cero con la nueva.
+            motionOrigGeometry.mesh.geometry = motionOrigGeometry.geo!;
+            motionAnimatedGeo.geo = null;
+            motionOrigGeometry.mesh = null;
+            motionOrigGeometry.geo = null;
+          }
+          if (!motionOrigGeometry.mesh) {
+            motionOrigGeometry.mesh = main;
+            motionOrigGeometry.geo = main.geometry;
+          }
+          if (motionAnimatedGeo.geo) motionAnimatedGeo.geo.dispose();
+          motionAnimatedGeo.geo = nuevaGeo;
+          main.geometry = nuevaGeo;
+          // Aristas del visual principal (marcadas con aristasDeMesh):
+          // reconstruirlas para que SIGAN a la malla transplantada.
+          for (const hermano of meshGroup.children) {
+            if (
+              hermano instanceof THREE.LineSegments &&
+              hermano.userData?.aristasDeMesh &&
+              main.geometry
+            ) {
+              hermano.geometry.dispose();
+              hermano.geometry = new THREE.EdgesGeometry(main.geometry, 1);
+            }
+          }
+          // Aristas del modo «gris con aristas» (marcadas
+          // __aristasVistaGris, hijas de la malla): salen de la malla
+          // LÓGICA capturada al entrar al modo. En cada transplante se
+          // redibujan con la malla DEFORMADA — si no, la surface gris se
+          // deforma y sus aristas quedan congeladas en el estado original.
+          const aristasGris = main.children.find(
+            (c) =>
+              c instanceof THREE.LineSegments &&
+              c.userData?.__aristasVistaGris
+          ) as THREE.LineSegments | undefined;
+          if (aristasGris && resultado.vertices.length > 0 && resultado.faces.length > 0) {
+            aristasGris.geometry.dispose();
+            aristasGris.geometry = aristasDeMallaLogica(resultado);
+          }
+          // La geometría del visual se queda en la malla principal:
+          // solo se disponen sus materiales (prestados y temporales).
+          visual.traverse((item) => {
+            const m = item as THREE.Mesh;
+            if (m.material) disposeMaterial(m.material as THREE.Material);
+          });
+        } else {
+          // Duplicado: sustituir sus hijos por el visual nuevo.
+          const dup = meshGroup.children.find(
+            (c) =>
+              c.userData.sceneObjectDuplicate &&
+              c.userData.sceneObjectId === oid
+          );
+          if (!dup) {
+            avisoTransplante(`Sin duplicado en meshGroup para ${oid}`);
+            return;
+          }
+          if (!motionOrigChildren.has(oid)) {
+            // Primera vez: los hijos actuales SON los originales.
+            motionOrigChildren.set(oid, [...dup.children]);
+          }
+          for (const hijo of [...dup.children]) {
+            dup.remove(hijo);
+            if (motionOrigChildren.has(oid)) {
+              hijo.traverse?.((item) => {
+                const m = item as THREE.Mesh;
+                m.geometry?.dispose?.();
+                if (m.material) disposeMaterial(m.material as THREE.Material);
+              });
+            }
+          }
+          dup.add(visual);
+        }
+      };
+
       // 3) Parámetros de plugin agrupados por objeto (un plugin por objeto).
       const pTracks = pluginTracksRef.current;
       if (pTracks && pTracks.length > 0) {
@@ -5658,70 +5877,271 @@ export default function Viewer3D({
             const resultado = def.aplicar(base as Mesh, params);
             if (!resultado || !resultado.vertices.length || !resultado.faces.length) continue;
             const obj = objectsRef.current?.find((o) => o.id === oid);
-            const visual = buildSnapshotObjectVisual(
-              resultado,
-              obj?.smooth ?? false,
-              obj?.textureProjection ?? 'planar',
-              undefined,
-              resultado.textureRepeat ?? 1,
-              resultado.textureRepeatY,
-              envCreadaRef.current
-            );
-            if (visual.children.length === 0) continue;
-            if (oid === selId) {
-              // Transplante de geometría a la malla principal.
-              const main = findMainMesh(meshGroup);
-              const nuevaGeo = findMainMesh(visual)?.geometry;
-              if (main && nuevaGeo) {
-                if (motionOrigGeometry.mesh && motionOrigGeometry.mesh !== main) {
-                  // La selección cambió durante la reproducción: devolver
-                  // la geometría original a la malla anterior y empezar
-                  // de cero con la nueva.
-                  motionOrigGeometry.mesh.geometry = motionOrigGeometry.geo!;
-                  motionAnimatedGeo.geo = null;
-                  motionOrigGeometry.mesh = null;
-                  motionOrigGeometry.geo = null;
-                }
-                if (!motionOrigGeometry.mesh) {
-                  motionOrigGeometry.mesh = main;
-                  motionOrigGeometry.geo = main.geometry;
-                }
-                if (motionAnimatedGeo.geo) motionAnimatedGeo.geo.dispose();
-                motionAnimatedGeo.geo = nuevaGeo;
-                main.geometry = nuevaGeo;
-              }
-              // La geometría del visual se queda en la malla principal:
-              // solo se disponen sus materiales (prestados y temporales).
-              visual.traverse((item) => {
-                const m = item as THREE.Mesh;
-                if (m.material) disposeMaterial(m.material as THREE.Material);
-              });
-            } else {
-              // Duplicado: sustituir sus hijos por el visual nuevo.
-              const dup = meshGroup.children.find(
-                (c) =>
-                  c.userData.sceneObjectDuplicate &&
-                  c.userData.sceneObjectId === oid
-              );
-              if (!dup) continue;
-              if (!motionOrigChildren.has(oid)) {
-                // Primera vez: los hijos actuales SON los originales.
-                motionOrigChildren.set(oid, [...dup.children]);
-              }
-              for (const hijo of [...dup.children]) {
-                dup.remove(hijo);
-                if (motionOrigChildren.has(oid)) {
-                  hijo.traverse?.((item) => {
-                    const m = item as THREE.Mesh;
-                    m.geometry?.dispose?.();
-                    if (m.material) disposeMaterial(m.material as THREE.Material);
-                  });
-                }
-              }
-              dup.add(visual);
+            if (deformadorTracksRef.current?.some((t) => t.objectId === oid || t.objectIds?.includes(oid))) {
+              // El objeto lleva deformadores ANIMADOS en cadena: el paso de
+              // plugins solo PRODUCE (cache del resultado) y la cadena del
+              // paso 3.5 trasplanta al final.
+              motionPluginResultCache.set(oid, resultado);
+              continue;
             }
+            transplantarVisual(oid, resultado, obj);
           } catch (err) {
             console.error('[motion] Error al aplicar plugin animado:', err);
+          }
+        }
+      }
+
+      // 3.5) Deformadores animados EN CADENA: cada pista aplica SU
+      // deformador sobre la salida de la anterior; la entrada es el
+      // resultado del plugin del paso 3 (cacheado) o la malla base
+      // congelada. Un objeto puede llevar varias pistas: orden del array.
+      const dTracks = deformadorTracksRef.current;
+      if (dTracks && dTracks.length > 0) {
+        const porObjeto = new Map<string, DeformadorTrack[]>();
+        for (const tr of dTracks) {
+          const lista = porObjeto.get(tr.objectId) ?? [];
+          lista.push(tr);
+          porObjeto.set(tr.objectId, lista);
+        }
+        // 3.6) Deformadores animados de GRUPO: los miembros de las pistas
+        // de grupo (objectId u objectIds) NO llevan cadena individual — la
+        // pista del grupo los cubre: la deformación se aplica a la UNIÓN
+        // «como si fuera 1» en el marco del principal.
+        const pistasGrupo = dTracks.filter((tr) => tr.objectIds && tr.objectIds.length > 0);
+        if (pistasGrupo.length > 0) {
+          const cubiertos = new Set<string>();
+          for (const tr of pistasGrupo) {
+            cubiertos.add(tr.objectId);
+            for (const id of tr.objectIds!) cubiertos.add(id);
+          }
+          const cubiertosPorObjeto = [...porObjeto].filter(([oid]) => cubiertos.has(oid));
+          for (const [oid] of cubiertosPorObjeto) porObjeto.delete(oid);
+        }
+        for (const [oid, tracks] of porObjeto) {
+          const obj = objectsRef.current?.find((o) => o.id === oid);
+          if (!obj) continue;
+          // Entrada: resultado del plugin de ESTE frame (si el objeto lleva
+          // pistas de plugin) o la malla base congelada. Último recurso: la
+          // malla viva del objeto — si la base congelada falta (pista creada
+          // fuera del flujo de «Añadir pista»/autoclave), el objeto quedaba
+          // INTACTO en silencio aunque la cage sí se deformara.
+          let entrada: Mesh | undefined;
+          let origenEntrada = '';
+          if (pTracks?.some((t) => t.objectId === oid)) {
+            entrada = motionPluginResultCache.get(oid);
+            origenEntrada = 'plugin';
+          } else {
+            entrada = pluginBaseMeshesRef.current?.[oid] as Mesh | undefined;
+            if (entrada) origenEntrada = 'base congelada';
+          }
+          if (!entrada) {
+            const viva = obj.mesh as Mesh | undefined;
+            if (viva && viva.vertices.length > 0 && viva.faces.length > 0) {
+              entrada = viva;
+              origenEntrada = 'malla viva';
+            } else {
+              if (!motionWarnedMissingBase.has(`deform:${oid}`)) {
+                console.warn('[motion] Sin malla base para el deformador animado de', oid);
+                motionWarnedMissingBase.add(`deform:${oid}`);
+              }
+              continue;
+            }
+          }
+          try {
+            let m = entrada;
+            // Transplante si CUALQUIER deformador cruzó su tolerancia o si
+            // la entrada es nueva (el paso 3 produjo un resultado distinto).
+            let huboCambio = entrada !== motionDeformEntradaCache.get(oid);
+            // Etapas del frame: params completos por pista (defaults +
+            // evaluados) y si su tolerancia cruzó vs lo último aplicado.
+            const etapas: Array<{ def: NonNullable<ReturnType<typeof deformadorPorId>>; params: PluginParams; sampled?: PluginParams; cacheKey: string }> = [];
+            for (const tr of tracks) {
+              const def = deformadorPorId(tr.deformadorId);
+              if (!def) continue;
+              const sampled = evaluateDeformadorTrack(tr, time);
+              if (sampled === null) continue;
+              const params: PluginParams = {};
+              for (const p of def.params) params[p.id] = p.valor;
+              for (const k of Object.keys(sampled)) params[k] = sampled[k];
+              const cacheKey = `${oid}:${tr.id}`;
+              etapas.push({ def, params, sampled, cacheKey });
+              const anterior = motionDeformParamsCache.get(cacheKey);
+              if (!anterior) {
+                // Sin valor aplicado: primer frame de la pista → HAY que
+                // reconstruir (BUG corregido: antes el transplante solo
+                // dependía de que cambiara la ENTRADA, y con deformadores
+                // sin plugin la malla base congelada nunca cambia → el
+                // playback quedaba congelado en el estado neutro).
+                huboCambio = true;
+                continue;
+              }
+              for (const k of Object.keys(sampled)) {
+                const av = anterior[k];
+                const nv = sampled[k];
+                const cruzo =
+                  typeof nv === 'number'
+                    ? (() => {
+                        const pDef = def.params.find((p) => p.id === k);
+                        const tol =
+                          pDef && pDef.tipo === 'slider' && typeof pDef.valor === 'number'
+                            ? (pDef.paso ?? Math.abs(pDef.max - pDef.min) / 200)
+                            : 1e-4;
+                        return av === undefined || Math.abs((av as number) - nv) > tol;
+                      })()
+                    : av !== nv;
+                if (cruzo) {
+                  huboCambio = true;
+                  break;
+                }
+              }
+            }
+            if (huboCambio) {
+              // CADENA COMPLETA siempre al reconstruir: si una pista cruzó
+              // su tolerancia y otra no, aplicar SOLO la primera producía
+              // una salida a medias y el objeto alternaba entre «con
+              // Afilar» y «con Afilar + Doblar» = TEMBLOR en el playback
+              // (BUG: los caches son solo de PERFORMANCE, cada etapa que
+              // no cruzó igual participa con sus params actuales).
+              for (const e of etapas) {
+                if (e.def.id === 'romper') {
+                  const tTrack = transformTracksRef.current?.find(
+                    (tk) => tk.objectId === oid
+                  );
+                  const transfTiempo: Record<string, number> = tTrack
+                    ? (evaluateTransformTrack(tTrack, time) ?? {})
+                    : {};
+                  const sueloExtra = paramsSueloLocal({ ...obj.transform, ...transfTiempo });
+                  for (const k of Object.keys(sueloExtra)) e.params[k] = sueloExtra[k];
+                }
+                const salida = aplicarDeformador(e.def.id, m, e.params);
+                if (salida && salida.vertices.length && salida.faces.length) m = salida;
+                // La cache guarda el ÚLTIMO VALOR APLICADO (no el del frame
+                // anterior): durante el PLAY el cambio por frame (~1°/frame)
+                // es menor que el paso del slider (~3°) y, comparando frame a
+                // frame, NUNCA cruzaba la tolerancia → el playback quedaba
+                // congelado en el estado neutro mientras el scrubbing (con
+                // brincos grandes) sí deformaba. Comparando contra lo último
+                // aplicado, los deltas chicos ACUMULAN hasta cruzar el paso.
+                if (e.sampled) motionDeformParamsCache.set(e.cacheKey, { ...e.sampled });
+              }
+            }
+            motionDeformEntradaCache.set(oid, entrada);
+            if (!huboCambio || !m || !m.vertices.length || !m.faces.length) continue;
+            avisoTransplante(
+              `transplante ${oid} (${tracks.map((t) => t.deformadorId).join('+')}, ${m.vertices.length} vértices, entrada ${origenEntrada})`
+            );
+            transplantarVisual(oid, m, obj);
+          } catch (err) {
+            console.error('[motion] Error al aplicar deformador animado:', err);
+          }
+        }
+      }
+
+      // 3.7) La UNIÓN del grupo: una sola cadena de deformadores sobre la
+      // malla combinada (caja COMBINADA — «como si fuera 1», igual que el
+      // modo directo de la Escena) y el resultado REPARTIDO a cada miembro
+      // en SU espacio local (cada uno conserva su transform: el visor lo
+      // deja exactamente donde estaba).
+      const pistasGrupo = (deformadorTracksRef.current ?? []).filter(
+        (tr) => tr.objectIds && tr.objectIds.length > 0
+      );
+      if (pistasGrupo.length > 0) {
+        const porGrupo = new Map<string, DeformadorTrack[]>();
+        for (const tr of pistasGrupo) {
+          const lista = porGrupo.get(tr.objectId) ?? [];
+          lista.push(tr);
+          porGrupo.set(tr.objectId, lista);
+        }
+        for (const [oid, tracks] of porGrupo) {
+          try {
+            // Miembros únicos con el principal PRIMERO (el marco es SU
+            // transformada estática, igual que en la Escena). Entran con
+            // la MISMA regla de malla base que el caso individual.
+            const idsMiembros = [oid, ...tracks.flatMap((tr) => tr.objectIds ?? [])];
+            const miembros: MiembroGrupoDeformador[] = [];
+            const ya = new Set<string>();
+            for (const mid of idsMiembros) {
+              if (ya.has(mid)) continue;
+              ya.add(mid);
+              const o = objectsRef.current?.find((oo) => oo.id === mid);
+              if (!o || o.hidden) continue;
+              let baseM: Mesh | undefined = pTracks?.some((t) => t.objectId === mid)
+                ? motionPluginResultCache.get(mid)
+                : undefined;
+              if (!baseM) {
+                const congelada = pluginBaseMeshesRef.current?.[mid] as Mesh | undefined;
+                if (congelada) baseM = congelada;
+              }
+              if (!baseM && o.mesh && o.mesh.vertices.length > 0 && o.mesh.faces.length > 0) {
+                baseM = o.mesh;
+              }
+              if (!baseM || baseM.vertices.length === 0 || baseM.faces.length === 0) continue;
+              miembros.push({ id: mid, mesh: baseM, transform: o.transform });
+            }
+            if (miembros.length < 2) continue;
+            const marco = miembros[0].transform;
+            // Cadena con tolerancia por pista (mismo patrón del caso
+            // individual: contra el ÚLTIMO VALOR APLICADO).
+            const cadenaPura: Array<{ tipo: string; params: PluginParams }> = [];
+            let huboCambio = false;
+            for (const tr of tracks) {
+              const def = deformadorPorId(tr.deformadorId);
+              if (!def) continue;
+              const sampled = evaluateDeformadorTrack(tr, time);
+              if (sampled === null) continue;
+              const params: PluginParams = {};
+              for (const p of def.params) params[p.id] = p.valor;
+              for (const k of Object.keys(sampled)) params[k] = sampled[k];
+              if (tr.deformadorId === 'romper') {
+                const sueloExtra = paramsSueloLocal(marco);
+                for (const k of Object.keys(sueloExtra)) {
+                  params[k] = sueloExtra[k] as number;
+                }
+              }
+              cadenaPura.push({ tipo: tr.deformadorId, params });
+              const cacheKey = `${oid}:${tr.id}`;
+              const anterior = motionDeformParamsCache.get(cacheKey);
+              if (!anterior) {
+                huboCambio = true;
+                continue;
+              }
+              for (const k of Object.keys(sampled)) {
+                const av = anterior[k];
+                const nv = sampled[k];
+                const cruzo =
+                  typeof nv === 'number'
+                    ? (() => {
+                        const pDef = def.params.find((p) => p.id === k);
+                        const tol =
+                          pDef && pDef.tipo === 'slider' && typeof pDef.valor === 'number'
+                            ? (pDef.paso ?? Math.abs(pDef.max - pDef.min) / 200)
+                            : 1e-4;
+                        return av === undefined || Math.abs((av as number) - nv) > tol;
+                      })()
+                    : av !== nv;
+                if (cruzo) {
+                  huboCambio = true;
+                  break;
+                }
+              }
+            }
+            // ¿Cambio la COMPOSICIÓN del grupo (miembro añadido/quitado o
+            // malla base distinta) o los parámetros cruzaron tolerancia?
+            const claveEntrada = miembros.map((mi) => `${mi.id}#${idMalla(mi.mesh)}`).join('|');
+            if (motionGrupoEntradaClave.get(oid) !== claveEntrada) huboCambio = true;
+            motionGrupoEntradaClave.set(oid, claveEntrada);
+            if (huboCambio && cadenaPura.length > 0) {
+              const resultado = deformarGrupoCadena(marco, miembros, cadenaPura);
+              if (resultado) {
+                for (const parte of resultado.porMiembro) {
+                  const o = objectsRef.current?.find((oo) => oo.id === parte.id);
+                  if (!o) continue;
+                  transplantarVisual(parte.id, parte.mesh, o);
+                }
+              }
+            }
+          } catch (err) {
+            console.error('[motion] Error al aplicar deformador de grupo:', err);
           }
         }
       }
@@ -5848,7 +6268,8 @@ export default function Viewer3D({
       const hasMotionTracks =
         (transformTracksRef.current?.length ?? 0) +
         (pluginTracksRef.current?.length ?? 0) +
-        (effectTracksRef.current?.length ?? 0) > 0;
+        (effectTracksRef.current?.length ?? 0) +
+        (deformadorTracksRef.current?.length ?? 0) > 0;
       const motionActivo = hasMotionTracks;
       if (motionActivo !== motionPrev) {
         motionPrev = motionActivo;
@@ -6144,10 +6565,12 @@ export default function Viewer3D({
         const meshObj = findMainMesh(meshGroupRef.current);
         // LAVADO GRIS compartido: sub-selección, deformador en vista
         // previa (exclusividad de modos la garantiza el editor) o el
-        // modo de vista global «gris con aristas».
+        // modo de vista global «gris con aristas». La cage ANIMADA de
+        // los deformadores (soloContorno) no lava: el objeto se ve
+        // normal, con su contorno alrededor.
         const modoLavado =
           faceSelectModeRef.current ||
-          !!deformadorActivoRef.current ||
+          (!!deformadorActivoRef.current && !deformadorActivoRef.current.soloContorno) ||
           vistaModoRef.current === 'gris';
         if (modoLavado && m && meshObj) {
           const raizWash = meshGroupRef.current;
@@ -6159,11 +6582,12 @@ export default function Viewer3D({
             lavadoGrises(raizWash, faceSelectionTargetRef.current, lavarDuplicados);
             if (lavarDuplicados) aplicarAristasGris(raizWash, m, meshObj);
           }
-          // El contorno del deformador vive DENTRO del grupo de la malla
-          // actual: un remontaje puede dejarlo huérfano (re-adesar).
-          const contorno = deformContornoRef.current;
-          if (contorno && contorno.parent !== meshObj) meshObj.add(contorno);
         }
+        // El contorno del deformador (vista previa o cage animada) vive
+        // DENTRO del grupo de la malla actual para seguir su transformada:
+        // un remontaje puede dejarlo huérfano (re-adosar cada frame).
+        const contorno = deformContornoRef.current;
+        if (contorno && meshObj && contorno.parent !== meshObj) meshObj.add(contorno);
         if (faceSelectModeRef.current && m && meshObj) {
           const worldMatrix = meshObj.matrixWorld;
           const target = faceSelectionTargetRef.current;
@@ -6389,11 +6813,13 @@ export default function Viewer3D({
           // comparte las marcas __ovPO y el restore solo procede cuando
           // NI UNO de los tres modos sigue activo (selección, deformador,
           // modo de vista gris global) — y entonces también se quitan las
-          // aristas negras del modo gris.
+          // aristas negras del modo gris. La cage animada (soloContorno)
+          // no lava, así que sí deja restaurar.
           const raizOff = meshGroupRef.current;
           if (
             raizOff &&
-            !deformadorActivoRef.current &&
+            (!deformadorActivoRef.current ||
+              deformadorActivoRef.current.soloContorno) &&
             vistaModoRef.current !== 'gris'
           ) {
             restaurarGrises(raizOff);
@@ -10479,7 +10905,9 @@ export default function Viewer3D({
           transparent: true,
           opacity: 0.9,
         });
-        meshGroup.add(new THREE.LineSegments(edgeGeo, edgeMat));
+        const aristasTx = new THREE.LineSegments(edgeGeo, edgeMat);
+        aristasTx.userData.aristasDeMesh = true; // rebuild en transplantarVisual
+        meshGroup.add(aristasTx);
       }
 
       return () => {
@@ -10950,6 +11378,10 @@ export default function Viewer3D({
         opacity: hasVertexColors ? 0.35 : 0.6,
       });
       const wireOverlay = new THREE.LineSegments(edges, lineMat);
+      // Marcado: el override de movimiento (paso 3.5) reconstruye estas
+      // aristas al trasplantar la geometría — si no, los «segmentos
+      // negros» quedan con la malla original durante la animación.
+      wireOverlay.userData.aristasDeMesh = true;
       meshGroup.add(wireOverlay);
     }
 
@@ -11506,7 +11938,7 @@ export default function Viewer3D({
   // «cage» envuelven al objeto ya deformado. renderOrder 992: el lavado
   // gris y el modo plano de las ventanas 2D no la tocan.
   const contornoParamsClave = deformadorActivo
-    ? JSON.stringify(deformadorActivo.params)
+    ? JSON.stringify(deformadorActivo.cadena ?? deformadorActivo.params)
     : '';
   useEffect(() => {
     const grupo = deformContornoRef.current;
@@ -11584,11 +12016,73 @@ export default function Viewer3D({
     // Deformar la cage con el MISMO deformador (así la caja curvada de
     // «Doblar» envuelve al objeto curvado). Si el deformador cambia el
     // número de vértices (no debería con faces: []) o no existe, queda
-    // la caja recta.
+    // la caja recta. Con CADENA (pistas animadas), cada deformador de la
+    // cadena se aplica en orden sobre las muestras. ROMPER es el caso
+    // aparte: reparte caras en pedazos y sin caras NO mueve nada — su
+    // cage sigue DELTA A DELTA al pedazo de destino de cada muestra
+    // (vértice más cercano de la malla base → su posición deformada).
+    const campoRomper = (
+      base: Mesh, params: PluginParams
+    ): ((p: Vertex3D) => Vertex3D) | null => {
+      const salida = aplicarDeformador('romper', base, params);
+      if (!salida || salida.vertices.length === 0 || salida.vertices === base.vertices) {
+        return null;
+      }
+      let hayMovimiento = false;
+      for (let i = 0; i < base.vertices.length && !hayMovimiento; i++) {
+        const a = base.vertices[i];
+        const b = salida.vertices[i];
+        if (
+          Math.abs(a.x - b.x) + Math.abs(a.y - b.y) + Math.abs(a.z - b.z) > 1e-9
+        ) {
+          hayMovimiento = true;
+        }
+      }
+      if (!hayMovimiento) return null;
+      const baseV = base.vertices;
+      return (p: Vertex3D): Vertex3D => {
+        let mejor = 0;
+        let mejorD = (baseV[0].x - p.x) ** 2 + (baseV[0].y - p.y) ** 2 + (baseV[0].z - p.z) ** 2;
+        for (let i = 1; i < baseV.length; i++) {
+          const d = (baseV[i].x - p.x) ** 2 + (baseV[i].y - p.y) ** 2 + (baseV[i].z - p.z) ** 2;
+          if (d < mejorD) {
+            mejorD = d;
+            mejor = i;
+          }
+        }
+        const s = salida.vertices[mejor];
+        return { x: p.x + (s.x - baseV[mejor].x), y: p.y + (s.y - baseV[mejor].y), z: p.z + (s.z - baseV[mejor].z) };
+      };
+    };
     let deformadas = muestras;
     try {
-      const prueba = aplicarDeformador(activo.tipo, { vertices: muestras, faces: [] }, activo.params);
-      if (prueba.vertices.length === muestras.length) deformadas = prueba.vertices;
+      if (activo.cadena && activo.cadena.length > 0) {
+        for (const c of activo.cadena) {
+          if (
+            c.tipo === 'romper' && activo.malla &&
+            activo.malla.vertices.length > 0
+          ) {
+            const campo = campoRomper(activo.malla, c.params);
+            if (campo) deformadas = deformadas.map(campo);
+            continue;
+          }
+          const prueba = aplicarDeformador(c.tipo, { vertices: deformadas, faces: [] }, c.params);
+          if (prueba.vertices.length !== deformadas.length) {
+            deformadas = muestras;
+            break;
+          }
+          deformadas = prueba.vertices;
+        }
+      } else if (
+        activo.tipo === 'romper' && activo.malla &&
+        activo.malla.vertices.length > 0
+      ) {
+        const campo = campoRomper(activo.malla, activo.params);
+        if (campo) deformadas = muestras.map(campo);
+      } else {
+        const prueba = aplicarDeformador(activo.tipo, { vertices: muestras, faces: [] }, activo.params);
+        if (prueba.vertices.length === muestras.length) deformadas = prueba.vertices;
+      }
     } catch { /* caja recta como reserva */ }
     const pares: number[] = [];
     for (const [ini, fin] of rangos) {
@@ -14436,23 +14930,11 @@ function aplicarTexturaRelieve(
   const repiteY =
     mesh.bumpTextureRepeatY ??
     (mesh.bumpTextureRepeat != null ? repiteX : repeatY ?? repeat);
-  new THREE.TextureLoader().load(
-    mesh.bumpTexture,
-    (t) => {
-      t.anisotropy = 4;
-      t.wrapS = THREE.RepeatWrapping;
-      t.wrapT = THREE.RepeatWrapping;
-      // Repetición INDEPENDIENTE por eje: horizontal (X) y vertical (Y).
-      t.repeat.set(repiteX, repiteY);
-      material.bumpMap = t;
-      material.bumpScale = (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP;
-      material.needsUpdate = true;
-    },
-    undefined,
-    () => {
-      // Sin la textura de relieve el objeto queda liso: no hay nada que hacer.
-    }
-  );
+  // Textura de relieve COMPARTIDA: sincrón desde el cache (mismo motivo
+  // que el mapa normal: una carga por reconstrucción nunca terminaba).
+  material.bumpMap = texturaImagenCompartida(mesh.bumpTexture, repiteX, repiteY);
+  material.bumpScale = (mesh.textureRelief ?? 0) * FACTOR_RELIEVE_BUMP;
+  material.needsUpdate = true;
 }
 
 function muestreadorDeMalla(malla: Mesh | null): () => THREE.Vector3 | null {

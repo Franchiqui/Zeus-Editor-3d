@@ -37,6 +37,7 @@ import type {
   TransformProperty,
   PluginParamTrack,
   EffectTrack,
+  DeformadorTrack,
   UnifiedTrack,
   EasingFunction,
 } from '@/lib/animation';
@@ -53,6 +54,8 @@ import {
   createTransformTrack,
   createPluginParamTrack,
   createEffectTrack,
+  createDeformadorTrack,
+  evaluateDeformadorTrack,
   EFFECT_TYPE_LABELS,
   type EffectType,
   EASING_OPTIONS,
@@ -74,7 +77,11 @@ import {
   DEFORMADORES_DIRECTOS,
   aplicarDeformador,
   deformadorPorId,
+  unirMallasComoGrupo,
+  deformarGrupoComoUnidad,
   type DeformadorDirecto,
+  type DeformadorId,
+  type UnionGrupoDeformador,
 } from '@/lib/deformadores';
 import { AxisHeader } from './axis-header';
 import { cloneMesh } from '@/lib/plugins/clone';
@@ -88,39 +95,12 @@ import PathCanvas from './path-canvas';
 import type { ObjectTransform, Camera3D, GizmoMode } from '@/components/viewer-3d';
 import type { ExtrusionCtrlSubSel } from '@/components/viewer-3d';
 import type { VistaModo } from '@/components/viewer-3d';
-
-/**
- * Suelo REAL del visor en coordenadas LOCALES del objeto: el plano de los
- * puntos locales cuya y-mundo es SUELO_MUNDO, transformados con la inversa
- * del transform del objeto. Va como params OCULTOS al deformador Romper
- * para que los pedazos caigan al suelo que se ve, aunque el objeto esté
- * girado, escalado o flotando por encima de la rejilla.
- */
-function paramsSueloLocal(t: ObjectTransform): PluginParams {
-  const SUELO_MUNDO = -1.05; // rejilla del visor (viewer-3d: grid.position.y)
-  const mat = new THREE.Matrix4().compose(
-    new THREE.Vector3(t.px, t.py, t.pz),
-    new THREE.Quaternion().setFromEuler(new THREE.Euler(t.rx, t.ry, t.rz)),
-    new THREE.Vector3(t.sx, t.sy, t.sz)
-  );
-  const p0 = new THREE.Vector3(0, SUELO_MUNDO, 0).applyMatrix4(
-    mat.clone().invert()
-  );
-  // El plano del suelo en local tiene normal g = Lᵀ·ĵ (L = parte lineal:
-  // rotación·escala): los puntos con p·g = c tienen y-mundo constante.
-  // En column-major, la fila 2 de la parte lineal es (e[1], e[5], e[9]).
-  // OJO: el truco secante Minv·(0,1,0) da L⁻¹·ĵ, que SOLO coincide con g
-  // si la escala es uniforme — con escala no uniforme el plano salía
-  // torcido y algunos pedazos quedaban en el aire.
-  const e = mat.elements;
-  const u = new THREE.Vector3(e[1], e[5], e[9]);
-  if (u.lengthSq() < 1e-12) return {};
-  u.normalize();
-  return { sueloUx: u.x, sueloUy: u.y, sueloUz: u.z, sueloD: u.dot(p0) };
-}
 import {
   IDENTITY_TRANSFORM,
   isIdentityTransform,
+  // Suelo real del visor en coords locales (params ocultos de Romper):
+  // UNA sola copia, junto a componerMatrizTransforma del visor.
+  paramsSueloLocal,
 } from '@/components/viewer-3d';
 import { meshInputToViews, fitSectionToViews } from '@/lib/mesh-to-views';
 import { SHAPES } from '@/lib/shapes';
@@ -906,6 +886,8 @@ type HistoryState = {
    pluginTracks: PluginParamTrack[];
    /** Editor de movimiento: pistas de efectos visuales. */
    effectTracks: EffectTrack[];
+/** Editor de movimiento: pistas de deformadores (en cadena). */
+   deformadorTracks: DeformadorTrack[];
 /** Mallas base congeladas para las pistas de plugin, por objectId. */
     pluginBaseMeshes: Record<string, Mesh>;
     /** Recorrido (Extruir): vértices con su posición, plantilla e inclinación. */
@@ -934,6 +916,7 @@ const isSameHistoryState = (a: HistoryState, b: HistoryState): boolean =>
   a.transformTracks === b.transformTracks &&
   a.pluginTracks === b.pluginTracks &&
   a.effectTracks === b.effectTracks &&
+  a.deformadorTracks === b.deformadorTracks &&
   a.pluginBaseMeshes === b.pluginBaseMeshes &&
   sameHistoryValue(a.views, b.views) &&
   sameHistoryValue(a.editedVertices, b.editedVertices) &&
@@ -3857,6 +3840,8 @@ export default function Home({
   const textureApplySkipRef = useRef(false);
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
     const [selectedObjectIds, setSelectedObjectIds] = useState<string[]>([]);
+    const selectedObjectIdsRef = useRef<string[]>([]);
+    selectedObjectIdsRef.current = selectedObjectIds;
     const [groups, setGroups] = useState<ObjectGroup[]>([]);
   // Espejo del estado de escena para lecturas fuera de los updaters
   // (el timer del debounce de «Copias calculadas» lee el estado fresco
@@ -4029,9 +4014,22 @@ export default function Home({
     const [transformTracks, setTransformTracks] = useState<TransformTrack[]>([]);
     const [pluginTracks, setPluginTracks] = useState<PluginParamTrack[]>([]);
     const [effectTracks, setEffectTracks] = useState<EffectTrack[]>([]);
+    const [deformadorTracks, setDeformadorTracks] = useState<DeformadorTrack[]>([]);
     const [pluginBaseMeshes, setPluginBaseMeshes] = useState<Record<string, Mesh>>({});
     const [motionEditorOpen, setMotionEditorOpen] = useState(false);
     const [autoKey, setAutoKey] = useState(false);
+    // Pista de deformador SELECCIONADA en el editor de movimiento: mientras
+    // esté elegida (y sea del objeto visible), el visor muestra su cage.
+    const [deformTrackSelId, setDeformTrackSelId] = useState<string | null>(null);
+    const handleDeformTrackSelected = useCallback(
+      (id: string | null) => setDeformTrackSelId(id),
+      []
+    );
+    useEffect(() => {
+      // Editor cerrado: no hay pista seleccionada (el editor manda null al
+      // deseleccionar, pero al desmontar no llega callback).
+      if (!motionEditorOpen) setDeformTrackSelId(null);
+    }, [motionEditorOpen]);
 
     // --- Derived unified motion tracks for the scene animation editor ---
     // Each UnifiedTrack carries its `kind` and `originalId` so we can
@@ -4396,6 +4394,7 @@ export default function Home({
     const handleRestoreMotionObject = useCallback((objectId: string) => {
       setTransformTracks((prev) => prev.filter((tr) => tr.objectId !== objectId));
       setPluginTracks((prev) => prev.filter((tr) => tr.objectId !== objectId));
+      setDeformadorTracks((prev) => prev.filter((tr) => tr.objectId !== objectId));
       setPluginBaseMeshes((prev) => {
         if (!(objectId in prev)) return prev;
         const next = { ...prev };
@@ -4412,6 +4411,8 @@ export default function Home({
     transformTracksRef.current = transformTracks;
     const effectTracksRef = useRef(effectTracks);
     effectTracksRef.current = effectTracks;
+    const deformadorTracksRef = useRef(deformadorTracks);
+    deformadorTracksRef.current = deformadorTracks;
     const currentTimeRef = useRef(currentTime);
     currentTimeRef.current = currentTime;
 
@@ -5481,7 +5482,7 @@ export default function Home({
           ? Math.max(...animationTracks.map((t) => t.duration)) / 1000
           : 0,
         camSpan,
-        motionMaxDuration(transformTracks, pluginTracks, effectTracks)
+        motionMaxDuration(transformTracks, pluginTracks, effectTracks, deformadorTracks)
       );
       if (!playing || maxDuration <= 0) {
         animationStartTimeRef.current = null;
@@ -5497,7 +5498,9 @@ export default function Home({
           const loop =
             animationTracks.some((track) => track.looping) ||
             transformTracks.some((track) => track.looping) ||
-            pluginTracks.some((track) => track.looping);
+            pluginTracks.some((track) => track.looping) ||
+            effectTracks.some((track) => track.looping) ||
+            deformadorTracks.some((track) => track.looping);
           if (!loop) {
             setPlaying(false);
             animationStartTimeRef.current = null;
@@ -5518,13 +5521,16 @@ export default function Home({
         }
         animationStartTimeRef.current = null;
       };
-    }, [playing, animationTracks, transformTracks, pluginTracks]);
+    }, [playing, animationTracks, transformTracks, pluginTracks, effectTracks, deformadorTracks]);
 
     // Al parar la reproducción, los visores restauran sus visuales
     // estáticos: las mallas deformadas por pistas de plugin eran solo un
     // override del render (la escena nunca se tocó).
     useEffect(() => {
-      if (!playing && pluginTracks.length > 0) {
+      if (
+        !playing &&
+        (pluginTracks.length > 0 || deformadorTracks.length > 0)
+      ) {
         setViewRefreshTick((v) => v + 1);
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -5678,6 +5684,7 @@ export default function Home({
       transformTracks,
       pluginTracks,
       effectTracks,
+      deformadorTracks,
       pluginBaseMeshes,
     });
 
@@ -5831,6 +5838,7 @@ pluginTracks,
     setTransformTracks(state.transformTracks ?? []);
     setPluginTracks(state.pluginTracks ?? []);
     setEffectTracks(state.effectTracks ?? []);
+    setDeformadorTracks(state.deformadorTracks ?? []);
     setPluginBaseMeshes(state.pluginBaseMeshes ?? {});
     // Recorrido (Extruir): fotos antiguas sin recorrido -> vacío.
     setSweepNodes(state.sweepNodes ?? []);
@@ -7051,8 +7059,28 @@ pluginTracks,
   // original deformada con los params actuales (identidad nueva → repintan
   // las 4 ventanas). Solo en modo escena con objeto propio: la figura de
   // la pestaña y los lienzos no se tocan.
+  //
+  // DEFORMADOR EN GRUPO (selección de varios objetos a la vez): la malla
+  // base es la UNIÓN de los miembros en el marco del seleccionado — la
+  // caja del deformador es la COMBINADA y el arco/la explosión los mueve
+  // juntos, «como si fuera 1». A aplicar se reparte a mallas locales por
+  // miembro; en la vista previa los demás miembros no se pintan.
+  const grupoDeformBase = useMemo(() => {
+    if (!deformadorId || mode !== 'scene' || !frozenSelected) return null;
+    const miembros = selectedObjectIds
+      .map((oid) => sceneObjects.find((o) => o.id === oid))
+      .filter((o) => !!o && !o.hidden && !!o.mesh && o.mesh.vertices.length > 0 && o.mesh.faces.length > 0)
+      .map((o) => ({ id: o!.id, mesh: o!.mesh!, transform: o!.transform }));
+    if (miembros.length < 2) return null;
+    try {
+      return unirMallasComoGrupo(miembros, frozenSelected.transform);
+    } catch {
+      return null;
+    }
+  }, [deformadorId, mode, frozenSelected, selectedObjectIds, sceneObjects]);
+  const mallaBaseDeformador = grupoDeformBase ? grupoDeformBase.unida : viewerMeshRaw;
   const viewerMesh = useMemo(() => {
-    let base = viewerMeshRaw;
+    let base = grupoDeformBase ? grupoDeformBase.unida : viewerMeshRaw;
     if (deformadorId && mode === 'scene' && frozenSelected && base.vertices.length > 0) {
       base = aplicarDeformador(deformadorId, base, {
         ...deformParams,
@@ -7077,13 +7105,13 @@ pluginTracks,
     return base;
     // deformTick: re-memo aunque params/caja repitan valores (re-activar
     // el mismo deformador debe repintar).
-  }, [mode, frozenSelected, sceneMeshStyle, viewerMeshRaw, deformadorId, deformParams, deformTick, paramsSueloLocal]);
+  }, [mode, sceneMeshStyle, viewerMeshRaw, grupoDeformBase, deformadorId, deformParams, deformTick, paramsSueloLocal]);
 
   // Caja envolvente de la malla SIN deformar: la cage del contorno se
   // construye sobre ella y se deforma con el mismo deformador, así
   // envuelve al objeto ya deformado (la malla del visor llega deformada).
   const deformadorCaja = useMemo(() => {
-    const vs = viewerMeshRaw.vertices;
+    const vs = mallaBaseDeformador.vertices;
     if (!deformadorId || vs.length === 0) return null;
     let minx = Infinity, miny = Infinity, minz = Infinity;
     let maxx = -Infinity, maxy = -Infinity, maxz = -Infinity;
@@ -7096,7 +7124,7 @@ pluginTracks,
       if (v.z > maxz) maxz = v.z;
     }
     return { min: { x: minx, y: miny, z: minz }, max: { x: maxx, y: maxy, z: maxz } };
-  }, [deformadorId, viewerMeshRaw]);
+  }, [deformadorId, mallaBaseDeformador]);
 
   const deformadorActivo = useMemo(
     () =>
@@ -7106,10 +7134,104 @@ pluginTracks,
             params: deformParams,
             tick: deformTick,
             caja: deformadorCaja,
+            // Con Romper la cage sigue al pedazo por delta de vértice:
+            // necesita la malla base (sin caras Romper no mueve nada).
+            malla: deformadorId === 'romper' ? mallaBaseDeformador : undefined,
           }
         : null,
-    [deformadorId, deformParams, deformTick, deformadorCaja]
+    [deformadorId, deformParams, deformTick, deformadorCaja, mallaBaseDeformador]
   );
+
+  // Cage ANIMADA del deformador SELECCIONADO (editor de movimiento): su
+  // contorno se muestra mientras la pista esté elegida y sea del objeto
+  // visible, con los params evaluados en el tiempo actual — el deformador
+  // «activo» en el objeto. Seleccionar otra pista (u otra de otro tipo)
+  // lo apaga. El modo deformador de la Escena manda (deformadorActivo).
+  const deformadorAnimado = useMemo(() => {
+    if (deformadorId || !deformTrackSelId) return null;
+    const pista = deformadorTracks.find((tr) => tr.id === deformTrackSelId);
+    if (!pista) return null;
+    const oid = frozenSelectedId ?? selectedObjectId;
+    if (!oid) return null;
+    const idsPista = [pista.objectId, ...(pista.objectIds ?? [])];
+    if (!idsPista.includes(oid)) return null;
+
+    // GRUPO: la cage envuelve a la UNIÓN de los miembros «como si fuera 1»
+    // (marco del objeto principal). Solo cuando el objeto visible en el
+    // visor ES el principal — la cage vive en ese marco local.
+    const esGrupo = !!pista.objectIds?.length;
+    let caja;
+    let mallaCage;
+    if (esGrupo) {
+      if (pista.objectId !== oid) return null;
+      const miembrosUnion = idsPista
+        .map((mid) => {
+          const obj = sceneObjects.find((o) => o.id === mid);
+          if (!obj || obj.hidden) return null;
+          const base = pluginBaseMeshes[mid] ?? obj.mesh;
+          if (!base || base.vertices.length === 0 || base.faces.length === 0) return null;
+          return { id: mid, mesh: base, transform: obj.transform };
+        })
+        .filter((m): m is { id: string; mesh: Mesh; transform: ObjectTransform } => !!m);
+      if (miembrosUnion.length < 2) return null;
+      const marcoPista = frozenSelected && frozenSelected.id === pista.objectId
+        ? frozenSelected.transform
+        : miembrosUnion[0].transform;
+      const union = unirMallasComoGrupo(miembrosUnion, marcoPista);
+      mallaCage = union.unida;
+    } else {
+      mallaCage = pluginBaseMeshes[pista.objectId] ?? viewerMeshRaw;
+    }
+    let minx = Infinity, miny = Infinity, minz = Infinity;
+    let maxx = -Infinity, maxy = -Infinity, maxz = -Infinity;
+    for (const v of mallaCage.vertices) {
+      if (v.x < minx) minx = v.x;
+      if (v.y < miny) miny = v.y;
+      if (v.z < minz) minz = v.z;
+      if (v.x > maxx) maxx = v.x;
+      if (v.y > maxy) maxy = v.y;
+      if (v.z > maxz) maxz = v.z;
+    }
+    if (!Number.isFinite(minx) || !Number.isFinite(maxy)) return null;
+    caja = { min: { x: minx, y: miny, z: minz }, max: { x: maxx, y: maxy, z: maxz } };
+    // Cadena COMPLETA (orden del array, como el playback): la cage envuelve
+    // al resultado de toda la cadena. En GRUPO la cadena son SOLO las pistas
+    // de grupo del mismo principal (las individuales de sus miembros están
+    // tapadas por la de grupo en el playback).
+    const mismoGrupo = (tr: DeformadorTrack): boolean =>
+      esGrupo ? !!tr.objectIds?.length : !tr.objectIds?.length;
+    const cadena = deformadorTracks
+      .filter((tr) => tr.objectId === pista.objectId && mismoGrupo(tr))
+      .map((tr) => {
+        const def = deformadorPorId(tr.deformadorId);
+        const neutro: PluginParams = {};
+        if (def) for (const p of def.params) neutro[p.id] = p.valor;
+        const evaluar = evaluateDeformadorTrack(tr, currentTime) ?? {};
+        return {
+          tipo: tr.deformadorId as string,
+          params: {
+            ...neutro,
+            ...evaluar,
+            // Romper necesita el suelo real (params ocultos) para que su
+            // cage caiga al MISMO plano que los pedazos del playback.
+            ...(tr.deformadorId === 'romper' && frozenSelected
+              ? paramsSueloLocal(frozenSelected.transform)
+              : {}),
+          },
+        };
+      });
+    return {
+      tipo: cadena[0].tipo,
+      params: cadena[0].params,
+      cadena,
+      caja,
+      // Malla base sin deformar: con ella la viewer-3d sigue al Romper
+      // (que reparte pedazos por CARAS — sin base la cage no se mueve).
+      // En GRUPO, la UNIÓN de las bases (la cage envuelve al conjunto).
+      malla: mallaCage,
+      soloContorno: true,
+    };
+  }, [deformadorId, deformTrackSelId, deformadorTracks, frozenSelectedId, selectedObjectId, pluginBaseMeshes, viewerMeshRaw, currentTime, frozenSelected, sceneObjects]);
   const viewerSmooth = frozenSelected
     ? (mode === 'scene' && sceneMeshStyle === 'suave'
         ? true
@@ -7119,7 +7241,16 @@ pluginTracks,
     ? (frozenSelected.textureProjection ?? 'planar')
     : textureProjection;
 
-  const visibleSceneObjects = useMemo(() => sceneObjects, [sceneObjects]);
+  // Durante la PREVIEW del deformador en grupo, los demás miembros del
+  // grupo no se pintan por separado (la pieza unida los representa — si
+  // quedaran visibles se verían dos veces: deformados y sin deformar).
+  const visibleSceneObjects = useMemo(() => {
+    if (!grupoDeformBase) return sceneObjects;
+    const enUnida = new Set(grupoDeformBase.partes.map((p) => p.id));
+    if (frozenSelectedId) enUnida.delete(frozenSelectedId);
+    if (enUnida.size === 0) return sceneObjects;
+    return sceneObjects.filter((o) => !enUnida.has(o.id));
+  }, [sceneObjects, grupoDeformBase, frozenSelectedId]);
   // ¿Hay algún plugin capaz de crear la malla desde cero? Si es así, el
   // modal de plugins se puede abrir aunque la escena esté vacía.
   const hayPluginGenerador = useMemo(
@@ -7666,6 +7797,7 @@ pluginTracks,
         transformTracks,
         pluginTracks,
         effectTracks,
+        deformadorTracks,
         pluginBaseMeshes,
         panelCamerasObjeto,
         // Fuentes importadas (Google Fonts y locales): viajan con el
@@ -8934,6 +9066,51 @@ pluginTracks,
                     };
                   }
                 )
+            );
+          }
+          if (Array.isArray(data.deformadorTracks)) {
+            const idsValidos = new Set(
+              (Array.isArray(data.sceneObjects) ? data.sceneObjects : []).map(
+                (o: { id?: string }) => o.id
+              )
+            );
+            setDeformadorTracks(
+              data.deformadorTracks.filter(
+                (t: {
+                  id?: unknown;
+                  objectId?: unknown;
+                  deformadorId?: unknown;
+                  keyframes?: unknown;
+                  values?: unknown[] | Record<string, unknown>;
+                }) =>
+                  typeof t.id === 'string' &&
+                  (typeof t.objectId === 'string' && idsValidos.has(t.objectId)) &&
+                  typeof t.deformadorId === 'string' &&
+                  DEFORMADORES_DIRECTOS.some((d) => d.id === t.deformadorId) &&
+                  Array.isArray(t.keyframes) &&
+                  t.keyframes.every(
+                    (kf: { time?: unknown; values?: unknown }) =>
+                      typeof kf?.time === 'number' && !!kf && typeof kf.values === 'object'
+                  )
+              )
+              .map((t: Record<string, unknown>) => ({
+                ...t,
+                // objectIds (pista de GRUPO): solo ids que existen; vacío
+                // queda como pista individual.
+                objectIds: Array.isArray(t.objectIds)
+                  ? (t.objectIds as unknown[]).filter(
+                      (x: unknown) => typeof x === 'string' && idsValidos.has(x)
+                    )
+                  : undefined,
+                keyframes: (t.keyframes as { time?: unknown; easing?: unknown; values?: unknown }[]).map(
+                  (kf) => ({
+                    ...kf,
+                    values: (kf.values && typeof kf.values === 'object' && !Array.isArray(kf.values)
+                      ? kf.values
+                      : {}) as Record<string, unknown>,
+                  })
+                ),
+              }))
             );
           }
           if (data.pluginBaseMeshes && typeof data.pluginBaseMeshes === 'object') {
@@ -11703,10 +11880,75 @@ pluginTracks,
    * el historial global la captura) y apaga el modo. La deformación es
    * destructiva: sustituye la malla COMPLETA, pero se deshace con el
    * historial.
+   *
+   * Excepción: si el objeto ya ANIMA este deformador (pista dtrack-),
+   * aplicar NO hornea la malla — sería doble deformación sobre la base
+   * congelada durante el playback. Los params de la vista previa se fijan
+   * como fotograma de la pista en el tiempo actual y se apaga el modo.
    */
   const handleDeformAplicar = useCallback(() => {
     const objectId = frozenSelected?.id ?? selectedObjectId;
     if (!deformadorId || !objectId) return;
+    // El objeto puede llevar su pista INDIVIDUAL o estar CUBIERTO por la
+    // de su GRUPO ( objectId u objectIds): en ambos casos aplicar NO hornea.
+    const pista = deformadorTracksRef.current.find(
+      (tr) =>
+        (tr.objectId === objectId || tr.objectIds?.includes(objectId)) &&
+        tr.deformadorId === deformadorId
+    );
+    if (pista) {
+      const def = deformadorPorId(pista.deformadorId);
+      const neutro: PluginParams = {};
+      if (def) for (const p of def.params) neutro[p.id] = p.valor;
+      const interpolados = evaluateDeformadorTrack(pista, currentTimeRef.current) ?? {};
+      setDeformadorTracks((current) =>
+        current.map((tr) =>
+          tr.id === pista.id
+            ? {
+                ...tr,
+                keyframes: upsertKeyframeAt(tr.keyframes, {
+                  time: currentTimeRef.current,
+                  values: { ...neutro, ...interpolados, ...deformParams },
+                  easing: 'linear' as EasingFunction,
+                }),
+                duration: Math.max(tr.duration, currentTimeRef.current),
+              }
+            : tr
+        )
+      );
+      setDeformParams({});
+      setDeformadorId(null);
+      setViewRefreshTick((v) => v + 1);
+      return;
+    }
+    // GRUPO (selección múltiple): la deformación se aplica UNA vez sobre
+    // la unión de los miembros (caja combinada, marco del seleccionado)
+    // y se reparte a mallas locales — cada miembro conserva su transform
+    // y el conjunto queda deformado «como un solo objeto».
+    const marco = frozenSelected?.transform
+      ?? sceneObjectsRef.current.find((o) => o.id === objectId)?.transform;
+    if (!marco) return;
+    const miembros = selectedObjectIdsRef.current
+      .map((oid) => sceneObjectsRef.current.find((o) => o.id === oid))
+      .filter((o) => !!o && !o.hidden && !!o.mesh && o.mesh.vertices.length > 0 && o.mesh.faces.length > 0)
+      .map((o) => ({ id: o!.id, mesh: o!.mesh!, transform: o!.transform }));
+    if (miembros.length > 1) {
+      const resultado = deformarGrupoComoUnidad(
+        deformadorId,
+        marco,
+        miembros,
+        { ...deformParams, ...paramsSueloLocal(marco) }
+      );
+      if (resultado) {
+        const mallas = new Map(resultado.porMiembro.map((m) => [m.id, m.mesh]));
+        setSceneObjects((current) =>
+          current.map((o) => (mallas.has(o.id) ? { ...o, mesh: mallas.get(o.id)! } : o))
+        );
+      }
+      setDeformParams({});
+      setDeformadorId(null);
+      return;
+    }
     const objeto = sceneObjectsRef.current.find((o) => o.id === objectId);
     const base = objeto?.mesh;
     if (!base || base.vertices.length === 0) return;
@@ -11721,7 +11963,82 @@ pluginTracks,
     );
     setDeformParams({});
     setDeformadorId(null);
-  }, [deformadorId, deformParams, frozenSelectedId, selectedObjectId, paramsSueloLocal]);
+  }, [deformadorId, deformParams, frozenSelected, selectedObjectId, paramsSueloLocal]);
+
+  /**
+   * Cambio de un parámetro del deformador en la vista previa (pestaña
+   * Escena). Con el autoclave conectado, el cambio se registra TAMBIÉN
+   * como fotograma de la pista del deformador en el tiempo actual: si el
+   * objeto ya tiene pista para ESTE deformador se actualiza ahí; si no,
+   * el autoclave crea una (malla base congelada) — igual que hace con las
+   * pistas de transformada.
+   */
+  const handleDeformPreviewParams = useCallback(
+    (next: PluginParams) => {
+      setDeformParams(next);
+      if (!autoKeyRef.current) return;
+      const objectId = frozenSelected?.id ?? selectedObjectId;
+      if (!objectId || !deformadorId) return;
+      const prev = deformadorTracksRef.current.find(
+        (tr) =>
+          (tr.objectId === objectId || tr.objectIds?.includes(objectId)) &&
+          tr.deformadorId === deformadorId
+      );
+      if (prev) {
+        const def = deformadorPorId(prev.deformadorId);
+        const neutro: PluginParams = {};
+        if (def) for (const p of def.params) neutro[p.id] = p.valor;
+        const interpolados = evaluateDeformadorTrack(prev, currentTimeRef.current) ?? {};
+        setDeformadorTracks((current) =>
+          current.map((tr) =>
+            tr.id === prev.id
+              ? {
+                  ...tr,
+                  keyframes: upsertKeyframeAt(tr.keyframes, {
+                    time: currentTimeRef.current,
+                    values: { ...neutro, ...interpolados, ...next },
+                    easing: 'linear' as EasingFunction,
+                  }),
+                  duration: Math.max(tr.duration, currentTimeRef.current),
+                }
+              : tr
+          )
+        );
+        return;
+      }
+      // Sin pista: el autoclave crea una — malla base congelada del
+      // objeto, fotograma neutro (vacío) en 0 s y el valores ya movidos
+      // en el tiempo actual.
+      const base = resolverMallaBase(objectId);
+      if (!base || base.vertices.length === 0) return;
+      const track = createDeformadorTrack(
+        objectId,
+        deformadorId as DeformadorId,
+        {},
+        Math.max(5, currentTimeRef.current)
+      );
+      track.keyframes = upsertKeyframeAt(
+        upsertKeyframeAt([], {
+          time: 0,
+          values: {},
+          easing: 'linear' as EasingFunction,
+        }),
+        {
+          time: currentTimeRef.current,
+          values: { ...next },
+          easing: 'linear' as EasingFunction,
+        }
+      );
+      // Como en congelarBases del editor de movimiento: si YA hay una
+      // malla base congelada (pista de plugin), se conserva — es la
+      // entrada de la cadena (plugin → deformadores).
+      setPluginBaseMeshes((p) =>
+        objectId in p ? p : { ...p, [objectId]: cloneMesh(base) }
+      );
+      setDeformadorTracks((p) => [...p, track]);
+    },
+    [deformadorId, frozenSelected, selectedObjectId, resolverMallaBase]
+  );
 
   /** Cancelar: solo apaga el modo; la malla queda intacta. */
   const handleDeformCancelar = useCallback(() => {
@@ -12219,7 +12536,7 @@ pluginTracks,
       faceSelectionTool={faceSelectionTool}
       faceSelectionTarget={faceSelectionTarget}
       anillosCaras={anillosCaras}
-      deformadorActivo={deformadorActivo}
+      deformadorActivo={deformadorActivo ?? deformadorAnimado}
       onCtrlEscalarSubSel={handleCtrlEscalarSubSel}
       faceSelectVisibleOnly={faceSelectVisibleOnly}
       wireframeOffSignal={wireframeOffSignal}
@@ -12351,6 +12668,7 @@ pluginTracks,
       transformTracks={transformTracks}
       pluginTracks={pluginTracks}
       effectTracks={effectTracks}
+      deformadorTracks={deformadorTracks}
       pluginBaseMeshes={pluginBaseMeshes}
       motionPlaying={playing || motionEditorOpen}
       showMotionPath={showMotionPath}
@@ -15532,7 +15850,7 @@ pluginTracks,
                         <DeformFields
                           deformador={def}
                           params={deformParams}
-                          onParams={setDeformParams}
+                          onParams={handleDeformPreviewParams}
                           onAplicar={handleDeformAplicar}
                           onCancelar={handleDeformCancelar}
                           t={t}
@@ -16234,6 +16552,9 @@ pluginTracks,
                    setPluginTracks={setPluginTracks}
                    effectTracks={effectTracks}
                    setEffectTracks={setEffectTracks}
+                   deformadorTracks={deformadorTracks}
+                   setDeformadorTracks={setDeformadorTracks}
+                   onDeformTrackSelected={handleDeformTrackSelected}
                    pluginBaseMeshes={pluginBaseMeshes}
                   setPluginBaseMeshes={setPluginBaseMeshes}
                   playing={playing}

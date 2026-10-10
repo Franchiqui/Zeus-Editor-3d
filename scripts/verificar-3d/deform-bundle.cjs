@@ -22,7 +22,13 @@ var deformadores_exports = {};
 __export(deformadores_exports, {
   DEFORMADORES_DIRECTOS: () => DEFORMADORES_DIRECTOS,
   aplicarDeformador: () => aplicarDeformador,
-  deformadorPorId: () => deformadorPorId
+  aplicarTransformacion: () => aplicarTransformacion,
+  aplicarTransformacionInversa: () => aplicarTransformacionInversa,
+  deformadorPorId: () => deformadorPorId,
+  deformarGrupoCadena: () => deformarGrupoCadena,
+  deformarGrupoComoUnidad: () => deformarGrupoComoUnidad,
+  repartirGrupoDeformado: () => repartirGrupoDeformado,
+  unirMallasComoGrupo: () => unirMallasComoGrupo
 });
 module.exports = __toCommonJS(deformadores_exports);
 
@@ -476,7 +482,8 @@ var doblar = {
     const [e1] = ejesTransversales(eje);
     const extent = cajaEje.max - cajaEje.min;
     const diametroPct = num(params, "diametro", 0);
-    const R = diametroPct > 0 ? diametroPct / 200 * extent : extent / theta;
+    const RManual = diametroPct > 0 ? diametroPct / 200 * extent : 0;
+    const R = Math.max(RManual, extent / theta);
     const k = R * theta / extent;
     if (!Number.isFinite(R) || R < 1e-9) return mesh;
     const centroTransversal = caja(mesh, e1).centro;
@@ -1633,9 +1640,156 @@ function aplicarDeformador(id, mesh, params) {
     return mesh;
   }
 }
+function rotacionXYZ(rx, ry, rz) {
+  const cx = Math.cos(rx), sx = Math.sin(rx);
+  const cy = Math.cos(ry), sy = Math.sin(ry);
+  const cz = Math.cos(rz), sz = Math.sin(rz);
+  return [
+    cy * cz,
+    -cy * sz,
+    sy,
+    sx * sy * cz + cx * sz,
+    -sx * sy * sz + cx * cz,
+    -sx * cy,
+    -cx * sy * cz + sx * sz,
+    cx * sy * sz + sx * cz,
+    cx * cy
+  ];
+}
+function aplicarTransformacion(t, v) {
+  const r = rotacionXYZ(t.rx ?? 0, t.ry ?? 0, t.rz ?? 0);
+  const x = (t.sx ?? 1) * v.x, y = (t.sy ?? 1) * v.y, z = (t.sz ?? 1) * v.z;
+  return {
+    x: r[0] * x + r[1] * y + r[2] * z + (t.px ?? 0),
+    y: r[3] * x + r[4] * y + r[5] * z + (t.py ?? 0),
+    z: r[6] * x + r[7] * y + r[8] * z + (t.pz ?? 0)
+  };
+}
+function aplicarTransformacionInversa(t, v) {
+  const r = rotacionXYZ(t.rx ?? 0, t.ry ?? 0, t.rz ?? 0);
+  const dx = v.x - (t.px ?? 0), dy = v.y - (t.py ?? 0), dz = v.z - (t.pz ?? 0);
+  const x = r[0] * dx + r[3] * dy + r[6] * dz;
+  const y = r[1] * dx + r[4] * dy + r[7] * dz;
+  const z = r[2] * dx + r[5] * dy + r[8] * dz;
+  return { x: x / (t.sx || 1), y: y / (t.sy || 1), z: z / (t.sz || 1) };
+}
+function unirMallasComoGrupo(miembros, marco) {
+  const vertices = [];
+  const faces = [];
+  const faceColors = [];
+  const faceOpacities = [];
+  const faceTextures = [];
+  const faceTextureGroups = [];
+  const uvs = [];
+  const hayUVs = miembros.some((m) => !!m.mesh.uvs);
+  const partes = miembros.map((miembro) => {
+    const vinicio = vertices.length;
+    const finicio = faces.length;
+    for (const v of miembro.mesh.vertices) {
+      const enMarco = aplicarTransformacion(miembro.transform, v);
+      vertices.push(aplicarTransformacionInversa(marco, enMarco));
+    }
+    for (const f of miembro.mesh.faces) {
+      faces.push(f.map((indice) => indice + vinicio));
+    }
+    const caras = miembro.mesh.faces.length;
+    for (let c = 0; c < caras; c++) {
+      faceColors.push(miembro.mesh.faceColors?.[c] ?? null);
+      faceOpacities.push(miembro.mesh.faceOpacities?.[c] ?? 1);
+      faceTextures.push(miembro.mesh.faceTextures?.[c] ?? null);
+      faceTextureGroups.push(miembro.mesh.faceTextureGroups?.[c] ?? null);
+    }
+    if (hayUVs) {
+      const uvsMiembro = miembro.mesh.uvs;
+      for (let vi = 0; vi < miembro.mesh.vertices.length; vi++) {
+        uvs.push(uvsMiembro?.[vi] ?? [0, 0]);
+      }
+    }
+    return {
+      id: miembro.id,
+      vinicio,
+      finicio,
+      base: miembro.mesh,
+      transform: miembro.transform,
+      teniaUVs: !!miembro.mesh.uvs,
+      teniaColores: !!miembro.mesh.faceColors,
+      teniaOpacidades: !!miembro.mesh.faceOpacities,
+      teniaTexturas: !!miembro.mesh.faceTextures,
+      teniaGruposT: !!miembro.mesh.faceTextureGroups
+    };
+  });
+  const unida = {
+    vertices,
+    faces,
+    ...faceColors.length ? { faceColors } : {},
+    ...faceOpacities.length ? { faceOpacities } : {},
+    ...faceTextures.length ? { faceTextures } : {},
+    ...faceTextureGroups.length ? { faceTextureGroups } : {},
+    ...hayUVs && uvs.length ? { uvs } : {},
+    // Campos de malla (nivel objeto): los del primer miembro (el marco).
+    ...deNivelObjeto(miembros[0]?.mesh)
+  };
+  return { unida, partes, marco };
+}
+function repartirGrupoDeformado(union, deformada) {
+  const total = deformada.vertices.length;
+  return union.partes.map((parte, i) => {
+    const sigV = i + 1 < union.partes.length ? union.partes[i + 1].vinicio : total;
+    const sigF = i + 1 < union.partes.length ? union.partes[i + 1].finicio : deformada.faces.length;
+    const vertices = deformada.vertices.slice(parte.vinicio, sigV).map(
+      (p) => aplicarTransformacionInversa(
+        parte.transform,
+        aplicarTransformacion(union.marco, p)
+      )
+    );
+    const mallaLocal = {
+      ...deNivelObjeto(parte.base),
+      vertices,
+      faces: deformada.faces.slice(parte.finicio, sigF).map((f) => f.map((indice) => indice - parte.vinicio)),
+      // SOLO los arrays que el miembro LLEVABA: inventarlos (de nulls o
+      // de 1s) cambia la RAMA del visual — uvs [0,0] colapsan la textura
+      // proyectada, faceColors de nulls puede tapar el color del objeto…
+      ...parte.teniaColores ? { faceColors: deformada.faceColors?.slice(parte.finicio, sigF) } : {},
+      ...parte.teniaOpacidades ? { faceOpacities: deformada.faceOpacities?.slice(parte.finicio, sigF) ?? [] } : {},
+      ...parte.teniaTexturas ? { faceTextures: deformada.faceTextures?.slice(parte.finicio, sigF) } : {},
+      ...parte.teniaGruposT ? { faceTextureGroups: deformada.faceTextureGroups?.slice(parte.finicio, sigF) } : {},
+      // UVs SOLO si el miembro LLEVABA: los [0,0] inventados mandan sobre
+      // la proyección y la textura colapsa a un texel.
+      ...union.unida.uvs && parte.teniaUVs ? { uvs: deformada.uvs?.slice(parte.vinicio, sigV) ?? [] } : {}
+    };
+    return { id: parte.id, mesh: mallaLocal, transform: parte.transform };
+  });
+}
+function deNivelObjeto(m) {
+  if (!m) return {};
+  const { vertices: _v, faces: _f, faceColors: _c, faceOpacities: _o, faceTextures: _t, faceTextureGroups: _g, uvs: _u, ...resto } = m;
+  return resto;
+}
+function deformarGrupoComoUnidad(id, marco, miembros, params) {
+  return deformarGrupoCadena(marco, miembros, [{ tipo: id, params }]);
+}
+function deformarGrupoCadena(marco, miembros, cadena) {
+  if (miembros.length === 0) return null;
+  const union = unirMallasComoGrupo(miembros, marco);
+  let m = union.unida;
+  for (const paso of cadena) {
+    const salida = aplicarDeformador(paso.tipo, m, paso.params);
+    if (salida && salida.vertices.length > 0 && salida.faces.length > 0) m = salida;
+  }
+  if (m === union.unida) {
+    return { porMiembro: miembros.map((mi) => ({ id: mi.id, mesh: mi.mesh, transform: mi.transform })), unida: union.unida };
+  }
+  return { porMiembro: repartirGrupoDeformado(union, m), unida: m };
+}
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   DEFORMADORES_DIRECTOS,
   aplicarDeformador,
-  deformadorPorId
+  aplicarTransformacion,
+  aplicarTransformacionInversa,
+  deformadorPorId,
+  deformarGrupoCadena,
+  deformarGrupoComoUnidad,
+  repartirGrupoDeformado,
+  unirMallasComoGrupo
 });

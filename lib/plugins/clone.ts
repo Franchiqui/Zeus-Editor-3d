@@ -14,6 +14,7 @@ export function cloneMesh(mesh: Mesh): Mesh {
   if (mesh.faceColors !== undefined) clone.faceColors = [...mesh.faceColors];
   if (mesh.faceOpacities !== undefined) clone.faceOpacities = [...mesh.faceOpacities];
   if (mesh.faceTextures !== undefined) clone.faceTextures = [...mesh.faceTextures];
+  if (mesh.faceTextureGroups !== undefined) clone.faceTextureGroups = [...mesh.faceTextureGroups];
   if (mesh.texture !== undefined) clone.texture = mesh.texture;
   if (mesh.texturePanela !== undefined) clone.texturePanela = mesh.texturePanela;
   if (mesh.textureOriginal !== undefined) clone.textureOriginal = mesh.textureOriginal;
@@ -25,6 +26,9 @@ export function cloneMesh(mesh: Mesh): Mesh {
   if (mesh.textureRepeat !== undefined) clone.textureRepeat = mesh.textureRepeat;
   if (mesh.textureRepeatY !== undefined) clone.textureRepeatY = mesh.textureRepeatY;
   if (mesh.textureFinish !== undefined) clone.textureFinish = mesh.textureFinish;
+  if (mesh.textureMaterialParams !== undefined) {
+    clone.textureMaterialParams = { ...mesh.textureMaterialParams };
+  }
   if (mesh.textureHelper !== undefined) clone.textureHelper = mesh.textureHelper;
   if (mesh.textureHelperTransform !== undefined) {
     clone.textureHelperTransform = { ...mesh.textureHelperTransform };

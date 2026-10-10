@@ -1,4 +1,4 @@
-import type { Mesh, Vertex3D } from '@/lib/geometry';
+import type { Mesh, ObjectTransform, Vertex3D } from '@/lib/geometry';
 import { construirAnillos } from '@/lib/geometry';
 import { smoothVoxelMesh } from '@/lib/mesh-smooth';
 import { DEFORMADORES } from '@/lib/plugins/builtin/deformadores';
@@ -1259,4 +1259,244 @@ export function aplicarDeformador(
     console.warn('[deformadores] Falló el deformador, se deja la malla tal cual:', error);
     return mesh;
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Deformadores sobre GRUPOS («como si fuera 1»)                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Matriz de rotación 3×3 con el orden de ángulos XYZ (la MISMA convención
+ * que THREE.Euler(rx, ry, rz) — rotación intrínseca X luego Y luego Z,
+ * R = Rx·Ry·Rz). Verificada numéricamente contra makeRotationFromEuler.
+ */
+function rotacionXYZ(rx: number, ry: number, rz: number): number[] {
+  const cx = Math.cos(rx), sx = Math.sin(rx);
+  const cy = Math.cos(ry), sy = Math.sin(ry);
+  const cz = Math.cos(rz), sz = Math.sin(rz);
+  // R = Rx·Ry·Rz (fila por fila)
+  return [
+    cy * cz, -cy * sz, sy,
+    sx * sy * cz + cx * sz, -sx * sy * sz + cx * cz, -sx * cy,
+    -cx * sy * cz + sx * sz, cx * sy * sz + sx * cz, cx * cy,
+  ];
+}
+
+/** Aplica el transform (escala → rotación → posición, como THREE.compose). */
+export function aplicarTransformacion(
+  t: ObjectTransform,
+  v: Vertex3D
+): Vertex3D {
+  const r = rotacionXYZ(t.rx ?? 0, t.ry ?? 0, t.rz ?? 0);
+  const x = (t.sx ?? 1) * v.x, y = (t.sy ?? 1) * v.y, z = (t.sz ?? 1) * v.z;
+  return {
+    x: r[0] * x + r[1] * y + r[2] * z + (t.px ?? 0),
+    y: r[3] * x + r[4] * y + r[5] * z + (t.py ?? 0),
+    z: r[6] * x + r[7] * y + r[8] * z + (t.pz ?? 0),
+  };
+}
+
+/** Inversa exacta (afín con escala): primero posición, luego Rᵀ, luego /escala. */
+export function aplicarTransformacionInversa(
+  t: ObjectTransform,
+  v: Vertex3D
+): Vertex3D {
+  const r = rotacionXYZ(t.rx ?? 0, t.ry ?? 0, t.rz ?? 0);
+  const dx = v.x - (t.px ?? 0), dy = v.y - (t.py ?? 0), dz = v.z - (t.pz ?? 0);
+  // Transpuesta (columna i de R = fila i de la inversa):
+  const x = r[0] * dx + r[3] * dy + r[6] * dz;
+  const y = r[1] * dx + r[4] * dy + r[7] * dz;
+  const z = r[2] * dx + r[5] * dy + r[8] * dz;
+  return { x: x / (t.sx || 1), y: y / (t.sy || 1), z: z / (t.sz || 1) };
+}
+
+export interface MiembroGrupoDeformador {
+  id: string;
+  mesh: Mesh;
+  transform: ObjectTransform;
+}
+
+export interface UnionGrupoDeformador {
+  /** Las mallas unidas en el marco `marco` (coordenadas de ese objeto). */
+  unida: Mesh;
+  partes: Array<{
+    id: string;
+    /** Índice del PRIMER vértice / cara de este miembro en `unida`. */
+    vinicio: number;
+    finicio: number;
+    /** La malla local original (para restaurar sus campos de textura). */
+    base: Mesh;
+    transform: ObjectTransform;
+    /** El miembro tenía UVs propias: si no, el reparto NO debe inventar
+     * [0,0] — el constructor del visual las proyecta (si no, la textura
+     * colapsa a un texel: «el objeto pierde la textura» al deformar). */
+    teniaUVs: boolean;
+    teniaColores: boolean;
+    teniaOpacidades: boolean;
+    teniaTexturas: boolean;
+    teniaGruposT: boolean;
+  }>;
+  /** El transform cuyo espacio local es el de `unida`. */
+  marco: ObjectTransform;
+}
+
+/**
+ * Une las mallas de los miembros en el marco del objeto seleccionado
+ * (`marco`): cada miembro entra con M = Marco⁻¹·L_miembro. La UNION no
+ * duplica vértices entre miembros (cada uno conserva sus datos por cara
+ * y por vértice: colores, opacidades, texturas, UVs).
+ */
+export function unirMallasComoGrupo(
+  miembros: MiembroGrupoDeformador[],
+  marco: ObjectTransform
+): UnionGrupoDeformador {
+  const vertices: Vertex3D[] = [];
+  const faces: number[][] = [];
+  const faceColors: (string | null)[] = [];
+  const faceOpacities: number[] = [];
+  const faceTextures: (string | null)[] = [];
+  const faceTextureGroups: (string | null)[] = [];
+  const uvs: [number, number][] = [];
+  const hayUVs = miembros.some((m) => !!m.mesh.uvs);
+
+  const partes = miembros.map((miembro) => {
+    const vinicio = vertices.length;
+    const finicio = faces.length;
+    for (const v of miembro.mesh.vertices) {
+      const enMarco = aplicarTransformacion(miembro.transform, v);
+      vertices.push(aplicarTransformacionInversa(marco, enMarco));
+    }
+    for (const f of miembro.mesh.faces) {
+      faces.push(f.map((indice) => indice + vinicio));
+    }
+    // Los arrays por cara SIEMPRE se emiten (null/1 donde el miembro no
+    // define): así el SLICE del reparto conserva los valores del miembro
+    // que SÍ los tenía aunque el resto no traiga el array.
+    const caras = miembro.mesh.faces.length;
+    for (let c = 0; c < caras; c++) {
+      faceColors.push(miembro.mesh.faceColors?.[c] ?? null);
+      faceOpacities.push(miembro.mesh.faceOpacities?.[c] ?? 1);
+      faceTextures.push(miembro.mesh.faceTextures?.[c] ?? null);
+      faceTextureGroups.push(miembro.mesh.faceTextureGroups?.[c] ?? null);
+    }
+    if (hayUVs) {
+      const uvsMiembro = miembro.mesh.uvs;
+      for (let vi = 0; vi < miembro.mesh.vertices.length; vi++) {
+        uvs.push(uvsMiembro?.[vi] ?? [0, 0]);
+      }
+    }
+    return {
+      id: miembro.id, vinicio, finicio, base: miembro.mesh, transform: miembro.transform,
+      teniaUVs: !!miembro.mesh.uvs,
+      teniaColores: !!miembro.mesh.faceColors,
+      teniaOpacidades: !!miembro.mesh.faceOpacities,
+      teniaTexturas: !!miembro.mesh.faceTextures,
+      teniaGruposT: !!miembro.mesh.faceTextureGroups,
+    };
+  });
+
+  const unida: Mesh = {
+    vertices,
+    faces,
+    ...(faceColors.length ? { faceColors } : {}),
+    ...(faceOpacities.length ? { faceOpacities } : {}),
+    ...(faceTextures.length ? { faceTextures } : {}),
+    ...(faceTextureGroups.length ? { faceTextureGroups } : {}),
+    ...(hayUVs && uvs.length ? { uvs } : {}),
+    // Campos de malla (nivel objeto): los del primer miembro (el marco).
+    ...deNivelObjeto(miembros[0]?.mesh),
+  };
+  return { unida, partes, marco };
+}
+
+/** Reparte la unida DEFORMADA a los espacios locales de cada miembro. */
+export function repartirGrupoDeformado(
+  union: UnionGrupoDeformador,
+  deformada: Mesh
+): MiembroGrupoDeformador[] {
+  const total = deformada.vertices.length;
+  return union.partes.map((parte, i) => {
+    const sigV = i + 1 < union.partes.length ? union.partes[i + 1].vinicio : total;
+    const sigF = i + 1 < union.partes.length ? union.partes[i + 1].finicio : deformada.faces.length;
+    // v_local = L_miembro⁻¹·(Marco·p_marco) — cada miembro conserva SU
+    // transform: el visor lo vuelve a colocar exactamente donde estaba.
+    const vertices = deformada.vertices
+      .slice(parte.vinicio, sigV)
+      .map((p) =>
+        aplicarTransformacionInversa(
+          parte.transform,
+          aplicarTransformacion(union.marco, p)
+        )
+      );
+    const mallaLocal: Mesh = {
+      ...deNivelObjeto(parte.base),
+      vertices,
+      faces: deformada.faces
+        .slice(parte.finicio, sigF)
+        .map((f) => f.map((indice) => indice - parte.vinicio)),
+      // SOLO los arrays que el miembro LLEVABA: inventarlos (de nulls o
+      // de 1s) cambia la RAMA del visual — uvs [0,0] colapsan la textura
+      // proyectada, faceColors de nulls puede tapar el color del objeto…
+      ...(parte.teniaColores ? { faceColors: deformada.faceColors?.slice(parte.finicio, sigF) } : {}),
+      ...(parte.teniaOpacidades ? { faceOpacities: deformada.faceOpacities?.slice(parte.finicio, sigF) ?? [] } : {}),
+      ...(parte.teniaTexturas ? { faceTextures: deformada.faceTextures?.slice(parte.finicio, sigF) } : {}),
+      ...(parte.teniaGruposT ? { faceTextureGroups: deformada.faceTextureGroups?.slice(parte.finicio, sigF) } : {}),
+      // UVs SOLO si el miembro LLEVABA: los [0,0] inventados mandan sobre
+      // la proyección y la textura colapsa a un texel.
+      ...(union.unida.uvs && parte.teniaUVs
+        ? { uvs: deformada.uvs?.slice(parte.vinicio, sigV) ?? [] }
+        : {}),
+    };
+    return { id: parte.id, mesh: mallaLocal, transform: parte.transform };
+  });
+}
+
+/** Copia SOLO los campos de nivel objeto de una malla (sin arrays por cara). */
+function deNivelObjeto(m: Mesh | undefined): Partial<Mesh> {
+  if (!m) return {};
+  const { vertices: _v, faces: _f, faceColors: _c, faceOpacities: _o, faceTextures: _t, faceTextureGroups: _g, uvs: _u, ...resto } = m;
+  return resto as Partial<Mesh>;
+}
+
+/**
+ * DEFORMAR UN GRUPO COMO UNA SOLA PIEZA: une las mallas en el marco del
+ * seleccionado, aplica el deformador UNA VEZ (la caja envolvente es la
+ * COMBINADA de todos los miembros — el arco/explosión los mueve juntos)
+ * y reparte el resultado a cada miembro en SU espacio local.
+ * Si el deformador sale neutral (misma malla), devuelve las locales
+ * originales sin recomponer.
+ */
+export function deformarGrupoComoUnidad(
+  id: string,
+  marco: ObjectTransform,
+  miembros: MiembroGrupoDeformador[],
+  params: PluginParams
+): { porMiembro: MiembroGrupoDeformador[]; unida: Mesh } | null {
+  return deformarGrupoCadena(marco, miembros, [{ tipo: id, params }]);
+}
+
+/**
+ * CADENA de deformadores sobre un GRUPO ( playback de pistas de deformador
+ * de grupo): une las mallas en el marco, aplica TODOS los deformadores en
+ * orden y reparte el resultado — exactamente como el modo directo de la
+ * Escena pero con varios pasos. Sin cadena o sin salida → las mallas
+ * base intactas.
+ */
+export function deformarGrupoCadena(
+  marco: ObjectTransform,
+  miembros: MiembroGrupoDeformador[],
+  cadena: Array<{ tipo: string; params: PluginParams }>
+): { porMiembro: MiembroGrupoDeformador[]; unida: Mesh } | null {
+  if (miembros.length === 0) return null;
+  const union = unirMallasComoGrupo(miembros, marco);
+  let m = union.unida;
+  for (const paso of cadena) {
+    const salida = aplicarDeformador(paso.tipo, m, paso.params);
+    if (salida && salida.vertices.length > 0 && salida.faces.length > 0) m = salida;
+  }
+  if (m === union.unida) {
+    // Sin deformación (neutro o error): las mallas base sin tocar.
+    return { porMiembro: miembros.map((mi) => ({ id: mi.id, mesh: mi.mesh, transform: mi.transform })), unida: union.unida };
+  }
+  return { porMiembro: repartirGrupoDeformado(union, m), unida: m };
 }

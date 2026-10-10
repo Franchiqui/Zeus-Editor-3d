@@ -29,34 +29,24 @@ type Props = {
   t: TFunction;
 };
 
+type RowsProps = {
+  /** Deformador activo (params y etiquetas). */
+  deformador: DeformadorDirecto;
+  /** Valores actuales de los parámetros. */
+  params: PluginParams;
+  /** Se llama con el objeto de parámetros completo ya actualizado. */
+  onParams: (next: PluginParams) => void;
+};
+
 /**
- * Panel del DEFORMADOR directo activo en la pestaña Escena: los campos
- * de sus params (contrato PluginParam del sistema de plugins: slider →
- * campo numérico, select → desplegable, check → casilla) más los botones
- * Aplicar/Cancelar. Los valores cambian la VISTA PREVIA en vivo (las 4
- * ventanas); Aplicar es la deformación permanente.
+ * Filas de los params de UN deformador (slider → numérico, select →
+ * desplegable, check → casilla). Compartido por el panel de la pestaña
+ * Escena (DeformFields) y el inspector de fotogramas del editor de
+ * movimiento. Solo la Vista PREVIEW de Escena: no toca el modal plugins.
  */
-export function DeformFields({
-  deformador,
-  params,
-  onParams,
-  onAplicar,
-  onCancelar,
-  t,
-}: Props) {
+export function DeformParamRows({ deformador, params, onParams }: RowsProps) {
   return (
-    <div className="shrink-0 px-3 py-2 border-b border-white/5 space-y-1.5" data-testid="deform-panel">
-      <div className="flex items-center justify-between">
-        <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-          {deformador.nombre}
-        </h3>
-      </div>
-      <p
-        className="text-[9px] leading-tight text-amber-300/80 break-words"
-        data-testid="deform-warn"
-      >
-        {t('editor3D.deformWarn')}
-      </p>
+    <>
       {deformador.params.map((p) => {
         if (p.tipo === 'slider') {
           const valor = typeof params[p.id] === 'number' ? (params[p.id] as number) : p.valor;
@@ -125,6 +115,39 @@ export function DeformFields({
           </div>
         );
       })}
+    </>
+  );
+}
+
+/**
+ * Panel del DEFORMADOR directo activo en la pestaña Escena: los campos
+ * de sus params (contrato PluginParam del sistema de plugins: slider →
+ * campo numérico, select → desplegable, check → casilla) más los botones
+ * Aplicar/Cancelar. Los valores cambian la VISTA PREVIA en vivo (las 4
+ * ventanas); Aplicar es la deformación permanente.
+ */
+export function DeformFields({
+  deformador,
+  params,
+  onParams,
+  onAplicar,
+  onCancelar,
+  t,
+}: Props) {
+  return (
+    <div className="shrink-0 px-3 py-2 border-b border-white/5 space-y-1.5" data-testid="deform-panel">
+      <div className="flex items-center justify-between">
+        <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          {deformador.nombre}
+        </h3>
+      </div>
+      <p
+        className="text-[9px] leading-tight text-amber-300/80 break-words"
+        data-testid="deform-warn"
+      >
+        {t('editor3D.deformWarn')}
+      </p>
+      <DeformParamRows deformador={deformador} params={params} onParams={onParams} />
       <div className="flex items-center gap-1.5 pt-0.5">
         <button
           data-testid="deform-apply"

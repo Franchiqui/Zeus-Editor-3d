@@ -1,5 +1,8 @@
 'use client';
 
+import type { PluginParams } from '@/lib/plugins/types';
+import type { DeformadorId } from '@/lib/deformadores';
+
 export type EasingFunction =
   | 'linear'
   | 'ease-in'
@@ -551,12 +554,14 @@ export function createPluginParamTrack(
 export function motionMaxDuration(
   transformTracks: TransformTrack[],
   pluginTracks: PluginParamTrack[],
-  effectTracks: EffectTrack[] = []
+  effectTracks: EffectTrack[] = [],
+  deformadorTracks: DeformadorTrack[] = []
 ): number {
   let max = 0;
   for (const t of transformTracks) max = Math.max(max, t.duration);
   for (const t of pluginTracks) max = Math.max(max, t.duration);
   for (const t of effectTracks) max = Math.max(max, t.duration);
+  for (const t of deformadorTracks) max = Math.max(max, t.duration);
   return max;
 }
 
@@ -708,6 +713,116 @@ export function createEffectTrack(
         easing: 'linear',
       },
     ],
+  };
+}
+
+// ============================================================================
+// PISTAS DE DEFORMADORES ANIMADOS: los 9 deformadores directos (doblar,
+// romper…) como pistas con fotogramas. Una pista = UN deformador en UN
+// objeto; cada fotograma guarda los valores de SUS parámetros completos.
+// Los defaults los rellena quien aplica (aplicarDeformador), nunca aquí.
+// ============================================================================
+
+/** Fotograma de una pista de deformador: valores COMPLETOS de sus params. */
+export interface DeformadorKeyframe {
+  time: number;
+  values: PluginParams;
+  easing: EasingFunction;
+}
+
+/** Pista de un deformador directo animado sobre un objeto de la escena. */
+export interface DeformadorTrack {
+  id: string; // prefijo `dtrack-` (como ttrack-/ptrack-/etrack-)
+  objectId: string;
+  /**
+   * Resto de miembros del grupo (pista de GRUPO): la deformación se aplica
+   * a la UNIÓN de objectId + objectIds «como si fuera 1» (caja combinada,
+   * marco del objeto principal = objectId) y se reparte a cada miembro.
+   */
+  objectIds?: string[];
+  deformadorId: DeformadorId;
+  /** Duración en segundos. */
+  duration: number;
+  looping: boolean;
+  keyframes: DeformadorKeyframe[];
+}
+
+/**
+ * Evalúa una pista de deformador en un instante (segundos). Mismo esquema
+ * que evaluateEffectTrack: números interpolados con easing del fotograma
+ * destino; strings (eje) y booleans se SOSTIENEN del fotograma de origen.
+ * Devuelve un PARCIAL: los params ausentes los completa aplicarDeformador.
+ */
+export function evaluateDeformadorTrack(
+  track: DeformadorTrack,
+  time: number
+): PluginParams | null {
+  if (track.keyframes.length === 0) return null;
+  const sorted = [...track.keyframes].sort((a, b) => a.time - b.time);
+  const effectiveTime = track.looping && track.duration > 0
+    ? ((time % track.duration) + track.duration) % track.duration
+    : time;
+
+  if (effectiveTime <= sorted[0].time) {
+    return { ...(sorted[0].values ?? {}) };
+  }
+  if (effectiveTime >= sorted[sorted.length - 1].time) {
+    return { ...(sorted[sorted.length - 1].values ?? {}) };
+  }
+
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const start = sorted[i];
+    const end = sorted[i + 1];
+    if (effectiveTime >= start.time && effectiveTime <= end.time) {
+      const segDur = end.time - start.time;
+      const progress = segDur > 0 ? (effectiveTime - start.time) / segDur : 0;
+      const eased = getEasingFunction(end.easing)(progress);
+      const props = Array.from(
+        new Set([...Object.keys(start.values ?? {}), ...Object.keys(end.values ?? {})])
+      );
+      const result: PluginParams = {};
+      for (const prop of props) {
+        const from = (start.values ?? {})[prop];
+        const to = (end.values ?? {})[prop];
+        if (from === undefined && to === undefined) continue;
+        if (typeof from === 'boolean' || typeof to === 'boolean') {
+          result[prop] = from !== undefined ? from : to;
+        } else if (typeof from === 'string' || typeof to === 'string') {
+          result[prop] = from !== undefined ? from : to;
+        } else {
+          const numFrom = from as number | undefined;
+          const numTo = to as number | undefined;
+          if (numFrom !== undefined && numTo !== undefined) {
+            result[prop] = numFrom + (numTo - numFrom) * eased;
+          } else {
+            result[prop] = from !== undefined ? from : to;
+          }
+        }
+      }
+      return result;
+    }
+  }
+  return { ...(sorted[sorted.length - 1].values ?? {}) };
+}
+
+/**
+ * Crea una pista de deformador neutra: todos los params en sus defaults.
+ * Los dos fotogramas (0 s y final) se insertan aparte — así la pista no
+ * deforma nada hasta que el usuario edite el inspector.
+ */
+export function createDeformadorTrack(
+  objectId: string,
+  deformadorId: DeformadorId,
+  defaults: PluginParams,
+  duration: number = 5
+): DeformadorTrack {
+  return {
+    id: `dtrack-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    objectId,
+    deformadorId,
+    duration,
+    looping: false,
+    keyframes: [],
   };
 }
 

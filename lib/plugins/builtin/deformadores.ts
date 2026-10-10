@@ -119,11 +119,22 @@ const doblar: ZeusPlugin = {
     const extent = cajaEje.max - cajaEje.min;
     const diametroPct = num(params, 'diametro', 0);
     // Radio AUTOMÁTICO: R = L/θ (el arco gasta la longitud exacta —
-    // sin estirar). Manual: R = diámetro/2, en % de la longitud L.
-    const R =
-      diametroPct > 0 ? (diametroPct / 200) * extent : extent / theta;
+    // sin estirar). Manual (diámetro, % de la longitud L): R = D%·L/200.
+    //
+    // El radio manual NUNCA baja del AUTOMÁTICO: R = max(R_manual, L/θ).
+    // El manual puro aplasta la malla entera en un arco diminuto cuando θ
+    // (y el diámetro animado) salen de 0: la columna se desploma a un
+    // bulto pegado al suelo y va creciendo con el ángulo — «semilla que
+    // echa raíces» (reproducido con columna-anim-check.mjs). Con el max,
+    // con θ chico manda el auto (doblado clásico k=1) y el manual solo
+    // manda cuando pide un arco MÁS ANCHO que el material permite (estira
+    // el objeto para seguirlo). En θ→0 el manual→0 converge con el auto:
+    // animar diametro desde su neutro 0 es CONTINUO, sin salto.
+    const RManual = diametroPct > 0 ? (diametroPct / 200) * extent : 0;
+    const R = Math.max(RManual, extent / theta);
     // Estiramiento a lo largo del arco para calar en el radio pedido:
-    // k = R·θ/L. Automático → k = 1 (comportamiento clásico).
+    // k = R·θ/L. R auto → k = 1 (comportamiento clásico sin estirar);
+    // R manual (> auto) → estira la malla para cubrir el arco ancho.
     const k = (R * theta) / extent;
     if (!Number.isFinite(R) || R < 1e-9) return mesh;
     const centroTransversal = caja(mesh, e1).centro;
