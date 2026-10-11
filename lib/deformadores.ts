@@ -22,7 +22,8 @@ export type DeformadorId =
   | 'suavizado'
   | 'afilar'
   | 'derretir'
-  | 'romper';
+  | 'romper'
+  | 'bisel-plano';
 
 export interface DeformadorDirecto {
   id: DeformadorId;
@@ -371,6 +372,829 @@ function bisel(mesh: Mesh, params: PluginParams): Mesh {
   // Guarda: si el chaflán no consiguió retraer NINGUNA cara (malla
   // degenerada), devolver la original tal cual — nunca vaciarla.
   if (caras.length === 0 || caras.length < mesh.faces.length) return mesh;
+  if (nuevaUvs) salida.uvs = nuevaUvs;
+  if (colorSi) salida.faceColors = coloresFinales;
+  if (opSi) salida.faceOpacities = opacidadesFinales;
+  if (texSi) salida.faceTextures = texturasFinales;
+  if (mesh.faceTextureGroups) salida.faceTextureGroups = gruposFinales;
+  return salida;
+}
+
+/* ------------------------------------------------------------------ */
+/* Bisel plano (marco interior sobre las caras seleccionadas)          */
+/* ------------------------------------------------------------------ */
+
+/** Valor del param oculto `carasSel` cuando NO hay caras capturadas. */
+export const CARAS_SEL_NINGUNA = '-1';
+
+/** ids de caras → valor del param oculto `carasSel` ('-1' = ninguna). */
+export const paramsCarasSel = (ids: Iterable<number>): PluginParams => {
+  const lista = [...ids].filter((n) => Number.isInteger(n) && n >= 0);
+  return { carasSel: lista.length ? lista.join(',') : CARAS_SEL_NINGUNA };
+};
+
+/** Desplaza los ids de caras un offset (pasan de indexar una malla a
+ *  indexar otra: la UNIÓN del grupo). Fuera de rango o vacío → '-1'. */
+export const desplazarCarasSel = (carasSel: unknown, offset: number): string => {
+  if (
+    typeof carasSel !== 'string' ||
+    carasSel === CARAS_SEL_NINGUNA ||
+    !Number.isFinite(offset)
+  ) {
+    return CARAS_SEL_NINGUNA;
+  }
+  const ids = carasSel
+    .split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isInteger(n) && n >= 0);
+  if (ids.length === 0) return CARAS_SEL_NINGUNA;
+  return ids.map((n) => String(n + offset)).join(',');
+};
+
+/** Remapa carasSel (que indexa la malla base del miembro dueño) a su
+ *  posición DENTRO de la unión del grupo (partes de unirMallasComoGrupo). */
+export const carasSelEnUnion = (
+  carasSel: unknown,
+  partes: Array<{ id: string; finicio: number }>,
+  idMiembro: string
+): string => {
+  if (typeof carasSel !== 'string' || carasSel === CARAS_SEL_NINGUNA) {
+    return CARAS_SEL_NINGUNA;
+  }
+  const parte = partes.find((p) => p.id === idMiembro);
+  if (!parte) return CARAS_SEL_NINGUNA;
+  return desplazarCarasSel(carasSel, parte.finicio);
+};
+
+/**
+ * INSET PLANO animable: sobre cada grupo coplanar de las caras
+ * seleccionadas (param oculto `carasSel`, capturado por el editor al
+ * activar el deformador) emite HACIA ADENTRO:
+ *   - un MARCO: banda de quads alrededor del perímetro, a una separación
+ *     editable (% de la dimensión menor del polígono en el plano);
+ *   - un polígono INTERIOR dentro del marco.
+ * Dos profundidades (% de la diagonal de la caja, como el radio del
+ * Bisel) animables cada una: profInterior mueve el polígono interior por
+ * la normal del plano; profMarco mueve el borde EXTERIOR del marco y las
+ * caras vecinas se inclinan para seguir estancas — cada copia del mismo
+ * vértice lógico recibe el MISMO delta (mismo criterio que los
+ * quad-puentes del chaflán y las normales de Hinchar).
+ * Neutro: separacion 0 o sin caras → la malla original sin tocar.
+ */
+function biselPlano(mesh: Mesh, params: PluginParams): Mesh {
+  const separacion = num(params, 'separacion', 0);
+  if (separacion <= 0) return mesh;
+  if (mesh.vertices.length === 0 || mesh.faces.length === 0) return mesh;
+
+  const bruta = params['carasSel'];
+  const seleccionadas =
+    typeof bruta === 'string'
+      ? [
+          ...new Set(
+            bruta
+              .split(',')
+              .map((s) => Number(s.trim()))
+              .filter(
+                (n) =>
+                  Number.isInteger(n) && n >= 0 && n < mesh.faces.length
+              )
+          ),
+        ]
+      : [];
+  if (seleccionadas.length === 0) return mesh;
+
+  const topo = construirAnillos(mesh);
+  if (!topo) return mesh;
+  const { canonDe, canonPos, bordeAFaces } = topo;
+
+  // Escala de las profundidades: % de la diagonal de la caja (mismo
+  // criterio que el radio del chaflán: comparable entre objetos).
+  let minX = Infinity;
+  let minY = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let maxZ = -Infinity;
+  for (const p of canonPos) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.z < minZ) minZ = p.z;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+    if (p.z > maxZ) maxZ = p.z;
+  }
+  const diagonal = Math.sqrt(
+    (maxX - minX) ** 2 + (maxY - minY) ** 2 + (maxZ - minZ) ** 2
+  );
+  if (!Number.isFinite(diagonal) || diagonal < 1e-9) return mesh;
+  const profIntAbs = (num(params, 'profInterior', 0) / 100) * diagonal * 0.5;
+  const profMarAbs = (num(params, 'profMarco', 0) / 100) * diagonal * 0.5;
+  // Interior SUELTO (param oculto que el panel pone al mover Prof.
+  // interior con CTRL): el marco NO se inclina — su anillo queda
+  // CONGELADO en la posición que ya tenía (profInteriorBase capturado
+  // por el panel = valor de profInterior en ese gesto; anillo e interior
+  // coinciden ahí, así que NO hay salto al cambiar de modo a mitad) y el
+  // polígono interior sigue en solitario según profInterior, con paredes
+  // conectándolo al anillo. El gesto queda fijado hasta Cancelar.
+  // Sin CTRL: compartido → la banda se inclina con el interior.
+  const suelto = num(params, 'interiorSuelto', 0) >= 0.5;
+  const profBaseAbs = suelto
+    ? (num(params, 'profInteriorBase', 0) / 100) * diagonal * 0.5
+    : 0;
+
+  const claveCanon = (a: number, b: number) =>
+    a < b ? `${a}-${b}` : `${b}-${a}`;
+
+  /** Normal Newell canónica de una cara (unitaria o null si degenerada). */
+  const newellCara = (fi: number): Vertex3D | null => {
+    const cara = mesh.faces[fi];
+    if (!cara || cara.length < 3) return null;
+    const vistos = new Set<number>();
+    const ciclo: number[] = [];
+    for (const vi of cara) {
+      const c = canonDe[vi];
+      if (c < 0 || vistos.has(c)) continue;
+      vistos.add(c);
+      ciclo.push(c);
+    }
+    if (ciclo.length < 3) return null;
+    let nx = 0;
+    let ny = 0;
+    let nz = 0;
+    for (let i = 0; i < ciclo.length; i++) {
+      const A = canonPos[ciclo[i]];
+      const B = canonPos[ciclo[(i + 1) % ciclo.length]];
+      nx += (A.y - B.y) * (A.z + B.z);
+      ny += (A.z - B.z) * (A.x + B.x);
+      nz += (A.x - B.x) * (A.y + B.y);
+    }
+    const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (len < 1e-12) return null;
+    return { x: nx / len, y: ny / len, z: nz / len };
+  };
+
+  // 1) GRUPOS COPLANARES: union-find de las caras seleccionadas conectadas
+  //    por aristas canon cuyas normales coinciden (dot > 0.99). Cada grupo
+  //    es un polígono lógico (mallas .zeus trianguladas en abanico).
+  const selSet = new Set(seleccionadas);
+  const selArista = new Map<string, number[]>();
+  const padre = new Map<number, number>();
+  const buscar = (x: number): number => {
+    let r = x;
+    while (padre.get(r) !== r) r = padre.get(r) as number;
+    return r;
+  };
+  for (const fi of seleccionadas) padre.set(fi, fi);
+  for (const fi of seleccionadas) {
+    const cara = mesh.faces[fi];
+    if (!cara || cara.length < 3) continue;
+    for (let j = 0; j < cara.length; j++) {
+      const cp = canonDe[cara[j]];
+      const cq = canonDe[cara[(j + 1) % cara.length]];
+      if (cp < 0 || cq < 0 || cp === cq) continue;
+      const key = claveCanon(cp, cq);
+      const lista = selArista.get(key);
+      if (lista) {
+        if (!lista.includes(fi)) lista.push(fi);
+      } else selArista.set(key, [fi]);
+    }
+  }
+  for (const lista of selArista.values()) {
+    if (lista.length < 2) continue;
+    for (let i = 1; i < lista.length; i++) {
+      const nA = newellCara(lista[0]);
+      const nB = newellCara(lista[i]);
+      if (!nA || !nB) continue;
+      const dot = nA.x * nB.x + nA.y * nB.y + nA.z * nB.z;
+      if (dot > 0.99) padre.set(buscar(lista[i]), buscar(lista[0]));
+    }
+  }
+  const grupos = new Map<number, number[]>();
+  for (const fi of seleccionadas) {
+    const r = buscar(fi);
+    const g = grupos.get(r);
+    if (g) g.push(fi);
+    else grupos.set(r, [fi]);
+  }
+  const gruposOrden = [...grupos.values()].sort(
+    (g1, g2) => Math.min(...g1) - Math.min(...g2)
+  );
+
+  // Salida: mismas bases que el chaflán (nuevaVertices parte de las
+  // originales; emite alinea los arrays por cara con su donante).
+  const nuevaVertices: Vertex3D[] = [...mesh.vertices];
+  const nuevaUvs = mesh.uvs ? ([...mesh.uvs] as [number, number][]) : undefined;
+  const colorSi = mesh.faceColors ? [...mesh.faceColors] : undefined;
+  const opSi = mesh.faceOpacities ? [...mesh.faceOpacities] : undefined;
+  const texSi = mesh.faceTextures ? [...mesh.faceTextures] : undefined;
+  const caras: number[][] = [];
+  const coloresFinales: (string | null)[] = [];
+  const opacidadesFinales: number[] = [];
+  const texturasFinales: (string | null)[] = [];
+  const gruposFinales: (string | null)[] = [];
+  const emite = (face: number[], donanteIdx: number) => {
+    caras.push(face);
+    coloresFinales.push(colorSi ? colorSi[donanteIdx] ?? null : null);
+    opacidadesFinales.push(opSi ? opSi[donanteIdx] ?? 1 : 1);
+    texturasFinales.push(texSi ? texSi[donanteIdx] ?? null : null);
+    if (mesh.faceTextureGroups) {
+      gruposFinales.push(mesh.faceTextureGroups[donanteIdx] ?? null);
+    }
+  };
+  const entraUv = (vi: number) => {
+    if (!nuevaUvs) return;
+    const uv = mesh.uvs?.[vi];
+    nuevaUvs.push(uv ? [uv[0], uv[1]] : [0, 0]);
+  };
+
+  // Copias brutas de cada canon: para mover TODAS las copias del mismo
+  // vértice lógico a la vez la superficie no se agrieta.
+  const copiasCanon = new Map<number, number[]>();
+  for (let i = 0; i < mesh.vertices.length; i++) {
+    const c = canonDe[i];
+    if (c < 0) continue;
+    const lista = copiasCanon.get(c);
+    if (lista) lista.push(i);
+    else copiasCanon.set(c, [i]);
+  }
+
+  interface BordeGrupo {
+    p: number;
+    q: number;
+    fi: number;
+    viP: number;
+    viQ: number;
+  }
+  interface BucleGrupo {
+    /** índices en bordes del grupo, en orden de la cadena dirigida. */
+    bordeIdx: number[];
+    /** área 2D con signo (proyección al plano del grupo). */
+    area2: number;
+    /** esquinas insetadas 2D, paralelas a bordeIdx (en el marco U,V). */
+    corner: Array<{ ix: number; iy: number }>;
+    /** vértice interior nuevo por esquina (m → índice). */
+    vertice: Map<number, number>;
+    /** TAPA del interior SUELTO: vértices del polígono extruido por
+     *  esquina (m → índice), aparte del anillo plano del marco. */
+    tapa: Map<number, number>;
+  }
+  interface DatosGrupo {
+    caras: number[];
+    normal: Vertex3D;
+    centro: Vertex3D;
+    u: Vertex3D;
+    v: Vertex3D;
+    sepAbs: number;
+    bordes: BordeGrupo[];
+    bucles: BucleGrupo[]; // el de mayor área PRIMERO (interior = bucle 0)
+    donanteInterior: number;
+  }
+
+  const datosGrupos: DatosGrupo[] = [];
+  /** Delta (marco desplazado) por canon de contorno: en coords de mundo. */
+  const deltaCanonLocal = new Map<number, Vertex3D>();
+
+  for (const carasGrupo of gruposOrden) {
+    // Plano del grupo: Newell acumulado sobre sus caras.
+    let nx = 0;
+    let ny = 0;
+    let nz = 0;
+    let cx = 0;
+    let cy = 0;
+    let cz = 0;
+    let nCentro = 0;
+    const grupoSet = new Set<number>();
+    for (const fi of carasGrupo) {
+      const cara = mesh.faces[fi];
+      if (!cara || cara.length < 3) continue;
+      grupoSet.add(fi);
+      const n2 = newellCara(fi);
+      if (!n2) {
+        grupoSet.delete(fi);
+        continue;
+      }
+      nx += n2.x;
+      ny += n2.y;
+      nz += n2.z;
+      const vistos = new Set<number>();
+      for (const vi of cara) {
+        const c = canonDe[vi];
+        if (c < 0 || vistos.has(c)) continue;
+        vistos.add(c);
+        const pos = canonPos[c];
+        cx += pos.x;
+        cy += pos.y;
+        cz += pos.z;
+        nCentro++;
+      }
+    }
+    if (grupoSet.size === 0) continue;
+
+    // Contorno (topología pura, ANTES de fijar el plano): aristas canon
+    // con EXACTAMENTE una cara del grupo. Sirve para orientar la normal.
+    const bordes: BordeGrupo[] = [];
+    for (const fi of carasGrupo) {
+      if (!grupoSet.has(fi)) continue;
+      const cara = mesh.faces[fi];
+      for (let j = 0; j < cara.length; j++) {
+        const viP = cara[j];
+        const viQ = cara[(j + 1) % cara.length];
+        const cp = canonDe[viP];
+        const cq = canonDe[viQ];
+        if (cp < 0 || cq < 0 || cp === cq) continue;
+        const listaF = bordeAFaces.get(claveCanon(cp, cq));
+        if (!listaF) continue;
+        let delGrupo = 0;
+        for (const f2 of listaF) if (grupoSet.has(f2)) delGrupo++;
+        if (delGrupo !== 1) continue;
+        bordes.push({ p: cp, q: cq, fi: fi as number, viP: viP as number, viQ: viQ as number });
+      }
+    }
+    if (bordes.length === 0) continue;
+
+    const largoN = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (largoN < 1e-12) continue;
+    const normal = { x: nx / largoN, y: ny / largoN, z: nz / largoN };
+    if (nCentro === 0) continue;
+    const centro = { x: cx / nCentro, y: cy / nCentro, z: cz / nCentro };
+
+    // Orientación GLOBAL de la normal: el enrolado de la malla .zeus no
+    // es fiable cara a cara (una se mete hacia adentro y la otra sale con
+    // el mismo slider). El lado SÓLIDO es el de las caras vecinas al
+    // contorno: si su material cae del lado +normal (normal apuntando
+    // hacia dentro de la pieza) se INVIERTE, de modo que profInterior/
+    // profMarco signifiquen lo mismo en TODAS las caras seleccionadas
+    // (positivo = sale, negativo = se mete). Sin vecinos (lámina aislada)
+    // se respeta el enrolado.
+    {
+      let sumaDist = 0;
+      let cuenta = 0;
+      for (const b of bordes) {
+        const listaF = bordeAFaces.get(claveCanon(b.p, b.q));
+        if (!listaF) continue;
+        for (const f2 of listaF) {
+          if (grupoSet.has(f2)) continue;
+          const cara2 = mesh.faces[f2];
+          if (!cara2) continue;
+          const vistos = new Set<number>();
+          let fx = 0;
+          let fy = 0;
+          let fz = 0;
+          let nc = 0;
+          for (const vi of cara2) {
+            const c = canonDe[vi];
+            if (c < 0 || vistos.has(c)) continue;
+            vistos.add(c);
+            const pos = canonPos[c];
+            fx += pos.x;
+            fy += pos.y;
+            fz += pos.z;
+            nc++;
+          }
+          if (nc === 0) continue;
+          sumaDist +=
+            ((fx / nc - centro.x) * normal.x +
+              (fy / nc - centro.y) * normal.y +
+              (fz / nc - centro.z) * normal.z);
+          cuenta++;
+        }
+      }
+      if (cuenta > 0 && sumaDist > 1e-9) {
+        normal.x = -normal.x;
+        normal.y = -normal.y;
+        normal.z = -normal.z;
+      }
+    }
+
+    // Base ortonormal (U,V) con U×V = normal (receta del chaflán).
+    const ref: Vertex3D =
+      Math.abs(normal.x) < 0.9
+        ? { x: 1, y: 0, z: 0 }
+        : { x: 0, y: 0, z: 1 };
+    const ux0 = ref.y * normal.z - ref.z * normal.y;
+    const uy0 = ref.z * normal.x - ref.x * normal.z;
+    const uz0 = ref.x * normal.y - ref.y * normal.x;
+    const lu0 = Math.sqrt(ux0 * ux0 + uy0 * uy0 + uz0 * uz0);
+    if (lu0 < 1e-12) continue;
+    const u = { x: ux0 / lu0, y: uy0 / lu0, z: uz0 / lu0 };
+    const v = {
+      x: normal.y * u.z - normal.z * u.y,
+      y: normal.z * u.x - normal.x * u.z,
+      z: normal.x * u.y - normal.y * u.x,
+    };
+    const proyecta = (p: Vertex3D): { a: number; b: number } => ({
+      a: (p.x - centro.x) * u.x + (p.y - centro.y) * u.y + (p.z - centro.z) * u.z,
+      b: (p.x - centro.x) * v.x + (p.y - centro.y) * v.y + (p.z - centro.z) * v.z,
+    });
+
+    // Cadena dirigida en bucles (un canon con 2 salidas cierra y abre
+    // otro: huecos como bucles separados).
+    const salidas = new Map<number, number[]>();
+    bordes.forEach((b, i) => {
+      const lista = salidas.get(b.p);
+      if (lista) lista.push(i);
+      else salidas.set(b.p, [i]);
+    });
+    const usados = new Set<number>();
+    const cadenas: number[][] = [];
+    for (let i = 0; i < bordes.length; i++) {
+      if (usados.has(i)) continue;
+      const cadena: number[] = [];
+      const inicio = bordes[i].p;
+      let cur: number | undefined = i;
+      while (cur !== undefined && !usados.has(cur)) {
+        usados.add(cur);
+        cadena.push(cur);
+        const bActual: BordeGrupo | undefined = bordes[cur];
+        if (!bActual || bActual.q === inicio) break;
+        const outs: number[] | undefined = salidas.get(bActual.q);
+        if (!outs) break;
+        const sig: number | undefined = (outs).find(
+          (k: number) => !usados.has(k)
+        );
+        cur = sig;
+      }
+      if (cadena.length >= 3) cadenas.push(cadena);
+    }
+    if (cadenas.length === 0) continue;
+
+    // Bbox 2D de TODO el contorno: separación = % de la menor dimensión.
+    let aMin = Infinity;
+    let aMax = -Infinity;
+    let bMin = Infinity;
+    let bMax = -Infinity;
+    const canonesVistos = new Set<number>();
+    for (const b of bordes) {
+      if (canonesVistos.has(b.p)) continue;
+      canonesVistos.add(b.p);
+      const pr = proyecta(canonPos[b.p]);
+      if (pr.a < aMin) aMin = pr.a;
+      if (pr.a > aMax) aMax = pr.a;
+      if (pr.b < bMin) bMin = pr.b;
+      if (pr.b > bMax) bMax = pr.b;
+    }
+    const sepAbs =
+      (separacion / 100) *
+      Math.min(Math.abs(aMax - aMin), Math.abs(bMax - bMin));
+    if (sepAbs < 1e-9) continue;
+
+    // Inset 2D por bucle: offset de líneas consecutivas hacia adentro
+    // (miter con límite; bisectriz como respaldo) y clamp por esquina a
+    // 45% de su distancia al centro del grupo (receta del chaflán).
+    const bucles: BucleGrupo[] = [];
+    for (const cadena of cadenas) {
+      const pts = cadena.map((k) => proyecta(canonPos[bordes[k].p]));
+      let area2 = 0;
+      for (let m = 0; m < pts.length; m++) {
+        const P = pts[m];
+        const Q = pts[(m + 1) % pts.length];
+        area2 += P.a * Q.b - Q.a * P.b;
+      }
+      area2 /= 2;
+      if (Math.abs(area2) < 1e-9) continue;
+      // Normal interior de la arista m→m+1 (izquierda si CCW área>0).
+      const dentroDe = (m: number): { x: number; y: number } => {
+        const P = pts[m];
+        const Q = pts[(m + 1) % pts.length];
+        const dx = Q.a - P.a;
+        const dy = Q.b - P.b;
+        const len = Math.hypot(dx, dy) || 1;
+        return area2 > 0
+          ? { x: -dy / len, y: dx / len }
+          : { x: dy / len, y: -dx / len };
+      };
+      const corner: Array<{ ix: number; iy: number }> = [];
+      for (let m = 0; m < pts.length; m++) {
+        const P = pts[m];
+        const nA = dentroDe((m - 1 + pts.length) % pts.length);
+        const nB = dentroDe(m);
+        const dA = pts[(m - 1 + pts.length) % pts.length]; // pts[m-1]
+        const dB = pts[(m + 1) % pts.length];
+        const OA = { x: dA.a + nA.x * sepAbs, y: dA.b + nA.y * sepAbs };
+        const OB = { x: P.a + nB.x * sepAbs, y: P.b + nB.y * sepAbs };
+        const dirA = { x: P.a - dA.a, y: P.b - dA.b };
+        const dirB = { x: dB.a - P.a, y: dB.b - P.b };
+        const den = dirA.x * dirB.y - dirA.y * dirB.x;
+        let ix = 0;
+        let iy = 0;
+        if (Math.abs(den) > 1e-12) {
+          const t =
+            ((OB.x - OA.x) * dirB.y - (OB.y - OA.y) * dirB.x) / den;
+          ix = OA.x + dirA.x * t;
+          iy = OA.y + dirA.y * t;
+        }
+        const mitX = ix - P.a;
+        const mitY = iy - P.b;
+        const mitLen = Math.hypot(mitX, mitY);
+        // Miter desbocado o líneas paralelas: bisectriz de las normales.
+        if (
+          mitLen < 1e-9 ||
+          mitLen > sepAbs * 4 ||
+          Math.abs(den) <= 1e-12
+        ) {
+          const bx = nA.x + nB.x;
+          const by = nA.y + nB.y;
+          const bl = Math.hypot(bx, by);
+          if (bl > 1e-12) {
+            ix = P.a + (bx / bl) * sepAbs;
+            iy = P.b + (by / bl) * sepAbs;
+          } else {
+            ix = P.a + nB.x * sepAbs;
+            iy = P.b + nB.y * sepAbs;
+          }
+        }
+        // Clamp al 45% de la distancia 2D de la esquina al centro (en
+        // este marco U,V el centro está en el origen).
+        const dCentro = Math.hypot(P.a, P.b);
+        const maxX = dCentro * 0.45;
+        const fx = ix - P.a;
+        const fy = iy - P.b;
+        const fl = Math.hypot(fx, fy);
+        if (fl > maxX && maxX > 1e-12) {
+          const fAjuste = maxX / fl;
+          ix = P.a + fx * fAjuste;
+          iy = P.b + fy * fAjuste;
+        }
+        corner.push({ ix, iy });
+      }
+      bucles.push({
+        bordeIdx: cadena,
+        area2,
+        corner,
+        vertice: new Map<number, number>(),
+        tapa: new Map<number, number>(),
+      });
+    }
+    if (bucles.length === 0) continue;
+    // El bucle de MAYOR área encabeza: solo él genera el polígono interior.
+    bucles.sort((b1, b2) => Math.abs(b2.area2) - Math.abs(b1.area2));
+
+    // Donante del polígono interior: la cara del grupo de mayor área.
+    let donanteInterior = -1;
+    let areaDonante = -1;
+    for (const fi of carasGrupo) {
+      if (!grupoSet.has(fi)) continue;
+      const cara = mesh.faces[fi];
+      const vistos = new Set<number>();
+      const ciclo: number[] = [];
+      for (const vi of cara) {
+        const c = canonDe[vi];
+        if (c < 0 || vistos.has(c)) continue;
+        vistos.add(c);
+        ciclo.push(c);
+      }
+      if (ciclo.length < 3) continue;
+      // |Newell|/2 = área: magnitud del vector acumulado.
+      let fx = 0;
+      let fy = 0;
+      let fz = 0;
+      for (let i = 0; i < ciclo.length; i++) {
+        const A = canonPos[ciclo[i]];
+        const B = canonPos[ciclo[(i + 1) % ciclo.length]];
+        fx += (A.y - B.y) * (A.z + B.z);
+        fy += (A.z - B.z) * (A.x + B.x);
+        fz += (A.x - B.x) * (A.y + B.y);
+      }
+      const mag = Math.sqrt(fx * fx + fy * fy + fz * fz);
+      if (mag > areaDonante) {
+        areaDonante = mag;
+        donanteInterior = fi;
+      }
+    }
+
+    // Delta del contorno por canon: primer grupo que reclama el canon
+    // gana (dos grupos en planos distintos comparten arista).
+    if (Math.abs(profMarAbs) > 1e-12) {
+      for (const bucle of bucles) {
+        for (const m of bucle.bordeIdx) {
+          const c = bordes[m].p;
+          if (!deltaCanonLocal.has(c)) {
+            deltaCanonLocal.set(c, {
+              x: normal.x * profMarAbs,
+              y: normal.y * profMarAbs,
+              z: normal.z * profMarAbs,
+            });
+          }
+        }
+      }
+    }
+
+    datosGrupos.push({
+      caras: [...grupoSet],
+      normal,
+      centro,
+      u,
+      v,
+      sepAbs,
+      bordes,
+      bucles,
+      donanteInterior,
+    });
+  }
+  if (datosGrupos.length === 0) return mesh;
+
+  // 2) REMAP: una copia NUEVA por cada copia bruta de cada canon de
+  //    contorno con delta — todas al MISMO punto desplazado (superficie
+  //    estanca: las caras vecinas se inclinan con el marco).
+  const remap = new Map<number, number>();
+  for (const [c, d] of deltaCanonLocal) {
+    const pos = canonPos[c];
+    for (const vi of copiasCanon.get(c) ?? []) {
+      remap.set(vi, nuevaVertices.length);
+      nuevaVertices.push({ x: pos.x + d.x, y: pos.y + d.y, z: pos.z + d.z });
+      entraUv(vi);
+    }
+  }
+
+  /** Anillo interior del marco (modo SUELTO): esquina insetada +
+   *  profInteriorBase — la posición congelada del gesto CTRL. */
+  const verticePlanoDe = (
+    gd: DatosGrupo,
+    bucle: BucleGrupo,
+    m: number
+  ): number => {
+    const ya = bucle.vertice.get(m);
+    if (ya !== undefined) return ya;
+    const b = gd.bordes[bucle.bordeIdx[m]];
+    const c2d = bucle.corner[m];
+    const idx = nuevaVertices.length;
+    nuevaVertices.push({
+      x:
+        gd.centro.x +
+        gd.u.x * c2d.ix +
+        gd.v.x * c2d.iy +
+        gd.normal.x * profBaseAbs,
+      y:
+        gd.centro.y +
+        gd.u.y * c2d.ix +
+        gd.v.y * c2d.iy +
+        gd.normal.y * profBaseAbs,
+      z:
+        gd.centro.z +
+        gd.u.z * c2d.ix +
+        gd.v.z * c2d.iy +
+        gd.normal.z * profBaseAbs,
+    });
+    const copias = copiasCanon.get(b.p);
+    entraUv(copias ? copias[0] : b.viP);
+    bucle.vertice.set(m, idx);
+    return idx;
+  };
+
+  /** TAPA del polígono interior en modo SUELTO: esquina insetada +
+   *  profInterior por la normal (vértices APARTE del anillo del marco). */
+  const verticeTapaDe = (
+    gd: DatosGrupo,
+    bucle: BucleGrupo,
+    m: number
+  ): number => {
+    const ya = bucle.tapa.get(m);
+    if (ya !== undefined) return ya;
+    const b = gd.bordes[bucle.bordeIdx[m]];
+    const c2d = bucle.corner[m];
+    const idx = nuevaVertices.length;
+    nuevaVertices.push({
+      x:
+        gd.centro.x +
+        gd.u.x * c2d.ix +
+        gd.v.x * c2d.iy +
+        gd.normal.x * profIntAbs,
+      y:
+        gd.centro.y +
+        gd.u.y * c2d.ix +
+        gd.v.y * c2d.iy +
+        gd.normal.y * profIntAbs,
+      z:
+        gd.centro.z +
+        gd.u.z * c2d.ix +
+        gd.v.z * c2d.iy +
+        gd.normal.z * profIntAbs,
+    });
+    const copias = copiasCanon.get(b.p);
+    entraUv(copias ? copias[0] : b.viP);
+    bucle.tapa.set(m, idx);
+    return idx;
+  };
+
+  /** Vértice interior de la esquina m del bucle (creado bajo demanda):
+   *  modo COMBINADO (sin CTRL): anillo e interior COMPARTEN el vértice
+   *  desplazado — la banda se inclina con el polígono interior. Es la
+   *  posición insetada en el plano + profInterior por la normal. */
+  const verticeInteriorDe = (
+    gd: DatosGrupo,
+    bucle: BucleGrupo,
+    m: number
+  ): number => {
+    const ya = bucle.vertice.get(m);
+    if (ya !== undefined) return ya;
+    const b = gd.bordes[bucle.bordeIdx[m]];
+    const c2d = bucle.corner[m];
+    const idx = nuevaVertices.length;
+    nuevaVertices.push({
+      x:
+        gd.centro.x +
+        gd.u.x * c2d.ix +
+        gd.v.x * c2d.iy +
+        gd.normal.x * profIntAbs,
+      y:
+        gd.centro.y +
+        gd.u.y * c2d.ix +
+        gd.v.y * c2d.iy +
+        gd.normal.y * profIntAbs,
+      z:
+        gd.centro.z +
+        gd.u.z * c2d.ix +
+        gd.v.z * c2d.iy +
+        gd.normal.z * profIntAbs,
+    });
+    const copias = copiasCanon.get(b.p);
+    entraUv(copias ? copias[0] : b.viP);
+    bucle.vertice.set(m, idx);
+    return idx;
+  };
+
+  // 3) EMISIÓN:
+  //    3a) caras NO seleccionadas: re-emitir con remap (los vecinos del
+  //        marco desplazado se inclinan; las demás quedan igual).
+  const carasGrupos = new Set<number>();
+  for (const gd of datosGrupos) {
+    for (const fi of gd.caras) carasGrupos.add(fi);
+  }
+  for (let fi = 0; fi < mesh.faces.length; fi++) {
+    if (carasGrupos.has(fi)) continue;
+    const cara = mesh.faces[fi];
+    emite(cara.map((vi) => remap.get(vi) ?? vi), fi);
+  }
+  //    3b) por grupo: banda del marco (quad por arista de contorno) y
+  //        polígono interior del bucle mayor. Orden del quad [out, in,
+  //        in, out]: sigue el enrolado de la cara donante (CCW en el
+  //        marco U,V) → normal de la banda = normal del grupo.
+  for (const gd of datosGrupos) {
+    for (const bucle of gd.bucles) {
+      for (let m = 0; m < bucle.bordeIdx.length; m++) {
+        const b = gd.bordes[bucle.bordeIdx[m]];
+        // SUELTO: el anillo del marco queda en el plano (no se inclina).
+        const inP = suelto
+          ? verticePlanoDe(gd, bucle, m)
+          : verticeInteriorDe(gd, bucle, m);
+        const inQ = suelto
+          ? verticePlanoDe(gd, bucle, (m + 1) % bucle.bordeIdx.length)
+          : verticeInteriorDe(gd, bucle, (m + 1) % bucle.bordeIdx.length);
+        const outP = remap.get(b.viP) ?? b.viP;
+        const outQ = remap.get(b.viQ) ?? b.viQ;
+        emite([outP, outQ, inQ, inP], b.fi);
+      }
+    }
+    const principal = gd.bucles[0];
+    if (gd.donanteInterior >= 0 && principal.bordeIdx.length >= 3) {
+      if (suelto) {
+        // Con profInterior sobre la base el anillo y la tapa coinciden
+        // (sin paredes ni vértices duplicados): reutiliza el anillo.
+        const desplazaTapa =
+          Math.abs(profIntAbs - profBaseAbs) > 1e-12;
+        const tapaOAnilloDe = (m: number): number =>
+          desplazaTapa
+            ? verticeTapaDe(gd, principal, m)
+            : verticePlanoDe(gd, principal, m);
+        // Paredes de la extrusión en solitario: quad anillo→tapa por
+        // arista. La normal mira hacia AFUERA si el bucle es CCW (área
+        // positiva); en CW (huecos) se invierte el enrolado.
+        if (desplazaTapa) {
+          for (let m = 0; m < principal.bordeIdx.length; m++) {
+            const b = gd.bordes[principal.bordeIdx[m]];
+            const pB = verticePlanoDe(gd, principal, m);
+            const qB = verticePlanoDe(
+              gd,
+              principal,
+              (m + 1) % principal.bordeIdx.length
+            );
+            const pT = tapaOAnilloDe(m);
+            const qT = tapaOAnilloDe((m + 1) % principal.bordeIdx.length);
+            emite(
+              principal.area2 > 0
+                ? [pB, qB, qT, pT]
+                : [pB, pT, qT, qB],
+              b.fi
+            );
+          }
+        }
+        const interior: number[] = [];
+        for (let m = 0; m < principal.bordeIdx.length; m++) {
+          interior.push(tapaOAnilloDe(m));
+        }
+        emite(interior, gd.donanteInterior);
+      } else {
+        const interior: number[] = [];
+        for (let m = 0; m < principal.bordeIdx.length; m++) {
+          interior.push(verticeInteriorDe(gd, principal, m));
+        }
+        emite(interior, gd.donanteInterior);
+      }
+    }
+  }
+
+  if (caras.length === 0) return mesh;
+  const salida: Mesh = { ...mesh, vertices: nuevaVertices, faces: caras };
   if (nuevaUvs) salida.uvs = nuevaUvs;
   if (colorSi) salida.faceColors = coloresFinales;
   if (opSi) salida.faceOpacities = opacidadesFinales;
@@ -1023,6 +1847,45 @@ const biselParams: PluginParam[] = [
   },
 ];
 
+const biselPlanoParams: PluginParam[] = [
+  {
+    tipo: 'slider',
+    id: 'separacion',
+    etiqueta: 'Separación',
+    min: 0,
+    max: 50,
+    paso: 1,
+    valor: 0,
+    unidad: '%',
+    descripcion:
+      'Ancho del marco interior, % de la dimensión menor del polígono en su plano (0 = sin marco). Captura las caras del botón Polígono al entrar.',
+  },
+  {
+    tipo: 'slider',
+    id: 'profInterior',
+    etiqueta: 'Profundidad interior',
+    min: -100,
+    max: 100,
+    paso: 1,
+    valor: 0,
+    unidad: '%',
+    descripcion:
+      'Sube (positivo) o hunde (negativo) el polígono que queda DENTRO del marco, % de la diagonal de la caja. Con CTRL: congela el marco DONDE ESTÁ (sin salto) y el interior sigue en solitario; el gesto queda fijado.',
+  },
+  {
+    tipo: 'slider',
+    id: 'profMarco',
+    etiqueta: 'Profundidad del marco',
+    min: -100,
+    max: 100,
+    paso: 1,
+    valor: 0,
+    unidad: '%',
+    descripcion:
+      'Sube (positivo) o hunde (negativo) el borde EXTERIOR del marco, % de la diagonal de la caja. Las caras vecinas se inclinan con él (marco «extruido»).',
+  },
+];
+
 export const DEFORMADORES_DIRECTOS: DeformadorDirecto[] = [
   {
     id: 'doblar',
@@ -1051,6 +1914,15 @@ export const DEFORMADORES_DIRECTOS: DeformadorDirecto[] = [
     icono: '/icons/Bisel.png',
     params: biselParams,
     aplicar: (mesh, params) => bisel(mesh, params),
+  },
+  {
+    id: 'bisel-plano',
+    nombre: 'Bisel plano',
+    icono: '/icons/Bisel Plano.png',
+    params: biselPlanoParams,
+    // El param OCULTO carasSel llega del editor (caras capturadas con el
+    // botón Polígono al entrar): no va en params para no salir en panel.
+    aplicar: (mesh, params) => biselPlano(mesh, params),
   },
   {
     id: 'hinchar',
@@ -1343,6 +2215,22 @@ export interface UnionGrupoDeformador {
   }>;
   /** El transform cuyo espacio local es el de `unida`. */
   marco: ObjectTransform;
+}
+
+/** Índice de la PRIMERA cara de `id` en la unión de `miembros` (suma de
+ * caras de los miembros anteriores); -1 si el miembro no está. Sirve para
+ * remapear carasSel (que indexa la malla base del miembro dueño) hacia la
+ * malla UNIDA del grupo. */
+export function finicioDeMiembro(
+  miembros: MiembroGrupoDeformador[],
+  id: string
+): number {
+  let acc = 0;
+  for (const mi of miembros) {
+    if (mi.id === id) return acc;
+    acc += mi.mesh.faces.length;
+  }
+  return -1;
 }
 
 /**

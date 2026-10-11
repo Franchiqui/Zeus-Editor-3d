@@ -20,13 +20,18 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 // lib/deformadores.ts
 var deformadores_exports = {};
 __export(deformadores_exports, {
+  CARAS_SEL_NINGUNA: () => CARAS_SEL_NINGUNA,
   DEFORMADORES_DIRECTOS: () => DEFORMADORES_DIRECTOS,
   aplicarDeformador: () => aplicarDeformador,
   aplicarTransformacion: () => aplicarTransformacion,
   aplicarTransformacionInversa: () => aplicarTransformacionInversa,
+  carasSelEnUnion: () => carasSelEnUnion,
   deformadorPorId: () => deformadorPorId,
   deformarGrupoCadena: () => deformarGrupoCadena,
   deformarGrupoComoUnidad: () => deformarGrupoComoUnidad,
+  desplazarCarasSel: () => desplazarCarasSel,
+  finicioDeMiembro: () => finicioDeMiembro,
+  paramsCarasSel: () => paramsCarasSel,
   repartirGrupoDeformado: () => repartirGrupoDeformado,
   unirMallasComoGrupo: () => unirMallasComoGrupo
 });
@@ -948,6 +953,577 @@ function bisel(mesh, params) {
   if (mesh.faceTextureGroups) salida.faceTextureGroups = gruposFinales;
   return salida;
 }
+var CARAS_SEL_NINGUNA = "-1";
+var paramsCarasSel = (ids) => {
+  const lista = [...ids].filter((n) => Number.isInteger(n) && n >= 0);
+  return { carasSel: lista.length ? lista.join(",") : CARAS_SEL_NINGUNA };
+};
+var desplazarCarasSel = (carasSel, offset) => {
+  if (typeof carasSel !== "string" || carasSel === CARAS_SEL_NINGUNA || !Number.isFinite(offset)) {
+    return CARAS_SEL_NINGUNA;
+  }
+  const ids = carasSel.split(",").map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n >= 0);
+  if (ids.length === 0) return CARAS_SEL_NINGUNA;
+  return ids.map((n) => String(n + offset)).join(",");
+};
+var carasSelEnUnion = (carasSel, partes, idMiembro) => {
+  if (typeof carasSel !== "string" || carasSel === CARAS_SEL_NINGUNA) {
+    return CARAS_SEL_NINGUNA;
+  }
+  const parte = partes.find((p) => p.id === idMiembro);
+  if (!parte) return CARAS_SEL_NINGUNA;
+  return desplazarCarasSel(carasSel, parte.finicio);
+};
+function biselPlano(mesh, params) {
+  const separacion = num2(params, "separacion", 0);
+  if (separacion <= 0) return mesh;
+  if (mesh.vertices.length === 0 || mesh.faces.length === 0) return mesh;
+  const bruta = params["carasSel"];
+  const seleccionadas = typeof bruta === "string" ? [
+    ...new Set(
+      bruta.split(",").map((s) => Number(s.trim())).filter(
+        (n) => Number.isInteger(n) && n >= 0 && n < mesh.faces.length
+      )
+    )
+  ] : [];
+  if (seleccionadas.length === 0) return mesh;
+  const topo = construirAnillos(mesh);
+  if (!topo) return mesh;
+  const { canonDe, canonPos, bordeAFaces } = topo;
+  let minX = Infinity;
+  let minY = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let maxZ = -Infinity;
+  for (const p of canonPos) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.z < minZ) minZ = p.z;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+    if (p.z > maxZ) maxZ = p.z;
+  }
+  const diagonal = Math.sqrt(
+    (maxX - minX) ** 2 + (maxY - minY) ** 2 + (maxZ - minZ) ** 2
+  );
+  if (!Number.isFinite(diagonal) || diagonal < 1e-9) return mesh;
+  const profIntAbs = num2(params, "profInterior", 0) / 100 * diagonal * 0.5;
+  const profMarAbs = num2(params, "profMarco", 0) / 100 * diagonal * 0.5;
+  const suelto = num2(params, "interiorSuelto", 0) >= 0.5;
+  const profBaseAbs = suelto ? num2(params, "profInteriorBase", 0) / 100 * diagonal * 0.5 : 0;
+  const claveCanon = (a, b) => a < b ? `${a}-${b}` : `${b}-${a}`;
+  const newellCara = (fi) => {
+    const cara = mesh.faces[fi];
+    if (!cara || cara.length < 3) return null;
+    const vistos = /* @__PURE__ */ new Set();
+    const ciclo = [];
+    for (const vi of cara) {
+      const c = canonDe[vi];
+      if (c < 0 || vistos.has(c)) continue;
+      vistos.add(c);
+      ciclo.push(c);
+    }
+    if (ciclo.length < 3) return null;
+    let nx = 0;
+    let ny = 0;
+    let nz = 0;
+    for (let i = 0; i < ciclo.length; i++) {
+      const A = canonPos[ciclo[i]];
+      const B = canonPos[ciclo[(i + 1) % ciclo.length]];
+      nx += (A.y - B.y) * (A.z + B.z);
+      ny += (A.z - B.z) * (A.x + B.x);
+      nz += (A.x - B.x) * (A.y + B.y);
+    }
+    const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (len < 1e-12) return null;
+    return { x: nx / len, y: ny / len, z: nz / len };
+  };
+  const selSet = new Set(seleccionadas);
+  const selArista = /* @__PURE__ */ new Map();
+  const padre = /* @__PURE__ */ new Map();
+  const buscar = (x) => {
+    let r = x;
+    while (padre.get(r) !== r) r = padre.get(r);
+    return r;
+  };
+  for (const fi of seleccionadas) padre.set(fi, fi);
+  for (const fi of seleccionadas) {
+    const cara = mesh.faces[fi];
+    if (!cara || cara.length < 3) continue;
+    for (let j = 0; j < cara.length; j++) {
+      const cp = canonDe[cara[j]];
+      const cq = canonDe[cara[(j + 1) % cara.length]];
+      if (cp < 0 || cq < 0 || cp === cq) continue;
+      const key = claveCanon(cp, cq);
+      const lista = selArista.get(key);
+      if (lista) {
+        if (!lista.includes(fi)) lista.push(fi);
+      } else selArista.set(key, [fi]);
+    }
+  }
+  for (const lista of selArista.values()) {
+    if (lista.length < 2) continue;
+    for (let i = 1; i < lista.length; i++) {
+      const nA = newellCara(lista[0]);
+      const nB = newellCara(lista[i]);
+      if (!nA || !nB) continue;
+      const dot = nA.x * nB.x + nA.y * nB.y + nA.z * nB.z;
+      if (dot > 0.99) padre.set(buscar(lista[i]), buscar(lista[0]));
+    }
+  }
+  const grupos = /* @__PURE__ */ new Map();
+  for (const fi of seleccionadas) {
+    const r = buscar(fi);
+    const g = grupos.get(r);
+    if (g) g.push(fi);
+    else grupos.set(r, [fi]);
+  }
+  const gruposOrden = [...grupos.values()].sort(
+    (g1, g2) => Math.min(...g1) - Math.min(...g2)
+  );
+  const nuevaVertices = [...mesh.vertices];
+  const nuevaUvs = mesh.uvs ? [...mesh.uvs] : void 0;
+  const colorSi = mesh.faceColors ? [...mesh.faceColors] : void 0;
+  const opSi = mesh.faceOpacities ? [...mesh.faceOpacities] : void 0;
+  const texSi = mesh.faceTextures ? [...mesh.faceTextures] : void 0;
+  const caras = [];
+  const coloresFinales = [];
+  const opacidadesFinales = [];
+  const texturasFinales = [];
+  const gruposFinales = [];
+  const emite = (face, donanteIdx) => {
+    caras.push(face);
+    coloresFinales.push(colorSi ? colorSi[donanteIdx] ?? null : null);
+    opacidadesFinales.push(opSi ? opSi[donanteIdx] ?? 1 : 1);
+    texturasFinales.push(texSi ? texSi[donanteIdx] ?? null : null);
+    if (mesh.faceTextureGroups) {
+      gruposFinales.push(mesh.faceTextureGroups[donanteIdx] ?? null);
+    }
+  };
+  const entraUv = (vi) => {
+    if (!nuevaUvs) return;
+    const uv = mesh.uvs?.[vi];
+    nuevaUvs.push(uv ? [uv[0], uv[1]] : [0, 0]);
+  };
+  const copiasCanon = /* @__PURE__ */ new Map();
+  for (let i = 0; i < mesh.vertices.length; i++) {
+    const c = canonDe[i];
+    if (c < 0) continue;
+    const lista = copiasCanon.get(c);
+    if (lista) lista.push(i);
+    else copiasCanon.set(c, [i]);
+  }
+  const datosGrupos = [];
+  const deltaCanonLocal = /* @__PURE__ */ new Map();
+  for (const carasGrupo of gruposOrden) {
+    let nx = 0;
+    let ny = 0;
+    let nz = 0;
+    let cx = 0;
+    let cy = 0;
+    let cz = 0;
+    let nCentro = 0;
+    const grupoSet = /* @__PURE__ */ new Set();
+    for (const fi of carasGrupo) {
+      const cara = mesh.faces[fi];
+      if (!cara || cara.length < 3) continue;
+      grupoSet.add(fi);
+      const n2 = newellCara(fi);
+      if (!n2) {
+        grupoSet.delete(fi);
+        continue;
+      }
+      nx += n2.x;
+      ny += n2.y;
+      nz += n2.z;
+      const vistos = /* @__PURE__ */ new Set();
+      for (const vi of cara) {
+        const c = canonDe[vi];
+        if (c < 0 || vistos.has(c)) continue;
+        vistos.add(c);
+        const pos = canonPos[c];
+        cx += pos.x;
+        cy += pos.y;
+        cz += pos.z;
+        nCentro++;
+      }
+    }
+    if (grupoSet.size === 0) continue;
+    const bordes = [];
+    for (const fi of carasGrupo) {
+      if (!grupoSet.has(fi)) continue;
+      const cara = mesh.faces[fi];
+      for (let j = 0; j < cara.length; j++) {
+        const viP = cara[j];
+        const viQ = cara[(j + 1) % cara.length];
+        const cp = canonDe[viP];
+        const cq = canonDe[viQ];
+        if (cp < 0 || cq < 0 || cp === cq) continue;
+        const listaF = bordeAFaces.get(claveCanon(cp, cq));
+        if (!listaF) continue;
+        let delGrupo = 0;
+        for (const f2 of listaF) if (grupoSet.has(f2)) delGrupo++;
+        if (delGrupo !== 1) continue;
+        bordes.push({ p: cp, q: cq, fi, viP, viQ });
+      }
+    }
+    if (bordes.length === 0) continue;
+    const largoN = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (largoN < 1e-12) continue;
+    const normal = { x: nx / largoN, y: ny / largoN, z: nz / largoN };
+    if (nCentro === 0) continue;
+    const centro = { x: cx / nCentro, y: cy / nCentro, z: cz / nCentro };
+    {
+      let sumaDist = 0;
+      let cuenta = 0;
+      for (const b of bordes) {
+        const listaF = bordeAFaces.get(claveCanon(b.p, b.q));
+        if (!listaF) continue;
+        for (const f2 of listaF) {
+          if (grupoSet.has(f2)) continue;
+          const cara2 = mesh.faces[f2];
+          if (!cara2) continue;
+          const vistos = /* @__PURE__ */ new Set();
+          let fx = 0;
+          let fy = 0;
+          let fz = 0;
+          let nc = 0;
+          for (const vi of cara2) {
+            const c = canonDe[vi];
+            if (c < 0 || vistos.has(c)) continue;
+            vistos.add(c);
+            const pos = canonPos[c];
+            fx += pos.x;
+            fy += pos.y;
+            fz += pos.z;
+            nc++;
+          }
+          if (nc === 0) continue;
+          sumaDist += (fx / nc - centro.x) * normal.x + (fy / nc - centro.y) * normal.y + (fz / nc - centro.z) * normal.z;
+          cuenta++;
+        }
+      }
+      if (cuenta > 0 && sumaDist > 1e-9) {
+        normal.x = -normal.x;
+        normal.y = -normal.y;
+        normal.z = -normal.z;
+      }
+    }
+    const ref = Math.abs(normal.x) < 0.9 ? { x: 1, y: 0, z: 0 } : { x: 0, y: 0, z: 1 };
+    const ux0 = ref.y * normal.z - ref.z * normal.y;
+    const uy0 = ref.z * normal.x - ref.x * normal.z;
+    const uz0 = ref.x * normal.y - ref.y * normal.x;
+    const lu0 = Math.sqrt(ux0 * ux0 + uy0 * uy0 + uz0 * uz0);
+    if (lu0 < 1e-12) continue;
+    const u = { x: ux0 / lu0, y: uy0 / lu0, z: uz0 / lu0 };
+    const v = {
+      x: normal.y * u.z - normal.z * u.y,
+      y: normal.z * u.x - normal.x * u.z,
+      z: normal.x * u.y - normal.y * u.x
+    };
+    const proyecta = (p) => ({
+      a: (p.x - centro.x) * u.x + (p.y - centro.y) * u.y + (p.z - centro.z) * u.z,
+      b: (p.x - centro.x) * v.x + (p.y - centro.y) * v.y + (p.z - centro.z) * v.z
+    });
+    const salidas = /* @__PURE__ */ new Map();
+    bordes.forEach((b, i) => {
+      const lista = salidas.get(b.p);
+      if (lista) lista.push(i);
+      else salidas.set(b.p, [i]);
+    });
+    const usados = /* @__PURE__ */ new Set();
+    const cadenas = [];
+    for (let i = 0; i < bordes.length; i++) {
+      if (usados.has(i)) continue;
+      const cadena = [];
+      const inicio = bordes[i].p;
+      let cur = i;
+      while (cur !== void 0 && !usados.has(cur)) {
+        usados.add(cur);
+        cadena.push(cur);
+        const bActual = bordes[cur];
+        if (!bActual || bActual.q === inicio) break;
+        const outs = salidas.get(bActual.q);
+        if (!outs) break;
+        const sig = outs.find(
+          (k) => !usados.has(k)
+        );
+        cur = sig;
+      }
+      if (cadena.length >= 3) cadenas.push(cadena);
+    }
+    if (cadenas.length === 0) continue;
+    let aMin = Infinity;
+    let aMax = -Infinity;
+    let bMin = Infinity;
+    let bMax = -Infinity;
+    const canonesVistos = /* @__PURE__ */ new Set();
+    for (const b of bordes) {
+      if (canonesVistos.has(b.p)) continue;
+      canonesVistos.add(b.p);
+      const pr = proyecta(canonPos[b.p]);
+      if (pr.a < aMin) aMin = pr.a;
+      if (pr.a > aMax) aMax = pr.a;
+      if (pr.b < bMin) bMin = pr.b;
+      if (pr.b > bMax) bMax = pr.b;
+    }
+    const sepAbs = separacion / 100 * Math.min(Math.abs(aMax - aMin), Math.abs(bMax - bMin));
+    if (sepAbs < 1e-9) continue;
+    const bucles = [];
+    for (const cadena of cadenas) {
+      const pts = cadena.map((k) => proyecta(canonPos[bordes[k].p]));
+      let area2 = 0;
+      for (let m = 0; m < pts.length; m++) {
+        const P = pts[m];
+        const Q = pts[(m + 1) % pts.length];
+        area2 += P.a * Q.b - Q.a * P.b;
+      }
+      area2 /= 2;
+      if (Math.abs(area2) < 1e-9) continue;
+      const dentroDe = (m) => {
+        const P = pts[m];
+        const Q = pts[(m + 1) % pts.length];
+        const dx = Q.a - P.a;
+        const dy = Q.b - P.b;
+        const len = Math.hypot(dx, dy) || 1;
+        return area2 > 0 ? { x: -dy / len, y: dx / len } : { x: dy / len, y: -dx / len };
+      };
+      const corner = [];
+      for (let m = 0; m < pts.length; m++) {
+        const P = pts[m];
+        const nA = dentroDe((m - 1 + pts.length) % pts.length);
+        const nB = dentroDe(m);
+        const dA = pts[(m - 1 + pts.length) % pts.length];
+        const dB = pts[(m + 1) % pts.length];
+        const OA = { x: dA.a + nA.x * sepAbs, y: dA.b + nA.y * sepAbs };
+        const OB = { x: P.a + nB.x * sepAbs, y: P.b + nB.y * sepAbs };
+        const dirA = { x: P.a - dA.a, y: P.b - dA.b };
+        const dirB = { x: dB.a - P.a, y: dB.b - P.b };
+        const den = dirA.x * dirB.y - dirA.y * dirB.x;
+        let ix = 0;
+        let iy = 0;
+        if (Math.abs(den) > 1e-12) {
+          const t = ((OB.x - OA.x) * dirB.y - (OB.y - OA.y) * dirB.x) / den;
+          ix = OA.x + dirA.x * t;
+          iy = OA.y + dirA.y * t;
+        }
+        const mitX = ix - P.a;
+        const mitY = iy - P.b;
+        const mitLen = Math.hypot(mitX, mitY);
+        if (mitLen < 1e-9 || mitLen > sepAbs * 4 || Math.abs(den) <= 1e-12) {
+          const bx = nA.x + nB.x;
+          const by = nA.y + nB.y;
+          const bl = Math.hypot(bx, by);
+          if (bl > 1e-12) {
+            ix = P.a + bx / bl * sepAbs;
+            iy = P.b + by / bl * sepAbs;
+          } else {
+            ix = P.a + nB.x * sepAbs;
+            iy = P.b + nB.y * sepAbs;
+          }
+        }
+        const dCentro = Math.hypot(P.a, P.b);
+        const maxX2 = dCentro * 0.45;
+        const fx = ix - P.a;
+        const fy = iy - P.b;
+        const fl = Math.hypot(fx, fy);
+        if (fl > maxX2 && maxX2 > 1e-12) {
+          const fAjuste = maxX2 / fl;
+          ix = P.a + fx * fAjuste;
+          iy = P.b + fy * fAjuste;
+        }
+        corner.push({ ix, iy });
+      }
+      bucles.push({
+        bordeIdx: cadena,
+        area2,
+        corner,
+        vertice: /* @__PURE__ */ new Map(),
+        tapa: /* @__PURE__ */ new Map()
+      });
+    }
+    if (bucles.length === 0) continue;
+    bucles.sort((b1, b2) => Math.abs(b2.area2) - Math.abs(b1.area2));
+    let donanteInterior = -1;
+    let areaDonante = -1;
+    for (const fi of carasGrupo) {
+      if (!grupoSet.has(fi)) continue;
+      const cara = mesh.faces[fi];
+      const vistos = /* @__PURE__ */ new Set();
+      const ciclo = [];
+      for (const vi of cara) {
+        const c = canonDe[vi];
+        if (c < 0 || vistos.has(c)) continue;
+        vistos.add(c);
+        ciclo.push(c);
+      }
+      if (ciclo.length < 3) continue;
+      let fx = 0;
+      let fy = 0;
+      let fz = 0;
+      for (let i = 0; i < ciclo.length; i++) {
+        const A = canonPos[ciclo[i]];
+        const B = canonPos[ciclo[(i + 1) % ciclo.length]];
+        fx += (A.y - B.y) * (A.z + B.z);
+        fy += (A.z - B.z) * (A.x + B.x);
+        fz += (A.x - B.x) * (A.y + B.y);
+      }
+      const mag = Math.sqrt(fx * fx + fy * fy + fz * fz);
+      if (mag > areaDonante) {
+        areaDonante = mag;
+        donanteInterior = fi;
+      }
+    }
+    if (Math.abs(profMarAbs) > 1e-12) {
+      for (const bucle of bucles) {
+        for (const m of bucle.bordeIdx) {
+          const c = bordes[m].p;
+          if (!deltaCanonLocal.has(c)) {
+            deltaCanonLocal.set(c, {
+              x: normal.x * profMarAbs,
+              y: normal.y * profMarAbs,
+              z: normal.z * profMarAbs
+            });
+          }
+        }
+      }
+    }
+    datosGrupos.push({
+      caras: [...grupoSet],
+      normal,
+      centro,
+      u,
+      v,
+      sepAbs,
+      bordes,
+      bucles,
+      donanteInterior
+    });
+  }
+  if (datosGrupos.length === 0) return mesh;
+  const remap = /* @__PURE__ */ new Map();
+  for (const [c, d] of deltaCanonLocal) {
+    const pos = canonPos[c];
+    for (const vi of copiasCanon.get(c) ?? []) {
+      remap.set(vi, nuevaVertices.length);
+      nuevaVertices.push({ x: pos.x + d.x, y: pos.y + d.y, z: pos.z + d.z });
+      entraUv(vi);
+    }
+  }
+  const verticePlanoDe = (gd, bucle, m) => {
+    const ya = bucle.vertice.get(m);
+    if (ya !== void 0) return ya;
+    const b = gd.bordes[bucle.bordeIdx[m]];
+    const c2d = bucle.corner[m];
+    const idx = nuevaVertices.length;
+    nuevaVertices.push({
+      x: gd.centro.x + gd.u.x * c2d.ix + gd.v.x * c2d.iy + gd.normal.x * profBaseAbs,
+      y: gd.centro.y + gd.u.y * c2d.ix + gd.v.y * c2d.iy + gd.normal.y * profBaseAbs,
+      z: gd.centro.z + gd.u.z * c2d.ix + gd.v.z * c2d.iy + gd.normal.z * profBaseAbs
+    });
+    const copias = copiasCanon.get(b.p);
+    entraUv(copias ? copias[0] : b.viP);
+    bucle.vertice.set(m, idx);
+    return idx;
+  };
+  const verticeTapaDe = (gd, bucle, m) => {
+    const ya = bucle.tapa.get(m);
+    if (ya !== void 0) return ya;
+    const b = gd.bordes[bucle.bordeIdx[m]];
+    const c2d = bucle.corner[m];
+    const idx = nuevaVertices.length;
+    nuevaVertices.push({
+      x: gd.centro.x + gd.u.x * c2d.ix + gd.v.x * c2d.iy + gd.normal.x * profIntAbs,
+      y: gd.centro.y + gd.u.y * c2d.ix + gd.v.y * c2d.iy + gd.normal.y * profIntAbs,
+      z: gd.centro.z + gd.u.z * c2d.ix + gd.v.z * c2d.iy + gd.normal.z * profIntAbs
+    });
+    const copias = copiasCanon.get(b.p);
+    entraUv(copias ? copias[0] : b.viP);
+    bucle.tapa.set(m, idx);
+    return idx;
+  };
+  const verticeInteriorDe = (gd, bucle, m) => {
+    const ya = bucle.vertice.get(m);
+    if (ya !== void 0) return ya;
+    const b = gd.bordes[bucle.bordeIdx[m]];
+    const c2d = bucle.corner[m];
+    const idx = nuevaVertices.length;
+    nuevaVertices.push({
+      x: gd.centro.x + gd.u.x * c2d.ix + gd.v.x * c2d.iy + gd.normal.x * profIntAbs,
+      y: gd.centro.y + gd.u.y * c2d.ix + gd.v.y * c2d.iy + gd.normal.y * profIntAbs,
+      z: gd.centro.z + gd.u.z * c2d.ix + gd.v.z * c2d.iy + gd.normal.z * profIntAbs
+    });
+    const copias = copiasCanon.get(b.p);
+    entraUv(copias ? copias[0] : b.viP);
+    bucle.vertice.set(m, idx);
+    return idx;
+  };
+  const carasGrupos = /* @__PURE__ */ new Set();
+  for (const gd of datosGrupos) {
+    for (const fi of gd.caras) carasGrupos.add(fi);
+  }
+  for (let fi = 0; fi < mesh.faces.length; fi++) {
+    if (carasGrupos.has(fi)) continue;
+    const cara = mesh.faces[fi];
+    emite(cara.map((vi) => remap.get(vi) ?? vi), fi);
+  }
+  for (const gd of datosGrupos) {
+    for (const bucle of gd.bucles) {
+      for (let m = 0; m < bucle.bordeIdx.length; m++) {
+        const b = gd.bordes[bucle.bordeIdx[m]];
+        const inP = suelto ? verticePlanoDe(gd, bucle, m) : verticeInteriorDe(gd, bucle, m);
+        const inQ = suelto ? verticePlanoDe(gd, bucle, (m + 1) % bucle.bordeIdx.length) : verticeInteriorDe(gd, bucle, (m + 1) % bucle.bordeIdx.length);
+        const outP = remap.get(b.viP) ?? b.viP;
+        const outQ = remap.get(b.viQ) ?? b.viQ;
+        emite([outP, outQ, inQ, inP], b.fi);
+      }
+    }
+    const principal = gd.bucles[0];
+    if (gd.donanteInterior >= 0 && principal.bordeIdx.length >= 3) {
+      if (suelto) {
+        const desplazaTapa = Math.abs(profIntAbs - profBaseAbs) > 1e-12;
+        const tapaOAnilloDe = (m) => desplazaTapa ? verticeTapaDe(gd, principal, m) : verticePlanoDe(gd, principal, m);
+        if (desplazaTapa) {
+          for (let m = 0; m < principal.bordeIdx.length; m++) {
+            const b = gd.bordes[principal.bordeIdx[m]];
+            const pB = verticePlanoDe(gd, principal, m);
+            const qB = verticePlanoDe(
+              gd,
+              principal,
+              (m + 1) % principal.bordeIdx.length
+            );
+            const pT = tapaOAnilloDe(m);
+            const qT = tapaOAnilloDe((m + 1) % principal.bordeIdx.length);
+            emite(
+              principal.area2 > 0 ? [pB, qB, qT, pT] : [pB, pT, qT, qB],
+              b.fi
+            );
+          }
+        }
+        const interior = [];
+        for (let m = 0; m < principal.bordeIdx.length; m++) {
+          interior.push(tapaOAnilloDe(m));
+        }
+        emite(interior, gd.donanteInterior);
+      } else {
+        const interior = [];
+        for (let m = 0; m < principal.bordeIdx.length; m++) {
+          interior.push(verticeInteriorDe(gd, principal, m));
+        }
+        emite(interior, gd.donanteInterior);
+      }
+    }
+  }
+  if (caras.length === 0) return mesh;
+  const salida = { ...mesh, vertices: nuevaVertices, faces: caras };
+  if (nuevaUvs) salida.uvs = nuevaUvs;
+  if (colorSi) salida.faceColors = coloresFinales;
+  if (opSi) salida.faceOpacities = opacidadesFinales;
+  if (texSi) salida.faceTextures = texturasFinales;
+  if (mesh.faceTextureGroups) salida.faceTextureGroups = gruposFinales;
+  return salida;
+}
 function hinchar(mesh, params) {
   const amplitud = num2(params, "amplitud", 20) / 100;
   if (amplitud === 0 || mesh.vertices.length === 0) return mesh;
@@ -1414,6 +1990,41 @@ var biselParams = [
     descripcion: "Tama\xF1o del chafl\xE1n relativo a la caja del objeto (0 = sin bisel). En figuras muy voxelizadas puede no apretar."
   }
 ];
+var biselPlanoParams = [
+  {
+    tipo: "slider",
+    id: "separacion",
+    etiqueta: "Separaci\xF3n",
+    min: 0,
+    max: 50,
+    paso: 1,
+    valor: 0,
+    unidad: "%",
+    descripcion: "Ancho del marco interior, % de la dimensi\xF3n menor del pol\xEDgono en su plano (0 = sin marco). Captura las caras del bot\xF3n Pol\xEDgono al entrar."
+  },
+  {
+    tipo: "slider",
+    id: "profInterior",
+    etiqueta: "Profundidad interior",
+    min: -100,
+    max: 100,
+    paso: 1,
+    valor: 0,
+    unidad: "%",
+    descripcion: "Sube (positivo) o hunde (negativo) el pol\xEDgono que queda DENTRO del marco, % de la diagonal de la caja. Con CTRL: congela el marco DONDE EST\xC1 (sin salto) y el interior sigue en solitario; el gesto queda fijado."
+  },
+  {
+    tipo: "slider",
+    id: "profMarco",
+    etiqueta: "Profundidad del marco",
+    min: -100,
+    max: 100,
+    paso: 1,
+    valor: 0,
+    unidad: "%",
+    descripcion: "Sube (positivo) o hunde (negativo) el borde EXTERIOR del marco, % de la diagonal de la caja. Las caras vecinas se inclinan con \xE9l (marco \xABextruido\xBB)."
+  }
+];
 var DEFORMADORES_DIRECTOS = [
   {
     id: "doblar",
@@ -1442,6 +2053,15 @@ var DEFORMADORES_DIRECTOS = [
     icono: "/icons/Bisel.png",
     params: biselParams,
     aplicar: (mesh, params) => bisel(mesh, params)
+  },
+  {
+    id: "bisel-plano",
+    nombre: "Bisel plano",
+    icono: "/icons/Bisel Plano.png",
+    params: biselPlanoParams,
+    // El param OCULTO carasSel llega del editor (caras capturadas con el
+    // botón Polígono al entrar): no va en params para no salir en panel.
+    aplicar: (mesh, params) => biselPlano(mesh, params)
   },
   {
     id: "hinchar",
@@ -1676,6 +2296,14 @@ function aplicarTransformacionInversa(t, v) {
   const z = r[2] * dx + r[5] * dy + r[8] * dz;
   return { x: x / (t.sx || 1), y: y / (t.sy || 1), z: z / (t.sz || 1) };
 }
+function finicioDeMiembro(miembros, id) {
+  let acc = 0;
+  for (const mi of miembros) {
+    if (mi.id === id) return acc;
+    acc += mi.mesh.faces.length;
+  }
+  return -1;
+}
 function unirMallasComoGrupo(miembros, marco) {
   const vertices = [];
   const faces = [];
@@ -1786,13 +2414,18 @@ function deformarGrupoCadena(marco, miembros, cadena) {
 }
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
+  CARAS_SEL_NINGUNA,
   DEFORMADORES_DIRECTOS,
   aplicarDeformador,
   aplicarTransformacion,
   aplicarTransformacionInversa,
+  carasSelEnUnion,
   deformadorPorId,
   deformarGrupoCadena,
   deformarGrupoComoUnidad,
+  desplazarCarasSel,
+  finicioDeMiembro,
+  paramsCarasSel,
   repartirGrupoDeformado,
   unirMallasComoGrupo
 });

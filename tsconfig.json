@@ -43,6 +43,8 @@
     "node_modules",
     "PB_Datos",
     "dist",
+    "API",
+    "api_agente_3d",
     "components/ui/calendar.tsx",
     "components/ui/chart.tsx"
   ]

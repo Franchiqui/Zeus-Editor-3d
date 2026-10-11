@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useRef } from 'react';
 import type { PluginParams } from '@/lib/plugins/types';
 import type { DeformadorDirecto } from '@/lib/deformadores';
 import { NumberInput } from './object-transform-fields';
@@ -45,6 +46,31 @@ type RowsProps = {
  * movimiento. Solo la Vista PREVIEW de Escena: no toca el modal plugins.
  */
 export function DeformParamRows({ deformador, params, onParams }: RowsProps) {
+  // Estado vivo de la tecla CTRL (sin re-render: se lee en el commit).
+  // Bisel plano la usa para el gesto «Prof. interior con CTRL = extruye
+  // el interior en solitario» (mismo criterio que el Ctrl+escala de la
+  // sub-selección).
+  const ctrlRef = useRef(false);
+  useEffect(() => {
+    const abajo = (e: KeyboardEvent) => {
+      if (e.key === 'Control') ctrlRef.current = true;
+    };
+    const arriba = (e: KeyboardEvent) => {
+      if (e.key === 'Control') ctrlRef.current = false;
+    };
+    const perdida = () => {
+      ctrlRef.current = false;
+    };
+    window.addEventListener('keydown', abajo);
+    window.addEventListener('keyup', arriba);
+    window.addEventListener('blur', perdida);
+    return () => {
+      window.removeEventListener('keydown', abajo);
+      window.removeEventListener('keyup', arriba);
+      window.removeEventListener('blur', perdida);
+    };
+  }, []);
+
   return (
     <>
       {deformador.params.map((p) => {
@@ -64,7 +90,30 @@ export function DeformParamRows({ deformador, params, onParams }: RowsProps) {
                   step={p.paso ?? 1}
                   testId={`deform-param-${p.id}`}
                   suffix={p.unidad}
-                  onCommit={(n) => onParams({ ...params, [p.id]: n })}
+                  onCommit={(n) => {
+                    // Bisel plano: el gesto CTRL al mover Prof. interior
+                    // CONGELA el marco donde está y el interior sigue en
+                    // solitario — sin salto: la base capturada es el valor
+                    // que ya tenía profInterior (anillo e interior
+                    // coinciden ahí). El gesto queda FIJADO: mover después
+                    // sin CTRL ya no revierte (usar profMarco para el
+                    // marco, o Cancelar para empezar de nuevo).
+                    let extra: PluginParams = {};
+                    if (deformador.id === 'bisel-plano' && p.id === 'profInterior') {
+                      const yaSuelto = Number(params.interiorSuelto ?? 0) >= 0.5;
+                      if (ctrlRef.current) {
+                        if (!yaSuelto) {
+                          extra = {
+                            interiorSuelto: 1,
+                            profInteriorBase: params.profInterior ?? 0,
+                          };
+                        }
+                      } else if (!yaSuelto) {
+                        extra = { interiorSuelto: 0 };
+                      }
+                    }
+                    onParams({ ...params, [p.id]: n, ...extra });
+                  }}
                 />
               </div>
             </div>

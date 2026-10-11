@@ -76,9 +76,13 @@ import { DeformFields } from './deform-fields';
 import {
   DEFORMADORES_DIRECTOS,
   aplicarDeformador,
+  carasSelEnUnion,
   deformadorPorId,
+  desplazarCarasSel,
+  finicioDeMiembro,
   unirMallasComoGrupo,
   deformarGrupoComoUnidad,
+  CARAS_SEL_NINGUNA,
   type DeformadorDirecto,
   type DeformadorId,
   type UnionGrupoDeformador,
@@ -7184,11 +7188,21 @@ pluginTracks,
   const viewerMesh = useMemo(() => {
     let base = grupoDeformBase ? grupoDeformBase.unida : viewerMeshRaw;
     if (deformadorId && mode === 'scene' && frozenSelected && base.vertices.length > 0) {
+      // Bisel plano: carasSel indexa la malla del objeto dueño; si la
+      // base ES LA UNIÓN del grupo, remapear al offset de ese miembro.
+      const ocultos: PluginParams = paramsSueloLocal(frozenSelected.transform);
+      if (deformadorId === 'bisel-plano' && grupoDeformBase) {
+        ocultos['carasSel'] = carasSelEnUnion(
+          deformParams['carasSel'],
+          grupoDeformBase.partes,
+          frozenSelected.id
+        );
+      }
       base = aplicarDeformador(deformadorId, base, {
         ...deformParams,
         // Suelo real del visor en coords locales (params ocultos; Romper
         // cae al suelo que se ve, no a la base del objeto).
-        ...paramsSueloLocal(frozenSelected.transform),
+        ...ocultos,
       });
     }
     if (
@@ -8624,11 +8638,14 @@ pluginTracks,
     // pulsarse → se sale del modo y se limpia la selección (los overlays
     // del visor se retiran al apagarse el modo).
     const toggleSubSelectTarget = useCallback((tg: 'cara' | 'vertice' | 'segmento') => {
-      // Exclusividad de modos: entrar en sub-selección apaga el deformador
-      // (comparten lavado gris; los overlays de caras no conviven con la
-      // cage del contorno).
-      setDeformadorId(null);
-      setDeformParams({});
+      // Exclusividad de modos, SALVO Bisel plano: su captura de caras ES
+      // la sub-selección (conviwiendo), así que los otros deformadores se
+      // apagan al entrar pero éste sobrevive (comparten lavado gris; los
+      // overlays de caras no conviven con la cage de los demás).
+      if (deformadorId && deformadorId !== 'bisel-plano') {
+        setDeformadorId(null);
+        setDeformParams({});
+      }
       setFaceSelectMode((prevMode) => {
         const salir = prevMode && faceSelectionTarget === tg;
         if (salir) {
@@ -8650,14 +8667,47 @@ pluginTracks,
       // Herramienta DIRECTA: el clic elige el elemento bajo el cursor
       // (sin marco — el marco es la barra clásica, no estos botones).
       setFaceSelectionTool('directo');
-    }, [faceSelectionTarget]);
+    }, [faceSelectionTarget, deformadorId]);
 
     /**
      * ENTRA/SUBE en un deformador directo. Si el mismo está activo, lo
      * apaga (re-pulsar = salir). Al entrar fija sus params por defecto.
      */
     const toggleDeformador = useCallback((id: string) => {
-      // Exclusividad: el deformador apaga la sub-selección (y el spline).
+      const carasPrevias = selectedFaceIds.slice();
+      if (id === 'bisel-plano') {
+        // Bisel plano CONVIVE con la sub-selección de caras: su «selección»
+        // es la captura en vivo (efecto de sincronía con selectedFaceIds),
+        // así que al entrar se asegura el modo Polígono y se conserva lo
+        // que ya estaba pintado — no hay que salir de un modo para entrar
+        // en el otro al revés.
+        if (deformadorId === id) {
+          // Re-pulsar el mismo: salir (la sub-selección queda como estaba).
+          setDeformParams({});
+          setDeformadorId(null);
+          return;
+        }
+        setModoSpline(false);
+        setSelGizmoConfigMode(false);
+        setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+        setSelectedVertexIds([]);
+        setSelectedEdgeIds([]);
+        setFaceSelectionTarget('cara');
+        setFaceSelectionTool('directo');
+        setFaceSelectMode(true);
+        const defBp = deformadorPorId(id);
+        const inicialesBp: PluginParams = {};
+        for (const p of defBp?.params ?? []) inicialesBp[p.id] = p.valor;
+        inicialesBp['carasSel'] = carasPrevias.length
+          ? carasPrevias.join(',')
+          : CARAS_SEL_NINGUNA;
+        setDeformParams(inicialesBp);
+        setDeformTick((n) => n + 1);
+        setDeformadorId(id);
+        return;
+      }
+      // Los demás deformadores SÍ se excluyen mutuamente con la
+      // sub-selección (y el spline).
       setFaceSelectMode(false);
       setSelectedFaceIds([]);
       setSelectedVertexIds([]);
@@ -8677,7 +8727,20 @@ pluginTracks,
       setDeformParams(iniciales);
       setDeformTick((n) => n + 1);
       setDeformadorId(id);
-    }, [deformadorId]);
+    }, [deformadorId, selectedFaceIds]);
+
+    // Bisel plano: la sub-selección de caras ALIMENTA EN VIVO el param
+    // oculto carasSel (clic, marco, Esc… todo llega a la vista previa al
+    // momento) — el marco se previsualiza sobre las caras pintadas.
+    useEffect(() => {
+      if (deformadorId !== 'bisel-plano') return;
+      setDeformParams((p) => ({
+        ...p,
+        carasSel: selectedFaceIds.length
+          ? selectedFaceIds.join(',')
+          : CARAS_SEL_NINGUNA,
+      }));
+    }, [deformadorId, selectedFaceIds]);
 
     /** Cancela el modo deformador: la malla no se toca. */
     const salirModoDeformador = useCallback(() => {
@@ -12416,11 +12479,24 @@ pluginTracks,
       .filter((o) => !!o && !o.hidden && !!o.mesh && o.mesh.vertices.length > 0 && o.mesh.faces.length > 0)
       .map((o) => ({ id: o!.id, mesh: o!.mesh!, transform: o!.transform }));
     if (miembros.length > 1) {
+      const paramsGrupo: PluginParams = {
+        ...deformParams,
+        ...paramsSueloLocal(marco),
+      };
+      // Bisel plano: remapear carasSel al offset del miembro dueño en la
+      // unión (el orden de seleccionados no siempre encabeza el dueño).
+      if (deformadorId === 'bisel-plano') {
+        const off = finicioDeMiembro(miembros, objectId);
+        paramsGrupo['carasSel'] =
+          off >= 0
+            ? desplazarCarasSel(deformParams['carasSel'], off)
+            : CARAS_SEL_NINGUNA;
+      }
       const resultado = deformarGrupoComoUnidad(
         deformadorId,
         marco,
         miembros,
-        { ...deformParams, ...paramsSueloLocal(marco) }
+        paramsGrupo
       );
       if (resultado) {
         const mallas = new Map(resultado.porMiembro.map((m) => [m.id, m.mesh]));
@@ -13049,13 +13125,16 @@ pluginTracks,
       }}
       onFaceSelectionModeChange={(v) => {
         if (v) {
-          // Exclusividad de modos: entrar en sub-selección apaga el deformador.
-          setDeformadorId(null);
-          setDeformParams({});
+          // Exclusividad de modos, salvo Bisel plano: su captura de caras
+          // ES la sub-selección (conviwen).
+          if (deformadorId !== 'bisel-plano') {
+            setDeformadorId(null);
+            setDeformParams({});
+          }
           setModoSpline(false);
         }
         setFaceSelectMode(v);
-        if (!v) {
+        if (!v && deformadorId !== 'bisel-plano') {
           setSelectedFaceIds([]);
           setSelectedVertexIds([]);
           setSelectedEdgeIds([]);
@@ -13920,9 +13999,8 @@ pluginTracks,
            <DropdownMenu>
              <DropdownMenuTrigger asChild>
                <button
-                 disabled={mesh.vertices.length === 0}
                  title={t('editor3D.exportImportTitle')}
-                 className="relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border bg-gray-700 hover:bg-gray-600 border-gray-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                 className="relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border bg-gray-700 hover:bg-gray-600 border-gray-500"
                >
                  <span
                    data-letra

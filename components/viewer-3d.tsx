@@ -71,6 +71,9 @@ import {
   aplicarDeformador,
   deformadorPorId,
   deformarGrupoCadena,
+  desplazarCarasSel,
+  finicioDeMiembro,
+  CARAS_SEL_NINGUNA,
   type MiembroGrupoDeformador,
 } from '@/lib/deformadores';
 import { aplicarMaterialCreado, limpiarExtrasCreados } from '@/lib/texture-generator';
@@ -6164,6 +6167,15 @@ export default function Viewer3D({
                 for (const k of Object.keys(sueloExtra)) {
                   params[k] = sueloExtra[k] as number;
                 }
+              } else if (tr.deformadorId === 'bisel-plano') {
+                // carasSel indexa la malla base del PRINCIPAL (oid); en la
+                // unión, remapear al offset de ese miembro (principal
+                // primero, pero la regla vale para cualquier orden).
+                const off = finicioDeMiembro(miembros, oid);
+                params['carasSel'] =
+                  off >= 0
+                    ? desplazarCarasSel(params['carasSel'], off)
+                    : CARAS_SEL_NINGUNA;
               }
               cadenaPura.push({ tipo: tr.deformadorId, params });
               const cacheKey = `${oid}:${tr.id}`;
