@@ -27,6 +27,221 @@ function claveArista(a: number, b: number): string {
   return `${x}-${y}`;
 }
 
+/** Clave cuantizada de un punto, para agrupar vértices COINCIDENTES que
+ *  vengan duplicados (mallas .zeus trianguladas guardan cada triángulo con
+ *  sus propios vértices: la adyacencia por índice no encuentra a nadie). */
+function clavePunto(v: Vertex3D): string {
+  return `${v.x.toFixed(6)}|${v.y.toFixed(6)}|${v.z.toFixed(6)}`;
+}
+
+/**
+ * Normal suavizada (unitaria, LOCAL) por VÉRTICE para la región extraída
+ * — la que usa el arrastre inflado de la extrusión con Ctrl (todas las
+ * caras salen lo mismo, estilo Blender «Extrude along Normals»).
+ *
+ * Dos correcciones sobre el promedio bruto, ambas necesarias porque el
+ * enrolado de las mallas .zeus no es fiable cara a cara:
+ * 1. COHERENCIA: se propaga la orientación por adyacencia (dos caras bien
+ *    enroscadas recorren su arista compartida en sentidos opuestos) y se
+ *    invierte la cara que no cuadra, así el promedio por vértice no se
+ *    cancela a la mitad.
+ * 2. HACIA FUERA: con los vecinos de la FRONTERA (fuera de la región) se
+ *    vota hacia dónde está el material del objeto; si el conjunto
+ *    propagado quedó mirando para dentro, se voltea todo.
+ *
+ * Los vértices se agrupan por POSICIÓN (no por índice), así la malla
+ * regenerada (índices compartidos) y la .zeus guardada (duplicados) salen
+ * iguales: un vértice del borde comparte la normal de su cúmulo y la copia
+ * inflatable no se desgarra entre caras vecinas.
+ */
+export function normalesSuavizadasDeRegion(
+  mesh: Mesh,
+  carasRegion: number[],
+): Map<number, Vertex3D> {
+  const totalCaras = mesh.faces.length;
+  const region = carasRegion.filter((f) => f >= 0 && f < totalCaras);
+  const salida = new Map<number, Vertex3D>();
+  if (region.length === 0) return salida;
+
+  // ── Cúmulos por posición y normales brutas ──────────────────────────
+  // Vértices que están en el MISMO sitio comparten cúmulo (índices iguales
+  // en la regenerada, posiciones iguales en la .zeus duplicada).
+  const clusterDeVert = new Map<number, number>();
+  const puntosDeCluster = new Map<number, Vertex3D>();
+  const cidDePunto = new Map<string, number>();
+  for (const idx of region) {
+    for (const v of mesh.faces[idx]) {
+      if (clusterDeVert.has(v)) continue;
+      const p = mesh.vertices[v];
+      if (!p) continue;
+      const key = clavePunto(p);
+      let cid = cidDePunto.get(key);
+      if (cid === undefined) {
+        cid = puntosDeCluster.size;
+        puntosDeCluster.set(cid, p);
+        cidDePunto.set(key, cid);
+      }
+      clusterDeVert.set(v, cid);
+    }
+  }
+  const caraClusters = region.map((idx) => mesh.faces[idx].map((v) => clusterDeVert.get(v)!));
+  const normalBruta = new Map<number, Vertex3D>();
+  for (let i = 0; i < region.length; i++) {
+    const cara = mesh.faces[region[i]];
+    if (cara.length < 3) continue;
+    const a = mesh.vertices[cara[0]];
+    const b = mesh.vertices[cara[1]];
+    const c = mesh.vertices[cara[2]];
+    if (!a || !b || !c) continue;
+    const ux = b.x - a.x, uy = b.y - a.y, uz = b.z - a.z;
+    const vx = c.x - a.x, vy = c.y - a.y, vz = c.z - a.z;
+    let nx = uy * vz - uz * vy;
+    let ny = uz * vx - ux * vz;
+    let nz = ux * vy - uy * vx;
+    const l = Math.hypot(nx, ny, nz);
+    if (l < 1e-12) continue;
+    nx /= l; ny /= l; nz /= l;
+    normalBruta.set(i, { x: nx, y: ny, z: nz });
+  }
+
+  // ── Adyacencia por aristas de cúmulos (dentro de la región) ─────────
+  //clave «cid menor-mayor» → lista de {cara, sentido +1/-1}
+  const aristasRegion = new Map<string, Array<{ cara: number; sentido: number }>>();
+  for (let i = 0; i < region.length; i++) {
+    const cl = caraClusters[i];
+    for (let k = 0; k < cl.length; k++) {
+      const ca = cl[k];
+      const cb = cl[(k + 1) % cl.length];
+      if (ca === cb) continue;
+      const key = claveArista(ca, cb);
+      const sentido = ca < cb ? 1 : -1;
+      const lista = aristasRegion.get(key) ?? [];
+      lista.push({ cara: i, sentido });
+      aristasRegion.set(key, lista);
+    }
+  }
+  const vecinosDe = (i: number): Array<{ cara: number; consistente: boolean }> => {
+    const salidaL: Array<{ cara: number; consistente: boolean }> = [];
+    const cl = caraClusters[i];
+    for (let k = 0; k < cl.length; k++) {
+      const ca = cl[k];
+      const cb = cl[(k + 1) % cl.length];
+      if (ca === cb) continue;
+      const key = claveArista(ca, cb);
+      const lista = aristasRegion.get(key) ?? [];
+      for (const otro of lista) {
+        if (otro.cara === i) continue;
+        // Consistente: la arista compartida se recorre en sentidos opuestos.
+        const miSentido = ca < cb ? 1 : -1;
+        salidaL.push({ cara: otro.cara, consistente: miSentido !== otro.sentido });
+      }
+    }
+    return salidaL;
+  };
+
+  // ── Propagación de la orientación (BFS desde la cara 0) ─────────────
+  const volteada = new Map<number, boolean>();
+  for (let i = 0; i < region.length; i++) volteada.set(i, false);
+  const vista = new Set<number>([0]);
+  const cola = [0];
+  while (cola.length > 0) {
+    const i = cola.shift()!;
+    for (const { cara: j, consistente } of vecinosDe(i)) {
+      const caraBruta = normalBruta.get(j);
+      if (!caraBruta || vista.has(j)) continue;
+      vista.add(j);
+      const miVolteada = volteada.get(i)!;
+      volteada.set(j, consistente ? miVolteada : !miVolteada);
+      cola.push(j);
+    }
+  }
+  const normalCoherente = (i: number): Vertex3D | undefined => {
+    const n = normalBruta.get(i);
+    if (!n) return undefined;
+    if (!volteada.get(i)) return n;
+    return { x: -n.x, y: -n.y, z: -n.z };
+  };
+
+  // ── ¿El conjunto mirando FUERA? Voto de los vecinos de la frontera ───
+  // Aristas tocadas UNA vez por la región tocan el resto del objeto: si el
+  // centroide de esa cara vecina cae del lado +normal, la normal apunta
+  // hacia el material y el conjunto va del revés (mismo criterio que el
+  // deformador Bisel plano orientando su normal de grupo).
+  const setRegion = new Set(region);
+  const carasDeArista = new Map<string, number[]>();
+  for (let i = 0; i < mesh.faces.length; i++) {
+    const cara = mesh.faces[i];
+    for (let k = 0; k < cara.length; k++) {
+      const ca = clusterDeVert.get(cara[k]);
+      const cb = clusterDeVert.get(cara[(k + 1) % cara.length]);
+      if (ca === undefined || cb === undefined || ca === cb) continue;
+      const key = claveArista(ca, cb);
+      const lista = carasDeArista.get(key) ?? [];
+      lista.push(i);
+      carasDeArista.set(key, lista);
+    }
+  }
+  let votosSalida = 0, votosEntrada = 0;
+  for (const [key, lista] of aristasRegion) {
+    if (lista.length !== 1) continue;
+    const n = normalCoherente(lista[0].cara);
+    if (!n) continue;
+    const fc = centroideCara(mesh, mesh.faces[region[lista[0].cara]]);
+    if (!fc) continue;
+    for (const vecina of carasDeArista.get(key) ?? []) {
+      if (setRegion.has(vecina)) continue;
+      const cn = centroideCara(mesh, mesh.faces[vecina]);
+      if (!cn) continue;
+      const dx = cn.x - fc.x, dy = cn.y - fc.y, dz = cn.z - fc.z;
+      const dot = dx * n.x + dy * n.y + dz * n.z;
+      if (dot > 1e-9) votosEntrada++;
+      else if (dot < -1e-9) votosSalida++;
+      break;
+    }
+  }
+  const invertirTodo = votosEntrada > votosSalida;
+  const normalAlineada = (i: number): Vertex3D | undefined => {
+    const n = normalCoherente(i);
+    if (!n) return undefined;
+    if (!invertirTodo) return n;
+    return { x: -n.x, y: -n.y, z: -n.z };
+  };
+
+  // ── Promedio por cúmulo (caras incidentes, orientadas) ───────────────
+  const sumaCluster = new Map<number, { ax: number; ay: number; az: number; n: number }>();
+  for (let i = 0; i < region.length; i++) {
+    const n = normalAlineada(i);
+    if (!n) continue;
+    for (const cid of caraClusters[i]) {
+      const s = sumaCluster.get(cid) ?? { ax: 0, ay: 0, az: 0, n: 0 };
+      s.ax += n.x; s.ay += n.y; s.az += n.z; s.n++;
+      sumaCluster.set(cid, s);
+    }
+  }
+  const normalDeCluster = new Map<number, Vertex3D>();
+  for (const [cid, s] of sumaCluster) {
+    const l = Math.hypot(s.ax, s.ay, s.az);
+    if (l < 1e-12) continue;
+    normalDeCluster.set(cid, { x: s.ax / l, y: s.ay / l, z: s.az / l });
+  }
+  for (const [v, cid] of clusterDeVert) {
+    const n = normalDeCluster.get(cid);
+    if (n) salida.set(v, n);
+  }
+  return salida;
+}
+
+/** Centroide de una cara (media de sus vértices) o null si no hay datos. */
+function centroideCara(mesh: Mesh, cara: number[]): Vertex3D | null {
+  let ax = 0, ay = 0, az = 0, n = 0;
+  for (const v of cara) {
+    const p = mesh.vertices[v];
+    if (!p) return null;
+    ax += p.x; ay += p.y; az += p.z; n++;
+  }
+  return n === 0 ? null : { x: ax / n, y: ay / n, z: az / n };
+}
+
 /** Aristas de una malla deducidas de las caras, sin repetir. */
 export function aristasDeMalla(mesh: Mesh): Array<{ a: number; b: number; key: string }> {
   const vistas = new Set<string>();

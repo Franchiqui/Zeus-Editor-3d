@@ -4,6 +4,181 @@ function claveArista(a, b) {
   const y = Math.max(a, b);
   return `${x}-${y}`;
 }
+function clavePunto(v) {
+  return `${v.x.toFixed(6)}|${v.y.toFixed(6)}|${v.z.toFixed(6)}`;
+}
+function normalesSuavizadasDeRegion(mesh, carasRegion) {
+  const totalCaras = mesh.faces.length;
+  const region = carasRegion.filter((f) => f >= 0 && f < totalCaras);
+  const salida = /* @__PURE__ */ new Map();
+  if (region.length === 0) return salida;
+  const clusterDeVert = /* @__PURE__ */ new Map();
+  const puntosDeCluster = /* @__PURE__ */ new Map();
+  const cidDePunto = /* @__PURE__ */ new Map();
+  for (const idx of region) {
+    for (const v of mesh.faces[idx]) {
+      if (clusterDeVert.has(v)) continue;
+      const p = mesh.vertices[v];
+      if (!p) continue;
+      const key = clavePunto(p);
+      let cid = cidDePunto.get(key);
+      if (cid === void 0) {
+        cid = puntosDeCluster.size;
+        puntosDeCluster.set(cid, p);
+        cidDePunto.set(key, cid);
+      }
+      clusterDeVert.set(v, cid);
+    }
+  }
+  const caraClusters = region.map((idx) => mesh.faces[idx].map((v) => clusterDeVert.get(v)));
+  const normalBruta = /* @__PURE__ */ new Map();
+  for (let i = 0; i < region.length; i++) {
+    const cara = mesh.faces[region[i]];
+    if (cara.length < 3) continue;
+    const a = mesh.vertices[cara[0]];
+    const b = mesh.vertices[cara[1]];
+    const c = mesh.vertices[cara[2]];
+    if (!a || !b || !c) continue;
+    const ux = b.x - a.x, uy = b.y - a.y, uz = b.z - a.z;
+    const vx = c.x - a.x, vy = c.y - a.y, vz = c.z - a.z;
+    let nx = uy * vz - uz * vy;
+    let ny = uz * vx - ux * vz;
+    let nz = ux * vy - uy * vx;
+    const l = Math.hypot(nx, ny, nz);
+    if (l < 1e-12) continue;
+    nx /= l;
+    ny /= l;
+    nz /= l;
+    normalBruta.set(i, { x: nx, y: ny, z: nz });
+  }
+  const aristasRegion = /* @__PURE__ */ new Map();
+  for (let i = 0; i < region.length; i++) {
+    const cl = caraClusters[i];
+    for (let k = 0; k < cl.length; k++) {
+      const ca = cl[k];
+      const cb = cl[(k + 1) % cl.length];
+      if (ca === cb) continue;
+      const key = claveArista(ca, cb);
+      const sentido = ca < cb ? 1 : -1;
+      const lista = aristasRegion.get(key) ?? [];
+      lista.push({ cara: i, sentido });
+      aristasRegion.set(key, lista);
+    }
+  }
+  const vecinosDe = (i) => {
+    const salidaL = [];
+    const cl = caraClusters[i];
+    for (let k = 0; k < cl.length; k++) {
+      const ca = cl[k];
+      const cb = cl[(k + 1) % cl.length];
+      if (ca === cb) continue;
+      const key = claveArista(ca, cb);
+      const lista = aristasRegion.get(key) ?? [];
+      for (const otro of lista) {
+        if (otro.cara === i) continue;
+        const miSentido = ca < cb ? 1 : -1;
+        salidaL.push({ cara: otro.cara, consistente: miSentido !== otro.sentido });
+      }
+    }
+    return salidaL;
+  };
+  const volteada = /* @__PURE__ */ new Map();
+  for (let i = 0; i < region.length; i++) volteada.set(i, false);
+  const vista = /* @__PURE__ */ new Set([0]);
+  const cola = [0];
+  while (cola.length > 0) {
+    const i = cola.shift();
+    for (const { cara: j, consistente } of vecinosDe(i)) {
+      const caraBruta = normalBruta.get(j);
+      if (!caraBruta || vista.has(j)) continue;
+      vista.add(j);
+      const miVolteada = volteada.get(i);
+      volteada.set(j, consistente ? miVolteada : !miVolteada);
+      cola.push(j);
+    }
+  }
+  const normalCoherente = (i) => {
+    const n = normalBruta.get(i);
+    if (!n) return void 0;
+    if (!volteada.get(i)) return n;
+    return { x: -n.x, y: -n.y, z: -n.z };
+  };
+  const setRegion = new Set(region);
+  const carasDeArista = /* @__PURE__ */ new Map();
+  for (let i = 0; i < mesh.faces.length; i++) {
+    const cara = mesh.faces[i];
+    for (let k = 0; k < cara.length; k++) {
+      const ca = clusterDeVert.get(cara[k]);
+      const cb = clusterDeVert.get(cara[(k + 1) % cara.length]);
+      if (ca === void 0 || cb === void 0 || ca === cb) continue;
+      const key = claveArista(ca, cb);
+      const lista = carasDeArista.get(key) ?? [];
+      lista.push(i);
+      carasDeArista.set(key, lista);
+    }
+  }
+  let votosSalida = 0, votosEntrada = 0;
+  for (const [key, lista] of aristasRegion) {
+    if (lista.length !== 1) continue;
+    const n = normalCoherente(lista[0].cara);
+    if (!n) continue;
+    const fc = centroideCara(mesh, mesh.faces[region[lista[0].cara]]);
+    if (!fc) continue;
+    for (const vecina of carasDeArista.get(key) ?? []) {
+      if (setRegion.has(vecina)) continue;
+      const cn = centroideCara(mesh, mesh.faces[vecina]);
+      if (!cn) continue;
+      const dx = cn.x - fc.x, dy = cn.y - fc.y, dz = cn.z - fc.z;
+      const dot = dx * n.x + dy * n.y + dz * n.z;
+      if (dot > 1e-9) votosEntrada++;
+      else if (dot < -1e-9) votosSalida++;
+      break;
+    }
+  }
+  const invertirTodo = votosEntrada > votosSalida;
+  const normalAlineada = (i) => {
+    const n = normalCoherente(i);
+    if (!n) return void 0;
+    if (!invertirTodo) return n;
+    return { x: -n.x, y: -n.y, z: -n.z };
+  };
+  const sumaCluster = /* @__PURE__ */ new Map();
+  for (let i = 0; i < region.length; i++) {
+    const n = normalAlineada(i);
+    if (!n) continue;
+    for (const cid of caraClusters[i]) {
+      const s = sumaCluster.get(cid) ?? { ax: 0, ay: 0, az: 0, n: 0 };
+      s.ax += n.x;
+      s.ay += n.y;
+      s.az += n.z;
+      s.n++;
+      sumaCluster.set(cid, s);
+    }
+  }
+  const normalDeCluster = /* @__PURE__ */ new Map();
+  for (const [cid, s] of sumaCluster) {
+    const l = Math.hypot(s.ax, s.ay, s.az);
+    if (l < 1e-12) continue;
+    normalDeCluster.set(cid, { x: s.ax / l, y: s.ay / l, z: s.az / l });
+  }
+  for (const [v, cid] of clusterDeVert) {
+    const n = normalDeCluster.get(cid);
+    if (n) salida.set(v, n);
+  }
+  return salida;
+}
+function centroideCara(mesh, cara) {
+  let ax = 0, ay = 0, az = 0, n = 0;
+  for (const v of cara) {
+    const p = mesh.vertices[v];
+    if (!p) return null;
+    ax += p.x;
+    ay += p.y;
+    az += p.z;
+    n++;
+  }
+  return n === 0 ? null : { x: ax / n, y: ay / n, z: az / n };
+}
 function aristasDeMalla(mesh) {
   const vistas = /* @__PURE__ */ new Set();
   const lista = [];
@@ -195,5 +370,6 @@ function extrudeRegionMesh(mesh, carasRegion, delta) {
 export {
   aristasDeMalla,
   extrudeRegionMesh,
+  normalesSuavizadasDeRegion,
   regionSegunObjetivo
 };

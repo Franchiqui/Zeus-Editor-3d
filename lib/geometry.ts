@@ -1416,6 +1416,150 @@ export function extremosBordeAnillo(
   return [A, B];
 }
 
+const normalCaraAnillo = (mesh: Mesh, fi: number): { x: number; y: number; z: number } | null => {
+  const face = mesh.faces[fi];
+  if (!face || face.length < 3) return null;
+  const a = mesh.vertices[face[0]];
+  const b = mesh.vertices[face[1]];
+  const c = mesh.vertices[face[2]];
+  if (!a || !b || !c) return null;
+  const u = { x: b.x - a.x, y: b.y - a.y, z: b.z - a.z };
+  const w = { x: c.x - a.x, y: c.y - a.y, z: c.z - a.z };
+  const n = {
+    x: u.y * w.z - u.z * w.y,
+    y: u.z * w.x - u.x * w.z,
+    z: u.x * w.y - u.y * w.x,
+  };
+  const len = Math.hypot(n.x, n.y, n.z) || 1;
+  return { x: n.x / len, y: n.y / len, z: n.z / len };
+};
+
+/**
+ * El casquete COPLANAR de caras sueltas (casquete de abanico, cara sin
+ * celda) que contiene a `faceIdx`: la tapa plana de un cilindro entera, no
+ * un triángulo suelto del abanico. La conexión va por los bordes del canon
+ * — los .zeus guardan triángulos con vértices duplicados, así que una
+ * comparación por índice no junta NADA — y solo entre caras SIN celda, para
+ * no enganchar caras distintas que casen por casualidad coplanares.
+ */
+export function casqueteCoplanarDe(
+  mesh: Mesh,
+  malla: AnillosMalla,
+  faceIdx: number
+): number[] {
+  if (malla.faceACelda[faceIdx] >= 0) return [faceIdx];
+  const normal0 = normalCaraAnillo(mesh, faceIdx);
+  if (!normal0) return [faceIdx];
+  const grupo = new Set<number>([faceIdx]);
+  const cola: number[] = [faceIdx];
+  while (cola.length > 0) {
+    const fi = cola.pop()!;
+    const face = mesh.faces[fi];
+    if (!face || face.length < 3) continue;
+    const canon = face.map((v) => malla.canonDe[v]);
+    if (canon.some((v) => v < 0)) continue;
+    for (let j = 0; j < canon.length; j++) {
+      const key = claveBordeAnillo(canon[j], canon[(j + 1) % canon.length]);
+      for (const f of malla.bordeAFaces.get(key) || []) {
+        if (grupo.has(f)) continue;
+        if (malla.faceACelda[f] >= 0) continue; // con celda: cara propia
+        const normal0b = normalCaraAnillo(mesh, f);
+        if (!normal0b) continue;
+        const dot = normal0.x * normal0b.x + normal0.y * normal0b.y + normal0.z * normal0b.z;
+        if (dot > 0.99) {
+          grupo.add(f);
+          cola.push(f);
+        }
+      }
+    }
+  }
+  return Array.from(grupo).sort((a, b) => a - b);
+}
+
+/**
+ * La cara LÓGICA COMPLETA de un pick de cara: los triángulos de su celda
+ * pareada (el cuadrilátero, ambos mitades) o, si la cara es suelta, su
+ * casquete coplanar entero. Sustituye al BFS coplanar por índices
+ * (`getFaceGroup`): en mallas .zeus trianguladas sin índices compartidos no
+ * junta nada (media cara por hover) y en mallas cuadranguladas sueldas
+ * engancha franjas coplanares de caras DISTINTAS (el lateral del cilindro:
+ * cuatro caras de golpe).
+ */
+export function caraLogicaDe(
+  mesh: Mesh,
+  malla: AnillosMalla,
+  faceIdx: number
+): number[] {
+  const celda0 = malla.faceACelda[faceIdx];
+  if (celda0 < 0) return casqueteAbanicoDe(mesh, malla, faceIdx);
+  const celda = malla.celdas[celda0];
+  return celda && celda.tris.length > 0 ? [...celda.tris] : [faceIdx];
+}
+
+/**
+ * ¿El grupo de caras es un ABANICO CERRADO alrededor de un solo vértice?
+ * La tapa de un cilindro: un vértice (el centro) en TODAS las caras del
+ * casquete y cada otro con exactamente 2 (el aro del contorno) — un disco
+ * completo. Los polos CURVOS de esfera/cápsula no cuadran: las normales se
+ * esparcen alrededor del disco, o su casquete coplanar se rompe (vértices
+ * del aro con 1 sola cara).
+ */
+export function esAbanicoCerrado(
+  mesh: Mesh,
+  malla: AnillosMalla,
+  tris: number[]
+): boolean {
+  if (tris.length < 2) return false;
+  const cnt = new Map<number, number>();
+  for (const fi of tris) {
+    const face = mesh.faces[fi];
+    if (!face || face.length !== 3) return false; // solo triángulos
+    const canon = new Set<number>(face.map((v) => malla.canonDe[v]));
+    if (canon.has(-1) || canon.size !== 3) return false;
+    for (const v of canon) cnt.set(v, (cnt.get(v) || 0) + 1);
+  }
+  let apex: number | null = null;
+  for (const [v, c] of cnt) {
+    if (c === tris.length) {
+      if (apex !== null) return false; // dos «centros»: no es un abanico
+      apex = v;
+    } else if (c !== 2) {
+      return false;
+    }
+  }
+  return apex !== null;
+}
+
+/**
+ * El casquete de un abanico CERRADO y PLANO que contiene a `faceIdx`: la
+ * tapa de un cilindro ENTERA. Un suelto de polo CURVO (esfera, cápsula)
+ * queda como su propia cara (su casquete coplanar se rompe en pedazos o sus
+ * normales se esparcen) — un anillo que pasa por el polo sigue pintando la
+ * cara del polo tal como estaba bien en la esfera.
+ */
+export function casqueteAbanicoDe(
+  mesh: Mesh,
+  malla: AnillosMalla,
+  faceIdx: number
+): number[] {
+  if (malla.faceACelda[faceIdx] >= 0) return [faceIdx];
+  const casquete = casqueteCoplanarDe(mesh, malla, faceIdx);
+  if (casquete.length <= 1) return casquete;
+  if (!esAbanicoCerrado(mesh, malla, casquete)) return [faceIdx];
+  // Plano: todas las caras dentro de una fracción de grado entre sí. El
+  // umbral de conexión (0.99) junta pedazos de polos casi planos; el del
+  // disco VERDADERO es mucho más estricto.
+  const n0 = normalCaraAnillo(mesh, casquete[0]);
+  if (!n0) return [faceIdx];
+  for (const fi of casquete) {
+    const n = normalCaraAnillo(mesh, fi);
+    if (!n) return [faceIdx];
+    const dot = n0.x * n.x + n0.y * n.y + n0.z * n.z;
+    if (dot <= 0.999) return [faceIdx];
+  }
+  return casquete;
+}
+
 export function meshToTriangles(mesh: Mesh): Mesh {
   const faces: number[][] = [];
   // faceColors viene 1:1 con las caras ORIGINALES: al partir cada

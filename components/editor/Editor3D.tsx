@@ -161,6 +161,7 @@ import {
 import {
   regionSegunObjetivo,
   extrudeRegionMesh,
+  normalesSuavizadasDeRegion,
   aristasDeMalla,
   type ObjetivoSeleccion,
 } from '@/lib/extrusion-seleccion';
@@ -1914,6 +1915,17 @@ export default function Home({
   // Su offset de sitio (mundo). Se resetea al cambiar la selección, el
   // objetivo o el modo (el gizmo vuelve a anclarse a la nueva selección).
   const [selGizmoOffset, setSelGizmoOffset] = useState({ x: 0, y: 0, z: 0 });
+  // Su giro (Euler en radianes): en modo configuración los aros rotan la
+  // ORIENTACIÓN del gizmo (flechas/bolas apuntan inclinadas con él). Se
+  // resetea junto al offset: tras el reset el gizmo vuelve a alinearse al
+  // mundo. Con el giro, mover/escalar la selección sigue los ejes pintados.
+  const [selGizmoRotation, setSelGizmoRotation] = useState({ x: 0, y: 0, z: 0 });
+  /** Resetea offset + giro del gizmo de la sub-selección (los dos ajustes
+   *  de su modo de configuración). */
+  const resetSelGizmo = useCallback(() => {
+    setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+    setSelGizmoRotation({ x: 0, y: 0, z: 0 });
+  }, []);
   // Guarda el estado showGizmo previo a la configuración para restaurarlo.
   const prevGizmoVisibleRef = useRef<boolean>(false);
   const [fontVersion, setFontVersion] = useState(0);
@@ -8465,24 +8477,35 @@ pluginTracks,
       moveSelDelta,
     ]);
 
-    // ---- Extrusión al ESCALAR con Ctrl (estilo Blender) ---------------
+    // ---- Extrusión al ARRASTRAR con Ctrl (estilo Blender) -------------
     // El usuario lo pidió: al escalar un anillo se estiraban los anillos
-    // vecinos (los vértices del borde son compartidos). Con Ctrl el visor
-    // pide esta extrusión de delta casi nulo ANTES del gesto: se duplica
-    // la selección con sus paredes y la escala opera sobre la COPIA —
-    // anillos de arriba/abajo/lados intactos. Devuelve el resultado para
-    // que el visor arme el arrastre sobre los duplicados, o null si la
-    // escala sigue siendo la clásica.
-    const handleCtrlEscalarSubSel = useCallback((): ExtrusionCtrlSubSel | null => {
+    // vecinos (los vértices del borde son compartidos) y al MOVER una
+    // cara se quería sacar hacia fuera sin arrastrar lo de al lado. Con
+    // Ctrl el visor pide esta extrusión de delta casi nulo ANTES del
+    // gesto (sirve con las flechas de mover, las bolas de escala y el
+    // cubo central): se duplica la selección con sus paredes y el
+    // arrastre opera sobre la COPIA — anillos de arriba/abajo/lados
+    // intactos. Devuelve el resultado para que el visor arme el arrastre
+    // sobre los duplicados, o null si el gesto sigue siendo el clásico.
+    const handleCtrlExtrudirSubSel = useCallback((): ExtrusionCtrlSubSel | null => {
       const id = selectedObjectId ?? configObjectId;
-      if (!id || faceSelectionTarget !== 'cara') return null;
+      if (!id) return null;
       const object = sceneObjects.find((o) => o.id === id);
       if (!object?.mesh || object.mesh.vertices.length === 0) return null;
       const mesh = object.mesh;
       if (mesh.faces.length !== (id === configObjectId ? triMesh : object.mesh).faces.length) {
         return null; // Solo con la malla vista = malla del objeto (modo escena).
       }
-      const region = selectedFaceIds.filter((f) => f >= 0 && f < mesh.faces.length);
+      // La región según el objetivo activo (caras, caras completas de sus
+      // vértices, o caras completas de sus aristas): sin región entera no
+      // hay extrusión — el gesto cae al clásico (mover/escalar tal cual).
+      const region = regionSegunObjetivo(
+        mesh,
+        faceSelectionTarget,
+        selectedFaceIds,
+        selectedVertexIds,
+        selectedEdgeIds,
+      );
       if (region.length === 0) return null;
       // Delta mínimo a lo largo de la normal media de la región: separa la
       // copia de la base para que no se solapen (z-fighting) si el usuario
@@ -8513,15 +8536,31 @@ pluginTracks,
       }
       const res = extrudeRegionMesh(mesh, region, delta);
       if (!res || res.haciaDentro) return null;
+      // Inflado del arrastre (Ctrl+flecha de mover): normal suavizada por
+      // vértice de la región (coherencia de enrolado + hacia fuera + cúmulos
+      // por posición), pasada a índices DUPLICADOS. Así cada cara de la
+      // copia sale por la suya con la misma profundidad — en superficie
+      // curvada todas salen igual, como pidió el usuario.
+      const normalesPorVert = new Map<number, Vertex3D>();
+      for (const [orig, n] of normalesSuavizadasDeRegion(mesh, region)) {
+        const dup = res.vmap.get(orig);
+        if (dup !== undefined) normalesPorVert.set(dup, n);
+      }
       setSceneObjects((current) =>
         current.map((o) => (o.id === id ? { ...o, mesh: res.mesh } : o)),
       );
       // La selección sigue a la copia (los índices originales se quedan
-      // con la base), como hace el botón Extrudir.
-      setSelectedFaceIds(res.carasNuevas);
-      if (selectedVertexIds.length > 0) setSelectedVertexIds([]);
-      if (selectedEdgeIds.length > 0) setSelectedEdgeIds([]);
-      return { mesh: res.mesh, vmap: res.vmap, carasNuevas: res.carasNuevas };
+      // con la base), como hace el botón Extrudir: según el objetivo.
+      if (faceSelectionTarget === 'cara') {
+        setSelectedFaceIds(res.carasNuevas);
+        if (selectedVertexIds.length > 0) setSelectedVertexIds([]);
+        if (selectedEdgeIds.length > 0) setSelectedEdgeIds([]);
+      } else if (faceSelectionTarget === 'vertice') {
+        setSelectedVertexIds(selectedVertexIds.map((v) => res.vmap.get(v) ?? v));
+      } else {
+        setSelectedEdgeIds(selectedEdgeIds.map((k) => res.mapaAristas.get(k) ?? k));
+      }
+      return { mesh: res.mesh, vmap: res.vmap, carasNuevas: res.carasNuevas, normalesPorVert };
     }, [
       selectedObjectId,
       configObjectId,
@@ -8689,7 +8728,7 @@ pluginTracks,
         }
         setModoSpline(false);
         setSelGizmoConfigMode(false);
-        setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+        resetSelGizmo();
         setSelectedVertexIds([]);
         setSelectedEdgeIds([]);
         setFaceSelectionTarget('cara');
@@ -8714,7 +8753,7 @@ pluginTracks,
       setSelectedEdgeIds([]);
       setModoSpline(false);
       setSelGizmoConfigMode(false);
-      setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+      resetSelGizmo();
       if (deformadorId === id) {
         // Re-pulsar el mismo: salir.
         setDeformParams({});
@@ -8727,7 +8766,7 @@ pluginTracks,
       setDeformParams(iniciales);
       setDeformTick((n) => n + 1);
       setDeformadorId(id);
-    }, [deformadorId, selectedFaceIds]);
+    }, [deformadorId, resetSelGizmo, selectedFaceIds]);
 
     // Bisel plano: la sub-selección de caras ALIMENTA EN VIVO el param
     // oculto carasSel (clic, marco, Esc… todo llega a la vista previa al
@@ -8773,7 +8812,7 @@ pluginTracks,
       setSelectedVertexIds([]);
       setSelectedEdgeIds([]);
       setSelGizmoConfigMode(false);
-      setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+      resetSelGizmo();
       setDeformadorId(null);
       setDeformParams({});
       if (modoSpline) {
@@ -8806,7 +8845,7 @@ pluginTracks,
         setSplineEditandoId(null);
       }
       setModoSpline(true);
-    }, [modoSpline, selectedObjectId, salirModoSpline]);
+    }, [modoSpline, selectedObjectId, salirModoSpline, resetSelGizmo]);
 
     /**
      * «Spline Rosca» (muelle): el MISMO modo spline, pero ARRANCANDO con
@@ -8824,7 +8863,7 @@ pluginTracks,
       setSelectedVertexIds([]);
       setSelectedEdgeIds([]);
       setSelGizmoConfigMode(false);
-      setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+      resetSelGizmo();
       setDeformadorId(null);
       setDeformParams({});
       if (modoSpline) {
@@ -8855,7 +8894,7 @@ pluginTracks,
       setSplineEditandoId(null);
       splineIdRef.current = helix[helix.length - 1]?.id ?? 0;
       setModoSpline(true);
-    }, [modoSpline, salirModoSpline]);
+    }, [modoSpline, salirModoSpline, resetSelGizmo]);
 
     // La sub-selección es del objeto activo: al cambiar de objeto se
     // limpia (índices rancos inofensivos, pero mejor sin basura visual).
@@ -13098,7 +13137,7 @@ pluginTracks,
       deformadorActivo={deformadorActivo ?? deformadorAnimado}
       splineEdicion={splineEdicion}
       splinePreview={splineVistaPrevia}
-      onCtrlEscalarSubSel={handleCtrlEscalarSubSel}
+      onCtrlExtrudirSubSel={handleCtrlExtrudirSubSel}
       faceSelectVisibleOnly={faceSelectVisibleOnly}
       wireframeOffSignal={wireframeOffSignal}
       vistaModo={vistaModos[viewName] ?? 'textura'}
@@ -13106,22 +13145,22 @@ pluginTracks,
       selectedFaceIds={selectedFaceIds}
       onFaceSelectionChange={(ids) => {
         setSelectedFaceIds(ids);
-        // La selección cambia: el offset de sitio del gizmo vuelve a cero
-        // (y sale de configuración) al re-anclarse a la nueva selección.
+        // La selección cambia: el offset (y el giro) del gizmo vuelven a
+        // cero (y sale de configuración) al re-anclarse a la nueva selección.
         setSelGizmoConfigMode(false);
-        setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+        resetSelGizmo();
       }}
       selectedVertexIds={selectedVertexIds}
       onVertexSelectionChange={(ids) => {
         setSelectedVertexIds(ids);
         setSelGizmoConfigMode(false);
-        setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+        resetSelGizmo();
       }}
       selectedEdgeIds={selectedEdgeIds}
       onEdgeSelectionChange={(ids) => {
         setSelectedEdgeIds(ids);
         setSelGizmoConfigMode(false);
-        setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+        resetSelGizmo();
       }}
       onFaceSelectionModeChange={(v) => {
         if (v) {
@@ -13139,7 +13178,7 @@ pluginTracks,
           setSelectedVertexIds([]);
           setSelectedEdgeIds([]);
           setSelGizmoConfigMode(false);
-          setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+          resetSelGizmo();
         }
       }}
       onFaceSelectionToolChange={setFaceSelectionTool}
@@ -13150,7 +13189,7 @@ pluginTracks,
         setSelectedVertexIds([]);
         setSelectedEdgeIds([]);
         setSelGizmoConfigMode(false);
-        setSelGizmoOffset({ x: 0, y: 0, z: 0 });
+        resetSelGizmo();
       }}
       onRegisterSelectionMove={(fn) => {
         moveSelectionFnRef.current = fn;
@@ -13165,6 +13204,8 @@ pluginTracks,
       selGizmoColorOverride={selGizmoConfigMode ? 0x888888 : undefined}
       selGizmoOffset={selGizmoOffset}
       onSelGizmoOffsetChange={setSelGizmoOffset}
+      selGizmoRotation={selGizmoRotation}
+      onSelGizmoRotationChange={setSelGizmoRotation}
       handleObjectTransform={handleObjectTransform}
       activeCamera={camaraObjetoDeVista(viewName)}
       exportCamera={activeCameraValue}
@@ -18212,8 +18253,9 @@ pluginTracks,
                   >
                     {t('editor3D.faceExtrude')}
                   </button>
-                  {/* Configuración del gizmo de la sub-selección (como la del
-                      gizmo de objetos): gris + sus asas lo mueven a él. */}
+                  {/* Configuración del gizmo de la sub-selección (como la
+                      del gizmo de objetos): gris + sus asas lo mueven a él
+                      y sus aros lo GIRAN (la selección no se toca). */}
                   <button
                     data-testid="sel-gizmo-config-btn"
                     onClick={() => {
@@ -18230,16 +18272,16 @@ pluginTracks,
                     }`}
                     title={selGizmoConfigMode
                       ? t('editor3D.gizmoApply')
-                      : t('editor3D.gizmoConfigure')}
+                      : t('editor3D.gizmoConfigureSel')}
                   >
                     {selGizmoConfigMode ? <Check className="w-3.5 h-3.5" /> : '⚙'}
                   </button>
                   {selGizmoConfigMode && (
                     <button
                       data-testid="sel-gizmo-center-btn"
-                      onClick={() => setSelGizmoOffset({ x: 0, y: 0, z: 0 })}
+                      onClick={resetSelGizmo}
                       className="px-2 py-1 rounded-md text-xs font-medium bg-black/40 text-muted-foreground hover:text-foreground border border-white/10 transition-colors shrink-0"
-                      title={t('editor3D.gizmoCenterOnObject')}
+                      title={t('editor3D.gizmoCenterOnSel')}
                     >
                       <Target className="w-3.5 h-3.5" />
                     </button>

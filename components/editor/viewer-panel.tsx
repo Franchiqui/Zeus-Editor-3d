@@ -73,9 +73,9 @@ interface ViewerPanelProps {
         max: { x: number; y: number; z: number };
       } | null;
     } | null;
-    /** Ctrl + arrastre de ESCALA en la sub-selección = extrudir la copia
-     *  (anillos vecinos intactos); null si no se puede. */
-    onCtrlEscalarSubSel?: () => ExtrusionCtrlSubSel | null;
+    /** Ctrl + arrastre de una asa de la sub-selección (flecha, bola o cubo)
+     *  = extrudir la copia (anillos vecinos intactos); null si no se puede. */
+    onCtrlExtrudirSubSel?: () => ExtrusionCtrlSubSel | null;
     /** Trazado SPLINE 3D en edición: línea + marcadores de vértice en las
      * ventanas planas (clic = vértice, arrastre = mover). */
     splineEdicion?: SplineEdicion | null;
@@ -119,6 +119,11 @@ interface ViewerPanelProps {
    selGizmoOffset?: { x: number; y: number; z: number };
    /** Notifica al padre el offset de sitio del gizmo de la sub-selección. */
    onSelGizmoOffsetChange?: (o: { x: number; y: number; z: number }) => void;
+   /** Giro del gizmo de la sub-selección (Euler en radianes, modo
+       configuración con los aros de rotación). */
+   selGizmoRotation?: { x: number; y: number; z: number };
+   /** Notifica al padre el giro del gizmo de la sub-selección. */
+   onSelGizmoRotationChange?: (r: { x: number; y: number; z: number }) => void;
    handleObjectTransform: (transform: any) => void;
    handleVerticesChange: (vertices: any) => void;
    showLatheAxis: boolean;
@@ -276,9 +281,11 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
    selGizmoColorOverride,
    selGizmoOffset,
    onSelGizmoOffsetChange,
+   selGizmoRotation,
+   onSelGizmoRotationChange,
    handleObjectTransform,
   handleVerticesChange,
-  onCtrlEscalarSubSel,
+  onCtrlExtrudirSubSel,
   showLatheAxis,
    viewerProjection,
    textureHelper,
@@ -589,6 +596,8 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
             selGizmoColorOverride={selGizmoColorOverride}
             selGizmoOffset={selGizmoOffset}
             onSelGizmoOffsetChange={onSelGizmoOffsetChange}
+            selGizmoRotation={selGizmoRotation}
+            onSelGizmoRotationChange={onSelGizmoRotationChange}
            booleanToolObjectId={booleanToolObjectId}
            forceObjectsUpdate={forceUpdate}
           objectTransform={
@@ -596,7 +605,7 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
          }
          onObjectTransform={handleObjectTransform}
          onVerticesChange={handleVerticesChange}
-         onCtrlEscalarSubSel={onCtrlEscalarSubSel}
+         onCtrlExtrudirSubSel={onCtrlExtrudirSubSel}
          showVerticesDefault={false}
          showLatheAxis={showLatheAxis}
          textureProjection={viewerProjection}

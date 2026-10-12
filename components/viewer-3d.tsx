@@ -66,6 +66,7 @@ import {
   carasAnilloDe,
   extremosBordeAnillo,
   bordesAnilloDe,
+  caraLogicaDe,
 } from '@/lib/geometry';
 import {
   aplicarDeformador,
@@ -309,16 +310,24 @@ export function resolveSpotTarget(
   };
 }
 
-/** Resultado de la extrusión al ESCALAR con Ctrl (ver `onCtrlEscalarSubSel`):
- *  la malla ya con la copia + paredes casi en el sitio de la selección y los
- *  mapas para que el arrastre opere sobre los duplicados, no sobre los
- *  vértices compartidos con el resto del objeto. */
+/** Resultado de la extrusión con Ctrl (flecha de mover, bola de escala o
+ *  cubo central — ver `onCtrlExtrudirSubSel`): la malla ya con la copia +
+ *  paredes casi en el sitio de la selección y los mapas para que el
+ *  arrastre opere sobre los duplicados, no sobre los vértices compartidos
+ *  con el resto del objeto. */
 export type ExtrusionCtrlSubSel = {
   mesh: Mesh;
   /** Vértice original usado por la selección → su duplicado. */
   vmap: Map<number, number>;
   /** Índices de las caras-copia (la nueva selección, como en Blender). */
   carasNuevas: number[];
+  /** Normal suavizada unitaria (LOCAL) por VÉRTICE DUPLICADO, de la región
+   *  extraída. Con ella el arrastre de mover con Ctrl es INFLADO (estilo
+   *  Blender «Extrude along Normals»): cada vértice sale por la suya con la
+   *  misma profundidad, así en superficie curvada todas las caras salen
+   *  IGUAL. Ausente (o sin la entrada de un vértice) → arrastre clásico de
+   *  una sola dirección. */
+  normalesPorVert?: Map<number, Vertex3D>;
 };
 
 interface Viewer3DProps {
@@ -453,15 +462,15 @@ interface Viewer3DProps {
     onFaceSelectionTargetChange?: (target: 'cara' | 'vertice' | 'segmento') => void;
   onVerticesChange?: (vertices: Vertex3D[]) => void;
   /**
-   * Ctrl mientras se ESCALA la sub-selección (flecha amarilla o cubo
-   * central): extrudir en vez de estirar — el editor duplica la selección
-   * con sus paredes (delta casi nulo, estilo Blender) y el arrastre escala
-   * la COPIA, así los anillos de arriba/abajo/lados no se deforman.
-   * El visor lo pide al empezar el gesto; si el editor no puede (malla
-   * vista ≠ malla del objeto, sin selección…) devuelve null y la escala
-   * funciona como siempre.
+   * Ctrl mientras se arrastra una asa de la sub-selección (flechas de
+   * mover, bolas de escala o cubo central): EXTRUDIR en vez de mover/
+   * estirar — el editor duplica la selección con sus paredes (delta casi
+   * nulo, estilo Blender) y el arrastre opera sobre la COPIA, así los
+   * anillos de arriba/abajo/lados no se deforman. El visor lo pide al
+   * empezar el gesto; si el editor no puede (malla vista ≠ malla del
+   * objeto, sin selección…) devuelve null y el gesto funciona como siempre.
    */
-  onCtrlEscalarSubSel?: () => ExtrusionCtrlSubSel | null;
+  onCtrlExtrudirSubSel?: () => ExtrusionCtrlSubSel | null;
   /** Registra la función que desplaza la selección actual (vértices/
    *  segmentos/caras): los campos numéricos de la barra del editor la
    *  guardan y la llaman con el desplazamiento X·Y·Z. */
@@ -537,6 +546,11 @@ interface Viewer3DProps {
   selGizmoOffset?: { x: number; y: number; z: number };
   /** Notifica al padre el offset de sitio del gizmo de la sub-selección. */
   onSelGizmoOffsetChange?: (o: { x: number; y: number; z: number }) => void;
+  /** Giro del gizmo de la sub-selección (Euler en radianes, se ajusta en
+      su modo de configuración con los aros de rotación). */
+  selGizmoRotation?: { x: number; y: number; z: number };
+  /** Notifica al padre el giro del gizmo de la sub-selección. */
+  onSelGizmoRotationChange?: (r: { x: number; y: number; z: number }) => void;
   /** Posición, rotación y escala actuales del objeto (las fija el manipulador) */
   objectTransform?: ObjectTransform;
   onObjectTransform?: (t: ObjectTransform) => void;
@@ -1644,7 +1658,9 @@ type GizmoDrag = {
 type SelectionGizmoDrag = {
   axis: GizmoAxis;
   mode: 'move' | 'scale' | 'uniform-scale';
-  /** eje (mundo, sin girar con el objeto) por el que se mueve el gesto */
+  /** eje (mundo, girado con la orientación que el usuario le puso a su
+   *  gizmo en modo configuración) por el que se mueve o escala el gesto.
+   *  En escala uniforme llega vacío: no se usa, escala los 3 ejes. */
   axisWorld: THREE.Vector3;
   startT: number;
   centroMundoStart: THREE.Vector3;
@@ -1656,6 +1672,11 @@ type SelectionGizmoDrag = {
   vertOriginales: Vertex3D[];
   vertIdx: number[];
   centroLocal: THREE.Vector3;
+  /** Inflado (mover desde la extrusión con Ctrl): normal LOCAL unitaria
+   *  por índice de la malla arrastrada. Presente → cada vértice se mueve
+   *  por la suya × la profundidad del gesto (todas las caras salen igual);
+   *  un índice sin entrada cae al delta clásico del eje. */
+  normalesPorVert?: Map<number, Vertex3D>;
   latestVerts?: Vertex3D[];
   lastEmit?: number;
 };
@@ -1932,17 +1953,21 @@ function buildGizmoHandles(group: THREE.Group): THREE.Mesh[] {
 /**
  * Manipulador de la SUB-SELECCIÓN (caras/aristas/vértices): tres flechas
  * para MOVER, tres bolas para ESCALAR por eje y un cubo central para
- * escala uniforme. Sin aros de rotación ni cuadrado plano (así se pidió:
- * solo mover + escalar). Mismo patrón de proxies «hit» invisibles que el
- * gizmo de objetos; asas con depthTest off para verse siempre delante.
+ * escala uniforme. Los AROS de rotación solo se usan en el modo de
+ * configuración del gizmo (giran su orientación): salen ocultos y el
+ * bucle de render los muestra/oculta con `selGizmoInteractive`.
+ * Mismo patrón de proxies «hit» invisibles que el gizmo de objetos; asas
+ * con depthTest off para verse siempre delante.
  */
+const SELECTION_GIZMO_RADIO_ARO = 0.95;
+
 function buildSelectionGizmoHandles(group: THREE.Group): THREE.Mesh[] {
   const handles: THREE.Mesh[] = [];
   const asa = (
     geo: THREE.BufferGeometry,
     mat: THREE.Material,
     axis: GizmoAxis,
-    mode: 'move' | 'scale' | 'uniform-scale',
+    mode: 'move' | 'scale' | 'uniform-scale' | 'rotate',
     pos: [number, number, number]
   ): THREE.Mesh => {
     const m = new THREE.Mesh(geo, mat);
@@ -1956,7 +1981,7 @@ function buildSelectionGizmoHandles(group: THREE.Group): THREE.Mesh[] {
   const hitAsa = (
     geo: THREE.BufferGeometry,
     axis: GizmoAxis,
-    mode: 'move' | 'scale' | 'uniform-scale',
+    mode: 'move' | 'scale' | 'uniform-scale' | 'rotate',
     pos: [number, number, number]
   ): THREE.Mesh => {
     const hit = new THREE.Mesh(
@@ -2011,6 +2036,44 @@ function buildSelectionGizmoHandles(group: THREE.Group): THREE.Mesh[] {
       [dir.x * 0.55, dir.y * 0.55, dir.z * 0.55]);
     hitAsa(new THREE.SphereGeometry(0.095, 16, 12), axis, 'scale',
       [dir.x * 0.55, dir.y * 0.55, dir.z * 0.55]);
+    // Aro de rotación: SOLO en el modo de configuración del gizmo (gira
+    // su orientación, no la selección). Nace oculto; el render lo muestra
+    // al entrar en configuración — fuera de él, invisible.
+    const aro = new THREE.Mesh(
+      new THREE.TorusGeometry(SELECTION_GIZMO_RADIO_ARO, 0.007, 10, 64),
+      new THREE.MeshBasicMaterial({
+        color,
+        depthTest: false,
+        transparent: true,
+        opacity: 0.55,
+      })
+    );
+    aro.userData = { axis, mode: 'rotate', originalColor: color };
+    handles.push(aro);
+    group.add(aro);
+    const aroHit = new THREE.Mesh(
+      new THREE.TorusGeometry(SELECTION_GIZMO_RADIO_ARO, 0.05, 10, 64),
+      new THREE.MeshBasicMaterial({
+        transparent: true,
+        opacity: 0,
+        depthTest: false,
+        depthWrite: false,
+      })
+    );
+    aroHit.userData = { axis, mode: 'rotate' };
+    group.add(aroHit);
+    handles.push(aroHit);
+    // Orientación de los aros: la normal del toro debe quedar sobre el
+    // eje (toro nace en plano XY con normal +Z; se gira al eje propio).
+    if (axis === 'x') {
+      aro.rotation.y = Math.PI / 2; // normal +Z → +X
+      aroHit.rotation.y = Math.PI / 2;
+    } else if (axis === 'y') {
+      aro.rotation.x = Math.PI / 2; // normal +Z → +Y
+      aroHit.rotation.x = Math.PI / 2;
+    } // eje z: sin giro (normal +Z ya)
+    aro.visible = false;
+    aroHit.visible = false;
   }
   return handles;
 }
@@ -2720,6 +2783,45 @@ function computeFaceNormal(mesh: Mesh, faceIdx: number): THREE.Vector3 | null {
   return new THREE.Vector3().subVectors(vb, va).cross(new THREE.Vector3().subVectors(vc, va)).normalize();
 }
 
+// Cuaternio que «acoda» el gizmo con las caras seleccionadas: el eje Z
+// pintado sigue la NORMAL de la selección (en mundo, con el giro del
+// objeto) y X/Y quedan dentro del plano (X = la X del mundo proyectada al
+// plano; si cae casi sobre la normal, la Y del mundo y luego la Z).
+// `ladoVisto` (+1/−1): lado (respecto a la normal) desde el que miraba el
+// usuario al seleccionar — algunas mallas (p. ej. Cubo.zeus) guardan
+// caras con la normal hacia DENTRO; el gizmo sale siempre por el lado
+// VISIBLE. null si las caras no cuadran (normales repartidas).
+function quatAcodadoACaras(
+  mesh: Mesh,
+  faces: number[],
+  worldMatrix: THREE.Matrix4,
+  ladoVisto: number
+): THREE.Quaternion | null {
+  if (faces.length === 0) return null;
+  const primera = computeFaceNormal(mesh, faces[0]);
+  if (!primera) return null;
+  const normal = new THREE.Vector3();
+  for (const f of faces) {
+    const nf = computeFaceNormal(mesh, f);
+    if (!nf) continue;
+    normal.add(nf);
+    // Coherencia: que cada cara del grupo apunte en la misma dirección
+    // (>60° de desvío = bandas curvas, sin alineación).
+    if (nf.dot(primera) < 0.5) return null;
+  }
+  if (normal.lengthSq() < 1e-12) return null;
+  const z = normal.normalize().transformDirection(worldMatrix);
+  if (ladoVisto < 0) z.negate();
+  let ref = new THREE.Vector3(1, 0, 0);
+  if (Math.abs(ref.dot(z)) > 0.9) ref.set(0, 1, 0);
+  if (Math.abs(ref.dot(z)) > 0.9) ref.set(0, 0, 1);
+  const x = ref.clone().sub(z.clone().multiplyScalar(ref.dot(z))).normalize();
+  const y = new THREE.Vector3().crossVectors(z, x);
+  return new THREE.Quaternion().setFromRotationMatrix(
+    new THREE.Matrix4().makeBasis(x, y, z)
+  );
+}
+
 export function getFaceGroup(mesh: Mesh, startFaceIdx: number): number[] {
   const group = new Set<number>();
   group.add(startFaceIdx);
@@ -2761,6 +2863,40 @@ export function getFaceGroup(mesh: Mesh, startFaceIdx: number): number[] {
     }
   }
   return Array.from(group);
+}
+
+/**
+ * Caras a pintar/elegir para el pick de un OBJETIVO «cara»: el anillo
+ * completo si el modo Anillos lo agrupó (con cada cara suelta EXPANDIDA a
+ * su cara lógica — si el anillo entra en la tapa del cilindro se pinta la
+ * tapa entera, no un triángulo suelto de media cara) o, sin anillos, la
+ * cara LÓGICA completa (la celda pareada, o el abanico cerrado y plano
+ * entero de una tapa). Las mallas .zeus guardan triángulos con vértices
+ * duplicados — el BFS coplanar por índice no junta nada (media cara) — y
+ * las regeneradas llegan cuadranguladas — en ellas el mismo BFS engancha
+ * franjas coplanares de caras DISTINTAS (el lateral del cilindro: cuatro
+ * caras de golpe). La topología del canon de `construirAnillos` resuelve
+ * las dos.
+ */
+function carasElementoCara(
+  mesh: Mesh,
+  faceIdx: number,
+  anillos?: number[] | null
+): number[] {
+  const datos = construirAnillos(mesh);
+  const salida = new Set<number>();
+  if (anillos && anillos.length > 0) {
+    for (const f of anillos) {
+      if (!datos) {
+        salida.add(f);
+        continue;
+      }
+      for (const t of caraLogicaDe(mesh, datos, f)) salida.add(t);
+    }
+    return Array.from(salida);
+  }
+  if (datos) return caraLogicaDe(mesh, datos, faceIdx);
+  return getFaceGroup(mesh, faceIdx);
 }
 
 export function getVertexGroup(mesh: Mesh, startVertexIdx: number): number[] {
@@ -3509,7 +3645,7 @@ export default function Viewer3D({
     onFaceSelectionToolChange,
     onFaceSelectionTargetChange,
     onVerticesChange,
-    onCtrlEscalarSubSel,
+    onCtrlExtrudirSubSel,
     onRegisterSelectionMove,
    showVerticesDefault = true,
   smoothShading = false,
@@ -3530,6 +3666,11 @@ export default function Viewer3D({
     selGizmoColorOverride,
     selGizmoOffset,
     onSelGizmoOffsetChange,
+    /** Giro del gizmo de la sub-selección (Euler en radianes): se ajusta
+     *  en su modo de configuración arrastrando los aros y sirve para que
+     *  flechas y bolas de escala apunten donde quedó el gizmo. */
+    selGizmoRotation,
+    onSelGizmoRotationChange,
    objectTransform,
    camera3D,
    flat2D,
@@ -4152,8 +4293,8 @@ export default function Viewer3D({
 
   const onVerticesChangeRef = useRef(onVerticesChange);
   onVerticesChangeRef.current = onVerticesChange;
-  const onCtrlEscalarSubSelRef = useRef(onCtrlEscalarSubSel);
-  onCtrlEscalarSubSelRef.current = onCtrlEscalarSubSel;
+  const onCtrlExtrudirSubSelRef = useRef(onCtrlExtrudirSubSel);
+  onCtrlExtrudirSubSelRef.current = onCtrlExtrudirSubSel;
   const onRegisterSelectionMoveRef = useRef(onRegisterSelectionMove);
   onRegisterSelectionMoveRef.current = onRegisterSelectionMove;
 
@@ -4267,6 +4408,23 @@ export default function Viewer3D({
   const selectionGizmoGroupRef = useRef<THREE.Group | null>(null);
   const selectionGizmoHandlesRef = useRef<THREE.Mesh[]>([]);
   const selectionGizmoDragRef = useRef<SelectionGizmoDrag | null>(null);
+  /** Extrusión con Ctrl PENDIENTE de activación: pulsó una asa con Ctrl y
+   *  la copia AÚN NO está horneada (el editor no ha sido llamado). El
+   *  primer movimiento real del ratón (> umbral, en onPointerMove) llama al
+   *  editor, hornea la extrusión y levanta el arrastre sobre la copia. Así
+   *  un mero presionar —p. ej. un Ctrl+clic para añadir caras a la
+   *  selección pasando sobre la asa— no deja nada: la queja del usuario
+   *  2026-10-11 «solo con marcar las caras ya empiezan a salirse». */
+  const ctrlExtrudirPendienteRef = useRef<{
+    udSel: { axis: GizmoAxis; mode: SelectionGizmoDrag['mode'] };
+    ray: THREE.Ray;
+    camDir: THREE.Vector3;
+    screenUp: THREE.Vector3;
+    quat: THREE.Quaternion;
+    recogido: { vertIdx: number[]; centroLocal: THREE.Vector3 };
+    x: number;
+    y: number;
+  } | null>(null);
   const selectionGizmoCentroRef = useRef<THREE.Vector3 | null>(null);
   const selectionGizmoNormalRef = useRef<THREE.Vector3 | null>(null);
   const selectionKeyRef = useRef(''); // re-deducir el centroide al cambiar
@@ -4288,6 +4446,21 @@ export default function Viewer3D({
     startT: number;
     startOffset: THREE.Vector3;
   } | null>(null);
+  /** Arrastre de un ARO en modo configuración: gira EL GIZMO (su
+   *  orientación), no la selección. Guarda el eje (mundo), el plano de
+   *  medición del ángulo, el ángulo inicial y la orientación de partida. */
+  const selGizmoRotateDragRef = useRef<{
+    axis: GizmoAxis;
+    axisWorld: THREE.Vector3;
+    startPos: THREE.Vector3;
+    plane: THREE.Plane;
+    basisU: THREE.Vector3;
+    basisV: THREE.Vector3;
+    startAngle: number;
+    sweptAngle: number;
+    prevAngle: number;
+    startQuat: THREE.Quaternion;
+  } | null>(null);
   // El offset llega como prop (vive en el editor, se sincroniza entre
   // ventanas): al cambiar desde fuera se recalca en el ref — menos
   // durante un arrastre activo, que ya actualiza el ref y el visual.
@@ -4295,6 +4468,35 @@ export default function Viewer3D({
     selGizmoOffsetPropRef.current = selGizmoOffset;
     if (selGizmoOffset && !selGizmoOffsetDragRef.current) {
       selGizmoOffsetRef.current.set(selGizmoOffset.x, selGizmoOffset.y, selGizmoOffset.z);
+    }
+  }
+  // Giro del gizmo de la sub-selección (Euler en radianes): mismo esquema
+  // que el offset — vive en el editor y se recalca aquí fuera del gesto.
+  const selGizmoRotRef = useRef({
+    x: 0,
+    y: 0,
+    z: 0,
+  });
+  // Base de alineación del gizmo de la sub-selección: al tomar caras, el
+  // gizmo se acoda con ellas (Z = normal de la selección). Se compone con
+  // el giro del usuario en el frame loop; null = ejes de mundo (caras sin
+  // cuadrar / vértices / aristas).
+  const selGizmoBaseQuatRef = useRef<THREE.Quaternion | null>(null);
+  // Escala del gizmo de la sub-selección a la medida del TAMAÑO de la
+  // selección (radio mundo de sus vértices; null = escala clásica).
+  const selGizmoEscalaRef = useRef<number | null>(null);
+  // LADO (respecto a la normal de la selección) desde el que miraba el
+  // usuario al tomarla: +1 = normal hacia él, −1 = normal contra él. Se
+  // congela en el momento de la selección (no baila al orbitar) pero
+  // sigue a la cara en vivo cuando rota el objeto.
+  const selGizmoLadoSignoRef = useRef(1);
+  const selGizmoRotPropRef = useRef(selGizmoRotation);
+  const onSelGizmoRotationChangeRef = useRef(onSelGizmoRotationChange);
+  onSelGizmoRotationChangeRef.current = onSelGizmoRotationChange;
+  if (selGizmoRotation !== selGizmoRotPropRef.current) {
+    selGizmoRotPropRef.current = selGizmoRotation;
+    if (selGizmoRotation && !selGizmoRotateDragRef.current) {
+      selGizmoRotRef.current = { ...selGizmoRotation };
     }
   }
   // Resaltado al pasar el ratón: un elemento «candidato» (la cara entera,
@@ -6793,11 +6995,12 @@ export default function Viewer3D({
               if (hover) {
                 if (hover.t === 'cara') {
                   // Modo anillos: resaltar el ANILLO completo que el pick
-                  // ya devolvió agrupado; si no viene, coplanares de siempre.
-                  const faceGroup =
-                    'anillos' in hover && hover.anillos && hover.anillos.length > 0
-                      ? hover.anillos
-                      : getFaceGroup(m, hover.id as number);
+                  // ya devolvió agrupado; si no viene, cara lógica completa.
+                  const faceGroup = carasElementoCara(
+                    m,
+                    hover.id as number,
+                    'anillos' in hover ? hover.anillos : null
+                  );
                   const overlay = buildFaceSelectionOverlay(
                     m,
                     new Set(faceGroup),
@@ -6837,11 +7040,14 @@ export default function Viewer3D({
           }
 
           // Gizmo de la sub-selección: anclado en vivo al centroide de la
-          // selección (en mundo) y a escala 3/4 del gizmo de objetos. El
-          // centroide se re-deduce al cambiar la selección o mientras un
-          // arrastre mueve los vértices.
+          // selección (en mundo), flotando DELANTE de la cara y a escala
+          // proporcional al TAMAÑO de la selección. El centroide se
+          // re-deduce al cambiar la selección o mientras un arrastre mueve
+          // los vértices; el tamaño solo al cambiar (estable durante los
+          // arrastres, como el gizmo de objetos).
           const selKey = `${target}|${selectedFaceIdsRef.current.join(',')}|${selectedVertexIdsRef.current.join(',')}|${selectedEdgeIdsRef.current.join(',')}`;
           if (selectionKeyRef.current !== selKey || selectionGizmoDragRef.current) {
+            const cambioSel = selectionKeyRef.current !== selKey;
             selectionKeyRef.current = selKey;
             const recogidoSel = collectSelectionVerts(
               m,
@@ -6856,31 +7062,104 @@ export default function Viewer3D({
               recogidoSel.vertIdx.length > 0
                 ? normalSubSeleccion(m, target, selectedFaceIdsRef.current, selectedVertexIdsRef.current, selectedEdgeIdsRef.current)
                 : null;
+            if (cambioSel) {
+              // LADO VISTO: signo de la normal de la selección respecto a
+              // donde está el ojo en EL MOMENTO de seleccionar. Mallas con
+              // caras de normal invertida (Cubo.zeus: 3 dentro, 3 fuera)
+              // salen del lado visible.
+              const normalLadoG = selectionGizmoNormalRef.current;
+              if (recogidoSel.vertIdx.length > 0 && normalLadoG) {
+                const nMundoLado = normalLadoG.clone().transformDirection(worldMatrix);
+                const centroMundoLado = recogidoSel.centroLocal.clone().applyMatrix4(worldMatrix);
+                const ojoLado = camera.getWorldPosition(new THREE.Vector3());
+                selGizmoLadoSignoRef.current =
+                  nMundoLado.dot(ojoLado.sub(centroMundoLado)) >= 0 ? 1 : -1;
+              }
+              // Al tomar caras (o cambiar de cara) el gizmo se acoda con la
+              // selección: Z = normal de las caras (del lado visto); si el
+              // grupo de caras no cuadra (normales repartidas), ejes de
+              // mundo.
+              selGizmoBaseQuatRef.current =
+                target === 'cara'
+                  ? quatAcodadoACaras(m, selectedFaceIdsRef.current, worldMatrix, selGizmoLadoSignoRef.current)
+                  : null;
+              // Tamaño a la medida: radio de la selección (distancia máx.
+              // del centro a un vértice, a tamaño mundo) → el gizmo de una
+              // cara pequeña se hace pequeño (con suelo, para poder cogerlo)
+              // y el de un grupo grande se queda en el tamaño clásico.
+              let radioAlCuadrado = 0;
+              const centroRadio = recogidoSel.centroLocal;
+              for (const idx of recogidoSel.vertIdx) {
+                const v = m.vertices[idx];
+                if (!v) continue;
+                const dx = v.x - centroRadio.x;
+                const dy = v.y - centroRadio.y;
+                const dz = v.z - centroRadio.z;
+                const d = dx * dx + dy * dy + dz * dz;
+                if (d > radioAlCuadrado) radioAlCuadrado = d;
+              }
+              const elemsM = worldMatrix.elements;
+              const escalaObjeto = Math.max(
+                Math.hypot(elemsM[0], elemsM[1], elemsM[2]),
+                Math.hypot(elemsM[4], elemsM[5], elemsM[6]),
+                Math.hypot(elemsM[8], elemsM[9], elemsM[10])
+              );
+              const escalaDefecto = Math.max(0.05, gizmoBaseScaleRef.current * 0.75);
+              selGizmoEscalaRef.current = Math.min(
+                Math.max(
+                  Math.sqrt(radioAlCuadrado) * escalaObjeto * 1.7,
+                  escalaDefecto * 0.35
+                ),
+                escalaDefecto
+              );
+            }
           }
           const selGizmoGr = selectionGizmoGroupRef.current;
           if (selGizmoGr) {
             const centroLocalG = selectionGizmoCentroRef.current;
             if (centroLocalG && !ayudasOcultas) {
+              // Escala del gizmo a la medida del tamaño de la selección
+              // (radio mundo de sus vértices; null → la clásica).
+              const escalaSelGizmo =
+                selGizmoEscalaRef.current ?? Math.max(0.05, gizmoBaseScaleRef.current * 0.75);
               const posSelGizmo = centroLocalG.clone().applyMatrix4(worldMatrix);
               // El gizmo flota por delante de la superficie: se desplaza
-              // a lo largo de la normal de la selección (en mundo) para
-              // que las flechas no queden dentro del objeto. Misma
-              // magnitud relativa mientras se arrastra (el centro se
-              // re-deduce en vivo y el offset lo sigue).
+              // a lo largo de la normal de la selección (en mundo), por el
+              // LADO el usuario miraba al seleccionar — caras con la
+              // normal invertida incluidas (el Cubo.zeus guarda 3). El
+              // desplazamiento es PROPORCIONAL AL PROPIO GIZMO (0.8×) para
+              // que se lea FUERA de la cara en cualquier vista — con el
+              // gizmo acodado y una flotada pequeña se fundía con la cara
+              // («quedaba detrás/ dentro»).
               const normalSelG = selectionGizmoNormalRef.current;
               if (normalSelG) {
                 posSelGizmo.add(
                   normalSelG.clone().transformDirection(worldMatrix)
-                    .multiplyScalar(Math.max(0.05, gizmoBaseScaleRef.current * 0.75) * 0.4)
+                    .multiplyScalar(selGizmoLadoSignoRef.current * escalaSelGizmo * 0.8)
                 );
               }
               // Más el offset que le puso el usuario desde su modo de
               // configuración (como el offset del gizmo de objetos).
               posSelGizmo.add(selGizmoOffsetRef.current);
               selGizmoGr.position.copy(posSelGizmo);
-              selGizmoGr.scale.setScalar(
-                Math.max(0.05, gizmoBaseScaleRef.current * 0.75)
+              // Alineación ACODADA: base girada hacia la cara (Z = su
+              // normal) más el giro que le puso el usuario en su modo de
+              // configuración (los aros): flechas y bolas quedan
+              // inclinadas con ambos.
+              const quatBaseCara = selGizmoBaseQuatRef.current;
+              const quatSelGizmoUsuario = new THREE.Quaternion().setFromEuler(
+                new THREE.Euler(
+                  selGizmoRotRef.current.x,
+                  selGizmoRotRef.current.y,
+                  selGizmoRotRef.current.z
+                )
               );
+              selGizmoGr.quaternion.copy(
+                quatBaseCara
+                  ? quatBaseCara.clone().multiply(quatSelGizmoUsuario)
+                  : quatSelGizmoUsuario
+              );
+              selGizmoGr.scale.setScalar(escalaSelGizmo);
               selGizmoGr.visible = true;
             } else {
               selGizmoGr.visible = false;
@@ -7508,6 +7787,42 @@ export default function Viewer3D({
           return;
         }
 
+        // --- Gizmo de sub-selección en modo configuración: girar SU ---
+        // --- orientación con los aros (no toca la selección) ----------
+        const rotDragSel = selGizmoRotateDragRef.current;
+        if (rotDragSel) {
+          raycasterRef.current.setFromCamera(pointerRef.current, camera);
+          const hitRot = new THREE.Vector3();
+          if (raycasterRef.current.ray.intersectPlane(rotDragSel.plane, hitRot)) {
+            const dRot = hitRot.sub(rotDragSel.startPos);
+            const angRot = Math.atan2(dRot.dot(rotDragSel.basisV), dRot.dot(rotDragSel.basisU));
+            // Ángulo continuo (sin salto ±π del atan2): poder dar toda la
+            // vuelta y revertir el arrastre sin cortes.
+            const prevRot = rotDragSel.prevAngle;
+            rotDragSel.sweptAngle += Math.atan2(
+              Math.sin(angRot - prevRot),
+              Math.cos(angRot - prevRot)
+            );
+            rotDragSel.prevAngle = angRot;
+            const dqRot = new THREE.Quaternion().setFromAxisAngle(
+              rotDragSel.axisWorld,
+              rotDragSel.sweptAngle
+            );
+            const quatNueva = dqRot.multiply(rotDragSel.startQuat);
+            // Lo que se guarda como giro del usuario es el residuo tras
+            // QUITAR la base acodada de la cara (el frame loop la vuelve
+            // a componer); sin base queda el giro tal cual.
+            const quatBaseG = selGizmoBaseQuatRef.current;
+            const quatUsuarioG = quatBaseG
+              ? quatBaseG.clone().invert().multiply(quatNueva)
+              : quatNueva;
+            const nuevaE = new THREE.Euler().setFromQuaternion(quatUsuarioG);
+            selGizmoRotRef.current = { x: nuevaE.x, y: nuevaE.y, z: nuevaE.z };
+            onSelGizmoRotationChangeRef.current?.({ ...selGizmoRotRef.current });
+          }
+          return;
+        }
+
         // --- Gizmo de sub-selección en modo configuración: mover SU ---
         // --- offset de sitio (no la selección) ------------------------
         const offDragSel = selGizmoOffsetDragRef.current;
@@ -7541,6 +7856,63 @@ export default function Viewer3D({
         }
 
         // --- Gizmo de sub-selección: mover/escalar en vivo ---------------
+        // Extrusión con Ctrl pendiente: arranca con el PRIMER movimiento
+        // real (>4 px desde la pulsación) — un mero clic no hornea nada.
+        {
+          const pendienteCtrl = ctrlExtrudirPendienteRef.current;
+          if (pendienteCtrl && !selectionGizmoDragRef.current) {
+            if (Math.hypot(e.clientX - pendienteCtrl.x, e.clientY - pendienteCtrl.y) > 4) {
+              ctrlExtrudirPendienteRef.current = null;
+              const resCtrl = onCtrlExtrudirSubSelRef.current?.() ?? null;
+              if (resCtrl) {
+                // Solo los DUPLICADOS de la selección se arrastran: los
+                // vértices originales siguen siendo de las caras vecinas.
+                const vertIdx = pendienteCtrl.recogido.vertIdx
+                  .map((idx) => resCtrl.vmap.get(idx))
+                  .filter((idx): idx is number => idx !== undefined);
+                let centroLocal = new THREE.Vector3();
+                for (const idx of vertIdx) {
+                  const v = resCtrl.mesh.vertices[idx];
+                  if (!v) continue;
+                  centroLocal.x += v.x;
+                  centroLocal.y += v.y;
+                  centroLocal.z += v.z;
+                }
+                if (vertIdx.length > 0) centroLocal.divideScalar(vertIdx.length);
+                else centroLocal.copy(pendienteCtrl.recogido.centroLocal);
+                const meshObjSelAct = findMainMesh(meshGroupRef.current);
+                const centroMundoAct = meshObjSelAct
+                  ? centroLocal.clone().applyMatrix4(meshObjSelAct.matrixWorld)
+                  : centroLocal.clone();
+                // Solo la FLECHA de MOVER infla la copia (normales
+                // suavizadas — todas las caras salen lo mismo); las bolas
+                // de escala siguen escalando la copia.
+                const normalesInfladoAct =
+                  pendienteCtrl.udSel.mode === 'move'
+                    ? resCtrl.normalesPorVert
+                    : undefined;
+                const dragSelAct = makeSelectionGizmoDrag(
+                  pendienteCtrl.udSel,
+                  pendienteCtrl.ray,
+                  pendienteCtrl.camDir,
+                  pendienteCtrl.screenUp,
+                  centroMundoAct,
+                  { vertIdx, centroLocal },
+                  resCtrl.mesh,
+                  pendienteCtrl.quat,
+                  normalesInfladoAct
+                );
+                if (dragSelAct) {
+                  selectionGizmoDragRef.current = dragSelAct;
+                  controls.enabled = false;
+                  renderer.domElement.style.cursor = 'grabbing';
+                  hoverElementRef.current = null;
+                  hoverKeyRef.current = '';
+                }
+              }
+            }
+          }
+        }
         const selDrag = selectionGizmoDragRef.current;
         if (selDrag) {
           raycasterRef.current.setFromCamera(pointerRef.current, camera);
@@ -7568,18 +7940,41 @@ export default function Viewer3D({
                 const dx = p1.x - p0.x;
                 const dy = p1.y - p0.y;
                 const dz = p1.z - p0.z;
+                // Inflado (extrusión con Ctrl, la pidió el usuario 2026-10-11
+                // tras ver en la cápsula que «unas caras salen más afuera
+                // que otras»): cada vértice avanza por SU normal suavizada
+                // con la MISMA profundidad (Blender «Extrude along
+                // Normals»). El signo sigue al gesto del ratón sobre la
+                // línea del eje; la magnitud es la del delta clásico en
+                // local (misma escala del objeto).
+                let sLocal = 0;
+                if (selDrag.normalesPorVert) {
+                  const signo = Math.sign(tc - selDrag.startT);
+                  sLocal = (signo === 0 ? 1 : signo) * Math.hypot(dx, dy, dz);
+                }
                 verts = selDrag.vertOriginales.map((v) => ({ ...v }));
                 for (const idx of selDrag.vertIdx) {
                   const v = verts[idx];
                   if (!v) continue;
-                  v.x += dx;
-                  v.y += dy;
-                  v.z += dz;
+                  const n = selDrag.normalesPorVert?.get(idx);
+                  if (n) {
+                    v.x += n.x * sLocal;
+                    v.y += n.y * sLocal;
+                    v.z += n.z * sLocal;
+                  } else {
+                    v.x += dx;
+                    v.y += dy;
+                    v.z += dz;
+                  }
                 }
               }
             } else {
               // Escala (uniforme con el cubo blanco; por eje con las bolas),
-              // pivotada en el centroide de la selección.
+              // pivotada en el centroide de la selección. Con el gizmo
+              // girado la bola escala a lo largo de SU eje pintado (el eje
+              // MUNDO del gizmo llevado a LOCAL de la malla): sin giro es
+              // el eje X/Y/Z clásico (mismo resultado que la versión por
+              // componentes: (v−c)·ex × ex solo toca la X).
               const hitSel = new THREE.Vector3();
               if (raycasterRef.current.ray.intersectPlane(selDrag.plane, hitSel)) {
                 const delta = hitSel.sub(selDrag.centroMundoStart).dot(selDrag.basisU);
@@ -7587,20 +7982,35 @@ export default function Viewer3D({
                 const cx = selDrag.centroLocal.x;
                 const cy = selDrag.centroLocal.y;
                 const cz = selDrag.centroLocal.z;
-                verts = selDrag.vertOriginales.map((v) => ({ ...v }));
-                for (const idx of selDrag.vertIdx) {
-                  const v = verts[idx];
-                  if (!v) continue;
-                  if (selDrag.mode === 'uniform-scale') {
+                if (selDrag.mode === 'uniform-scale') {
+                  verts = selDrag.vertOriginales.map((v) => ({ ...v }));
+                  for (const idx of selDrag.vertIdx) {
+                    const v = verts[idx];
+                    if (!v) continue;
                     v.x = cx + (v.x - cx) * factor;
                     v.y = cy + (v.y - cy) * factor;
                     v.z = cz + (v.z - cz) * factor;
-                  } else if (selDrag.axis === 'x') {
-                    v.x = cx + (v.x - cx) * factor;
-                  } else if (selDrag.axis === 'y') {
-                    v.y = cy + (v.y - cy) * factor;
-                  } else {
-                    v.z = cz + (v.z - cz) * factor;
+                  }
+                } else {
+                  // Eje pintado del gizmo (mundo) → espacio LOCAL de la
+                  // malla (la dirección vive en el mundo; la malla local
+                  // la recibe por la inversa de matrixWorld, como el delta
+                  // del gesto de mover).
+                  const axisLocalSel = selDrag.axisWorld
+                    .clone()
+                    .transformDirection(invMatrixSel);
+                  verts = selDrag.vertOriginales.map((v) => ({ ...v }));
+                  for (const idx of selDrag.vertIdx) {
+                    const v = verts[idx];
+                    if (!v) continue;
+                    const proj =
+                      (v.x - cx) * axisLocalSel.x +
+                      (v.y - cy) * axisLocalSel.y +
+                      (v.z - cz) * axisLocalSel.z;
+                    const k = proj * (factor - 1);
+                    v.x += axisLocalSel.x * k;
+                    v.y += axisLocalSel.y * k;
+                    v.z += axisLocalSel.z * k;
                   }
                 }
               }
@@ -8099,7 +8509,7 @@ export default function Viewer3D({
         if (selectionGizmoGroupRef.current?.visible) {
           raycasterRef.current.setFromCamera(pointerRef.current, camera);
           const selHoverHandles = raycasterRef.current.intersectObjects(
-            selectionGizmoHandlesRef.current,
+            selectionGizmoHandlesRef.current.filter((h) => h.visible),
             false
           );
           if (selHoverHandles.length > 0) {
@@ -8432,11 +8842,12 @@ export default function Viewer3D({
     };
 
     // Arrastre del gizmo de SUB-SELECCIÓN. mover: delta del rayo sobre la
-    // línea del eje (en MUNDO; ejes siempre alineados al mundo — la
-    // selección es una parte de la malla, no tiene orientación propia).
-    // escalar: plano frontal a la cámara por el centroide, factor = 1 +
-    // desplazamiento en pantalla (mismo criterio que el cubo blanco del
-    // gizmo de objetos), pivotado en el centroide de la selección.
+    // línea del eje (en MUNDO; ejes girados con el giro que el usuario le
+    // puso al gizmo en su modo de configuración — sin giro, alineados al
+    // mundo). escalar: plano frontal a la cámara por el centroide,
+    // factor = 1 + desplazamiento en pantalla (mismo criterio que el cubo
+    // blanco del gizmo de objetos), pivotado en el centroide de la
+    // selección.
     const makeSelectionGizmoDrag = (
       ud: { axis: GizmoAxis; mode: 'move' | 'scale' | 'uniform-scale' },
       ray: THREE.Ray,
@@ -8444,9 +8855,13 @@ export default function Viewer3D({
       screenUp: THREE.Vector3,
       centroMundo: THREE.Vector3,
       recogido: { vertIdx: number[]; centroLocal: THREE.Vector3 },
-      m: Mesh
+      m: Mesh,
+      gizmoQuat?: THREE.Quaternion,
+      normalesPorVert?: Map<number, Vertex3D>
     ): SelectionGizmoDrag | null => {
       if (recogido.vertIdx.length === 0) return null;
+      const ejeGirado = (axis: GizmoAxis): THREE.Vector3 =>
+        GIZMO_AXIS_DIR[axis].clone().applyQuaternion(gizmoQuat ?? new THREE.Quaternion());
       if (ud.mode === 'scale' || ud.mode === 'uniform-scale') {
         const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
           camDir.clone().negate(),
@@ -8454,13 +8869,12 @@ export default function Viewer3D({
         );
         const hit = new THREE.Vector3();
         if (!ray.intersectPlane(plane, hit)) return null;
+        const axisWorld =
+          ud.mode === 'uniform-scale' ? new THREE.Vector3() : ejeGirado(ud.axis);
         return {
           axis: ud.axis,
           mode: ud.mode,
-          axisWorld:
-            ud.mode === 'uniform-scale'
-              ? new THREE.Vector3() // no se usa: escala los 3 ejes
-              : GIZMO_AXIS_DIR[ud.axis].clone(),
+          axisWorld,
           startT: 0,
           centroMundoStart: centroMundo.clone(),
           plane,
@@ -8470,7 +8884,7 @@ export default function Viewer3D({
           centroLocal: recogido.centroLocal.clone(),
         };
       }
-      const axisWorld = GIZMO_AXIS_DIR[ud.axis].clone();
+      const axisWorld = ejeGirado(ud.axis);
       const t0 = closestPointOnAxis(ray, centroMundo, axisWorld);
       if (t0 === null) return null;
       return {
@@ -8484,6 +8898,7 @@ export default function Viewer3D({
         vertOriginales: m.vertices.map((v) => ({ ...v })),
         vertIdx: recogido.vertIdx,
         centroLocal: recogido.centroLocal.clone(),
+        normalesPorVert,
       };
     };
 
@@ -8630,7 +9045,7 @@ export default function Viewer3D({
               -((e.clientY - rect.top) / rect.height) * 2 + 1;
             raycasterRef.current.setFromCamera(pointerRef.current, camera);
             const hitsSel = raycasterRef.current.intersectObjects(
-              selectionGizmoHandlesRef.current,
+              selectionGizmoHandlesRef.current.filter((h) => h.visible),
               false
             );
             const udSel = hitsSel[0]?.object
@@ -8644,6 +9059,7 @@ export default function Viewer3D({
               // MUEVE EL GIZMO de sitio (su offset de mundo), no la
               // selección — igual que el gizmo de objetos. Flecha/bola:
               // sigue su eje; cubo central: libre en el plano de vista.
+              // ARO: GIRA EL GIZMO (su orientación), no la selección.
               if (!selGizmoInteractiveRef.current) {
                 const gizmoGrSel = selectionGizmoGroupRef.current;
                 const gizmoPosSel = gizmoGrSel
@@ -8653,22 +9069,95 @@ export default function Viewer3D({
                   axis?: GizmoAxis;
                   mode?: string;
                 };
+                // El eje REAL del gizmo, tal como está pintado: extraído
+                // de su matriz mundial (con el giro que ya le pusieron).
+                gizmoGrSel?.updateWorldMatrix(true, true);
+                const quatSelGizmo = new THREE.Quaternion();
+                if (gizmoGrSel) {
+                  gizmoGrSel.matrixWorld.decompose(
+                    new THREE.Vector3(),
+                    quatSelGizmo,
+                    new THREE.Vector3()
+                  );
+                }
+                if (udAsaSel.mode === 'rotate' && udAsaSel.axis) {
+                  const axisWorldAro = GIZMO_AXIS_DIR[udAsaSel.axis]
+                    .clone()
+                    .applyQuaternion(quatSelGizmo);
+                  const planeAro = new THREE.Plane().setFromNormalAndCoplanarPoint(
+                    axisWorldAro,
+                    gizmoPosSel
+                  );
+                  const hitAro = new THREE.Vector3();
+                  if (raycasterRef.current.ray.intersectPlane(planeAro, hitAro)) {
+                    let basisUAro = new THREE.Vector3();
+                    if (camera) {
+                      const camDirAro = new THREE.Vector3();
+                      camera.getWorldDirection(camDirAro);
+                      basisUAro = camDirAro.sub(
+                        axisWorldAro.clone().multiplyScalar(camDirAro.dot(axisWorldAro))
+                      );
+                      if (basisUAro.lengthSq() < 1e-6) {
+                        basisUAro =
+                          Math.abs(axisWorldAro.x) < 0.5
+                            ? new THREE.Vector3(1, 0, 0)
+                            : new THREE.Vector3(0, 1, 0);
+                        basisUAro.sub(
+                          axisWorldAro.clone().multiplyScalar(axisWorldAro.dot(basisUAro))
+                        );
+                        if (basisUAro.lengthSq() < 1e-6) {
+                          basisUAro =
+                            Math.abs(axisWorldAro.y) < 0.5
+                              ? new THREE.Vector3(0, 1, 0)
+                              : new THREE.Vector3(0, 0, 1);
+                        }
+                      }
+                    }
+                    basisUAro.normalize();
+                    const basisVAro = new THREE.Vector3().crossVectors(axisWorldAro, basisUAro);
+                    const dAro = hitAro.sub(gizmoPosSel);
+                    selGizmoRotateDragRef.current = {
+                      axis: udAsaSel.axis,
+                      axisWorld: axisWorldAro,
+                      startPos: gizmoPosSel.clone(),
+                      plane: planeAro,
+                      basisU: basisUAro,
+                      basisV: basisVAro,
+                      startAngle: Math.atan2(dAro.dot(basisVAro), dAro.dot(basisUAro)),
+                      sweptAngle: 0,
+                      prevAngle: Math.atan2(dAro.dot(basisVAro), dAro.dot(basisUAro)),
+                      startQuat: quatSelGizmo.clone(),
+                    };
+                  }
+                  controls.enabled = false;
+                  renderer.domElement.style.cursor = 'grabbing';
+                  return;
+                }
                 const ejeSel: GizmoAxis | null =
                   (udAsaSel.mode === 'move' || udAsaSel.mode === 'scale') && udAsaSel.axis
                     ? udAsaSel.axis
                     : null;
+                // El desplazamiento del gizmo en configuración sigue sus
+                // EJES PINTADOS (con el giro que ya tenga), así la flecha
+                // arrastrada es la flecha que se mueve.
                 const camDirSel = new THREE.Vector3();
                 camera.getWorldDirection(camDirSel);
                 selGizmoOffsetDragRef.current = {
                   axis: ejeSel,
-                  axisDir: ejeSel ? GIZMO_AXIS_DIR[ejeSel].clone() : new THREE.Vector3(),
+                  axisDir: ejeSel
+                    ? GIZMO_AXIS_DIR[ejeSel].clone().applyQuaternion(quatSelGizmo)
+                    : new THREE.Vector3(),
                   startPos: gizmoPosSel,
                   plane: new THREE.Plane().setFromNormalAndCoplanarPoint(
                     camDirSel.clone().negate(),
                     gizmoPosSel
                   ),
                   startT: ejeSel
-                    ? (closestPointOnAxis(raycasterRef.current.ray, gizmoPosSel, GIZMO_AXIS_DIR[ejeSel]) ?? 0)
+                    ? (closestPointOnAxis(
+                        raycasterRef.current.ray,
+                        gizmoPosSel,
+                        GIZMO_AXIS_DIR[ejeSel].clone().applyQuaternion(quatSelGizmo)
+                      ) ?? 0)
                     : 0,
                   startOffset: selGizmoOffsetRef.current.clone(),
                 };
@@ -8685,35 +9174,68 @@ export default function Viewer3D({
                 selectedEdgeIdsRef.current
               );
               let mArrastre = mSel;
-              // CTRL AL ESCALAR = EXTRUDIR (estilo Blender): el editor
-              // duplica la selección con sus paredes casi en el sitio; el
-              // arrastre escala la COPIA y los anillos vecinos (arriba/
-              // abajo/lados) no se estiran por los vértices compartidos.
+              // CTRL = EXTRUDIR (estilo Blender) con cualquiera de las
+              // asas: los ejes del gizmo tal como están pintados (con el
+              // giro que le puso el usuario en su modo configuración); sin
+              // giro quedan alineados al mundo.
+              const quatSelGizmoArrastre = new THREE.Quaternion();
+              if (selectionGizmoGroupRef.current) {
+                selectionGizmoGroupRef.current.updateWorldMatrix(true, true);
+                selectionGizmoGroupRef.current.matrixWorld.decompose(
+                  new THREE.Vector3(),
+                  quatSelGizmoArrastre,
+                  new THREE.Vector3()
+                );
+              }
+              // FLECHAS AL ESCALAR: el editor duplica la selección con sus
+              // paredes casi en el sitio; el arrastre escala la COPIA y los
+              // anillos vecinos (arriba/abajo/lados) no se estiran por los
+              // vértices compartidos.
+              // FLECHAS de MOVER con Ctrl: lo mismo — extrude en el PRIMER
+              // movimiento, y el arrastre mueve la COPIA por la flecha
+              // (paredes rectas desde la base; como Blender).
               if (
-                (udSel.mode === 'scale' || udSel.mode === 'uniform-scale') &&
+                (udSel.mode === 'move' ||
+                  udSel.mode === 'scale' ||
+                  udSel.mode === 'uniform-scale') &&
                 e.ctrlKey &&
                 recogidoSel.vertIdx.length > 0
               ) {
-                const resCtrl = onCtrlEscalarSubSelRef.current?.() ?? null;
-                if (resCtrl) {
-                  // Solo los DUPLICADOS de la selección se escalan: los
-                  // vértices originales siguen siendo de las caras vecinas.
-                  const vertIdx = recogidoSel.vertIdx
-                    .map((idx) => resCtrl.vmap.get(idx))
-                    .filter((idx): idx is number => idx !== undefined);
-                  let centroLocal = new THREE.Vector3();
-                  for (const idx of vertIdx) {
-                    const v = resCtrl.mesh.vertices[idx];
-                    if (!v) continue;
-                    centroLocal.x += v.x;
-                    centroLocal.y += v.y;
-                    centroLocal.z += v.z;
-                  }
-                  if (vertIdx.length > 0) centroLocal.divideScalar(vertIdx.length);
-                  else centroLocal.copy(recogidoSel.centroLocal);
-                  recogidoSel = { vertIdx, centroLocal };
-                  mArrastre = resCtrl.mesh;
-                }
+                // PENDIENTE de activación: pulsar NO hornea nada (la copia
+                // con sus paredes ni siquiera existe todavía). El primer
+                // movimiento real del gesto (>4 px) llama al editor en
+                // onPointerMove; un Ctrl+clic sin arrastre —típico para
+                // AÑADIR caras a la selección pasando sobre la asa— queda
+                // en nada, como pidió el usuario 2026-10-11.
+                ctrlExtrudirPendienteRef.current = {
+                  udSel: {
+                    axis: udSel.axis as GizmoAxis,
+                    mode: udSel.mode as SelectionGizmoDrag['mode'],
+                  },
+                  ray: raycasterRef.current.ray.clone(),
+                  camDir: (() => {
+                    const d = new THREE.Vector3();
+                    camera.getWorldDirection(d);
+                    return d;
+                  })(),
+                  screenUp: camera.up
+                    .clone()
+                    .applyQuaternion(camera.quaternion)
+                    .normalize(),
+                  quat: quatSelGizmoArrastre.clone(),
+                  recogido: {
+                    vertIdx: recogidoSel.vertIdx.slice(),
+                    centroLocal: recogidoSel.centroLocal.clone(),
+                  },
+                  x: e.clientX,
+                  y: e.clientY,
+                };
+                controls.enabled = false;
+                renderer.domElement.style.cursor = 'grabbing';
+                // El resaltado de hover se apaga al arrastrar.
+                hoverElementRef.current = null;
+                hoverKeyRef.current = '';
+                return;
               }
               const centroMundo = recogidoSel.centroLocal
                 .clone()
@@ -8724,6 +9246,9 @@ export default function Viewer3D({
                 .clone()
                 .applyQuaternion(camera.quaternion)
                 .normalize();
+              // Gesto clásico (sin Ctrl): mover/escalar los vértices de la
+              // selección tal cual. La extrusión con Ctrl nace en
+              // onPointerMove con la copia del editor.
               const dragSel = makeSelectionGizmoDrag(
                 udSel as { axis: GizmoAxis; mode: SelectionGizmoDrag['mode'] },
                 raycasterRef.current.ray,
@@ -8731,7 +9256,8 @@ export default function Viewer3D({
                 screenUpSel,
                 centroMundo,
                 recogidoSel,
-                mArrastre
+                mArrastre,
+                quatSelGizmoArrastre
               );
               if (dragSel) {
                 selectionGizmoDragRef.current = dragSel;
@@ -8972,11 +9498,12 @@ export default function Viewer3D({
               if (targetDir === 'cara') {
                 const prev = selectedFaceIdsRef.current ?? [];
                 // Modo anillos: el clic elige el ANILLO completo que el
-                // hover ya señala; sin anillos, el grupo de coplanares.
-                const faceGroup =
-                  elegido.anillos && elegido.anillos.length > 0
-                    ? elegido.anillos
-                    : getFaceGroup(mDir!, elegido.id as number);
+                // hover ya señala; sin anillos, la cara lógica completa.
+                const faceGroup = carasElementoCara(
+                  mDir!,
+                  elegido.id as number,
+                  elegido.anillos
+                );
                 const yaEstaba = faceGroup.some(f => prev.includes(f));
                 const nuevos = toggle
                   ? yaEstaba
@@ -9713,19 +10240,23 @@ export default function Viewer3D({
                   const prev = selectedFaceIdsRef.current ?? [];
                   // Quitar lo mismo que el hover señala: la cara del grupo
                   // coplanar, o el ANILLO entero si el modo está activo.
-                  const grupoQuitar = faceAnillosRef.current
-                    ? pickSubElemento(
-                        mClic,
-                        meshObjClic,
-                        camera,
-                        e.clientX,
-                        e.clientY,
-                        rectClic,
-                        'cara',
-                        faceSelectVisibleOnlyRef.current,
-                        true
-                      )?.anillos ?? getFaceGroup(mClic, mejorIdx)
-                    : [mejorIdx];
+                  const grupoQuitar = carasElementoCara(
+                    mClic,
+                    mejorIdx,
+                    faceAnillosRef.current
+                      ? pickSubElemento(
+                          mClic,
+                          meshObjClic,
+                          camera,
+                          e.clientX,
+                          e.clientY,
+                          rectClic,
+                          'cara',
+                          faceSelectVisibleOnlyRef.current,
+                          true
+                        )?.anillos
+                      : null
+                  );
                   if (prev.includes(mejorIdx)) {
                     const nuevos = prev.filter((f) => !grupoQuitar.includes(f));
                     onFaceSelectionChangeRef.current?.(nuevos);
@@ -9742,6 +10273,13 @@ export default function Viewer3D({
         }
 
         // --- Gizmo de sub-selección (modo configuración): soltar ---------
+        // Aro: el giro ya se fue notificando; nada más que limpiar.
+        if (selGizmoRotateDragRef.current) {
+          selGizmoRotateDragRef.current = null;
+          controls.enabled = true;
+          renderer.domElement.style.cursor = '';
+          return;
+        }
         if (selGizmoOffsetDragRef.current) {
           // Emisión final: el último pointermove pudo quedar sin emitir.
           onSelGizmoOffsetChangeRef.current?.({
@@ -9756,6 +10294,13 @@ export default function Viewer3D({
         }
 
         // --- Gizmo de sub-selección: soltar -------------------------------
+        // La extrusión con Ctrl que nunca arrancó (clic sin arrastre)
+        // caduca aquí: no hornea nada y la cámara recibe sus controles.
+        if (ctrlExtrudirPendienteRef.current) {
+          ctrlExtrudirPendienteRef.current = null;
+          controls.enabled = true;
+          renderer.domElement.style.cursor = '';
+        }
         if (selectionGizmoDragRef.current) {
           // Emisión final: el último frame pudo quedar throttled.
           const selDrag = selectionGizmoDragRef.current;
@@ -10143,11 +10688,17 @@ export default function Viewer3D({
           }
           if (clicSimple && mejorIdx >= 0) selected.push(mejorIdx);
 
-          // Expand selection to coplanar face groups
+          // Expandir a caras LÓGICAS completas (celda pareada o casquete
+          // coplanar del abanico): el BFS coplanar por índice en mallas .zeus
+          // trianguladas no junta nada (media cara) y en cuadranguladas
+          // sueldas engancha franjas de caras distintas del cilindro.
+          const datosArea = construirAnillos(m);
           const expandedSelected = new Set<number>();
           for (const f of selected) {
-            if (!expandedSelected.has(f)) {
-              getFaceGroup(m, f).forEach((gf) => expandedSelected.add(gf));
+            if (datosArea) {
+              caraLogicaDe(m, datosArea, f).forEach((gf) => expandedSelected.add(gf));
+            } else {
+              expandedSelected.add(f);
             }
           }
           const expandedArray = Array.from(expandedSelected);
@@ -10159,7 +10710,12 @@ export default function Viewer3D({
           // que no vuelven a estar dentro salen de la selección sola.
           let newFaceIds: number[];
           if (clicSimple && !modificada) {
-            newFaceIds = mejorIdx >= 0 ? getFaceGroup(m, mejorIdx) : [];
+            newFaceIds =
+              mejorIdx >= 0 && datosArea
+                ? caraLogicaDe(m, datosArea, mejorIdx)
+                : mejorIdx >= 0
+                  ? [mejorIdx]
+                  : [];
           } else if (esMayus) {
             // Mayús+clic: QUITA las caras nuevas de la selección (los que
             // ya no vuelven a estar dentro salen; el resto se conserva).
@@ -13480,16 +14036,22 @@ uniform vec3 sombraFocoPos[8];`
   // Color de las asas del gizmo de la SUB-selección: gris en su modo
   // configuración (como el gizmo de objetos) y colores por eje el resto.
   // Las asas «hit» (userData sin originalColor) son invisibles: fuera.
+  // Los AROS de rotación SOLO se ven en el modo configuración: ahí giran
+  // la orientación del gizmo (no la selección). Fuera de él, ocultos.
   useEffect(() => {
     for (const h of selectionGizmoHandlesRef.current) {
-      const ud = h.userData as { originalColor?: number };
+      const ud = h.userData as { originalColor?: number; mode?: string };
       const mat = h.material as THREE.MeshBasicMaterial;
+      if (ud.mode === 'rotate') {
+        h.visible = !selGizmoInteractive;
+        continue;
+      }
       if (!mat || !mat.color || ud.originalColor === undefined) continue;
       mat.color.setHex(
         selGizmoColorOverride !== undefined ? selGizmoColorOverride : ud.originalColor
       );
     }
-  }, [selGizmoColorOverride, faceSelectMode]);
+  }, [selGizmoColorOverride, selGizmoInteractive, faceSelectMode]);
 
   // Captura el texto 3D como PNG con fondo transparente (solo la malla).
   // Si el suavizado está activo, la captura usa una COPIA suavizada de la
