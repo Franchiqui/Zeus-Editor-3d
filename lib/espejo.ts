@@ -1,3 +1,4 @@
+import * as THREE from 'three';
 import type { Mesh, Vertex3D } from '@/lib/geometry';
 
 /**
@@ -46,4 +47,94 @@ export function espejarMesh(mesh: Mesh, eje: EjeEspejo): Mesh {
     );
   }
   return { ...mesh, vertices, faces, uvs };
+}
+
+/**
+ * ESPEJO EN MUNDO para el modo «Crear objeto nuevo»: refleja la malla
+ * según el eje de la VISTA (el del mundo, no el del objeto inclinado), de
+ * modo que la pieza salga como un reflejo de verdad — un cubo inclinado
+ * 45° sale inclinado −45°, no con la misma inclinación. (El espejo LOCAL
+ * de `espejarMesh` sobre un objeto girado voltea en su eje propio: en
+ * piezas simétricas produce la MISMA figura y parece una copia.)
+ *
+ * Receta: sube cada vértice a mundo con la transformada del objeto
+ * (misma regla que el visor: T·R·S, euler XYZ en radianes), refleja el
+ * componente del eje respecto al CENTRO de la caja MUNDIAL (la pieza no
+ * salta de sitio) y hornea el resultado con un transform NUEVO: pivote en
+ * ese centro y rotación a cero — la inclinación original queda HORNEADA
+ * dentro de la malla reflejada, y el gemelo se mueve/gira/escala desde
+ * su propio centro (pivote limpio, rotación a 0).
+ *
+ * Las caras se recorren al revés (la reflexión invierte el winding) y
+ * las UV se dejan CLAVADAS a sus vértices: con un eje de reflexión que
+ * no coincide con ninguno local, la textura debe reflejarse pegada a la
+ * superficie (como un espejo real), no en un eje de mapeo.
+ */
+export type TransformEspejo = {
+  px?: number; py?: number; pz?: number;
+  rx?: number; ry?: number; rz?: number;
+  sx?: number; sy?: number; sz?: number;
+};
+
+export type EspejoMundoResultado = {
+  mesh: Mesh;
+  transform: TransformEspejo;
+};
+
+export function espejarObjetoMundo(
+  mesh: Mesh,
+  transform: TransformEspejo | undefined,
+  eje: EjeEspejo
+): EspejoMundoResultado {
+  if (mesh.vertices.length === 0) {
+    return { mesh: { ...mesh }, transform: { ...(transform ?? {}) } };
+  }
+  const p = new THREE.Vector3(
+    transform?.px ?? 0, transform?.py ?? 0, transform?.pz ?? 0
+  );
+  const quat = new THREE.Quaternion().setFromEuler(
+    new THREE.Euler(transform?.rx ?? 0, transform?.ry ?? 0, transform?.rz ?? 0)
+  );
+  const s = new THREE.Vector3(
+    transform?.sx ?? 1, transform?.sy ?? 1, transform?.sz ?? 1
+  );
+  // 1) Vértices a mundo.
+  const mundo = mesh.vertices.map(
+    (v) =>
+      new THREE.Vector3(v.x * s.x, v.y * s.y, v.z * s.z)
+        .applyQuaternion(quat)
+        .add(p)
+  );
+  // 2) Centro de la caja MUNDIAL (los 3 ejes: será el pivote del gemelo).
+  let minX = Infinity; let minY = Infinity; let minZ = Infinity;
+  let maxX = -Infinity; let maxY = -Infinity; let maxZ = -Infinity;
+  for (const w of mundo) {
+    if (w.x < minX) minX = w.x;
+    if (w.y < minY) minY = w.y;
+    if (w.z < minZ) minZ = w.z;
+    if (w.x > maxX) maxX = w.x;
+    if (w.y > maxY) maxY = w.y;
+    if (w.z > maxZ) maxZ = w.z;
+  }
+  const centro = new THREE.Vector3(
+    (minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2
+  );
+  // 3) Reflejo en mundo (eje de la vista) y pivote en el centro.
+  const vertices: Vertex3D[] = mundo.map((w) => {
+    const m = w.clone();
+    m[eje] = 2 * centro[eje] - m[eje];
+    m.sub(centro);
+    return { x: m.x, y: m.y, z: m.z };
+  });
+  const faces: number[][] = mesh.faces.map((f) =>
+    f.length >= 3 ? [...f].reverse() : [...f]
+  );
+  return {
+    mesh: { ...mesh, vertices, faces },
+    transform: {
+      px: centro.x, py: centro.y, pz: centro.z,
+      rx: 0, ry: 0, rz: 0,
+      sx: 1, sy: 1, sz: 1,
+    },
+  };
 }

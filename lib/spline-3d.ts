@@ -19,7 +19,8 @@ import {
  * retuerza en las inflexiones.
  */
 
-type V3 = { x: number; y: number; z: number };
+/** Vector 3D propio de este módulo (posiciones/tangentes/anillos en mundo). */
+export type V3 = { x: number; y: number; z: number };
 
 /** Vértice del trazado 3D: posición en MUNDO (no el lienzo 0..1 de Extruir). */
 export type SplineNode3D = {
@@ -37,6 +38,16 @@ export type SplineNode3D = {
   escala?: number;
   /** Plantilla (0..1, la y hacia abajo, igual que las plantillas de Extruir). */
   polygon?: Polygon;
+  /**
+   * Alineación MUNDIAL de esta plantilla — la ventana en la que se calcó
+   * (⤢ Extrusión spline con destino spline). `right`/`up` son los ejes de
+   * pantalla de ESA ventana en el mundo (unitarios), `rx`/`ry` son el mapa
+   * del lienzo 0..1 al mundo RELATIVO a la escala del vértice (1 = lienzo
+   * cuadrado). Con él, la plantilla sale EXACTAMENTE como se dibujó en esa
+   * ventana en vez de torcerse con el marco transportado del trazado.
+   * Falta = comportamiento de siempre (marco RMF).
+   */
+  baseMundo?: { right: V3; up: V3; rx: number; ry: number };
 };
 
 export type SplineDatos = {
@@ -351,20 +362,36 @@ export type SplineOptions = {
   orientacion?: 'transporte' | 'radial';
 };
 
-/**
- * Construye la malla de un trazado spline 3D: cada vértice lleva su
- * plantilla (perpendicular al trazado, interpolada entre vértices) y las
- * anillas se cosen en una sola malla con tapas planas en los extremos.
- */
-export function buildSpline3DMesh(
+/** Preparación común de la malla y de los contornos por vértice. */
+type Preparo = {
+  util: SplineNode3D[];
+  closed: boolean;
+  /** Plantillas remuestreadas (una anilla por vértice). */
+  rings: Point2D[][];
+  ringCount: number;
+  muestras: { pos: V3; seg: number; t: number }[];
+  tangentes: V3[];
+  normales: V3[];
+  /** Giro TOTAL de cada vértice alrededor del trazado (radianes): el tilt
+      manual + el φ automático de baseMundo (ver prepararSpline). */
+  rolls: number[];
+  escalas: number[];
+  /** Factores anisótropos del lienzo→mundo (baseMundo.rx/ry; 1 = cuadrado). */
+  facX: number[];
+  facY: number[];
+  /** Muestras por segmento: el cruce del vértice j queda en j·steps
+      (en trazado abierto el último vértice es la muestra final). */
+  steps: number;
+};
+
+function prepararSpline(
   nodes: SplineNode3D[],
-  options: SplineOptions = {}
-): Mesh {
-  const empty: Mesh = { vertices: [], faces: [] };
+  options: SplineOptions
+): Preparo | null {
   const util: SplineNode3D[] = nodes.filter(
     (n) => vfinito(n.p) && (n.esquina || (n.polygon ?? []).length >= 3)
   );
-  if (util.length < 2) return empty;
+  if (util.length < 2) return null;
 
   const closed = !!options.closed;
   const esc = options.escala && options.escala > 0 ? options.escala : 0.5;
@@ -377,14 +404,14 @@ export function buildSpline3DMesh(
   });
   let densa = 0;
   for (const f of flats) densa = Math.max(densa, f.length);
-  if (flats.some((f) => f.length < 3)) return empty;
+  if (flats.some((f) => f.length < 3)) return null;
   const ringCount = Math.max(16, Math.min(96, densa));
   const rings: Point2D[][] = flats.map((f) => resampleClosed(f, ringCount));
 
   // Muestreo del trazado (con los toques del vértice en esquina).
   const subdivisions = Math.max(1, Math.min(64, Math.round(options.subdivisions ?? 5)));
   const muestras = muestrearSpline(util, closed, subdivisions);
-  if (muestras.length < 2) return empty;
+  if (muestras.length < 2) return null;
 
   // Protección de rendimiento: recorta subdivisiones si la malla va a ser
   // gigante (la vista previa se regenera en vivo durante el arrastre).
@@ -410,59 +437,195 @@ export function buildSpline3DMesh(
     options.orientacion === 'radial'
       ? frenet(tangentes)
       : transportadores(tangentes);
+
   const tilts = util.map((n) => ((n.tilt ?? 0) * Math.PI) / 180);
   // Escala de plantilla por vértice (0.01..8): la del nodo si la trae,
   // si no la de los datos (compatibilidad con .zeus anteriores).
-  const escalas = util.map((n) =>
-    n.escala && n.escala > 0 ? Math.max(0.01, Math.min(8, n.escala)) : esc
+  const escalas = util.map(
+    (n) => (n.escala && n.escala > 0 ? Math.max(0.01, Math.min(8, n.escala)) : esc)
   );
 
+  // ALINEACIÓN A LA VENTANA DE LA CAPTURA (baseMundo). Giro TOTAL de cada
+  // vértice = tilt manual + φ automático: φ rota el marco EN SU PROPIO
+  // plano para que el eje-x de la plantilla salga mirando al «right» de la
+  // ventana donde se calcó (con el trazado ⟂ a esa ventana — el uso
+  // normal: plantilla de Superior, camino por Frente — sale EXACTO:
+  // plantilla-x → right de la ventana y plantilla-y → −up). Rotar en el
+  // propio plano NO toca el radio: vale también para 'radial'. Sin un
+  // baseMundo válido, todo queda idéntico a antes (compatibilidad .zeus).
+  const rolls = tilts.slice();
+  const facX: number[] = util.map(() => 1);
+  const facY: number[] = util.map(() => 1);
+  if (util.some((n) => n.baseMundo)) {
+    // Proyección de un eje de ventana sobre el plano ⟂ de la tangente.
+    const proyecta = (v: V3, t: V3): { d: V3; largo: number } => {
+      const p = vsub(v, vmul(t, vdot(v, t)));
+      return { d: vnorm(p), largo: Math.hypot(p.x, p.y, p.z) };
+    };
+    for (let j = 0; j < util.length; j++) {
+      const base = util[j].baseMundo;
+      if (!base) continue;
+      if (
+        !vfinito(base.right) ||
+        !vfinito(base.up) ||
+        Math.hypot(base.right.x, base.right.y, base.right.z) < 1e-9 ||
+        Math.hypot(base.up.x, base.up.y, base.up.z) < 1e-9
+      )
+        continue;
+      facX[j] = Math.max(0.01, Math.min(32, base.rx > 0 ? base.rx : 1));
+      facY[j] = Math.max(0.01, Math.min(32, base.ry > 0 ? base.ry : 1));
+      const idx = !closed && j === util.length - 1 ? total - 1 : j * steps;
+      const t = tangentes[idx];
+      const n1 = normales[idx];
+      const b1 = vcross(n1, t);
+      const dR = proyecta(base.right, t);
+      const dU = proyecta(base.up, t);
+      let d: V3 | null = null;
+      let ejeY = false;
+      if (dR.largo >= 0.05) {
+        // Normal: el eje-x de la plantilla mira al «right» de la ventana.
+        d = dR.d;
+      } else if (dU.largo >= 0.05) {
+        // Camino DEGENERADO: el trazado corre hacia el eje-x (‖ right), la
+        // proyección muere y algún eje se sacrifica sí o sí (un giro de 90°
+        // es inevitable en esa esquina). Mejor candidato: mantener el eje-y
+        // de la plantilla mirando al «up» de la ventana — así la VERTICAL
+        // del dibujo sigue leyéndose bien («arriba» arriba).
+        d = dU.d;
+        ejeY = true;
+      }
+      if (!d) continue;
+      // φ que pone el eje pedido mirando a d — la misma rotación que sufre
+      // el (lx, ly) de la plantilla en el mapeo: plantilla-x → (cosφ, sinφ)
+      // y plantilla-y → (−sinφ, cosφ) en (N, B).
+      rolls[j] = tilts[j]
+        + (ejeY
+          ? Math.atan2(-vdot(d, n1), vdot(d, b1))
+          : Math.atan2(vdot(d, b1), vdot(n1, d)));
+    }
+  }
+
+  return {
+    util,
+    closed,
+    rings,
+    ringCount,
+    muestras: muestrasFinal,
+    tangentes,
+    normales,
+    rolls,
+    escalas,
+    facX,
+    facY,
+    steps,
+  };
+}
+
+/**
+ * Anillo (V3 en mundo) de UNA muestra preparada: plantilla interpolada
+ * entre vértices, giro interpolado, mapa al plano (N, B) del marco.
+ */
+function anilloDeMuestra(prep: Preparo, i: number): V3[] {
+  const m = prep.muestras[i];
+  const j = m.seg;
+  const j2 = (j + 1) % prep.util.length;
+  const ringA = prep.rings[j];
+  const ringB = prep.rings[j2];
+  // Plantilla interpolada (deformación progresiva entre vértices).
+  const prof: Point2D[] = [];
+  for (let k = 0; k < prep.ringCount; k++) {
+    const a = ringA[k];
+    const b = ringB[k];
+    prof.push({ x: a.x + (b.x - a.x) * m.t, y: a.y + (b.y - a.y) * m.t });
+  }
+  const c = centroid(prof);
+  const esc = prep.escalas[j] + (prep.escalas[j2] - prep.escalas[j]) * m.t;
+  const fX = prep.facX[j] + (prep.facX[j2] - prep.facX[j]) * m.t;
+  const fY = prep.facY[j] + (prep.facY[j2] - prep.facY[j]) * m.t;
+  const t1 = prep.tangentes[i];
+  const n1 = prep.normales[i];
+  const b1 = vcross(n1, t1);
+  const roll = prep.rolls[j] + (prep.rolls[j2] - prep.rolls[j]) * m.t;
+  const cos = Math.cos(roll);
+  const sin = Math.sin(roll);
+  const ux = UNIT * esc * fX;
+  const uy = UNIT * esc * fY;
+  const anillo: V3[] = [];
+  for (let k = 0; k < prep.ringCount; k++) {
+    const lx = (prof[k].x - c.x) * ux;
+    const ly = (prof[k].y - c.y) * uy;
+    const a2 = lx * cos - ly * sin;
+    const b2 = lx * sin + ly * cos;
+    anillo.push(vadd(m.pos, vadd(vmul(n1, a2), vmul(b1, b2))));
+  }
+  return anillo;
+}
+
+/** Todos los anillos del barrido (uno por muestra). */
+function anillosDelBarrido(prep: Preparo): V3[][] {
+  const salida: V3[][] = [];
+  for (let i = 0; i < prep.muestras.length; i++) {
+    salida.push(anilloDeMuestra(prep, i));
+  }
+  return salida;
+}
+
+/**
+ * Anillo de plantilla de cada VÉRTICE en el mundo — la forma dibujada en
+ * ese punto. Con baseMundo el anillo cae alineado a la ventana de la
+ * captura: es el MISMO mapeo de la malla, así lo que se ve contorneado es
+ * lo que sale al aplicar.
+ */
+export function contornosDeVertices(
+  nodes: SplineNode3D[],
+  options: SplineOptions = {}
+): V3[][] {
+  const prep = prepararSpline(nodes, options);
+  if (!prep) return [];
+  const ultima = prep.util.length - 1;
+  const salida: V3[][] = [];
+  for (let j = 0; j <= ultima; j++) {
+    // El cruce del vértice j: t=0 del segmento que lo empieza (en abierto,
+    // el último vértice es la muestra final). En cerrado, el índice j·steps
+    // cae igualmente entre los anillos de la malla.
+    const idx =
+      !prep.closed && j === ultima ? prep.muestras.length - 1 : j * prep.steps;
+    salida.push(anilloDeMuestra(prep, idx));
+  }
+  return salida;
+}
+
+/**
+ * Construye la malla de un trazado spline 3D: cada vértice lleva su
+ * plantilla (perpendicular al trazado, interpolada entre vértices) y las
+ * anillas se cosen en una sola malla con tapas planas en los extremos.
+ */
+export function buildSpline3DMesh(
+  nodes: SplineNode3D[],
+  options: SplineOptions = {}
+): Mesh {
+  const empty: Mesh = { vertices: [], faces: [] };
+  const prep = prepararSpline(nodes, options);
+  if (!prep) return empty;
+
+  const total = prep.muestras.length;
   const vertices: Vertex3D[] = [];
   const anillas: number[][] = [];
   for (let i = 0; i < total; i++) {
-    const m = muestrasFinal[i];
-    const ringA = rings[m.seg];
-    const ringB = rings[(m.seg + 1) % util.length];
-    const tiltA = tilts[m.seg];
-    const tiltB = tilts[(m.seg + 1) % util.length];
-    const tilt = tiltA + (tiltB - tiltA) * m.t;
-
-    // Plantilla interpolada (deformación progresiva entre vértices).
-    const prof: Point2D[] = [];
-    for (let k = 0; k < ringCount; k++) {
-      const a = ringA[k];
-      const b = ringB[k];
-      prof.push({ x: a.x + (b.x - a.x) * m.t, y: a.y + (b.y - a.y) * m.t });
-    }
-    const c = centroid(prof);
-
-    // Escala por vértice: la propia del nodo A (su falta = la global) se
-    // funde con la del B a lo largo del segmento.
-    const escA = escalas[m.seg];
-    const escB = escalas[(m.seg + 1) % util.length];
-    const esc = escA + (escB - escA) * m.t;
-
-    // Marco local: N viaja por la tangente; la plantilla se apoya en (N, B)
-    // con B = N×T (para un trazado plano en XY reproduce el marco de
-    // Extruir: plantilla en la pantalla Frontal).
-    const t1 = tangentes[i];
-    const n1 = normales[i];
-    const b1 = vcross(n1, t1);
-    const cos = Math.cos(tilt);
-    const sin = Math.sin(tilt);
-
     const ids: number[] = [];
-    for (let k = 0; k < ringCount; k++) {
-      const lx = (prof[k].x - c.x) * UNIT * esc;
-      const ly = (prof[k].y - c.y) * UNIT * esc;
-      const a = lx * cos - ly * sin;
-      const b = lx * sin + ly * cos;
-      const p = vadd(m.pos, vadd(vmul(n1, a), vmul(b1, b)));
+    for (const p of anilloDeMuestra(prep, i)) {
       vertices.push({ x: p.x, y: p.y, z: p.z });
       ids.push(vertices.length - 1);
     }
     anillas.push(ids);
   }
+
+  // Aliases del bloque de cosido y tapas (el mismo vocabulario de siempre).
+  const ringCount = prep.ringCount;
+  const closed = prep.closed;
+  const muestrasFinal = prep.muestras;
+  const tangentes = prep.tangentes;
+  const normales = prep.normales;
 
   const faces: number[][] = [];
   const stitch = (aIds: number[], bIds: number[], eje: V3) => {
@@ -634,6 +797,35 @@ export function validarSplineDatos(raw: unknown): SplineDatos | undefined {
         poly.push(punto);
       }
       if (poly.length >= 3) node.polygon = poly;
+    }
+    // Alineación mundial de la plantilla (la ventana donde se calcó con ⤢):
+    // right/up se renormalizan; si alguno está podrido, se tira TODO el
+    // anclaje (mejor el marco de siempre que un marco roto).
+    if (o.baseMundo && typeof o.baseMundo === 'object') {
+      const b = o.baseMundo as Record<string, unknown>;
+      const v3 = (v: unknown): V3 | null => {
+        if (!v || typeof v !== 'object') return null;
+        const w = v as Record<string, unknown>;
+        const vx = puntoNum(w.x);
+        const vy = puntoNum(w.y);
+        const vz = puntoNum(w.z);
+        if (vx === null || vy === null || vz === null) return null;
+        const p = { x: vx, y: vy, z: vz };
+        if (Math.hypot(p.x, p.y, p.z) < 1e-9) return null;
+        return vnorm(p);
+      };
+      const right = v3(b.right);
+      const up = v3(b.up);
+      const rxN = puntoNum(b.rx);
+      const ryN = puntoNum(b.ry);
+      if (right && up && rxN !== null && ryN !== null && rxN > 0 && ryN > 0) {
+        node.baseMundo = {
+          right,
+          up,
+          rx: Math.max(0.01, Math.min(32, rxN)),
+          ry: Math.max(0.01, Math.min(32, ryN)),
+        };
+      }
     }
     nodes.push(node);
   }

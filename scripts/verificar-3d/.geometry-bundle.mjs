@@ -750,74 +750,7 @@ function construirAnillos(mesh) {
       else bordeAFaces.set(key, [i]);
     }
   }
-  return { faceACelda, celdas, bordeAFaces, canonDe, canonPos };
-}
-function bordesAnilloDe(malla, bordeCanon, claseBloqueo) {
-  let celda0 = -1;
-  for (const f of malla.bordeAFaces.get(bordeCanon) || []) {
-    const c = malla.faceACelda[f];
-    if (c >= 0 && malla.celdas[c].clases[claseBloqueo].includes(bordeCanon)) {
-      celda0 = c;
-      break;
-    }
-  }
-  if (celda0 < 0) return null;
-  const celdas = malla.celdas;
-  const visitadas = /* @__PURE__ */ new Set([celda0]);
-  const bordes = /* @__PURE__ */ new Set([bordeCanon]);
-  const cola = [
-    { celda: celda0, clase: claseBloqueo }
-  ];
-  while (cola.length > 0) {
-    const { celda, clase } = cola.pop();
-    const celdaAct = celdas[celda];
-    for (const borde of celdaAct.clases[clase]) bordes.add(borde);
-    for (const borde of celdaAct.bordes) {
-      if (celdaAct.clases[clase].includes(borde)) continue;
-      const faces = malla.bordeAFaces.get(borde) || [];
-      for (const f of faces) {
-        const tc = malla.faceACelda[f];
-        if (tc === celda) continue;
-        if (tc >= 0 && !visitadas.has(tc)) {
-          visitadas.add(tc);
-          const c2 = celdas[tc];
-          cola.push({
-            celda: tc,
-            // La clase bloqueada de la celda vecina es la opuesta al borde
-            // de entrada (mismo criterio que `carasAnilloDe`).
-            clase: c2.clases[0].includes(borde) ? 1 : 0
-          });
-        }
-      }
-    }
-  }
-  const vecinos = /* @__PURE__ */ new Map();
-  for (const borde of bordes) {
-    const [p, q] = borde.split("-").map(Number);
-    const lp = vecinos.get(p);
-    if (lp) lp.push(borde);
-    else vecinos.set(p, [borde]);
-    const lq = vecinos.get(q);
-    if (lq) lq.push(borde);
-    else vecinos.set(q, [borde]);
-  }
-  const cadena = [];
-  const visitadosB = /* @__PURE__ */ new Set([bordeCanon]);
-  const pila = [bordeCanon];
-  while (pila.length > 0) {
-    const b = pila.pop();
-    cadena.push(b);
-    const [p, q] = b.split("-").map(Number);
-    for (const pu of [p, q]) {
-      for (const nb of vecinos.get(pu) || []) {
-        if (!visitadosB.has(nb)) {
-          visitadosB.add(nb);
-          pila.push(nb);
-        }
-      }
-    }
-  }
-  return cadena.length > 1 ? cadena.sort() : null;
+  return { faceACelda, celdas, bordeAFaces, canonPos };
 }
 function carasAnilloDe(malla, faceIdx, claseBloqueo) {
   const celda0 = malla.faceACelda[faceIdx];
@@ -867,94 +800,6 @@ function extremosBordeAnillo(malla, borde) {
   const B = malla.canonPos[qa];
   if (!A || !B) return null;
   return [A, B];
-}
-var normalCaraAnillo = (mesh, fi) => {
-  const face = mesh.faces[fi];
-  if (!face || face.length < 3) return null;
-  const a = mesh.vertices[face[0]];
-  const b = mesh.vertices[face[1]];
-  const c = mesh.vertices[face[2]];
-  if (!a || !b || !c) return null;
-  const u = { x: b.x - a.x, y: b.y - a.y, z: b.z - a.z };
-  const w = { x: c.x - a.x, y: c.y - a.y, z: c.z - a.z };
-  const n = {
-    x: u.y * w.z - u.z * w.y,
-    y: u.z * w.x - u.x * w.z,
-    z: u.x * w.y - u.y * w.x
-  };
-  const len = Math.hypot(n.x, n.y, n.z) || 1;
-  return { x: n.x / len, y: n.y / len, z: n.z / len };
-};
-function casqueteCoplanarDe(mesh, malla, faceIdx) {
-  if (malla.faceACelda[faceIdx] >= 0) return [faceIdx];
-  const normal0 = normalCaraAnillo(mesh, faceIdx);
-  if (!normal0) return [faceIdx];
-  const grupo = /* @__PURE__ */ new Set([faceIdx]);
-  const cola = [faceIdx];
-  while (cola.length > 0) {
-    const fi = cola.pop();
-    const face = mesh.faces[fi];
-    if (!face || face.length < 3) continue;
-    const canon = face.map((v) => malla.canonDe[v]);
-    if (canon.some((v) => v < 0)) continue;
-    for (let j = 0; j < canon.length; j++) {
-      const key = claveBordeAnillo(canon[j], canon[(j + 1) % canon.length]);
-      for (const f of malla.bordeAFaces.get(key) || []) {
-        if (grupo.has(f)) continue;
-        if (malla.faceACelda[f] >= 0) continue;
-        const normal0b = normalCaraAnillo(mesh, f);
-        if (!normal0b) continue;
-        const dot = normal0.x * normal0b.x + normal0.y * normal0b.y + normal0.z * normal0b.z;
-        if (dot > 0.99) {
-          grupo.add(f);
-          cola.push(f);
-        }
-      }
-    }
-  }
-  return Array.from(grupo).sort((a, b) => a - b);
-}
-function caraLogicaDe(mesh, malla, faceIdx) {
-  const celda0 = malla.faceACelda[faceIdx];
-  if (celda0 < 0) return casqueteAbanicoDe(mesh, malla, faceIdx);
-  const celda = malla.celdas[celda0];
-  return celda && celda.tris.length > 0 ? [...celda.tris] : [faceIdx];
-}
-function esAbanicoCerrado(mesh, malla, tris) {
-  if (tris.length < 2) return false;
-  const cnt = /* @__PURE__ */ new Map();
-  for (const fi of tris) {
-    const face = mesh.faces[fi];
-    if (!face || face.length !== 3) return false;
-    const canon = new Set(face.map((v) => malla.canonDe[v]));
-    if (canon.has(-1) || canon.size !== 3) return false;
-    for (const v of canon) cnt.set(v, (cnt.get(v) || 0) + 1);
-  }
-  let apex = null;
-  for (const [v, c] of cnt) {
-    if (c === tris.length) {
-      if (apex !== null) return false;
-      apex = v;
-    } else if (c !== 2) {
-      return false;
-    }
-  }
-  return apex !== null;
-}
-function casqueteAbanicoDe(mesh, malla, faceIdx) {
-  if (malla.faceACelda[faceIdx] >= 0) return [faceIdx];
-  const casquete = casqueteCoplanarDe(mesh, malla, faceIdx);
-  if (casquete.length <= 1) return casquete;
-  if (!esAbanicoCerrado(mesh, malla, casquete)) return [faceIdx];
-  const n0 = normalCaraAnillo(mesh, casquete[0]);
-  if (!n0) return [faceIdx];
-  for (const fi of casquete) {
-    const n = normalCaraAnillo(mesh, fi);
-    if (!n) return [faceIdx];
-    const dot = n0.x * n.x + n0.y * n.y + n0.z * n.z;
-    if (dot <= 0.999) return [faceIdx];
-  }
-  return casquete;
 }
 function meshToTriangles(mesh) {
   const faces = [];
@@ -1170,15 +1015,10 @@ export {
   GRID_SIZE,
   HIGH_FIDELITY_RES,
   VOXEL_COUNT,
-  bordesAnilloDe,
   buildLatheMesh,
-  caraLogicaDe,
   carasAnilloDe,
-  casqueteAbanicoDe,
-  casqueteCoplanarDe,
   closestEdgeHit,
   construirAnillos,
-  esAbanicoCerrado,
   estamparGrupoTextura,
   extremosBordeAnillo,
   flattenPolygon,

@@ -1,7 +1,8 @@
 import type { Mesh, ObjectTransform, Vertex3D } from './geometry';
 import type { EffectKeyframe, EffectProperty, EffectTrack, TransformProperty, TransformTrack } from './animation';
+import type { PrimitiveParams } from './primitivas-parametricas';
 import type { ZeiaApplyResult, ZeiaAppliedPlan, ZeiaPlanStep } from './zeia';
-import { buildPrimitiveMesh, fallbackMesh, normalizePrimitiveName, primitiveIsSmooth, type ZeiaPrimitiveName } from './zeia-primitives';
+import { buildPrimitiveMesh, buildPrimitiveFromParams, fallbackMesh, legacyPrimitiveParams, normalizePrimitiveName, primitiveIsSmooth, type ZeiaPrimitiveName } from './zeia-primitives';
 
 /**
  * Puente ZEIA -> escena del EDITOR 3D (lógica pura).
@@ -23,6 +24,8 @@ export type ZeiaSceneObject = {
   transform: ObjectTransform;
   mesh: Mesh;
   smooth?: boolean;
+  /** Params paramétricos si la malla salió de una primitiva reconocida: activa el panel de propiedades del editor. */
+  primitiveParams?: PrimitiveParams;
   [k: string]: unknown;
 };
 
@@ -69,6 +72,45 @@ function triple(t: unknown, fallback: [number, number, number]): [number, number
   return fallback;
 }
 
+/** Claves de medida que puede soltar el modelo/planner -> canon interno. */
+const DIM_ALIASES: Record<string, string> = {
+  radius: 'radio', radio: 'radio', r: 'radio',
+  diameter: 'diametro', diametro: 'diametro',
+  height: 'altura', altura: 'altura', h: 'altura', length: 'altura', largo: 'altura',
+  width: 'ancho', ancho: 'ancho', w: 'ancho',
+  depth: 'profundo', profundidad: 'profundo', prof: 'profundo', d: 'profundo', profundo: 'profundo',
+  alto: 'alto',
+  innerRadius: 'radioInterno', radioInterno: 'radioInterno', inner: 'radioInterno',
+  outerRadius: 'radioExterno', radioExterno: 'radioExterno', outer: 'radioExterno',
+  thickness: 'grosor', grosor: 'grosor', espesor: 'grosor',
+  size: 'size', tamano: 'size', tamaño: 'size', escala: 'size',
+  segments: 'segmentos', segmentos: 'segmentos', sides: 'segmentos', lados: 'segmentos',
+  sectors: 'sectores', sectores: 'sectores',
+  turns: 'vueltas', vueltas: 'vueltas', loops: 'vueltas',
+  pitch: 'separacion', separacion: 'separacion', separación: 'separacion',
+};
+
+/**
+ * Extrae las medidas que el modelo haya soltado en cualquier parte de los
+ * params (`radius`, `radio`, `height`, ...). Devuelve claves CANÓNICAS
+ * (`radio`, `altura`, ...) con valores numéricos finitos. `diametro` se
+ * convierte a `radio` (mitad) si no hay `radio` explícito.
+ */
+export function extractDims(src: Record<string, unknown>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [key, raw] of Object.entries(src)) {
+    const canon = DIM_ALIASES[key];
+    if (!canon || canon === 'diametro') continue;
+    if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) continue;
+    if (out[canon] === undefined) out[canon] = raw;
+  }
+  const diam = src.diameter ?? src.diametro;
+  if (out.radio === undefined && typeof diam === 'number' && Number.isFinite(diam) && diam >= 0) {
+    out.radio = diam / 2;
+  }
+  return out;
+}
+
 /** Transformada del editor a partir del `transform` de un paso ZEIA (rotación en grados). */
 function transformFromParams(params: Record<string, unknown>): ObjectTransform {
   const t = (params.transform && typeof params.transform === 'object' ? params.transform : {}) as Record<string, unknown>;
@@ -100,23 +142,34 @@ function objectName(params: Record<string, unknown>): string {
 function buildObject<T extends ZeiaSceneObject>(id: string, params: Record<string, unknown>): T {
   const prim = resolvePrimitiveName(params);
   const primName = prim?.toString() ?? params.primitive ?? primitiveFromGeometry(params.geometry) ?? null;
-  const primitiveMesh = buildPrimitiveMesh(primName) ?? fallbackMesh();
+  // Con medidas del modelo (radius/height/...) se delega en las primitivas
+  // paramétricas del editor; sin medidas, los builders artesanales de
+  // siempre (geometría bit-idéntica a la histórica). Cualquier cosa no
+  // reconocida cae en el cubo de reserva, igual que antes.
+  const dims = extractDims(params);
+  const fromParams = primName !== null ? buildPrimitiveFromParams(primName, dims) : null;
+  const primitiveMesh = fromParams?.mesh ?? buildPrimitiveMesh(primName) ?? fallbackMesh();
   // Si se proporcionó una malla explícita (execute.mesh), usarla en lugar
   // de generar una primitiva: así los objetos guardados con geometría real
   // (p. ej. Taza.txt) se crean con su malla original, no con un cubo de reserva.
-  const mesh: Mesh =
-    params.mesh && typeof params.mesh === 'object' && !Array.isArray(params.mesh)
-      ? (params.mesh as Mesh)
-      : primitiveMesh;
+  const meshExplicit = params.mesh && typeof params.mesh === 'object' && !Array.isArray(params.mesh) ? (params.mesh as Mesh) : null;
+  const mesh: Mesh = meshExplicit ?? primitiveMesh;
   // Luces/cámaras: usamos una esfera (marcador) si no son una primitiva conocida.
   const meshFinal = params.type === 'light' || params.type === 'camera' ? buildPrimitiveMesh('sphere') ?? mesh : mesh;
   const smooth = primitiveIsSmooth(prim);
+  // Panel de propiedades: params EXACTOS si la malla salió de las primitivas
+  // paramétricas (regenerar daría la misma malla); estimados para las
+  // artesanales sin medidas. Sin panel si la malla fue explícita (execute.mesh).
+  const primitiveParams: PrimitiveParams | undefined = meshExplicit
+    ? undefined
+    : (fromParams?.params ?? (primName !== null ? legacyPrimitiveParams(primName) : undefined)) ?? undefined;
   const obj: ZeiaSceneObject = {
     id,
     name: objectName(params),
     transform: transformFromParams(params),
     mesh: meshFinal,
     smooth,
+    ...(primitiveParams ? { primitiveParams } : {}),
     // Propiedades de textura/acabado/opacity pasadas desde execute.
     ...extractTextureProps(params),
   };
@@ -374,6 +427,9 @@ function shapeAlias(prim: string | null | undefined): string | null {
   if (n === 'bell' || n === 'teardrop' || n === 'drop') return 'cone';
   if (n === 'pyramid' || n === 'tetrahedron') return 'pyramid';
   if (n === 'torus' || n === 'donut') return 'torus';
+  if (n === 'plate' || n === 'plato' || n === 'bandeja' || n === 'tray') return 'disc';
+  if (n === 'pipe' || n === 'tuberia' || n === 'tubería' || n === 'cañeria' || n === 'tubo') return 'tube';
+  if (n === 'coil' || n === 'resorte' || n === 'resolte') return 'spring';
   return null;
 }
 
@@ -430,20 +486,16 @@ function normalizeCreateParams(execute: Record<string, unknown>): Record<string,
     Object.assign(transform, execute.transform as Record<string, unknown>);
   }
 
-  // Extraer transform del primer shape de un geometry compound si no se especificó en nivel superior
+  // Compound: pasar TODAS las shapes como `parts` (el caso objects.create
+  // las expande a un objeto del editor por cada una). Antes solo la primera
+  // forma se usaba y el resto se descartaba ("muñeco" -> una bola sola).
   if (execute.geometry && typeof execute.geometry === 'object') {
     const g = execute.geometry as Record<string, unknown>;
-    if (g.type === 'compound' && Array.isArray(g.shapes)) {
-      const firstShape = g.shapes[0] as Record<string, unknown> | undefined;
-      if (firstShape) {
-        if (firstShape.position && !transform.position) transform.position = firstShape.position;
-        if (firstShape.rotation && !transform.rotation) transform.rotation = firstShape.rotation;
-        if (firstShape.scale && !transform.scale) transform.scale = firstShape.scale;
-        if (!params.name && typeof firstShape.type === 'string') {
-          const prim = normalizePrimitiveName(firstShape.type);
-          if (prim) params.name = capitalize(prim);
-        }
-      }
+    if (g.type === 'compound' && Array.isArray(g.shapes) && g.shapes.length > 0) {
+      const shapes = g.shapes.filter(
+        (s): s is Record<string, unknown> => Boolean(s) && typeof s === 'object' && !Array.isArray(s)
+      );
+      if (shapes.length > 0) params.parts = shapes;
     }
   }
 
@@ -463,6 +515,11 @@ function normalizeCreateParams(execute: Record<string, unknown>): Record<string,
    for (const key of ['texture', 'textureColor', 'textureRelief', 'textureRepeat', 'textureRepeatY', 'textureFinish', 'texturePanela', 'textureHelper', 'textureHelperTransform', 'opacity']) {
      if (key in execute && execute[key] !== undefined) (params as Record<string, unknown>)[key] = execute[key];
    }
+
+   // Medidas del modelo (radius/radio/height/...): pasarlas tal cual para
+   // que buildObject las honre (extractDims las vuelve a leer). Sin esto,
+   // normalizeCreateParams las descartaba y todo caía en su tamaño fijo.
+   Object.assign(params, extractDims(execute));
 
    return params;
 }
@@ -780,6 +837,75 @@ export function applyZeiaPlansToScene<T extends ZeiaSceneObject>(
 
       switch (action) {
         case 'objects.create': {
+          // Los pasos crudos de ZEIA pueden traer el compound sin normalizar;
+          // pasan por normalizeCreateParams para obtener sus `parts`.
+          let pCreate = params;
+          if (
+            !Array.isArray((params as Record<string, unknown>).parts) &&
+            (params as Record<string, unknown>).geometry &&
+            typeof (params as Record<string, unknown>).geometry === 'object' &&
+            !Array.isArray((params as Record<string, unknown>).geometry) &&
+            typeof ((params as Record<string, unknown>).geometry as Record<string, unknown>).type === 'string' &&
+            (((params as Record<string, unknown>).geometry as Record<string, unknown>).type as string).toLowerCase() === 'compound'
+          ) {
+            pCreate = normalizeCreateParams(params);
+          }
+          const parts = Array.isArray((pCreate as Record<string, unknown>).parts)
+            ? ((pCreate as Record<string, unknown>).parts as unknown[]).filter(
+                (s): s is Record<string, unknown> => Boolean(s) && typeof s === 'object' && !Array.isArray(s)
+              )
+            : null;
+
+          if (parts && parts.length > 0) {
+            // Compound: un objeto del editor por cada shape, con sus
+            // transforms COMPUESTAS sobre la del padre (offset escalado por
+            // la escala del padre, rotación sumada, escala multiplicada).
+            const base = transformFromParams(pCreate);
+            const baseName =
+              typeof pCreate.name === 'string' && pCreate.name.trim() ? (pCreate.name as string).trim() : null;
+            const dimsBase = extractDims(pCreate);
+            let firstId: string | null = null;
+            for (let i = 0; i < parts.length; i++) {
+              const nP = normalizeCreateParams(parts[i]);
+              const t = transformFromParams(nP);
+              const comp: ObjectTransform = {
+                px: base.px + t.px * base.sx,
+                py: base.py + t.py * base.sy,
+                pz: base.pz + t.pz * base.sz,
+                rx: base.rx + t.rx,
+                ry: base.ry + t.ry,
+                rz: base.rz + t.rz,
+                sx: base.sx * t.sx,
+                sy: base.sy * t.sy,
+                sz: base.sz * t.sz,
+              };
+              const dims = { ...dimsBase, ...extractDims(parts[i]) };
+              const nombre =
+                baseName !== null
+                  ? parts.length > 1
+                    ? `${baseName} ${i + 1}`
+                    : baseName
+                  : typeof nP.name === 'string' && nP.name.trim()
+                    ? nP.name
+                    : 'Objeto';
+              const editorId = makeId('obj');
+              const creado = buildObject<T>(editorId, { ...nP, ...dims, name: nombre });
+              objs = [...objs, { ...creado, transform: comp } as T];
+              if (firstId === null) firstId = editorId;
+              created++;
+              applied++;
+            }
+            lastCreatedId = firstId;
+            if (firstId) {
+              if (typeof res.object_id === 'string') idMap[res.object_id] = firstId;
+              if (typeof params.id === 'string') idMap[params.id] = firstId;
+              if (baseName) idMap[baseName] = firstId;
+            }
+            if (pCreate.type === 'light') warnOnce('ZEIA creó una luz; el editor la representa como una malla (sin iluminación real).');
+            if (pCreate.type === 'camera') warnOnce('ZEIA creó una cámara; el editor la representa como una malla.');
+            break;
+          }
+
           const editorId = makeId('obj');
           objs = [...objs, buildObject<T>(editorId, params)];
           lastCreatedId = editorId;

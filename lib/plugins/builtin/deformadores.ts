@@ -1,5 +1,5 @@
 import type { Mesh, Vertex3D } from '@/lib/geometry';
-import type { ZeusPlugin, PluginParams } from '../types';
+import type { ZeusPlugin, PluginParams, PluginParam } from '../types';
 
 /**
  * Deformadores integrados: los equivalentes libres de los modificadores
@@ -58,6 +58,35 @@ const ejeDe = (params: PluginParams, id: string, porDefecto: Eje): Eje => {
 };
 
 /**
+ * GUÍA (dónde empieza/centra la deformación): el slider `guia` es % de la
+ * caja a lo largo del eje. Con 0 (el default) devuelve null y cada
+ * deformador usa su ancla de siempre (el borde min de la caja) — un
+ * guia:0 explícito reproduce EXACTO el comportamiento histórico y los
+ * .zeus/pistas viejos sin la clave no cambian ni con el relleno de
+ * defaults. Con 1..100 devuelve la coordenada local del guía.
+ */
+const guiaDe = (mesh: Mesh, params: PluginParams, eje: Eje): number | null => {
+  const g = num(params, 'guia', 0);
+  if (g <= 0) return null;
+  const c = caja(mesh, eje);
+  return c.min + (g / 100) * (c.max - c.min);
+};
+
+/** Slider común de la GUÍA en los deformadores con eje posicional. */
+const paramGuia: PluginParam = {
+  tipo: 'slider',
+  id: 'guia',
+  etiqueta: 'Guía',
+  min: 0,
+  max: 100,
+  paso: 1,
+  valor: 0,
+  unidad: '%',
+  descripcion:
+    'Dónde empieza/centra la deformación a lo largo del eje: 0 = donde empezaba de siempre (la base de la caja), 50 = el centro, 100 = el otro extremo. También se arrastra la guía naranja en la ventana 3D.',
+};
+
+/**
  * Doblar (como el modificador Bend, en versión «abanico»): el eje
  * elegido se curva en un arco de radio constante. El ángulo es el giro
  * TOTAL entre la base y la cima del objeto. Con suficiente segmentación
@@ -105,6 +134,7 @@ const doblar: ZeusPlugin = {
       opciones: EJES,
       valor: 'y',
     },
+    paramGuia,
   ],
   aplicar(mesh, params) {
     const anguloDeg = num(params, 'angulo', 45);
@@ -118,6 +148,9 @@ const doblar: ZeusPlugin = {
     const [e1] = ejesTransversales(eje);
     const extent = cajaEje.max - cajaEje.min;
     const diametroPct = num(params, 'diametro', 0);
+    // GUÍA: el arco se ANCLA donde esté la guía (la parte de debajo queda
+    // recta: phi >= 0). Sin guía (0): el borde min de la caja, como siempre.
+    const ancla = guiaDe(mesh, params, eje) ?? cajaEje.min;
     // Radio AUTOMÁTICO: R = L/θ (el arco gasta la longitud exacta —
     // sin estirar). Manual (diámetro, % de la longitud L): R = D%·L/200.
     //
@@ -140,22 +173,27 @@ const doblar: ZeusPlugin = {
     const centroTransversal = caja(mesh, e1).centro;
 
     const vertices = mesh.vertices.map((v) => {
-      // s: avance del vértice por el arco desde la base (0 abajo), ya
-      // reescalado por k; d: separación respecto al eje de curvatura en
-      // el eje transversal — se vuelve RADIAL (radio R − d: los puntos
-      // de +e1 quedan más cerca del centro del arco).
-      const s = (leerEje(v, eje) - cajaEje.min) * k;
+      // s: avance del vértice por el arco desde el ANCLA (la guía o la
+      // base), ya reescalado por k; d: separación respecto al eje de
+      // curvatura en el eje transversal — se vuelve RADIAL (radio R − d:
+      // los puntos de +e1 quedan más cerca del centro del arco).
+      const s = (leerEje(v, eje) - ancla) * k;
       const d = leerEje(v, e1) - centroTransversal;
-      const phi = s / R;
-      // Arco de curvatura con la BASE FIJA: la cruz de la base no se
-      // mueve; el objeto se alza como un abanico curvándose hacia +e1.
-      // d2/h2: punto (d, s) envuelto en el círculo de radio R cuyo
-      // centro queda al nivel de la base, a distancia R hacia +e1.
+      // Arco de curvatura con la BASE FIJA en el ancla: la cruz del ancla
+      // no se mueve; el objeto se alza como un abanico curvándose hacia
+      // +e1. d2/h2: punto (d, s) envuelto en el círculo de radio R cuyo
+      // centro queda al nivel del ancla, a distancia R hacia +e1.
       const radial = R - d;
+      const phi = Math.max(0, s / R);
       const d2 = R - radial * Math.cos(phi);
       const h2 = radial * Math.sin(phi);
-      let nuevo = conEje(v, eje, cajaEje.min + h2);
-      nuevo = conEje(nuevo, e1, centroTransversal + d2);
+      // Por DEBAJO del guía la pieza queda RECTA (sin arco hacia atrás):
+      // sigue en su sitio, avanzando s (escalada por k como arriba). El
+      // ancla en sí queda clavada (s = 0 → posición íntegra).
+      const porDebajo = s <= 0;
+      const d2Salida = porDebajo ? d : d2;
+      let nuevo = conEje(v, eje, porDebajo ? ancla + s : ancla + h2);
+      nuevo = conEje(nuevo, e1, centroTransversal + d2Salida);
       return nuevo;
     });
 
@@ -190,6 +228,7 @@ const torcionar: ZeusPlugin = {
       opciones: EJES,
       valor: 'y',
     },
+    paramGuia,
   ],
   aplicar(mesh, params) {
     const anguloDeg = num(params, 'angulo', 90);
@@ -203,11 +242,15 @@ const torcionar: ZeusPlugin = {
     const [e1, e2] = ejesTransversales(eje);
     const c1 = caja(mesh, e1).centro;
     const c2 = caja(mesh, e2).centro;
+    // GUÍA: giro CERO donde esté la guía, creciendo hacia los DOS lados
+    // (la guía es el centro del giro). Sin guía (0): el borde min.
+    const ancla = guiaDe(mesh, params, eje) ?? cajaEje.min;
 
     const vertices = mesh.vertices.map((v) => {
-      // 0..1 según la altura del vértice en el eje de giro
+      // 0..1 según la altura del vértice en el eje de giro (negativa por
+      // debajo del guía: gira al lado contrario, giro cero EN el guía)
       const t =
-        (leerEje(v, eje) - cajaEje.min) / (cajaEje.max - cajaEje.min);
+        (leerEje(v, eje) - ancla) / (cajaEje.max - cajaEje.min);
       const phi = theta * t;
       const cos = Math.cos(phi);
       const sin = Math.sin(phi);
@@ -259,6 +302,7 @@ const afilar: ZeusPlugin = {
       opciones: EJES,
       valor: 'y',
     },
+    paramGuia,
   ],
   aplicar(mesh, params) {
     const fInicio = num(params, 'escalaInicio', 100) / 100;
@@ -270,11 +314,16 @@ const afilar: ZeusPlugin = {
     const [e1, e2] = ejesTransversales(eje);
     const c1 = caja(mesh, e1).centro;
     const c2 = caja(mesh, e2).centro;
+    // GUÍA: por DEBAJO del guía la pieza va constante a escalaInicio y
+    // AFILAR EMPIEZA ahí (llega a escalaFin a un largo de caja del guía).
+    // Sin guía (0): perfil lineal de siempre entre los dos bordes.
+    const ancla = guiaDe(mesh, params, eje) ?? cajaEje.min;
 
     const vertices = mesh.vertices.map((v) => {
       const t =
-        (leerEje(v, eje) - cajaEje.min) / (cajaEje.max - cajaEje.min);
-      const f = fInicio + (fFin - fInicio) * t;
+        (leerEje(v, eje) - ancla) / (cajaEje.max - cajaEje.min);
+      const f =
+        t <= 0 ? fInicio : fInicio + (fFin - fInicio) * Math.min(t, 1);
       let nuevo = conEje(v, e1, c1 + (leerEje(v, e1) - c1) * f);
       nuevo = conEje(nuevo, e2, c2 + (leerEje(v, e2) - c2) * f);
       return nuevo;

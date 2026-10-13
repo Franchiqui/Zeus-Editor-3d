@@ -100,7 +100,8 @@ import type {
      DeformadorTrack,
 } from '@/lib/animation';
 import { obtenerPlugin, type PluginParams } from '@/lib/plugins';
-import { muestrearSpline, type SplineEdicion, type SplineNode3D } from '@/lib/spline-3d';
+import { muestrearSpline, type SplineEdicion, type SplineNode3D, type V3 } from '@/lib/spline-3d';
+import type { CapturaExtrusionMeta } from '@/lib/extrusion-spline';
 import { useI18n } from '@/lib/i18n';
 import { smoothVoxelMesh } from '@/lib/mesh-smooth';
 import { Slider } from '@/components/ui/slider';
@@ -368,6 +369,13 @@ interface Viewer3DProps {
    configObjectId?: string | null;
    /** Malla del dueño de la configuración (para su copia en la escena) */
    configMesh?: Mesh;
+   /**
+    * Captura para «Extrusión spline»: número > 0 = hay petición pendiente
+    * (cambia en cada pulsación del botón de la cabecera de la ventana).
+    */
+   solicitudCapturaExtrusion?: number;
+   /** Entrega la captura de ESTA ventana (PNG + metadatos del plano). */
+   onCapturaExtrusion?: (meta: CapturaExtrusionMeta) => void;
    /** Objeto cortador en modo boolean preview: se muestra transparente */
    booleanToolObjectId?: string | null;
    /** Fuerza re-render del objects-loop (preview boolean, etc.) */
@@ -430,12 +438,24 @@ interface Viewer3DProps {
       /** Cage SIN lavado gris (pistas de deformador animadas: el objeto
        *  se ve normal, solo lleva el contorno alrededor). */
       soloContorno?: boolean;
+      /** GUÍA de deformación (naranja, arrastrable): eje y % de la caja
+       *  (0 = base). Ausente = el deformador no la lleva (sin eje). */
+      guia?: { eje: 'x' | 'y' | 'z'; pct: number } | null;
     } | null;
+    /** El asa de la GUÍA del deformador se movió: % nuevo del eje (0-100). */
+    onDeformGuiaChange?: (pct: number) => void;
     /** Trazado SPLINE 3D en edición (botón Spline del editor): línea del
      *  camino + marcadores de vértice arrastrables en las ventanas planas. */
     splineEdicion?: SplineEdicion | null;
     /** Malla EN VIVO del trazado spline: vista previa translúcida. */
     splinePreview?: Mesh | null;
+    /** La malla translúcida de la vista previa del spline se muestra SÍ/NO
+     *  (desactivable en el panel del spline; la línea cian y los vértices
+     *  siguen siempre). */
+    splinePreviewVisible?: boolean;
+    /** Contornos (en mundo) de la plantilla de cada vértice del spline —
+        se dibujan en naranja SOLO mientras el balón azul está visible. */
+    splineContornos?: V3[][] | null;
     /** Solo capturar lo visible (caras frontales, no lo que está detrás) */
     faceSelectVisibleOnly?: boolean;
     /** Al incrementarse, apaga la vista de alambre (fin del ciclo de textura por caras) */
@@ -921,6 +941,61 @@ function restaurarGrises(raiz: THREE.Object3D): void {
       delete matU.userData.__ovApariencia;
     }
   });
+}
+
+/** MODO ALAMBRE en los DUPLICADOS de escena: el mismo estilo de la malla
+ *  principal (aristas + fantasma translúcido) aunque el objeto NO esté
+ *  seleccionado. Las aristas salen de las CARAS LÓGICAS de la malla (no de
+ *  los triángulos del abanico: una cara cuadrilátera mostraría su diagonal,
+ *  que no existe como arista de la pieza) — mismo procedimiento que
+ *  `aristasDeMallaLogica`. El LineSegments vive DENTRO del grupo del
+ *  duplicado y hereda su transformada. */
+function aplicarAlambreADuplicado(
+  visual: THREE.Object3D,
+  mesh: Mesh | null | undefined
+): void {
+  visual.traverse((o) => {
+    if (!(o instanceof THREE.Mesh)) return;
+    if (o.material) disposeMaterial(o.material);
+    o.material = new THREE.MeshStandardMaterial({
+      color: 0x9db4c8,
+      metalness: 0.1,
+      roughness: 0.6,
+      transparent: true,
+      opacity: 0.12,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      envMapIntensity: 0,
+    });
+  });
+  if (!mesh || !Array.isArray(mesh.faces) || !Array.isArray(mesh.vertices)) return;
+  const vistas = new Set<string>();
+  const puntos: number[] = [];
+  for (const cara of mesh.faces) {
+    if (cara.length < 2) continue;
+    for (let i = 0; i < cara.length; i++) {
+      const va = mesh.vertices[cara[i]];
+      const vb = mesh.vertices[cara[(i + 1) % cara.length]];
+      if (!va) continue;
+      // Duplicado por POSICIÓN: caras contiguas comparten vértices con
+      // índices distintos (malla no indexada) y la arista sale una vez.
+      const llave = `${Math.round(va.x * 1e5)}|${Math.round(va.y * 1e5)}|${Math.round(va.z * 1e5)}>${Math.round(vb.x * 1e5)}|${Math.round(vb.y * 1e5)}|${Math.round(vb.z * 1e5)}`;
+      const llaveInversa = llave.split('>').reverse().join('>');
+      if (vistas.has(llave) || vistas.has(llaveInversa)) continue;
+      vistas.add(llave);
+      if (!vb) continue;
+      puntos.push(va.x, va.y, va.z, vb.x, vb.y, vb.z);
+    }
+  }
+  if (puntos.length === 0) return;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(puntos, 3));
+  const aristas = new THREE.LineSegments(
+    geo,
+    new THREE.LineBasicMaterial({ color: 0x8fb0cc, transparent: true, opacity: 0.9 })
+  );
+  aristas.userData.aristasAlambreDuplicado = true;
+  visual.add(aristas);
 }
 
 /** ARISTAS NEGRAS del modo de vista «gris con aristas»: un LineSegments
@@ -1543,12 +1618,18 @@ export function buildSnapshotObjectVisual(
     const e2 = new THREE.Vector3(v2.x - v0.x, v2.y - v0.y, v2.z - v0.z);
     const n = e1.cross(e2).normalize();
     const col = hex ? new THREE.Color(hex) : null;
-    for (const idx of face) {
-      const v = mesh.vertices[idx];
-      if (!v) continue;
-      positions.push(v.x, v.y, v.z);
-      normals.push(n.x, n.y, n.z);
-      if (col) colorAttr.push(col.r, col.g, col.b);
+    // El buffer NO indexado se lee de 3 en 3: una cara cuadrilátera (mallas
+    // paramétricas del chat) debe ventilarse en abanico — si se vuelcan sus
+    // 4 vértices seguidos, el 4.º se empareja con los 2 primeros de la cara
+    // SIGUIENTE y todas las caras salen cruzadas en triángulos «origami».
+    for (let j = 1; j + 1 < face.length; j++) {
+      for (const idx of [face[0], face[j], face[j + 1]]) {
+        const v = mesh.vertices[idx];
+        if (!v) continue;
+        positions.push(v.x, v.y, v.z);
+        normals.push(n.x, n.y, n.z);
+        if (col) colorAttr.push(col.r, col.g, col.b);
+      }
     }
   }
   if (positions.length === 0) return group;
@@ -3613,6 +3694,8 @@ export default function Viewer3D({
    selectedObjectId,
    configObjectId,
    configMesh,
+   solicitudCapturaExtrusion = 0,
+   onCapturaExtrusion,
    booleanToolObjectId = null,
    forceObjectsUpdate = 0,
     configSmooth,
@@ -3630,8 +3713,11 @@ export default function Viewer3D({
     faceSelectionTarget,
     anillosCaras,
     deformadorActivo,
+    onDeformGuiaChange,
     splineEdicion = null,
     splinePreview = null,
+    splinePreviewVisible = true,
+    splineContornos = null,
     faceSelectVisibleOnly,
     wireframeOffSignal,
     vistaModo,
@@ -3925,6 +4011,7 @@ export default function Viewer3D({
       group: THREE.Group;
       line: THREE.Line;
       markers: THREE.Group;
+      contornos: THREE.LineSegments;
     } | null>(null);
     // Arrastre activo de un marcador del trazado: plano orto de la ventana
     // (fijo en el eje que la vista no ve) + vértice arrastrado.
@@ -3990,6 +4077,21 @@ export default function Viewer3D({
     // meshGroup: sigue el transform del objeto). renderOrder 992:
     // sobrevive al lavado gris y al modo plano de las ventanas 2D.
     const deformContornoRef = useRef<THREE.Group | null>(null);
+    // GUÍA naranja arrastrable del deformador (dónde empieza la
+    // deformación: % del eje); hija de meshGroup.
+    const deformGuiaRef = useRef<THREE.Group | null>(null);
+    const deformGuiaDragRef = useRef<
+      | {
+          eje: 'x' | 'y' | 'z';
+          cajaMin: number;
+          cajaExt: number;
+          /** Punto LOCAL por donde corre el eje (centros transversales). */
+          puntoLocal: THREE.Vector3;
+        }
+      | null
+    >(null);
+    const onDeformGuiaChangeRef = useRef(onDeformGuiaChange);
+    onDeformGuiaChangeRef.current = onDeformGuiaChange;
     // Espejo de showLightHelpers para el bucle animate (ocultar/restaurar
     // los ayudantes de luz durante la exportación de vídeo).
     const showLightHelpersRef = useRef(showLightHelpers);
@@ -5470,10 +5572,27 @@ export default function Viewer3D({
       splinePreviewMesh.renderOrder = 990;
       splinePreviewMesh.raycast = () => {};
       splineOverlayGroup.add(splinePreviewMesh);
+      // Contornos NARANJAS de la plantilla de cada vértice (cuando la
+      // vista previa está activa): un LineSegments con los pares de cada
+      // anillo — distinto del azul del balón y del cian del camino.
+      const splineContornosLine = new THREE.LineSegments(
+        new THREE.BufferGeometry(),
+        new THREE.LineBasicMaterial({
+          color: 0xff9300,
+          transparent: true,
+          opacity: 0.95,
+          depthTest: false,
+          depthWrite: false,
+        })
+      );
+      splineContornosLine.renderOrder = 999;
+      splineContornosLine.raycast = () => {};
+      splineOverlayGroup.add(splineContornosLine);
       splineOverlayRef.current = {
         group: splineOverlayGroup,
         line: splineLine,
         markers: splineMarkers,
+        contornos: splineContornosLine,
       };
 
       const meshGroup = new THREE.Group();
@@ -5532,6 +5651,12 @@ export default function Viewer3D({
     deformContornoGroup.visible = false;
     meshGroup.add(deformContornoGroup);
     deformContornoRef.current = deformContornoGroup;
+
+    // GUÍA del deformador (naranja): hijo de meshGroup (sigue al objeto).
+    const deformGuiaGroup = new THREE.Group();
+    deformGuiaGroup.visible = false;
+    meshGroup.add(deformGuiaGroup);
+    deformGuiaRef.current = deformGuiaGroup;
 
     const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
     planeRef.current = plane;
@@ -7708,6 +7833,55 @@ export default function Viewer3D({
        pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
        pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 
+      // GUÍA del deformador: arrastre a lo largo del eje. El rayo del
+      // ratón busca el punto más cercano a la LÍNEA del eje del
+      // deformador (en mundo, con el transform del meshGroup); el % sale
+      // de la coordenada local del punto hallado (mundo → local con la
+      // inversa de matrixWorld). Funciona en orto (2D) y perspectiva.
+      if (deformGuiaDragRef.current) {
+        const drag = deformGuiaDragRef.current;
+        const raiz = meshGroupRef.current;
+        if (raiz) {
+          raiz.updateMatrixWorld(true);
+          raycasterRef.current.setFromCamera(pointerRef.current, camera);
+          // Eje del deformador EN MUNDO: punto por donde corre + dirección.
+          const a = drag.puntoLocal.clone().applyMatrix4(raiz.matrixWorld);
+          const dirLocal = new THREE.Vector3(
+            drag.eje === 'x' ? 1 : 0,
+            drag.eje === 'y' ? 1 : 0,
+            drag.eje === 'z' ? 1 : 0
+          )
+            .applyQuaternion(
+              new THREE.Quaternion().setFromRotationMatrix(raiz.matrixWorld)
+            )
+            .normalize();
+          // Punto más cercano del rayo del ratón a esa línea: sistema de
+          // dos ecuaciones con los productos punto (B=d·u, D=d·w, E=u·w).
+          const d = raycasterRef.current.ray.direction.clone();
+          const w0 = raycasterRef.current.ray.origin.clone().sub(a);
+          const B = d.dot(dirLocal);
+          const D = d.dot(w0);
+          const E = dirLocal.dot(w0);
+          const denom = 1 - B * B;
+          if (Math.abs(denom) > 1e-9) {
+            // t: avance sobre la LÍNEA del eje (no del rayo) — s no se
+            // usa, sólo interesa dónde aterrizar en el eje.
+            const t = (E - B * D) / denom;
+            const pMundo = a.clone().add(dirLocal.clone().multiplyScalar(t));
+            const inv = new THREE.Matrix4().copy(raiz.matrixWorld).invert();
+            const pLocal = pMundo.applyMatrix4(inv);
+            const coord =
+              drag.eje === 'x' ? pLocal.x : drag.eje === 'y' ? pLocal.y : pLocal.z;
+            const pct = ((coord - drag.cajaMin) / drag.cajaExt) * 100;
+            const pctRedondo = Math.round(
+              Math.max(0, Math.min(100, pct)) * 10
+            ) / 10;
+            onDeformGuiaChangeRef.current?.(pctRedondo);
+          }
+        }
+        return;
+      }
+
       // SPLINE 3D: arrastre de un marcador del trazado. Solo toca los dos
       // ejes de la ventana; el eje ausente queda fijo (su valor actual).
       if (splineDragRef.current) {
@@ -8962,6 +9136,71 @@ export default function Viewer3D({
       return p;
     };
 
+    // ─── GUÍA del deformador: arranque del arrastre del asa naranja ────
+    // Caja de la malla base SIN deformar (la manda el editor; igual que
+    // la cage: deducida de la malla si falta), en rangos por eje.
+    const cajaRangosDeformador = (): Record<
+      'x' | 'y' | 'z',
+      [number, number]
+    > | null => {
+      const cajaIn = deformadorActivoRef.current?.caja;
+      const base = meshRef.current;
+      let minx = Infinity; let miny = Infinity; let minz = Infinity;
+      let maxx = -Infinity; let maxy = -Infinity; let maxz = -Infinity;
+      if (cajaIn) {
+        minx = cajaIn.min.x; miny = cajaIn.min.y; minz = cajaIn.min.z;
+        maxx = cajaIn.max.x; maxy = cajaIn.max.y; maxz = cajaIn.max.z;
+      } else {
+        for (const v of base.vertices) {
+          if (v.x < minx) minx = v.x;
+          if (v.y < miny) miny = v.y;
+          if (v.z < minz) minz = v.z;
+          if (v.x > maxx) maxx = v.x;
+          if (v.y > maxy) maxy = v.y;
+          if (v.z > maxz) maxz = v.z;
+        }
+      }
+      if (!Number.isFinite(minx) || !Number.isFinite(maxy)) return null;
+      return { x: [minx, maxx], y: [miny, maxy], z: [minz, maxz] };
+    };
+    const deformGuiaArranque = (e: PointerEvent): boolean => {
+      const guia = deformadorActivoRef.current?.guia;
+      if (!guia || !onDeformGuiaChangeRef.current) return false;
+      const grupo = deformGuiaRef.current;
+      if (!grupo || !grupo.visible || e.button !== 0) return false;
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointerRef.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      pointerRef.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      raycasterRef.current.setFromCamera(pointerRef.current, camera);
+      grupo.updateMatrixWorld(true);
+      const hits = raycasterRef.current.intersectObjects(grupo.children, true);
+      const toca = hits.some((h) => {
+        let o: THREE.Object3D | null = h.object;
+        while (o && !o.userData.deformGuia) o = o.parent;
+        return !!o;
+      });
+      if (!toca) return false;
+      const rangos = cajaRangosDeformador();
+      if (!rangos) return false;
+      const [min, max] = rangos[guia.eje];
+      const ext = max - min;
+      if (ext < 1e-9) return false;
+      const centro = (r: [number, number]) => (r[0] + r[1]) / 2;
+      deformGuiaDragRef.current = {
+        eje: guia.eje,
+        cajaMin: min,
+        cajaExt: ext,
+        puntoLocal: new THREE.Vector3(
+          guia.eje === 'x' ? min : centro(rangos.x),
+          guia.eje === 'y' ? min : centro(rangos.y),
+          guia.eje === 'z' ? min : centro(rangos.z)
+        ),
+      };
+      controls.enabled = false;
+      renderer.domElement.style.cursor = 'grabbing';
+      return true;
+    };
+
      const onPointerDown = (e: PointerEvent) => {
        if (placeTargetRef.current) {
          // Registrar el punto inicial: solo coloca si NO hubo arrastre
@@ -8969,6 +9208,11 @@ export default function Viewer3D({
          placeDownRef.current = { x: e.clientX, y: e.clientY };
          return;
        }
+
+      // GUÍA del deformador: el gesto toca el asa naranja ANTES de nada
+      // (arrastrar la guía del deformador activo, igual que los
+      // marcadores del trazado spline).
+      if (deformGuiaArranque(e)) return;
 
       // SPLINE 3D: el gesto toca PRIMERO los marcadores del trazado
       // (arrastrar un vértice) o, en ventanas planas, añade uno; así el
@@ -10888,6 +11132,14 @@ export default function Viewer3D({
         return;
       }
 
+      // Release guide (guía del deformador) drag
+      if (deformGuiaDragRef.current) {
+        deformGuiaDragRef.current = null;
+        controls.enabled = true;
+        renderer.domElement.style.cursor = '';
+        return;
+      }
+
       // Release spline marker drag (trazado 3D en edición)
       if (splineDragRef.current) {
         splineDragRef.current = null;
@@ -11242,7 +11494,7 @@ export default function Viewer3D({
   useEffect(() => {
     const entry = splineOverlayRef.current;
     if (!entry) return;
-    const { group, line, markers } = entry;
+    const { group, line, markers, contornos } = entry;
     for (const h of [...markers.children]) {
       markers.remove(h);
       (h as THREE.Mesh).geometry?.dispose();
@@ -11287,12 +11539,14 @@ export default function Viewer3D({
       s.renderOrder = 996;
       markers.add(s);
     }
-    // Malla de vista previa (barrido en vivo del trazado).
+    // Malla de vista previa (barrido en vivo del trazado). Desactivable
+    // (splinePreviewVisible): solo se ve la línea cian del camino.
     const prev = splinePreview;
     const pm = group.children.find((c) => (c as THREE.Mesh).isMesh) as
       | THREE.Mesh
       | undefined;
     if (pm) {
+      pm.visible = splinePreviewVisible;
       const salida = new THREE.BufferGeometry();
       const pos = new Float32Array(prev.vertices.length * 3);
       for (let i = 0; i < prev.vertices.length; i++) {
@@ -11311,10 +11565,33 @@ export default function Viewer3D({
       pm.geometry.dispose();
       pm.geometry = salida;
     }
+
+    // Contornos NARANJAS por vértice (solo con la vista previa activa y
+    // anillos presentes): la plantilla que toca en cada punto, en SU
+    // alineación — así se ve qué va ahí antes de aplicar.
+    const anillos = splineContornos ?? [];
+    const segsPts: THREE.Vector3[] = [];
+    for (const a of anillos) {
+      for (let k = 0; k < a.length; k++) {
+        const p0 = a[k];
+        const p1 = a[(k + 1) % a.length];
+        segsPts.push(
+          new THREE.Vector3(p0.x, p0.y, p0.z),
+          new THREE.Vector3(p1.x, p1.y, p1.z)
+        );
+      }
+    }
+    contornos.geometry.dispose();
+    contornos.geometry =
+      segsPts.length >= 2
+        ? new THREE.BufferGeometry().setFromPoints(segsPts)
+        : new THREE.BufferGeometry();
+    contornos.visible = splinePreviewVisible && segsPts.length >= 2;
+
     group.visible = true;
     // Vuelta al manejo de cámara si un arrastre quedó a mitad (remontaje).
     // El visor no necesita nada más aquí: el gate de puntero es el que arma.
-  }, [splineEdicion, splinePreview]);
+  }, [splineEdicion, splinePreview, splinePreviewVisible, splineContornos]);
 
   useEffect(() => {
     if (latheAxisRef.current) latheAxisRef.current.visible = showLatheAxis;
@@ -12107,12 +12384,17 @@ export default function Viewer3D({
       const e2 = new THREE.Vector3(v2.x - v0.x, v2.y - v0.y, v2.z - v0.z);
       const n = e1.cross(e2).normalize();
       const col = hex ? new THREE.Color(hex) : null;
-      for (const idx of face) {
-        const v = mesh.vertices[idx];
-        if (!v) continue;
-        positions.push(v.x, v.y, v.z);
-        normals.push(n.x, n.y, n.z);
-        if (col) colorAttr.push(col.r, col.g, col.b);
+      // Igual que el duplicado (buildSnapshotObjectVisual): buffer no
+      // indexado leído de 3 en 3 — cara cuadrilátera = abanico, jamás sus
+      // 4+ vértices seguidos (se cruzarían con la cara siguiente).
+      for (let j = 1; j + 1 < face.length; j++) {
+        for (const idx of [face[0], face[j], face[j + 1]]) {
+          const v = mesh.vertices[idx];
+          if (!v) continue;
+          positions.push(v.x, v.y, v.z);
+          normals.push(n.x, n.y, n.z);
+          if (col) colorAttr.push(col.r, col.g, col.b);
+        }
       }
     }
 
@@ -12536,7 +12818,9 @@ export default function Viewer3D({
        // Config cambió SIN seleccionar el objeto (p. ej. tex/acabado/opacidad
        // escritos en su malla desde Escena o por el agente): el duplicado que
        // había dibujaba el material viejo — se rehace desde su instantánea.
-       const firma = firmaVisualObjeto(object);
+       // El modo alambre TAMBIÉN forma parte: al entrar/salir, todos los
+       // duplicados se remontan (con aristas o restaurados).
+       const firma = firmaVisualObjeto(object) + (wireframe ? '|alambre' : '');
        if (duplicate && duplicate.userData.sceneObjectFirma !== firma) {
          meshGroup.remove(duplicate);
          duplicate.traverse((item) => {
@@ -12604,6 +12888,11 @@ export default function Viewer3D({
           // Mira a su foco (posición del fotograma o camera.target).
           const focoDuplicada = object.camera?.keyframes[0]?.target ?? object.camera?.target;
           orientCameraBodyVisual(duplicate, focoDuplicada ?? null);
+        }
+        // Modo alambre global: los duplicados TAMBIÉN se ven en alambre
+        // (mismo estilo que la malla principal), aunque NO estén seleccionados.
+        if (wireframe && object.kind !== 'camera') {
+          aplicarAlambreADuplicado(duplicate, object.mesh);
         }
         meshGroup.add(duplicate);
       }
@@ -12736,6 +13025,7 @@ export default function Viewer3D({
     configRelief,
     smoothShading,
     textureProjection,
+    wireframe,
     ]);
 
   // --- Contorno del DEFORMADOR en vista previa -----------------------
@@ -12919,6 +13209,127 @@ export default function Viewer3D({
     deformadorActivo?.caja,
     mesh,
   ]);
+
+  // --- GUÍA del deformador (naranja, arrastrable) --------------------
+  // Cruz naranja en la sección del eje donde empieza/centra la
+  // deformación (% de la caja a lo largo del eje, manda el editor) +
+  // esferita-asa raycastable. NO se deforma con el deformador (marca la
+  // posición sobre la caja SIN deformar, al revés que la cage).
+  const guiaEje = deformadorActivo?.guia?.eje ?? null;
+  const guiaPct = deformadorActivo?.guia?.pct ?? null;
+  useEffect(() => {
+    const grupo = deformGuiaRef.current;
+    if (!grupo) return;
+    while (grupo.children.length) {
+      const hijo = grupo.children[0] as THREE.Mesh;
+      grupo.remove(hijo);
+      hijo.geometry?.dispose?.();
+      (hijo.material as THREE.Material)?.dispose?.();
+    }
+    const activo = deformadorActivoRef.current;
+    if (!activo || !guiaEje || guiaPct === null || !onDeformGuiaChangeRef.current) {
+      grupo.visible = false;
+      deformGuiaDragRef.current = null;
+      return;
+    }
+    // Caja de la malla base SIN deformar: la manda el editor (bbox de la
+    // malla base); si falta se deduce de la malla actual (igual que la cage).
+    const cajaIn = activo.caja;
+    const base = meshRef.current;
+    let minx = Infinity; let miny = Infinity; let minz = Infinity;
+    let maxx = -Infinity; let maxy = -Infinity; let maxz = -Infinity;
+    if (cajaIn) {
+      minx = cajaIn.min.x; miny = cajaIn.min.y; minz = cajaIn.min.z;
+      maxx = cajaIn.max.x; maxy = cajaIn.max.y; maxz = cajaIn.max.z;
+    } else {
+      for (const v of base.vertices) {
+        if (v.x < minx) minx = v.x;
+        if (v.y < miny) miny = v.y;
+        if (v.z < minz) minz = v.z;
+        if (v.x > maxx) maxx = v.x;
+        if (v.y > maxy) maxy = v.y;
+        if (v.z > maxz) maxz = v.z;
+      }
+    }
+    if (!Number.isFinite(minx) || !Number.isFinite(maxy)) {
+      grupo.visible = false;
+      return;
+    }
+    const margenX = (maxx - minx) * 0.03 || 0.01;
+    const margenY = (maxy - miny) * 0.03 || 0.01;
+    const margenZ = (maxz - minz) * 0.03 || 0.01;
+    const rangos: Record<'x' | 'y' | 'z', [number, number]> = {
+      x: [minx - margenX, maxx + margenX],
+      y: [miny - margenY, maxy + margenY],
+      z: [minz - margenZ, maxz + margenZ],
+    };
+    const [e1, e2] =
+      guiaEje === 'x' ? (['y', 'z'] as const) : guiaEje === 'y' ? (['x', 'z'] as const) : (['x', 'y'] as const);
+    // Extensión del EJE sin margen (el % es de la caja real del deformador).
+    const extMin = guiaEje === 'x' ? minx : guiaEje === 'y' ? miny : minz;
+    const extMax = guiaEje === 'x' ? maxx : guiaEje === 'y' ? maxy : maxz;
+    const gVal = extMin + (Math.max(0, Math.min(100, guiaPct)) / 100) * (extMax - extMin);
+    // Cruz: dos segmentos (uno por cada eje transversal) en la sección
+    // del guía; la asa vive en el cruce.
+    const pares: number[] = [];
+    const seg = (a: Vertex3D, b: Vertex3D) => {
+      pares.push(a.x, a.y, a.z, b.x, b.y, b.z);
+    };
+    const pCruce = {
+      x: (rangos.x[0] + rangos.x[1]) / 2,
+      y: (rangos.y[0] + rangos.y[1]) / 2,
+      z: (rangos.z[0] + rangos.z[1]) / 2,
+    };
+    if (guiaEje === 'x') pCruce.x = gVal;
+    else if (guiaEje === 'y') pCruce.y = gVal;
+    else pCruce.z = gVal;
+    const a1 = { ...pCruce };
+    const b1 = { ...pCruce };
+    const a2 = { ...pCruce };
+    const b2 = { ...pCruce };
+    (a1 as unknown as { x: number; y: number; z: number })[e1] = rangos[e1][0];
+    (b1 as unknown as { x: number; y: number; z: number })[e1] = rangos[e1][1];
+    (a2 as unknown as { x: number; y: number; z: number })[e2] = rangos[e2][0];
+    (b2 as unknown as { x: number; y: number; z: number })[e2] = rangos[e2][1];
+    seg(a1, b1);
+    seg(a2, b2);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pares, 3));
+    const mat = new THREE.LineBasicMaterial({
+      color: 0xff7a2f,
+      toneMapped: false,
+      depthWrite: false,
+      depthTest: false,
+    });
+    const lineas = new THREE.LineSegments(geo, mat);
+    lineas.renderOrder = 993;
+    lineas.frustumCulled = false;
+    grupo.add(lineas);
+    // Asa: esfera en el cruce, raycastable (userData.deformGuia).
+    const diagonal =
+      (maxx - minx) ** 2 + (maxy - miny) ** 2 + (maxz - minz) ** 2;
+    const radioAsa = Math.max(0.04, Math.sqrt(diagonal) * 0.045);
+    const asa = new THREE.Mesh(
+      new THREE.SphereGeometry(radioAsa, 12, 10),
+      new THREE.MeshBasicMaterial({
+        color: 0xff7a2f,
+        toneMapped: false,
+        depthTest: false,
+        depthWrite: false,
+        transparent: true,
+        opacity: 0.95,
+      })
+    );
+    asa.position.set(pCruce.x, pCruce.y, pCruce.z);
+    asa.renderOrder = 994;
+    asa.frustumCulled = false;
+    asa.userData.deformGuia = true;
+    grupo.add(asa);
+    grupo.visible = true;
+    // Si meshGroup se reconstruyó (remontaje del visor), re-adosar.
+    const raiz = meshGroupRef.current;
+    if (raiz && grupo.parent !== raiz) raiz.add(grupo);
+  }, [guiaEje, guiaPct, deformadorActivo?.caja, mesh, deformadorActivo?.tipo]);
 
   // --- Exclusión de luces por objeto (luz ambiente y focos) ----------
   // Excluir un objeto de una luz NO puede hacerse con capas de three:
@@ -13807,27 +14218,40 @@ uniform vec3 sombraFocoPos[8];`
       fg.rotation.set(0, 0, Math.PI / 2);
       eje = 'x';
     }
-    // SIN LÍMITE: la retícula cubre SIEMPRE la vista. Centro = target de
-    // la órbita (sigue el pan) ajustado a la retícula (celda de 0.25,
-    // la misma de la rejilla del suelo) — al ajustarlo a la retícula los
-    // cuadros quedan pegados a las mismas posiciones del mundo aunque
-    // la rejilla se desplace; solo se RECONSTRUYE cuando hay que crecer.
+    // SIN LÍMITE: la retícula cubre SIEMPRE la vista. El CENTRO (sus dos
+    // líneas más claras) queda CLAVADO EN EL ORIGEN del mundo en TODAS las
+    // ventanas 2D — el mismo punto que marca la rejilla del suelo de la
+    // ventana 3D y que «Centrar escena». Antes el centro seguía el target
+    // de la órbita de CADA ventana: encuadrar lo llevaba al objeto (y pan
+    // lo movía al gusto), así que cada ventana marcaba el «centro» en un
+    // punto distinto del objeto y la 3D en otro (el origen). Cubrir la
+    // vista aunque se aleje del centro se resuelve CRECIENDO el cuadro:
+    // sigue ajustado a la celda de 0.25 (la de la rejilla del suelo), así
+    // los cuadros quedan pegados a las mismas posiciones del mundo; solo
+    // se RECONSTRUYE cuando hay que crecer.
     const controls = controlsRef.current;
     const centroVista = controls
       ? controls.target.clone()
       : new THREE.Vector3();
     const CELLA = 0.25;
-    const ajusta = (v: number) => Math.round(v / CELLA) * CELLA;
-    // Coordenadas EN PLANO del centro de la vista, ajustadas a la
-    // retícula: eje 'z' → plano X-Y, 'x' → plano Z-Y, 'y' → plano X-Z.
-    const px =
+    // Centro EN PLANO del cuadro = el origen del mundo: eje 'z' → plano
+    // X-Y, 'x' → plano Z-Y, 'y' → plano X-Z.
+    const px = 0;
+    const py = 0;
+    // Alejamiento del target de la vista respecto al cuadro (el origen),
+    // EN PLANO: decide cuánto debe crecer el cuadro.
+    const cu =
       eje === 'z'
-        ? ajusta(centroVista.x)
-        : ajusta(centroVista.y);
-    const py =
+        ? Math.abs(centroVista.x)
+        : eje === 'x'
+          ? Math.abs(centroVista.y)
+          : Math.abs(centroVista.x);
+    const cv =
       eje === 'z'
-        ? ajusta(centroVista.y)
-        : ajusta(centroVista.z);
+        ? Math.abs(centroVista.y)
+        : eje === 'x'
+          ? Math.abs(centroVista.z)
+          : Math.abs(centroVista.z);
     // Radio visible (semidiagonal del frustum orto) + margen.
     const radio =
       Math.hypot((camera.right - camera.left) / 2, (camera.top - camera.bottom) / 2) + 0.6;
@@ -13862,15 +14286,18 @@ uniform vec3 sombraFocoPos[8];`
     } else {
       pos.set(px, centroM.y + dir.y * (profundo + 0.03), py);
     }
-    // Crecer SOLO si la vista ya no cabe: si cabe, basta mover la
-    // rejilla (el desplazamiento en plano es múltiplo de la celda, así
-    // que la retícula sigue pegada al mundo).
+    // Crecer SOLO si la vista ya no cabe: el cuadro está centrado en el
+    // origen, así que debe alcanzar la vista completa (el target más el
+    // radio del frustum). El desplazamiento en profundidad es el de la
+    // malla; con esto no toca moverlo en el plano.
     const lado = (fg.userData as { lado?: number }).lado ?? 0;
-    const necesita = radio * 2;
+    const necesita = (Math.max(cu, cv) + radio) * 2;
     if (lado < necesita) {
       const escena = sceneRef.current;
       if (!escena) return;
-      const ladoNuevo = Math.ceil(necesita / 4) * 4; // múltiplo de 2 unidades, con aire
+      // Con aire de sobra (×1.3, múltiplo de 4) para que un pan seguido
+      // no esté reconstruyendo la retícula en cada paso.
+      const ladoNuevo = Math.ceil((necesita * 1.3) / 4) * 4;
       const nuevo = new THREE.GridHelper(
         ladoNuevo,
         Math.round(ladoNuevo / CELLA),
@@ -14053,20 +14480,22 @@ uniform vec3 sombraFocoPos[8];`
     }
   }, [selGizmoColorOverride, selGizmoInteractive, faceSelectMode]);
 
-  // Captura el texto 3D como PNG con fondo transparente (solo la malla).
-  // Si el suavizado está activo, la captura usa una COPIA suavizada de la
-  // malla (curvas redondeadas, sin escalones de vóxeles); la malla
-  // original se restaura intacta inmediatamente después.
-  const capturePNG = useCallback(() => {
-    const renderer = rendererRef.current;
-    const scene = sceneRef.current;
-    const camera = cameraRef.current;
+  // Callback de captura entrante, en ref: puede ser una función nueva en
+  // cada render del padre sin disparar la captura.
+  const onCapturaExtrusionRef = useRef(onCapturaExtrusion);
+  onCapturaExtrusionRef.current = onCapturaExtrusion;
+
+  /**
+   * Oculta TODAS las ayudas de edición durante una captura (patrón de
+   * capturePNG: rejilla, gizmos, selección, focos, recorridos, FX…).
+   * Devuelve la función que lo restaura TODO; capturar el renderer
+   * requiere renderizar con la escena limpia y volver a ponerla intacta
+   * inmediatamente después (el usuario no debe notar nada).
+   */
+  const esconderAyudasCaptura = useCallback((): (() => void) => {
     const gridGroup = gridGroupRef.current;
     const vertexGroup = vertexHelpersRef.current;
     const gizmoGroup = gizmoGroupRef.current;
-    const meshGroup = meshGroupRef.current;
-    if (!renderer || !scene || !camera) return;
-
     const prevGridVisible = gridGroup?.visible ?? true;
     const prevVertexVisible = vertexGroup?.visible ?? true;
     const prevGizmoVisible = gizmoGroup?.visible ?? false;
@@ -14121,7 +14550,155 @@ uniform vec3 sombraFocoPos[8];`
     if (textureHelperGroup) textureHelperGroup.visible = false;
     if (textureHelperGizmoGroup) textureHelperGizmoGroup.visible = false;
     if (latheAxis) latheAxis.visible = false;
+    return () => {
+      if (gridGroup) gridGroup.visible = prevGridVisible;
+      if (vertexGroup) vertexGroup.visible = prevVertexVisible;
+      if (gizmoGroup) gizmoGroup.visible = prevGizmoVisible;
+      if (lightHelpersGroup) lightHelpersGroup.visible = prevLightHelpersVisible;
+      if (lightGizmoGroup) lightGizmoGroup.visible = prevLightGizmoVisible;
+      if (cameraObjectPath) cameraObjectPath.group.visible = prevCameraObjectPathVisible;
+      if (objectMotionPath) objectMotionPath.group.visible = prevObjectMotionPathVisible;
+      if (faceSelectionOverlay) faceSelectionOverlay.visible = prevFaceSelectionOverlayVisible;
+      if (faceGuide) faceGuide.visible = prevFaceGuideVisible;
+      if (deformContorno) deformContorno.visible = prevDeformContornoVisible;
+      anchorsFx.forEach((g, i) => {
+        g.visible = prevAnchorsFxVisible[i];
+      });
+      if (textureHelperGroup) textureHelperGroup.visible = prevTextureHelperVisible;
+      if (textureHelperGizmoGroup)
+        textureHelperGizmoGroup.visible = prevTextureHelperGizmoVisible;
+      if (latheAxis) latheAxis.visible = prevLatheAxisVisible;
+    };
+  }, []);
 
+  /**
+   * Captura para «Extrusión spline»: instantánea de ESTA ventana sin
+   * ayudas de edición, recuadrada a CUADRADO (la plantilla del lienzo 2D
+   * dibuja la imagen en una caja cuadrada con 'meet'), y metadatos del
+   * plano donde vive lo capturado: el plano perpendicular a la cámara que
+   * pasa por el ORIGEN — los 5 rayos (centro y laterales NDC, todos
+   * paralelos a la dirección de la cámara en orto, casi paralelos en la
+   * libre) lo cortan el uno al lado del otro. La rotación sale de las
+   * bases de la ventana: el eje Z de la malla extraída (su tapa mira a +Z)
+   * debe apuntar HACIA la ventana = right × up.
+   */
+  const capturarParaExtrusion = useCallback(() => {
+    const renderer = rendererRef.current;
+    const scene = sceneRef.current;
+    const camera = cameraRef.current;
+    const captura = onCapturaExtrusionRef.current;
+    if (!renderer || !scene || !camera || !captura) return;
+    const restaurarAyudas = esconderAyudasCaptura();
+    const prevBackground = scene.background;
+    scene.background = null;
+    renderer.render(scene, camera);
+    const dom = renderer.domElement;
+    const base = dom.toDataURL('image/png');
+    scene.background = prevBackground;
+    restaurarAyudas();
+    const W = dom.width;
+    const H = dom.height;
+    const L = Math.max(W, H);
+    const cv = document.createElement('canvas');
+    cv.width = L;
+    cv.height = L;
+    const ctx = cv.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(dom, (L - W) / 2, (L - H) / 2);
+    const dataURL = cv.toDataURL('image/png');
+    const dir = camera.getWorldDirection(new THREE.Vector3());
+    // El plano de captura pasa por el punto al que la ventana MIRA (target
+    // del orbit), no por el origen a secas: en la 3d en perspectiva, si la
+    // pieza está más cerca de la cámara que el plano, su proyección sale
+    // DEFORMADA y más grande (parallax). En las ventanas planas el target
+    // cae en el MISMO plano coordenado (0 en el eje de profundidad), así
+    // que no cambia nada.
+    const objetivo = controlsRef.current?.target ?? new THREE.Vector3(0, 0, 0);
+    const plano = new THREE.Plane().setFromNormalAndCoplanarPoint(
+      dir,
+      objetivo.clone()
+    );
+    const ray = new THREE.Raycaster();
+    const punto = (nx: number, ny: number): THREE.Vector3 | null => {
+      ray.setFromCamera(new THREE.Vector2(nx, ny), camera);
+      const hit = new THREE.Vector3();
+      return ray.ray.intersectPlane(plano, hit) ? hit.clone() : null;
+    };
+    const centro = punto(0, 0);
+    const pR = punto(1, 0);
+    const pL = punto(-1, 0);
+    const pU = punto(0, 1);
+    const pD = punto(0, -1);
+    if (!centro || !pR || !pL || !pU || !pD) return;
+    const rightVec = pR.clone().sub(pL);
+    const spanX = rightVec.length();
+    rightVec.normalize();
+    const upVec = pU.clone().sub(pD);
+    const spanY = upVec.length();
+    upVec.normalize();
+    const capN = rightVec.clone().cross(upVec).normalize();
+    const base3 = new THREE.Matrix4().makeBasis(rightVec, upVec, capN);
+    const eul = new THREE.Euler().setFromRotationMatrix(base3, 'XYZ');
+    const R = 180 / Math.PI;
+    // Nombre de la vista (informativo): la dirección de la cámara delata
+    // el preset de ventana (las vistas planas apuntan sobre un eje).
+    const esEje = (v: THREE.Vector3, e: number[], tol = 0.01) =>
+      Math.abs(v.x - e[0]) < tol &&
+      Math.abs(v.y - e[1]) < tol &&
+      Math.abs(v.z - e[2]) < tol;
+    const vista = esEje(dir, [0, 0, -1])
+      ? 'front'
+      : esEje(dir, [0, 0, 1])
+        ? 'back'
+        : esEje(dir, [0, -1, 0])
+          ? 'top'
+          : esEje(dir, [0, 1, 0])
+            ? 'bottom'
+            : esEje(dir, [-1, 0, 0])
+              ? 'side'
+              : esEje(dir, [1, 0, 0])
+                ? 'sideLeft'
+                : '3d';
+    captura({
+      vista,
+      dataURL,
+      px: L,
+      pxW: W,
+      pxH: H,
+      centro: { x: centro.x, y: centro.y, z: centro.z },
+      right: { x: rightVec.x, y: rightVec.y, z: rightVec.z },
+      up: { x: upVec.x, y: upVec.y, z: upVec.z },
+      spanX,
+      spanY,
+      rotDeg: [eul.x * R, eul.y * R, eul.z * R],
+    });
+  }, [esconderAyudasCaptura]);
+
+  // Petición de captura entrante (token que cambia en cada pulsación del
+  // botón «Extrusión spline» de la cabecera de esta ventana).
+  const capturaSolicitadaRef = useRef(0);
+  useEffect(() => {
+    if (
+      solicitudCapturaExtrusion > 0 &&
+      solicitudCapturaExtrusion !== capturaSolicitadaRef.current
+    ) {
+      capturaSolicitadaRef.current = solicitudCapturaExtrusion;
+      capturarParaExtrusion();
+    }
+  }, [solicitudCapturaExtrusion, capturarParaExtrusion]);
+
+  // Captura el texto 3D como PNG con fondo transparente (solo la malla).
+  // Si el suavizado está activo, la captura usa una COPIA suavizada de la
+  // malla (curvas redondeadas, sin escalones de vóxeles); la malla
+  // original se restaura intacta inmediatamente después.
+  const capturePNG = useCallback(() => {
+    const renderer = rendererRef.current;
+    const scene = sceneRef.current;
+    const camera = cameraRef.current;
+    const meshGroup = meshGroupRef.current;
+    if (!renderer || !scene || !camera) return;
+
+    const restaurarAyudas = esconderAyudasCaptura();
     const currentMesh = meshRef.current;
     const doSmooth =
       smoothCapture &&
@@ -14193,29 +14770,13 @@ uniform vec3 sombraFocoPos[8];`
       for (const child of savedChildren) meshGroup.add(child);
     }
 
-    if (gridGroup) gridGroup.visible = prevGridVisible;
-    if (vertexGroup) vertexGroup.visible = prevVertexVisible;
-    if (gizmoGroup) gizmoGroup.visible = prevGizmoVisible;
-    if (lightHelpersGroup) lightHelpersGroup.visible = prevLightHelpersVisible;
-    if (lightGizmoGroup) lightGizmoGroup.visible = prevLightGizmoVisible;
-    if (cameraObjectPath) cameraObjectPath.group.visible = prevCameraObjectPathVisible;
-    if (objectMotionPath) objectMotionPath.group.visible = prevObjectMotionPathVisible;
-    if (faceSelectionOverlay) faceSelectionOverlay.visible = prevFaceSelectionOverlayVisible;
-    if (faceGuide) faceGuide.visible = prevFaceGuideVisible;
-    if (deformContorno) deformContorno.visible = prevDeformContornoVisible;
-    anchorsFx.forEach((g, i) => {
-      g.visible = prevAnchorsFxVisible[i];
-    });
-    if (textureHelperGroup) textureHelperGroup.visible = prevTextureHelperVisible;
-    if (textureHelperGizmoGroup)
-      textureHelperGizmoGroup.visible = prevTextureHelperGizmoVisible;
-    if (latheAxis) latheAxis.visible = prevLatheAxisVisible;
+    restaurarAyudas();
 
     const link = document.createElement('a');
     link.href = dataURL;
     link.download = 'texto-3d.png';
     link.click();
-   }, [smoothCapture, wireframe]);
+   }, [esconderAyudasCaptura, smoothCapture, wireframe]);
 
   const resetCamera = useCallback(() => {
     const cam = cameraRef.current;

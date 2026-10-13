@@ -5,7 +5,8 @@ import { createPortal } from 'react-dom';
 import Viewer3D, { type ObjectTransform, type GizmoMode, type ExtrusionCtrlSubSel, type VistaModo } from '@/components/viewer-3d';
 import type { TextureMaterialParams } from '@/lib/geometry';
 import type { EfectoObjeto } from '@/lib/efectos-objeto';
-import type { SplineEdicion } from '@/lib/spline-3d';
+import type { SplineEdicion, V3 } from '@/lib/spline-3d';
+import type { CapturaExtrusionMeta } from '@/lib/extrusion-spline';
 import type { Mesh } from '@/lib/geometry';
 import { PanelButtons } from '@/components/editor/Editor3D';
 import { useI18n } from '@/lib/i18n';
@@ -72,7 +73,12 @@ interface ViewerPanelProps {
         min: { x: number; y: number; z: number };
         max: { x: number; y: number; z: number };
       } | null;
+      /** GUÍA del deformador: posición % del eje donde empieza la
+       *  deformación (el visor dibuja la guía naranja arrastrable). */
+      guia?: { eje: 'x' | 'y' | 'z'; pct: number } | null;
     } | null;
+    /** El asa de la GUÍA del deformador se movió: % nuevo del eje (0-100). */
+    onDeformGuiaChange?: (pct: number) => void;
     /** Ctrl + arrastre de una asa de la sub-selección (flecha, bola o cubo)
      *  = extrudir la copia (anillos vecinos intactos); null si no se puede. */
     onCtrlExtrudirSubSel?: () => ExtrusionCtrlSubSel | null;
@@ -81,12 +87,28 @@ interface ViewerPanelProps {
     splineEdicion?: SplineEdicion | null;
     /** Malla EN VIVO del trazado spline (vista previa translúcida). */
     splinePreview?: Mesh | null;
+    /** Muestra/oculta SOLO la malla translúcida de vista previa del
+        spline (la cian siempre queda: línea y vértices). */
+    splinePreviewVisible?: boolean;
+    /** Contorno (en mundo) de la plantilla de CADA vértice del spline —
+        se traza en naranja sobre la vista previa solo cuando el balón
+        está activo. */
+    splineContornos?: V3[][] | null;
     faceSelectVisibleOnly?: boolean;
     wireframeOffSignal?: number;
     /** Modo de visualización GLOBAL de las ventanas 3D (compartido por las cuatro). */
     vistaModo?: VistaModo;
     /** Cambia el modo de visualización global. */
     onVistaModoChange?: (m: VistaModo) => void;
+    /** Botón «Extrusión spline» de ESTA ventana (presentar botón = activo). */
+    onExtrusionSpline?: () => void;
+    /** Título del botón ⤢ (distinto en modo spline: va para una plantilla
+        de vértice). Vacío/omitido = el título por defecto de Extruir. */
+    extrusionSplineTitle?: string;
+    /** Solicitud de captura: token > 0 (cambia en cada pulsación). */
+    solicitudExtrusion?: number;
+    /** Entrega la captura de esta ventana al editor (plantilla + plano). */
+    onCapturaExtrusion?: (meta: CapturaExtrusionMeta) => void;
     selectedFaceIds?: number[];
     onFaceSelectionChange?: (faceIds: number[]) => void;
     selectedVertexIds?: number[];
@@ -251,12 +273,19 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
     faceSelectionTarget,
     anillosCaras,
     deformadorActivo,
+    onDeformGuiaChange,
     splineEdicion,
     splinePreview,
+    splinePreviewVisible,
+    splineContornos,
     faceSelectVisibleOnly,
     wireframeOffSignal,
     vistaModo,
     onVistaModoChange,
+    onExtrusionSpline,
+    extrusionSplineTitle,
+    solicitudExtrusion,
+    onCapturaExtrusion,
     selectedFaceIds,
     onFaceSelectionChange,
     selectedVertexIds,
@@ -532,6 +561,16 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
             <option value="gris">{t('editor3D.vistaModoGris')}</option>
           </select>
         )}
+        {onExtrusionSpline && (
+          <button
+            onClick={() => onExtrusionSpline?.()}
+            title={extrusionSplineTitle || t('editor3D.extrusionSplineTitle')}
+            data-testid={`extru-spline-${viewName}`}
+            className="px-1.5 py-0.5 rounded bg-black/40 border border-white/10 text-[10px] text-foreground/80 hover:text-green-300 cursor-pointer shrink-0"
+          >
+            ⤢ {t('editor3D.extrusionSpline')}
+          </button>
+        )}
       </div>
       <PanelButtons
         onPan={(dx: number, dy: number) => pan3D(viewName, dx * 0.02, dy * 0.02)}
@@ -567,8 +606,11 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
            faceSelectionTarget={faceSelectionTarget}
            anillosCaras={anillosCaras}
            deformadorActivo={deformadorActivo}
+           onDeformGuiaChange={onDeformGuiaChange}
            splineEdicion={splineEdicion}
            splinePreview={splinePreview}
+           splinePreviewVisible={splinePreviewVisible}
+           splineContornos={splineContornos}
            faceSelectVisibleOnly={faceSelectVisibleOnly}
            wireframeOffSignal={wireframeOffSignal}
            vistaModo={vistaModo}
@@ -600,6 +642,8 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
             onSelGizmoRotationChange={onSelGizmoRotationChange}
            booleanToolObjectId={booleanToolObjectId}
            forceObjectsUpdate={forceUpdate}
+         solicitudCapturaExtrusion={solicitudExtrusion}
+         onCapturaExtrusion={onCapturaExtrusion}
           objectTransform={
            sceneObjects.find((o) => o.id === selectedObjectId)?.transform
          }

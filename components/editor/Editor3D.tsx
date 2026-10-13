@@ -99,6 +99,7 @@ import {
   buildSpline3DMesh,
   buildRoscaMesh,
   construirMuestraHelix,
+  contornosDeVertices,
   validarSplineDatos,
   ROSCA_DEFECTO,
   PLANTILLA_SPLINE_DEFECTO,
@@ -106,7 +107,7 @@ import {
   type SplineDatos,
   type RoscaParams,
 } from '@/lib/spline-3d';
-import { espejarMesh } from '@/lib/espejo';
+import { espejarMesh, espejarObjetoMundo } from '@/lib/espejo';
 import PathCanvas from './path-canvas';
 import type { ObjectTransform, Camera3D, GizmoMode } from '@/components/viewer-3d';
 import type { ExtrusionCtrlSubSel } from '@/components/viewer-3d';
@@ -167,6 +168,7 @@ import {
 } from '@/lib/extrusion-seleccion';
 import { resolveLatheProfile, resampleLatheProfile, LATHE_PRESET_NAMES } from '@/lib/lathe-profiles';
 import { buildViewsMesh, buildExtrudeMesh, buildExtrudeMeshes, polylineToPolygon } from '@/lib/views-mesh';
+import { mapeaColocacionExtrusion, type CapturaExtrusionMeta } from '@/lib/extrusion-spline';
 import { sanitizePolylinesByCanvas, newPolylineId } from '@/lib/polylines';
 import type { PolylinesByCanvas, Polyline, CanvasTool } from '@/lib/polylines';
 import { listTemplates, saveTemplate, deleteTemplate, type SavedTemplate } from '@/lib/template-storage';
@@ -217,6 +219,8 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuCheckboxItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu';
 import Object3DPreview, {
@@ -1814,6 +1818,19 @@ export default function Home({
   const [templateOffset, setTemplateOffset] = useState({ x: 0, y: 0 });
   const templateInputRef = useRef<HTMLInputElement | null>(null);
 
+  /** MODO EXTRUSIÓN SPLINE: captura viva de una ventana (plantilla + plano
+      para colocar a tamaño exacto) y el token de la petición pendiente. */
+  const [capturaExtrusion, setCapturaExtrusion] = useState<CapturaExtrusionMeta | null>(null);
+  /**
+   * Destino SPLINE de la captura (⤢): la imagen entra como calco del
+   * lienzo DE LA PLANTILLA DEL VÉRTICE ACTIVO del modo spline (el usuario
+   * elige el vértice en la lista ANTES de pulsar ⤢). Estado aparte de
+   * `capturaExtrusion`: los lienzos de Extruir nunca ven esta captura.
+   */
+  const [capturaSpline, setCapturaSpline] = useState<CapturaExtrusionMeta | null>(null);
+  const [solicitudCaptura, setSolicitudCaptura] = useState(0);
+  const [solicitudCapturaVista, setSolicitudCapturaVista] = useState<PanelSlot | null>(null);
+
   const [imageHeightScale, setImageHeightScale] = useState(10);
   const [imageCols, setImageCols] = useState(128);
   const [imageRows, setImageRows] = useState(128);
@@ -1956,6 +1973,11 @@ export default function Home({
   const [splineNodes, setSplineNodes] = useState<SplineNode3D[]>([]);
   const [splineActivoId, setSplineActivoId] = useState<number | null>(null);
   const [splineClosed, setSplineClosed] = useState(false);
+  /** Vista previa translúcida del spline (los volúmenes azules a lo
+      largo del camino): desactivable — que solo se vea la línea. APAGADA
+      por defecto a pedido del usuario (13/10): dibujar con el balón
+      es opt-in, de serie se ve solo la línea. */
+  const [splinePrevVista, setSplinePrevVista] = useState(false);
   const [splineSubdivisions, setSplineSubdivisions] = useState(5);
   const [splineEscala, setSplineEscala] = useState(0.5);
   /** Spline: la plantilla gira con el enrollado (marco radial, tornillo). */
@@ -3921,6 +3943,9 @@ export default function Home({
     const selectedObjectIdsRef = useRef<string[]>([]);
     selectedObjectIdsRef.current = selectedObjectIds;
     const [groups, setGroups] = useState<ObjectGroup[]>([]);
+  // Modo del Espejo: false = transformar el objeto seleccionado (original),
+  // true = crear un objeto nuevo gemelo con la malla espejada.
+  const [espejoCrearNuevo, setEspejoCrearNuevo] = useState(false);
   // Espejo del estado de escena para lecturas fuera de los updaters
   // (el timer del debounce de «Copias calculadas» lee el estado fresco
   // sin encadenar setState dentro de setState).
@@ -4529,6 +4554,13 @@ export default function Home({
         });
         zeiaIdMapRef.current = out.idMap;
         lastCreatedIdRef.current = out.lastCreatedId;
+        // Escribir de vuelta los refs YA (no esperar al re-render): si llegan
+        // varias acciones seguidas en el mismo turno (un [ZEUS_ACTION] por cada
+        // pieza), cada llamada debe ver los objetos/las pistas de la ANTERIOR,
+        // si no la última pisa a las demás y solo queda un objeto.
+        sceneObjectsPlaybackRef.current = out.objects as unknown as SceneObject[];
+        transformTracksRef.current = out.transformTracks;
+        effectTracksRef.current = out.effectTracks;
         setSceneObjects(out.objects as unknown as SceneObject[]);
         setTransformTracks(out.transformTracks);
         setEffectTracks(out.effectTracks);
@@ -4573,8 +4605,16 @@ export default function Home({
            '[ZEUS_ACTION]{"action":"<nombre>","params":{...}}[/ZEUS_ACTION]',
            'Acciones disponibles:',
           '- getScene: {} -> devuelve objetos de la escena.',
-          '- createObject: {"type":"mesh","primitive":"cube","name":"Cubo","transform":{"position":[0,0,0]}} -> Crea un objeto (primitive puede ser cube, sphere, plane).',
-          '- updateObject: {"id":"...","transform":{"position":[1,0,0],"scale":[2,2,2]}} -> Modifica la transformación.',
+          '- createObject: {"type":"mesh","primitive":"cylinder","radius":0.5,"height":3,"name":"Poste","transform":{"position":[0,1.5,0]}} -> Crea un objeto. Las MEDIDAS van como campos sueltos (no dentro de transform).',
+          '  · primitive (ES o EN, escribe el nombre que corresponda): cube/caja/cubo, sphere/esfera/bola, cylinder/cilindro, cone/cono, torus/toro/donut, plane/plano, pyramid/pirámide, tetrahedron/tetraedro, capsule/cápsula/pastilla, tube/tubo/pipe (caño hueco), disc/disco (plato), ring/anillo/argolla (aro hueco), spring/muelle/resorte.',
+          '  · medidas por forma: cube -> width/height/depth (ancho/alto/profundo); sphere -> radius; cylinder/cone -> radius + height; capsule -> radius + height (altura TOTAL, casquetes incluidos); torus -> radius + thickness; tube -> radius + thickness | outerRadius + innerRadius (siempre height); disc/ring -> radius (+ innerRadius); plane -> width + depth; pyramid -> width + height; spring -> radius + turns + thickness.',
+          '  · DIÁMETRO NO es un campo: si el usuario da diámetro, envía radius=diametro/2. No inventes campos no listados (se ignoran).',
+          '  · NUNCA uses scale no uniforme ([2,0.5,2], [1,3,1]...) para "estirar" una forma: DEFORMA los círculos en óvalos (un cilindro escalado [1,3,1] se ve huevado, no redondo). Círculos SIEMPRE con scale uniforme o mejor sin scale: usa radius/height reales para el tamaño. scale solo uniforme [s,s,s] o para cubos/plane.',
+          '  · Objetos de VARIAS piezas (un trineo, un muñeco, una mesa): emite UN createObject por pieza, en órdenes consecutivos, todas con el transform.position en la posición REAL global de esa pieza (suelo y=alto/2 para que apoye en el suelo). NO uses scale para simular piezas. Máximo ~8 piezas: piensa ANTES la lista de piezas con sus posiciones y crea SOLO esa lista; si el RESULTADOS ya contiene los objetos, NO crees más (no repitas ni añadas).',
+          '  · La rotación va en GRADOS: {"rotation":[90,0,0]} tumba el eje del cilindro de vertical (Y) a horizontal (Z).',
+          '  · OJO con los nombres: "plane" es una PLANCHA plana (una lámina en el suelo), NO un avión. Para un AVIÓN (aviación) compón por piezas: fuselaje (cápsula o cilindro rotado 90), alas planas (box alto 0.06), cola vertical (box) y hélices (disc o cilindro fino). NUNCA repitas el mismo createObject cambiando solo el nombre con sufijos -2, -3, -4...: eso es spam; cada pieza debe ser DISTINTA en forma o posición.',
+          '  · Ejemplo multi-pieza CORRECTO (trineo de 8 piezas, todas apoyando en el suelo): [ZEUS_ACTION]{"action":"createObject","params":{"primitive":"box","width":1.7,"height":0.1,"depth":0.1,"name":"Trineo-PatinIzq","transform":{"position":[0,0.05,-0.28]}}}[/ZEUS_ACTION] [ZEUS_ACTION]{"action":"createObject","params":{"primitive":"box","width":1.7,"height":0.1,"depth":0.1,"name":"Trineo-PatinDer","transform":{"position":[0,0.05,0.28]}}}[/ZEUS_ACTION] [ZEUS_ACTION]{"action":"createObject","params":{"primitive":"box","width":1.6,"height":0.1,"depth":0.7,"name":"Trineo-Tabla","transform":{"position":[0,0.25,0]}}}[/ZEUS_ACTION] [ZEUS_ACTION]{"action":"createObject","params":{"primitive":"box","width":0.08,"height":0.1,"depth":0.5,"name":"Trineo-Soporte1","transform":{"position":[-0.65,0.15,0]}}}[/ZEUS_ACTION] [ZEUS_ACTION]{"action":"createObject","params":{"primitive":"box","width":0.08,"height":0.1,"depth":0.5,"name":"Trineo-Soporte2","transform":{"position":[0.65,0.15,0]}}}[/ZEUS_ACTION] [ZEUS_ACTION]{"action":"createObject","params":{"primitive":"box","width":0.08,"height":0.5,"depth":0.7,"name":"Trineo-Respaldo","transform":{"position":[-0.8,0.5,0]}}}[/ZEUS_ACTION] [ZEUS_ACTION]{"action":"createObject","params":{"primitive":"cylinder","radius":0.04,"height":0.45,"name":"Trineo-Mango","transform":{"position":[0.72,0.55,0]}}}[/ZEUS_ACTION] [ZEUS_ACTION]{"action":"createObject","params":{"primitive":"cylinder","radius":0.04,"height":0.6,"name":"Trineo-Barra","transform":{"position":[0.72,0.77,0],"rotation":[90,0,0]}}}[/ZEUS_ACTION] — dos patines a los lados, tabla encima, soportes, respaldo y manillar con su barra horizontal (rotation 90).',
+           '- updateObject: {"id":"...","transform":{"position":[1,0,0],"scale":[2,2,2]}} -> Modifica la transformación (recuerda: scale uniforme salvo en cubos).',
           '- duplicateObject: {"id":"..."} -> Duplica un objeto.',
           '- createAnimation: {"type":"rotate","object_id":"...","duration":5,"loop":true,"degrees":360} -> Crea una animación simple.',
           '- selectObject: {"id":"..."} -> Selecciona un objeto en la interfaz.',
@@ -4591,7 +4631,7 @@ export default function Home({
            '- applyEffect: {"effectType":"rain","count":320,"speed":2,"duration":5,"loop":true} (o {"effectType":"glow","glowColor":"#5fd4ff","glowIntensity":1.4}) -> Activa un EFECTO VISUAL en la escena: rain/lluvia, smoke/humo, stars/estrellas, fire/fuego, sparks/chispas, glow/brillo. Los parámetros (count, speed, size, intensity, color, riseSpeed, starSize, glowColor, glowIntensity, glowObjects) se aplican como valores del efecto; duration/loop definen la pista (los valores se mantienen tras la duración).',
            'Animaciones: createAnimation admite type rotate|spin|orbit|translate|move|scale|pulse|bounce (pulse/bounce son de ida y vuelta; translate acepta "to":[x,y,z] o "axis"+"distance"; bounce "height") y también "keyframes":[{"time":0,"position":[0,0,0],"rotation":[0,0,0],"scale":[1,1,1]},...] (time en segundos, rotation en GRADOS, cualquier subconjunto de campos).',
            'El modelo de visión inspecciona el render del visor activo (registerDocumentImages capta el canvas vía toDataURL). Puede pedirle coordenadas de perfil precisas y aplicarlas con setLatheProfile.',
-           'Si el usuario pide un objeto que ya existe guardado en OBJ_ZEUS_ACTION (p. ej. "taza", "Taza"), usa loadSavedObject con ese nombre ANTES que recrearlo desde cero. La pista de contexto enumera los objetos guardados disponibles en cada turno.',
+           'REGLA OBLIGATORIA para objetos de VARIAS PIEZAS que ya existen guardados en OBJ_ZEUS_ACTION (p. ej. "trineo", "avion/avión", "coche", "tren", "taza", "tornillo", "árbol", "copa", "botella", "candelabro"): si el nombre (o su raíz, p. ej. "coche de juguete" → "Coche") aparece en la lista de objetos guardados de la pista de contexto, tu ÚNICA respuesta para ese pedido es UN bloque loadSavedObject: [ZEUS_ACTION]{"action":"loadSavedObject","params":{"name":"Coche"}}[/ZEUS_ACTION] — está PROHIBIDO crear las piezas con createObject aunque sepas cómo componerlo: el guardado siempre sale mejor construido y es más rápido. Cárgalo y NO añadas ni una pieza más. Si NO está en la lista (p. ej. "molinete", "noria"), entonces sí compón las piezas tú: un createObject por pieza, name distinto y position DISTINTA por pieza (en la misma posición se apilan y no se ve el conjunto).',
            'Si la acción depende de un objeto existente, usa su id (o su nombre exacto, p. ej. "Cartel-Z"); si no lo conoces, llama PRIMERO a getScene y usa los ids/nombres REALES del resultado. NO inventes ids.',
         ].join('\n')
       );
@@ -4675,6 +4715,12 @@ export default function Home({
           ...(opts.config ? { config: opts.config } : {}),
         };
         setSceneObjects((current) => [...current, nuevoObjeto]);
+        // Ref al día YA: ver comentario en el applier ZEIA. Evita que un
+        // createObject posterior EN EL MISMO turno pise este objeto.
+        sceneObjectsPlaybackRef.current = [
+          ...(sceneObjectsPlaybackRef.current ?? []),
+          nuevoObjeto,
+        ];
         setSelectedObjectId(id);
         setSelectedObjectIds([id]);
         const center = computeMeshBoundsCenter(mesh);
@@ -4738,6 +4784,11 @@ export default function Home({
             });
             zeiaIdMapRef.current = out.idMap;
             lastCreatedIdRef.current = out.lastCreatedId;
+            // Refs al día YA: ver comentario en el applier ZEIA (acciones
+            // seguidas en el mismo turno, p. ej. 7 piezas de un trineo).
+            sceneObjectsPlaybackRef.current = out.objects as unknown as SceneObject[];
+            transformTracksRef.current = out.transformTracks;
+            effectTracksRef.current = out.effectTracks;
             setSceneObjects(out.objects as unknown as SceneObject[]);
             setTransformTracks(out.transformTracks);
             setEffectTracks(out.effectTracks);
@@ -4764,6 +4815,11 @@ export default function Home({
             });
             zeiaIdMapRef.current = out.idMap;
             lastCreatedIdRef.current = out.lastCreatedId;
+            // Refs al día YA: ver comentario en el applier ZEIA (acciones
+            // seguidas en el mismo turno, p. ej. 7 piezas de un trineo).
+            sceneObjectsPlaybackRef.current = out.objects as unknown as SceneObject[];
+            transformTracksRef.current = out.transformTracks;
+            effectTracksRef.current = out.effectTracks;
             setSceneObjects(out.objects as unknown as SceneObject[]);
             setTransformTracks(out.transformTracks);
             setEffectTracks(out.effectTracks);
@@ -4778,6 +4834,9 @@ export default function Home({
             const id = (params.id ?? params.objectId) as string | undefined;
             if (!id) throw new Error('deleteObject: falta el id del objeto');
             setSceneObjects((prev) => prev.filter((o) => o.id !== id));
+            // Ref al día YA (deleteObject: que un createObject posterior del
+            // mismo turno no resucite el borrado por venir del ref viejo).
+            sceneObjectsPlaybackRef.current = (sceneObjectsPlaybackRef.current ?? []).filter((o) => o.id !== id);
             setTransformTracks((prev) => prev.filter((t) => t.objectId !== id));
             return { deleted: id };
            }
@@ -4932,6 +4991,11 @@ export default function Home({
                  textureProjection,
                },
              ]);
+             // Ref al día YA: ver comentario en el applier ZEIA.
+             sceneObjectsPlaybackRef.current = [
+               ...(sceneObjectsPlaybackRef.current ?? []),
+               { id, name: nombre, mode: 'lathe', transform, mesh, smooth: smoothShadingValue, textureProjection },
+             ];
              setSelectedObjectId(id);
              setConfigObjectId(id);
              return {
@@ -5021,6 +5085,11 @@ export default function Home({
                   textureProjection,
                 },
               ]);
+              // Ref al día YA: ver comentario en el applier ZEIA.
+              sceneObjectsPlaybackRef.current = [
+                ...(sceneObjectsPlaybackRef.current ?? []),
+                { id, name: nombre, mode: 'extrude', transform, mesh, smooth: true, textureProjection },
+              ];
               setSelectedObjectId(id);
               setSelectedObjectIds([id]);
               const center = computeMeshBoundsCenter(mesh);
@@ -5059,7 +5128,19 @@ export default function Home({
             case 'loadSavedObject': {
               const name = typeof params.name === 'string' ? params.name.trim() : '';
               if (!name) throw new Error('loadSavedObject: falta el nombre del objeto');
-              const res = await fetch(`/api/obj-zeus-action?name=${encodeURIComponent(name)}`);
+              // El archivo real puede variar en mayúsculas/minúsculas ("Avion"
+              // vs "avion"): si el pedido directo falla, se busca en el
+              // catálogo una coincidencia insensible y se reintenta.
+              let res = await fetch(`/api/obj-zeus-action?name=${encodeURIComponent(name)}`);
+              if (!res.ok) {
+                const lista = await fetch('/api/obj-zeus-action').then((r) => r.json()).catch(() => null);
+                const items = Array.isArray(lista?.objects) ? lista.objects : [];
+                const hallado = items.find((it: { name?: string }) =>
+                  typeof it?.name === 'string' && it.name.toLowerCase() === name.toLowerCase());
+                if (hallado?.name) {
+                  res = await fetch(`/api/obj-zeus-action?name=${encodeURIComponent(hallado.name)}`);
+                }
+              }
               if (!res.ok) {
                 const data = await res.json().catch(() => ({}));
                 throw new Error(data.error || `No se encontró el objeto guardado "${name}"`);
@@ -5409,6 +5490,9 @@ export default function Home({
              const out = applyZeiaPlansToScene(plans, [], transformTracksRef.current, {
                effectTracks: effectTracksRef.current,
              });
+             // Ref al día YA: dos applyEffect seguidos en el mismo turno
+             // (p. ej. lluvia + brillo) deben ver la pista de la anterior.
+             effectTracksRef.current = out.effectTracks;
              setEffectTracks(out.effectTracks);
              if (!out.result.effects) {
                return {
@@ -7265,6 +7349,27 @@ pluginTracks,
             // Con Romper la cage sigue al pedazo por delta de vértice:
             // necesita la malla base (sin caras Romper no mueve nada).
             malla: deformadorId === 'romper' ? mallaBaseDeformador : undefined,
+            // GUÍA arrastrable: solo en los deformadores con eje
+            // posicional (doblar/enroscar/sesgar/afilar/derretir — los
+            // que llevan el slider `guia`). % del eje (0 = base).
+            guia: (() => {
+              const def = DEFORMADORES_DIRECTOS.find(
+                (d) => d.id === deformadorId
+              );
+              const eje = deformParams.eje;
+              if (
+                !def ||
+                !def.params.some((p) => p.id === 'guia') ||
+                !deformadorCaja ||
+                (eje !== 'x' && eje !== 'y' && eje !== 'z')
+              )
+                return null;
+              const g = deformParams.guia;
+              return {
+                eje: eje as 'x' | 'y' | 'z',
+                pct: typeof g === 'number' && Number.isFinite(g) && g >= 0 ? g : 0,
+              };
+            })(),
           }
         : null,
     [deformadorId, deformParams, deformTick, deformadorCaja, mallaBaseDeformador]
@@ -7498,11 +7603,22 @@ pluginTracks,
     setSplineActivoId((cur) => (cur === id ? null : cur));
   }, []);
 
-  const updateSplineNodePolygon = useCallback((id: number, polygon: Polygon) => {
-    setSplineNodes((prev) =>
-      prev.map((n) => (n.id === id ? { ...n, polygon } : n))
-    );
-  }, []);
+  const updateSplineNodePolygon = useCallback(
+    (id: number, polygon: Polygon) => {
+      setSplineNodes((prev) =>
+        prev.map((n) => {
+          if (n.id !== id) return n;
+          // Sin captura activa, el dibujo ya NO corresponde a la ventana
+          // de la última captura: pierde su anclaje mundial (baseMundo)
+          // y vuelve al marco del trazado. Con el calco abierto se
+          // conserva (se sigue dibujando EN la imagen de esa ventana).
+          const baseMundo = capturaSpline ? n.baseMundo : undefined;
+          return { ...n, polygon, baseMundo };
+        })
+      );
+    },
+    [capturaSpline]
+  );
 
   const toggleSplineEsquina = useCallback((id: number) => {
     setSplineNodes((prev) =>
@@ -7527,9 +7643,38 @@ pluginTracks,
     );
   }, []);
 
-  // Copia la plantilla del vértice ACTIVO a TODOS los vértices de golpe.
-  // Cada nodo lleva su PROPIO clon (nada de referencias compartidas: así,
-  // reeditar luego un vértice no arrastra al resto).
+  /** Ancla la plantilla del vértice a la VENTANA de la captura (⤢): con
+      ella, el constructor gira el marco en su propio plano para que la
+      forma salga como se dibujó en ESA ventana (no torcida con el marco
+      del trazado). right/up viajan limpios como V3 propios (el meta es
+      Vec3L; mismos campos, pero sin compartir mutables del visor). */
+  const setSplineNodeBaseMundo = useCallback(
+    (id: number, base: { right: { x: number; y: number; z: number }; up: { x: number; y: number; z: number }; rx: number; ry: number }) => {
+      setSplineNodes((prev) =>
+        prev.map((n) =>
+          n.id === id
+            ? {
+                ...n,
+                baseMundo: {
+                  right: { x: base.right.x, y: base.right.y, z: base.right.z },
+                  up: { x: base.up.x, y: base.up.y, z: base.up.z },
+                  rx: base.rx,
+                  ry: base.ry,
+                },
+              }
+            : n
+        )
+      );
+    },
+    []
+  );
+
+  // Copia la PLANTILLA COMPLETA del vértice ACTIVO a todos: forma,
+  // escala propia, tilt y anclaje a su ventana (baseMundo). Antes copiaba
+  // solo la forma y el resto caía a la escala global: las piezas de todos
+  // los vértices salían CHICAS (reporte del usuario 13/10). Cada nodo
+  // lleva su PROPIO clon (nada de referencias compartidas: así, reeditar
+  // luego un vértice no arrastra al resto).
   const aplicarPlantillaATodos = useCallback(() => {
     setSplineNodes((prev) => {
       const activo = prev.find((n) => n.id === splineActivoId);
@@ -7537,6 +7682,16 @@ pluginTracks,
       return prev.map((n) => ({
         ...n,
         polygon: structuredClone(activo.polygon),
+        escala: activo.escala,
+        tilt: activo.tilt,
+        baseMundo: activo.baseMundo
+          ? {
+              right: { ...activo.baseMundo.right },
+              up: { ...activo.baseMundo.up },
+              rx: activo.baseMundo.rx,
+              ry: activo.baseMundo.ry,
+            }
+          : undefined,
       }));
     });
   }, [splineActivoId]);
@@ -7589,6 +7744,26 @@ pluginTracks,
       return null;
     try {
       return buildSpline3DMesh(splineNodes, {
+        closed: splineClosed,
+        subdivisions: splineSubdivisions,
+        escala: splineEscala,
+        orientacion: splineRadial ? 'radial' : undefined,
+      });
+    } catch {
+      return null;
+    }
+  }, [modoSpline, splineNodes, splineClosed, splineSubdivisions, splineEscala, splineRadial]);
+
+  // Contorno de la plantilla de CADA vértice (el dibujo que ahí va). Mismo
+  // mapeo que la malla y misma condición: con el balón azul activo, el
+  // visor lo traza en naranja sobre cada punto — así se ve QUÉ plantilla
+  // lleva cada vértice antes de aplicar (pedido del usuario 13/10).
+  const splineContornos = useMemo(() => {
+    if (!modoSpline) return null;
+    if (splineNodes.filter((n) => (n.polygon ?? []).length >= 3).length < 2)
+      return null;
+    try {
+      return contornosDeVertices(splineNodes, {
         closed: splineClosed,
         subdivisions: splineSubdivisions,
         escala: splineEscala,
@@ -8796,6 +8971,7 @@ pluginTracks,
       setSplineEditandoId(null);
       setSplineRadial(false);
       setSplineRosca(null);
+      setCapturaSpline(null);
       // Si el lienzo de plantilla estaba maximizado, devuelve la rejilla.
       setEditingSplineCanvas(false);
     }, []);
@@ -8906,7 +9082,9 @@ pluginTracks,
       setDeformadorId((prev) => (prev ? null : prev));
       setDeformParams((prev) => (Object.keys(prev).length > 0 ? {} : prev));
       // El borrador del spline también es del objeto activo: descartado.
+      // Su captura viviente (calco destino spline) va con él.
       setModoSpline((prev) => (prev ? false : prev));
+      setCapturaSpline((prev) => (prev ? null : prev));
     }, [selectedObjectId, configObjectId]);
 
     const handleFaceTextureFile = useCallback((file: File | null) => {
@@ -11205,6 +11383,215 @@ pluginTracks,
     setConfigObjectId(id);
   }, [sceneObjects, selectedObjectId, mode]);
 
+  // ── MODO EXTRUSIÓN SPLINE ────────────────────────────────────────────
+  /** Recibe la captura de una ventana: su PNG entra como PLANTILLA en la
+   *  pestaña Extruir (escala exacta, sin desplazamiento: la colocación
+   *  después reconstruye el mundo desde este encuadre), se abre el lienzo
+   *  grande para calcar y se sale de la ventana solicitante. */
+  const recibirCapturaExtrusion = useCallback(
+    (meta: CapturaExtrusionMeta) => {
+      // Dos destinos, decididos POR EL ESTADO al capturar: si el usuario
+      // está en modo spline (botón Spline) con vértices, el ⤢ no va a la
+      // pestaña Extruir — la captura se vuelve el CALCO del lienzo de la
+      // plantilla del vértice ACTIVO (elegido en la lista antes de
+      // pulsar ⤢, o el último si ninguno). La escala del vértice se
+      // preajusta: el lienzo 0..1 debe equivaler al cuadro capturado en
+      // mundo (lado S = max(spanX, spanY) en su fracción del PNG), así el
+      // calco sale del TAMAÑO de verdad de la ventana, como Colocar en
+      // Extruir. Sin este encaminamiento, calcar una plantilla del spline
+      // exigía pasar por la pestaña Extruir y copiar lo dibujado a mano.
+      if (modoSpline && splineNodes.length > 0) {
+        const destinoId =
+          splineActivoId ??
+          splineNodes[splineNodes.length - 1]?.id ??
+          null;
+        // El lienzo (0..1) muestra el PNG CUADRADO, cuyo contenido capturado
+        // ocupa la banda central: igual que aFrac en mapeaColocacionExtrusion,
+        // el lienzo completo equivale a spanX·(pxW/px) en mundo a lo ancho.
+        const kX = meta.pxW / Math.max(1, meta.px);
+        const kY = meta.pxH / Math.max(1, meta.px);
+        const escalaNodo = Math.max(
+          0.05,
+          Math.min(
+            8,
+            (Math.max(meta.spanX * kX, meta.spanY * kY)) / 2
+          )
+        );
+        setCapturaSpline(meta);
+        setSolicitudCapturaVista(null);
+        if (destinoId !== null) {
+          setSplineActivoId(destinoId);
+          setSplineNodeEscala(destinoId, escalaNodo);
+          // Lienzo LIMPIO en cada captura (mismo motivo que en Extruir:
+          // con figura cerrada el lienzo solo inserta sobre aristas y el
+          // calco nuevo no salía). El anillo del vértice se queda sin
+          // plantilla mientras se calca — reaparece en el primer trazo.
+          // VA ANTES del setSplineNodeBaseMundo: en este mismo lote el
+          // callback aún ve el capturaSpline VIEJO y su guardia limpiaría
+          // el anclaje recién puesto (borrón de la misma tanda).
+          updateSplineNodePolygon(destinoId, []);
+          // ANCLAJE A LA VENTANA: right/up de ESTA ventana van con la
+          // plantilla. Así el constructor gira el marco del trazado para
+          // que la forma salga como se dibujó AQUÍ — sin esto, una
+          // plantilla calcada en Superior (o en cualquier ventana que no
+          // sea Frontal) salía torcida «mirando para otro lado» (el marco
+          // transportado arranca en (0,0,1)/(0,1,0), ajeno a la ventana).
+          // rx/ry llevan el ASPECTO real del lienzo (spanX·kX vs spanY·kY
+          // pueden diferir si la ventana no es cuadrada); como son
+          // relativos a la escala ya fijada, el slider sigue funcionando.
+          setSplineNodeBaseMundo(destinoId, {
+            right: { x: meta.right.x, y: meta.right.y, z: meta.right.z },
+            up: { x: meta.up.x, y: meta.up.y, z: meta.up.z },
+            rx: (meta.spanX * kX) / 2 / escalaNodo,
+            ry: (meta.spanY * kY) / 2 / escalaNodo,
+          });
+        }
+        setEditingSplineCanvas(true);
+        return;
+      }
+      setCapturaExtrusion(meta);
+      setTemplateImage(meta.dataURL);
+      setTemplateScale(1);
+      setTemplateOffset({ x: 0, y: 0 });
+      setTemplateOpacity(1);
+      setSolicitudCapturaVista(null);
+      // Lienzo LIMPIO en cada captura: el calco nuevo se hace desde cero.
+      // Sin esto, el trazo anterior (3+ puntos en Frontal o polilíneas
+      // con Línea) seguía ahí, el lienzo ignoraba los clics nuevos
+      // (con figura cerrada solo se inserta sobre aristas) y Colocar
+      // armaba el objeto con el trazo viejo y la captura nueva — la pieza
+      // deforme y gigante que reportó el usuario en su 2.ª prueba.
+      setViews((prev) => ({ ...prev, front: [] }));
+      updatePolylines('views:front', []);
+      if (sweepNodes.length > 0) {
+        setSweepNodes([]);
+        setSweepActiveId(null);
+      }
+      if (mode !== 'extrude') switchTab('extrude');
+      setEditingViewProfile('front');
+    },
+    [
+      mode,
+      switchTab,
+      updatePolylines,
+      sweepNodes,
+      modoSpline,
+      splineNodes,
+      splineActivoId,
+      setSplineNodeEscala,
+      setSplineNodeBaseMundo,
+      updateSplineNodePolygon,
+    ]
+  );
+
+  /** El trazo ACTUAL del calco sobre la plantilla, en orden de verdad:
+   *  el nodo de recorrido activo (el lienzo escribe ahí si hay uno), el
+   *  contorno Frontal, o — si el usuario calcó con la herramienta Línea —
+   *  la ÚLTIMA polilínea cerrada de la vista Frente. Sin esa última
+   *  alternativa, el calcado con Línea no llegaba a Colocar y el objeto
+   *  se armaba con restos viejos (deforme y con tamaño falso: repro
+   *  e2e-extru-dos-pruebas). Devuelve null si no hay aún nada colocado. */
+  const trazoExtrusionActual = useCallback((): {
+    poly: Polygon | null;
+    len: number;
+    /** De dónde salió el trazo: 'nodo' (recorrido), 'front' (contorno) o
+     *  'linea' (polilínea con Línea). Con 'linea' el panel no construye
+     *  malla (el umbral de adopción solo mira el contorno), así que
+     *  Colocar hornea la malla del calcado en el objeto. */
+    fuente: 'nodo' | 'front' | 'linea';
+  } => {
+    if (activeSweepNode && activeSweepNode.polygon.length >= 3) {
+      return { poly: activeSweepNode.polygon, len: activeSweepNode.polygon.length, fuente: 'nodo' };
+    }
+    if (views.front.length >= 3) return { poly: views.front, len: views.front.length, fuente: 'front' };
+    const frontPolylines = getPolylines('views:front');
+    for (let i = frontPolylines.length - 1; i >= 0; i--) {
+      const line = frontPolylines[i];
+      if (extrudeHoles.includes(line.id)) continue;
+      const poly = polylineToPolygon(line);
+      if (poly && poly.length >= 3) return { poly, len: poly.length, fuente: 'linea' };
+    }
+    return { poly: null, len: 0, fuente: 'linea' };
+  }, [activeSweepNode, views, getPolylines, extrudeHoles]);
+
+  /** Botón «Colocar objeto»: el trazo calcado se vuelve objeto con la
+   *  profundidad del slider (la malla del dueño ya la lleva) y el
+   *  transform que lo pone AL TAMAÑO EXACTO calcado en su sitio exacto. */
+  const aplicarExtrusionSpline = useCallback(() => {
+    const meta = capturaExtrusion;
+    if (!meta) return;
+    const { poly: poligono, fuente } = trazoExtrusionActual();
+    if (!poligono) {
+      toast.error(t('editor3D.extrusionSplineSinTrazo'));
+      return;
+    }
+    const colocacion = mapeaColocacionExtrusion(
+      poligono,
+      meta,
+      { escala: templateScale, offset: templateOffset }
+    );
+    // Calcado con la herramienta Línea: el panel no construye malla para
+    // polilíneas solas (el umbral de adopción solo mira el contorno
+    // Frontal), así que Colocar HORNEA la malla del calcado en el objeto —
+    // y no lo deja como dueño del panel: freezeObjectSnapshot hornearía la
+    // malla vacía del panel y se la borraría al cambiar de pestaña.
+    const mallaHorneada =
+      fuente === 'linea'
+        ? buildExtrudeMeshes([poligono], extrudeDepth, [])
+        : null;
+    let ownerId = configObjectId ?? '';
+    const esNuevo = !ownerId;
+    if (esNuevo) ownerId = `object-${Date.now()}`;
+    const idFinal = ownerId;
+    setSceneObjects((objects) => {
+      const base = esNuevo
+        ? [
+            ...objects,
+            {
+              id: idFinal,
+              name: `Objeto ${objects.length + 1}`,
+              mode: 'extrude' as const,
+              transform: { ...IDENTITY_TRANSFORM },
+              ...(mallaHorneada ? { mesh: mallaHorneada } : {}),
+            },
+          ]
+        : objects;
+      return base.map((o) =>
+        o.id === idFinal
+          ? {
+              ...o,
+              transform: {
+                px: colocacion.px,
+                py: colocacion.py,
+                pz: colocacion.pz,
+                rx: colocacion.rx,
+                ry: colocacion.ry,
+                rz: colocacion.rz,
+                sx: colocacion.sx,
+                sy: colocacion.sy,
+                sz: colocacion.sz,
+              },
+              ...(mallaHorneada ? { mesh: mallaHorneada } : {}),
+            }
+          : o
+      );
+    });
+    if (esNuevo) {
+      setSelectedObjectId(idFinal);
+      if (fuente !== 'linea') setConfigObjectId(idFinal);
+    }
+    toast.success(t('editor3D.extrusionSplineHecho'));
+  }, [
+    capturaExtrusion,
+    trazoExtrusionActual,
+    extrudeDepth,
+    configObjectId,
+    templateScale,
+    templateOffset,
+    setSceneObjects,
+    t,
+  ]);
+
   /**
    * APLICAR el trazado del modo spline: crea un objeto nuevo (o actualiza
    * el que se reeditaba) con la spline y su malla horneada (patrón de
@@ -11281,11 +11668,46 @@ pluginTracks,
    * (editar sus parámetros o rehacer la spline) la reconstruiría SIN espejo,
    * así que se retiran del objeto espejado (destruye la parametrización,
    * como cualquier horneado).
+   *
+   * Dos modos (desplegable): `crearNuevo` false TRANSFORMA el objeto
+   * (comportamiento original); true crea un objeto GEMELO nuevo con la
+   * malla espejada EN MUNDO (espejarObjetoMundo): un objeto inclinado
+   * sale reflejado de verdad — inclinación invertida, no la misma — con
+   * transform NUEVO (pivote en el centro de su caja, rotación a cero:
+   * la inclinación original viaja horneada dentro de la malla reflejada).
+   * Sin parametrización (primitiveParams/spline/pluginEdit se retiran,
+   * mismo horneado) y `espejoSufijo` se añade al nombre.
    */
   const aplicarEspejo = useCallback(
-    (eje: 'x' | 'y' | 'z') => {
+    (eje: 'x' | 'y' | 'z', crearNuevo = false) => {
       if (!selectedObjectId) {
         toast.error(t('editor3D.espejoSinObjeto'));
+        return;
+      }
+      if (crearNuevo) {
+        const original = sceneObjects.find((o) => o.id === selectedObjectId);
+        if (!original || !original.mesh || original.mesh.vertices.length === 0) {
+          toast.error(t('editor3D.espejoSinObjeto'));
+          return;
+        }
+        const { mesh: mallaEspejada, transform: transformEspejo } =
+          espejarObjetoMundo(original.mesh, original.transform, eje);
+        const gemeloId = `object-${Date.now()}`;
+        const gemelo: SceneObject = {
+          ...original,
+          id: gemeloId,
+          name: `${original.name} ${t('editor3D.espejoSufijo')}`,
+          // El espejo en mundo trae transform propio (pivote/rotación).
+          transform: transformEspejo as SceneObject['transform'],
+          mesh: mallaEspejada,
+          primitiveParams: undefined,
+          spline: undefined,
+          pluginEdit: undefined,
+        };
+        setSceneObjects((current) => [...current, gemelo]);
+        setSelectedObjectId(gemeloId);
+        setSelectedObjectIds([gemeloId]);
+        setViewRefreshTick((v) => v + 1);
         return;
       }
       let espejado = false;
@@ -11305,7 +11727,7 @@ pluginTracks,
       if (espejado) setViewRefreshTick((v) => v + 1);
       else toast.error(t('editor3D.espejoSinObjeto'));
     },
-    [selectedObjectId, setSceneObjects, t]
+    [selectedObjectId, sceneObjects, setSceneObjects, t]
   );
 
   /**
@@ -12638,6 +13060,24 @@ pluginTracks,
     [deformadorId, frozenSelected, selectedObjectId, resolverMallaBase]
   );
 
+  /**
+   * La asa de la GUÍA naranja se arrastra en la ventana: actualiza el
+   * slider `guia` por el mismo camino del preview (y con autoclave, la
+   * pista del deformador en el tiempo actual — animable gratis).
+   */
+  const handleDeformGuiaChange = useCallback(
+    (pct: number) => {
+      if (!deformadorId) return;
+      const def = DEFORMADORES_DIRECTOS.find((d) => d.id === deformadorId);
+      if (!def || !def.params.some((p) => p.id === 'guia')) return;
+      handleDeformPreviewParams({
+        ...deformParams,
+        guia: Math.max(0, Math.min(100, Math.round(pct * 10) / 10)),
+      });
+    },
+    [deformadorId, deformParams, handleDeformPreviewParams]
+  );
+
   /** Cancelar: solo apaga el modo; la malla queda intacta. */
   const handleDeformCancelar = useCallback(() => {
     setDeformParams({});
@@ -13135,13 +13575,27 @@ pluginTracks,
       faceSelectionTarget={faceSelectionTarget}
       anillosCaras={anillosCaras}
       deformadorActivo={deformadorActivo ?? deformadorAnimado}
+      onDeformGuiaChange={handleDeformGuiaChange}
       splineEdicion={splineEdicion}
       splinePreview={splineVistaPrevia}
+      splinePreviewVisible={splinePrevVista}
+      splineContornos={splineContornos}
       onCtrlExtrudirSubSel={handleCtrlExtrudirSubSel}
       faceSelectVisibleOnly={faceSelectVisibleOnly}
       wireframeOffSignal={wireframeOffSignal}
       vistaModo={vistaModos[viewName] ?? 'textura'}
       onVistaModoChange={(m) => setVistaModos((prev) => ({ ...prev, [viewName]: m }))}
+      onExtrusionSpline={() => {
+        setSolicitudCaptura((n) => n + 1);
+        setSolicitudCapturaVista(viewName);
+      }}
+      extrusionSplineTitle={
+        modoSpline && splineNodes.length > 0
+          ? t('editor3D.extrusionSplineVertexTitle')
+          : undefined
+      }
+      solicitudExtrusion={solicitudCapturaVista === viewName ? solicitudCaptura : 0}
+      onCapturaExtrusion={recibirCapturaExtrusion}
       selectedFaceIds={selectedFaceIds}
       onFaceSelectionChange={(ids) => {
         setSelectedFaceIds(ids);
@@ -13453,9 +13907,10 @@ pluginTracks,
               className="h-full w-full object-contain"
             />
           </button>
-          {/* ESPEJO: abre un desplegable con los 3 ejes; el elegido voltea
-              el objeto seleccionado respecto a ese eje (centro de su caja,
-              la malla queda horneada — lib/espejo.ts). Sin selección: aviso.
+          {/* ESPEJO: abre un desplegable con el MODO (transformar el objeto
+              o crear un gemelo espejado nuevo) y los 3 ejes; el elegido
+              aplica según ese modo respecto al centro de la caja del objeto
+              (la malla queda horneada — lib/espejo.ts). Sin selección: aviso.
               Icono /icons/Espejo.png (igual que los deformadores). */}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -13485,22 +13940,42 @@ pluginTracks,
             </DropdownMenuTrigger>
             <DropdownMenuContent
               align="start"
-              className="bg-gray-900 border-gray-800 text-white min-w-[190px]"
+              className="bg-gray-900 border-gray-800 text-white min-w-[230px]"
             >
+              <DropdownMenuRadioGroup
+                value={espejoCrearNuevo ? 'nuevo' : 'transformar'}
+                onValueChange={(v) => setEspejoCrearNuevo(v === 'nuevo')}
+              >
+                <DropdownMenuRadioItem
+                  value="transformar"
+                  data-testid="espejo-modo-transformar"
+                  onSelect={(e) => e.preventDefault()}
+                >
+                  {t('editor3D.espejoModoTransformar')}
+                </DropdownMenuRadioItem>
+                <DropdownMenuRadioItem
+                  value="nuevo"
+                  data-testid="espejo-modo-nuevo"
+                  onSelect={(e) => e.preventDefault()}
+                >
+                  {t('editor3D.espejoModoNuevo')}
+                </DropdownMenuRadioItem>
+              </DropdownMenuRadioGroup>
+              <DropdownMenuSeparator />
               <DropdownMenuItem
-                onClick={() => aplicarEspejo('x')}
+                onClick={() => aplicarEspejo('x', espejoCrearNuevo)}
                 data-testid="espejo-x"
               >
                 {t('editor3D.espejoEjeX')}
               </DropdownMenuItem>
               <DropdownMenuItem
-                onClick={() => aplicarEspejo('y')}
+                onClick={() => aplicarEspejo('y', espejoCrearNuevo)}
                 data-testid="espejo-y"
               >
                 {t('editor3D.espejoEjeY')}
               </DropdownMenuItem>
               <DropdownMenuItem
-                onClick={() => aplicarEspejo('z')}
+                onClick={() => aplicarEspejo('z', espejoCrearNuevo)}
                 data-testid="espejo-z"
               >
                 {t('editor3D.espejoEjeZ')}
@@ -14723,6 +15198,21 @@ pluginTracks,
                          {t('editor3D.extrusionHint', { depth: extrudeDepth.toFixed(2) })}
                       </p>
                     </div>
+
+                    {/* MODO EXTRUSIÓN SPLINE: con captura viva, el botón
+                        coloca el trazo como objeto al tamaño exacto. */}
+                    {capturaExtrusion && (
+                      <button
+                        data-testid="extrude-colocar-btn"
+                        onClick={aplicarExtrusionSpline}
+                        disabled={trazoExtrusionActual().len < 3}
+                        className="w-full px-3 py-2 text-[11px] font-semibold rounded-md bg-green-600 hover:bg-green-500 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-1"
+                        title={t('editor3D.extrusionSplinePlaceTitle')}
+                      >
+                        <Expand className="w-3.5 h-3.5" />
+                        {t('editor3D.extrusionSplinePlace')}
+                      </button>
+                    )}
                     
                     <div className="flex flex-col gap-2">
                        <button
@@ -16773,6 +17263,16 @@ pluginTracks,
                       />
                       {t('editor3D.splineClosedToggle')}
                     </label>
+                    <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground cursor-pointer">
+                      <input
+                        type="checkbox"
+                        data-testid="spline-preview-toggle"
+                        checked={splinePrevVista}
+                        onChange={(e) => setSplinePrevVista(e.target.checked)}
+                        className="w-3 h-3 accent-green-500"
+                      />
+                      {t('editor3D.splinePrevToggle')}
+                    </label>
                     <label className="flex items-center gap-2 cursor-pointer select-none">
                       <input
                         type="checkbox"
@@ -16843,7 +17343,9 @@ pluginTracks,
                         </label>
                         <Slider
                           min={0.05}
-                          max={2}
+                          max={8} /* = tope de buildSpline3DMesh: las
+                                    plantillas de captura (⤢) pueden ser
+                                    de vistas de mundo grandes */
                           step={0.05}
                           value={[activo.escala ?? splineEscala]}
                           onValueChange={([v]) => setSplineNodeEscala(activo.id, v)}
@@ -18113,6 +18615,13 @@ pluginTracks,
                         onGridResolutionChange={setEditorGridResolution}
                         canvasZoom={editorCanvasZoom}
                         onCanvasZoomChange={setEditorCanvasZoom}
+                        /* Calco de la CAPTURA (destino spline): imagen
+                            entera (escala 1, offset 0) — el usuario calcó
+                            encima y cambia la plantilla del vértice. */
+                        templateImage={capturaSpline?.dataURL ?? null}
+                        templateOpacity={templateOpacity}
+                        templateScale={templateScale}
+                        templateOffset={templateOffset}
                       />
                     </div>
                   );

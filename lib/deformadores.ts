@@ -93,6 +93,21 @@ function pluginAplicar(id: string, mesh: Mesh, params: PluginParams): Mesh {
   return p ? p.aplicar(mesh, params) : mesh;
 }
 
+/**
+ * GUÍA (dónde empieza/centra la deformación): el slider `guia` es % de la
+ * caja a lo largo del eje. Con 0 (default) devuelve null y cada
+ * deformador usa su ancla de siempre (el borde min de la caja) — un
+ * guia:0 explícito reproduce EXACTO el comportamiento histórico y los
+ * .zeus/pistas viejos no cambian con el relleno de defaults. Con 1..100
+ * devuelve la coordenada local del guía.
+ */
+function guiaDe(mesh: Mesh, params: PluginParams, eje: Eje): number | null {
+  const g = num(params, 'guia', 0);
+  if (g <= 0) return null;
+  const c = caja(mesh, eje);
+  return c.min + (g / 100) * (c.max - c.min);
+}
+
 /* ------------------------------------------------------------------ */
 /* Bisel (chaflán de aristas, como Chamfer/Bevel de 3ds Max)           */
 /* ------------------------------------------------------------------ */
@@ -1293,7 +1308,9 @@ function hinchar(mesh: Mesh, params: PluginParams): Mesh {
 /**
  * Desplaza las secciones transversales al eje elegido proporcionalmente
  * a su altura (0 en la base, máximo en la cima): desplazamiento = % de
- * la extensión transversal.
+ * la extensión transversal. CON GUÍA: el desplazamiento es CERO donde
+ * esté la guía y crece simétrico para los dos lados (la guía es el plano
+ * de referencia del sesgado); 0 = automático (la base, como siempre).
  */
 function sesgar(mesh: Mesh, params: PluginParams): Mesh {
   const desplazamiento = num(params, 'desplazamiento', 20) / 100;
@@ -1306,9 +1323,9 @@ function sesgar(mesh: Mesh, params: PluginParams): Mesh {
   const total = desplazamiento * cajaT.extension;
   if (!Number.isFinite(total)) return mesh;
 
+  const ancla = guiaDe(mesh, params, eje) ?? cajaEje.min;
   const vertices = mesh.vertices.map((v) => {
-    const t =
-      (leerEje(v, eje) - cajaEje.min) / (cajaEje.max - cajaEje.min);
+    const t = (leerEje(v, eje) - ancla) / (cajaEje.max - cajaEje.min);
     return conEje(v, e1, leerEje(v, e1) + total * t);
   });
   return { ...mesh, vertices };
@@ -1320,7 +1337,9 @@ function sesgar(mesh: Mesh, params: PluginParams): Mesh {
 
 /**
  * Los vértices altos ceden hacia abajo con caída ∝ t² (t = altura) y la
- * base se ensancha (barril derretido). Determinista.
+ * base se ensancha (barril derretido). Determinista. CON GUÍA: la CAÍDA
+ * empieza donde esté la guía (por debajo no cede, t=0: sin caída y con
+ * el ensanche del barril); 0 = automático (la base, como siempre).
  */
 function derretir(mesh: Mesh, params: PluginParams): Mesh {
   const caida = num(params, 'caida', 40) / 100;
@@ -1339,9 +1358,12 @@ function derretir(mesh: Mesh, params: PluginParams): Mesh {
     caja(mesh, e2).extension
   ) * ensanche;
 
+  const ancla = guiaDe(mesh, params, eje) ?? cajaEje.min;
   const vertices = mesh.vertices.map((v) => {
-    const t =
-      (leerEje(v, eje) - cajaEje.min) / (cajaEje.max - cajaEje.min);
+    const t = Math.max(
+      0,
+      (leerEje(v, eje) - ancla) / (cajaEje.max - cajaEje.min)
+    );
     const d1 = leerEje(v, e1) - c1;
     const d2 = leerEje(v, e2) - c2;
     let nuevo = conEje(v, eje, leerEje(v, eje) - caidaAbs * t * t);
@@ -1886,6 +1908,26 @@ const biselPlanoParams: PluginParam[] = [
   },
 ];
 
+/**
+ * Slider común de la GUÍA en los deformadores con eje posicional
+ * (doblar, enroscar, sesgar, afilar, derretir): 0 = donde empezaba de
+ * siempre (neutro exacto), 0–100 = posición a lo largo del eje. En la
+ * ventana 3D hay una GUÍA NARANJA arrastrable (la asa la mueve
+ * handleDeformPreviewParams con el mismo param).
+ */
+const paramGuia: PluginParam = {
+  tipo: 'slider',
+  id: 'guia',
+  etiqueta: 'Guía',
+  min: 0,
+  max: 100,
+  paso: 1,
+  valor: 0,
+  unidad: '%',
+  descripcion:
+    'Dónde empieza/centra la deformación a lo largo del eje: 0 = donde empezaba de siempre (la base de la caja), 50 = el centro, 100 = el otro extremo. También se arrastra la guía naranja en la ventana 3D.',
+};
+
 export const DEFORMADORES_DIRECTOS: DeformadorDirecto[] = [
   {
     id: 'doblar',
@@ -1964,6 +2006,7 @@ export const DEFORMADORES_DIRECTOS: DeformadorDirecto[] = [
         opciones: EJES,
         valor: 'y',
       },
+      paramGuia,
     ],
     aplicar: (mesh, params) => sesgar(mesh, params),
   },
@@ -2028,6 +2071,7 @@ export const DEFORMADORES_DIRECTOS: DeformadorDirecto[] = [
         opciones: EJES,
         valor: 'y',
       },
+      paramGuia,
     ],
     aplicar: (mesh, params) => derretir(mesh, params),
   },
