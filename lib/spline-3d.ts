@@ -31,6 +31,12 @@ export type SplineNode3D = {
   esquina?: boolean;
   /** Inclinación de la plantilla en grados alrededor del eje del trazado. */
   tilt?: number;
+  /** Inclinación en grados alrededor del EJE-X de la plantilla (su ancho):
+      la parte alta «se acuesta» — acorta el ALTO del anillo (corte oblicuo). */
+  tiltX?: number;
+  /** Inclinación en grados alrededor del EJE-Y de la plantilla (su alto):
+      acorta el ANCHO del anillo (corte oblicuo). */
+  tiltY?: number;
   /**
    * Escala PROPIA de la plantilla (unidades del mundo). Si falta, se usa
    * la escala de los datos del spline (la de los .zeus viejos).
@@ -375,6 +381,10 @@ type Preparo = {
   /** Giro TOTAL de cada vértice alrededor del trazado (radianes): el tilt
       manual + el φ automático de baseMundo (ver prepararSpline). */
   rolls: number[];
+  /** Inclinación de cada vértice alrededor del eje-x / eje-y de SU
+      plantilla (radianes): acortan alto/ancho del anillo (corte oblicuo). */
+  inclX: number[];
+  inclY: number[];
   escalas: number[];
   /** Factores anisótropos del lienzo→mundo (baseMundo.rx/ry; 1 = cuadrado). */
   facX: number[];
@@ -439,6 +449,10 @@ function prepararSpline(
       : transportadores(tangentes);
 
   const tilts = util.map((n) => ((n.tilt ?? 0) * Math.PI) / 180);
+  // Inclinación del CORTE alrededor de los ejes de la propia plantilla: el
+  // eje-x «acuesta» el alto (canvas-y · cos) y el eje-y acorta el ancho.
+  const inclX = util.map((n) => ((n.tiltX ?? 0) * Math.PI) / 180);
+  const inclY = util.map((n) => ((n.tiltY ?? 0) * Math.PI) / 180);
   // Escala de plantilla por vértice (0.01..8): la del nodo si la trae,
   // si no la de los datos (compatibilidad con .zeus anteriores).
   const escalas = util.map(
@@ -514,6 +528,8 @@ function prepararSpline(
     tangentes,
     normales,
     rolls,
+    inclX,
+    inclY,
     escalas,
     facX,
     facY,
@@ -546,10 +562,17 @@ function anilloDeMuestra(prep: Preparo, i: number): V3[] {
   const n1 = prep.normales[i];
   const b1 = vcross(n1, t1);
   const roll = prep.rolls[j] + (prep.rolls[j2] - prep.rolls[j]) * m.t;
+  // Inclinación del corte interpolada A→B: el giro alrededor del eje-y
+  // acorta el ANCHO (lx·cos) y el del eje-x acorta el ALTO (ly·cos) — el
+  // anillo sale elíptico como un corte oblicuo del barrido.
+  const inclXi = prep.inclX[j] + (prep.inclX[j2] - prep.inclX[j]) * m.t;
+  const inclYi = prep.inclY[j] + (prep.inclY[j2] - prep.inclY[j]) * m.t;
+  const cosX = Math.cos(inclXi);
+  const cosY = Math.cos(inclYi);
   const cos = Math.cos(roll);
   const sin = Math.sin(roll);
-  const ux = UNIT * esc * fX;
-  const uy = UNIT * esc * fY;
+  const ux = UNIT * esc * fX * cosY;
+  const uy = UNIT * esc * fY * cosX;
   const anillo: V3[] = [];
   for (let k = 0; k < prep.ringCount; k++) {
     const lx = (prof[k].x - c.x) * ux;
@@ -771,6 +794,10 @@ export function validarSplineDatos(raw: unknown): SplineDatos | undefined {
     if (o.esquina === true) node.esquina = true;
     if (typeof o.tilt === 'number' && Number.isFinite(o.tilt))
       node.tilt = Math.max(-360, Math.min(360, o.tilt));
+    if (typeof o.tiltX === 'number' && Number.isFinite(o.tiltX))
+      node.tiltX = Math.max(-360, Math.min(360, o.tiltX));
+    if (typeof o.tiltY === 'number' && Number.isFinite(o.tiltY))
+      node.tiltY = Math.max(-360, Math.min(360, o.tiltY));
     const escalaN = puntoNum(o.escala);
     if (escalaN !== null && escalaN > 0) node.escala = Math.max(0.01, Math.min(8, escalaN));
     if (Array.isArray(o.polygon)) {

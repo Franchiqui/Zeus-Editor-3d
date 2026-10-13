@@ -151,24 +151,18 @@ const doblar: ZeusPlugin = {
     // GUÍA: el arco se ANCLA donde esté la guía (la parte de debajo queda
     // recta: phi >= 0). Sin guía (0): el borde min de la caja, como siempre.
     const ancla = guiaDe(mesh, params, eje) ?? cajaEje.min;
-    // Radio AUTOMÁTICO: R = L/θ (el arco gasta la longitud exacta —
-    // sin estirar). Manual (diámetro, % de la longitud L): R = D%·L/200.
-    //
-    // El radio manual NUNCA baja del AUTOMÁTICO: R = max(R_manual, L/θ).
-    // El manual puro aplasta la malla entera en un arco diminuto cuando θ
-    // (y el diámetro animado) salen de 0: la columna se desploma a un
-    // bulto pegado al suelo y va creciendo con el ángulo — «semilla que
-    // echa raíces» (reproducido con columna-anim-check.mjs). Con el max,
-    // con θ chico manda el auto (doblado clásico k=1) y el manual solo
-    // manda cuando pide un arco MÁS ANCHO que el material permite (estira
-    // el objeto para seguirlo). En θ→0 el manual→0 converge con el auto:
-    // animar diametro desde su neutro 0 es CONTINUO, sin salto.
+    // El LADO del arco lo elige el signo del ángulo: positivo curva hacia
+    // +e1 (como siempre), negativo hacia −e1 (espejo en el plano e1 =
+    // centroTransversal). El radio solo depende de |θ|: con la división
+    // firmada de antes, R = max(0, extent/θ) daba 0 y la malla volvía
+    // INTACTA en todo ángulo negativo (giraba arriba y nunca abajo).
+    const lado = theta < 0 ? -1 : 1;
     const RManual = diametroPct > 0 ? (diametroPct / 200) * extent : 0;
-    const R = Math.max(RManual, extent / theta);
+    const R = Math.max(RManual, extent / Math.abs(theta));
     // Estiramiento a lo largo del arco para calar en el radio pedido:
-    // k = R·θ/L. R auto → k = 1 (comportamiento clásico sin estirar);
+    // k = R·|θ|/L. R auto → k = 1 (comportamiento clásico sin estirar);
     // R manual (> auto) → estira la malla para cubrir el arco ancho.
-    const k = (R * theta) / extent;
+    const k = (R * Math.abs(theta)) / extent;
     if (!Number.isFinite(R) || R < 1e-9) return mesh;
     const centroTransversal = caja(mesh, e1).centro;
 
@@ -176,13 +170,15 @@ const doblar: ZeusPlugin = {
       // s: avance del vértice por el arco desde el ANCLA (la guía o la
       // base), ya reescalado por k; d: separación respecto al eje de
       // curvatura en el eje transversal — se vuelve RADIAL (radio R − d:
-      // los puntos de +e1 quedan más cerca del centro del arco).
+      // los puntos del lado INTERIOR quedan más cerca del centro del
+      // arco). Con ángulo negativo `lado` = −1 mete el espejo: el lado
+      // interior pasa a ser −e1 y la salida sale espejada igual.
       const s = (leerEje(v, eje) - ancla) * k;
-      const d = leerEje(v, e1) - centroTransversal;
+      const d = (leerEje(v, e1) - centroTransversal) * lado;
       // Arco de curvatura con la BASE FIJA en el ancla: la cruz del ancla
       // no se mueve; el objeto se alza como un abanico curvándose hacia
-      // +e1. d2/h2: punto (d, s) envuelto en el círculo de radio R cuyo
-      // centro queda al nivel del ancla, a distancia R hacia +e1.
+      // lado·e1. d2/h2: punto (d, s) envuelto en el círculo de radio R
+      // cuyo centro queda al nivel del ancla, a distancia R hacia lado·e1.
       const radial = R - d;
       const phi = Math.max(0, s / R);
       const d2 = R - radial * Math.cos(phi);
@@ -193,7 +189,7 @@ const doblar: ZeusPlugin = {
       const porDebajo = s <= 0;
       const d2Salida = porDebajo ? d : d2;
       let nuevo = conEje(v, eje, porDebajo ? ancla + s : ancla + h2);
-      nuevo = conEje(nuevo, e1, centroTransversal + d2Salida);
+      nuevo = conEje(nuevo, e1, centroTransversal + lado * d2Salida);
       return nuevo;
     });
 

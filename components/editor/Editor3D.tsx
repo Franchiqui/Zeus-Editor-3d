@@ -70,7 +70,7 @@ import CalculatedCopiesModal, {
 } from './CalculatedCopiesModal';
 import WindowLayoutModal, { type WindowLayout } from './WindowLayoutModal';
 import { MotionEditor } from './MotionEditor';
-import { ObjectTransformFields } from './object-transform-fields';
+import { ObjectTransformFields, NumberInput } from './object-transform-fields';
 import { ObjectPrimitiveFields } from './object-primitive-fields';
 import { DeformFields } from './deform-fields';
 import {
@@ -108,6 +108,7 @@ import {
   type RoscaParams,
 } from '@/lib/spline-3d';
 import { espejarMesh, espejarObjetoMundo } from '@/lib/espejo';
+import { uvPlanasDeObjeto } from '@/lib/uv-proyeccion';
 import PathCanvas from './path-canvas';
 import type { ObjectTransform, Camera3D, GizmoMode } from '@/components/viewer-3d';
 import type { ExtrusionCtrlSubSel } from '@/components/viewer-3d';
@@ -7634,6 +7635,19 @@ pluginTracks,
     );
   }, []);
 
+  // Inclinación del CORTE de la plantilla alrededor de SU eje-x (acuesta el
+  // alto) o SU eje-y (acorta el ancho) — «los 3 ejes»: tilt = giro en el
+  // propio plano del trazado, tiltX/tiltY = inclinación del corte. Grados.
+  const setSplineNodeInclinacion = useCallback(
+    (id: number, eje: 'tiltX' | 'tiltY', grados: number) => {
+      const v = Math.max(-360, Math.min(360, grados));
+      setSplineNodes((prev) =>
+        prev.map((n) => (n.id === id ? { ...n, [eje]: v } : n))
+      );
+    },
+    []
+  );
+
   // Escala de la plantilla SOLO del vértice activo: el resto de vértices
   // quedan con su propia escala (o la global si nunca la cambió).
   const setSplineNodeEscala = useCallback((id: number, escala: number) => {
@@ -7684,6 +7698,8 @@ pluginTracks,
         polygon: structuredClone(activo.polygon),
         escala: activo.escala,
         tilt: activo.tilt,
+        tiltX: activo.tiltX,
+        tiltY: activo.tiltY,
         baseMundo: activo.baseMundo
           ? {
               right: { ...activo.baseMundo.right },
@@ -11692,6 +11708,24 @@ pluginTracks,
         }
         const { mesh: mallaEspejada, transform: transformEspejo } =
           espejarObjetoMundo(original.mesh, original.transform, eje);
+        // UV horneadas para el gemelo: el espejo en mundo HORNEA la
+        // inclinación en la malla, así que la caja local del gemelo ya
+        // no es la del original — y la proyección plana viva (que cada
+        // render calcula sobre la caja local + escala) puede elegir OTRO
+        // eje: la textura sale de otra cara, oscura/rayada donde el
+        // original sale liso (los gemelos de cristal de un coche). Se
+        // calculan las UV del original con su marco de siempre (caja +
+        // escala + cara más probable) y se CLAVAN al gemelo, que conserva
+        // el orden de los vértices: las tres rutas de render honran
+        // mesh.uvs en la plana. Si el original ya llevaba UV propias, van
+        // clavadas de serie; cilíndrica/esférica no se pueden hornear
+        // (se calculan vivas en cada render y no miran las UV).
+        const uvsPropiasOriginal = original.mesh.uvs?.length ?? 0;
+        const proyeccionOriginal = original.textureProjection ?? 'planar';
+        const uvsGemelo =
+          proyeccionOriginal === 'planar' && uvsPropiasOriginal === 0
+            ? uvPlanasDeObjeto(original.mesh, original.transform)
+            : undefined;
         const gemeloId = `object-${Date.now()}`;
         const gemelo: SceneObject = {
           ...original,
@@ -11699,7 +11733,9 @@ pluginTracks,
           name: `${original.name} ${t('editor3D.espejoSufijo')}`,
           // El espejo en mundo trae transform propio (pivote/rotación).
           transform: transformEspejo as SceneObject['transform'],
-          mesh: mallaEspejada,
+          mesh: uvsGemelo
+            ? { ...mallaEspejada, uvs: uvsGemelo }
+            : mallaEspejada,
           primitiveParams: undefined,
           spline: undefined,
           pluginEdit: undefined,
@@ -17352,21 +17388,38 @@ pluginTracks,
                           className="w-full"
                           data-testid="spline-escala"
                         />
-                        <label className="text-[10px] text-muted-foreground/80 flex items-center justify-between">
-                          <span>{t('editor3D.splineTilt')}</span>
-                          <span className="font-mono text-[10px] text-green-400">
-                            {Math.round(activo.tilt ?? 0)}°
-                          </span>
-                        </label>
-                        <Slider
-                          min={-180}
-                          max={180}
-                          step={5}
-                          value={[Math.round(activo.tilt ?? 0)]}
-                          onValueChange={([v]) => setSplineNodeTilt(activo.id, v)}
-                          className="w-full"
-                          data-testid="spline-tilt"
-                        />
+                        <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+                          <label className="text-[10px] text-muted-foreground/80">
+                            {t('editor3D.splineTiltX')}
+                          </label>
+                          <NumberInput
+                            value={Math.round(activo.tiltX ?? 0)}
+                            step={5}
+                            onCommit={(n) => setSplineNodeInclinacion(activo.id, 'tiltX', n)}
+                            testId="spline-tilt-x"
+                            suffix="°"
+                          />
+                          <label className="text-[10px] text-muted-foreground/80">
+                            {t('editor3D.splineTiltY')}
+                          </label>
+                          <NumberInput
+                            value={Math.round(activo.tiltY ?? 0)}
+                            step={5}
+                            onCommit={(n) => setSplineNodeInclinacion(activo.id, 'tiltY', n)}
+                            testId="spline-tilt-y"
+                            suffix="°"
+                          />
+                          <label className="text-[10px] text-muted-foreground/80">
+                            {t('editor3D.splineTiltZ')}
+                          </label>
+                          <NumberInput
+                            value={Math.round(activo.tilt ?? 0)}
+                            step={5}
+                            onCommit={(n) => setSplineNodeTilt(activo.id, n)}
+                            testId="spline-tilt"
+                            suffix="°"
+                          />
+                        </div>
                       </div>
                     )}
                     <div className="flex gap-1.5 pt-0.5">
