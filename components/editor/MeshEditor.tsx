@@ -389,7 +389,7 @@ export default function MeshEditor() {
   };
 
   return (
-    <div className="flex h-screen bg-gray-900">
+    <div className="flex h-full bg-gray-900">
       {/* Panel de controles */}
       <div className="w-64 bg-gray-800 p-4 flex flex-col gap-4">
         <h1 className="text-xl font-bold text-white mb-4">Editor de Malla</h1>

@@ -42,7 +42,19 @@
       var st = document.documentElement.style;
       var apply = function () {
         st.zoom = String(z);
+        st.setProperty("--vp-zoom", String(z));
         document.documentElement.setAttribute("data-vp-zoom", String(z));
+        /* El zoom CSS rehace anchos en % pero NO las alturas en 100vh: sin
+           esto la web se queda encogida en una franja y no llena la pantalla.
+           Con body alto exacto (viewport/z) y margen 0, las apps que encadenan
+           alturas en % llenan todo, como el zoom nativo del navegador (Ctrl -). */
+        var css = document.getElementById("vp-zoom-style");
+        if (!css) {
+          css = document.createElement("style");
+          css.id = "vp-zoom-style";
+          document.head.appendChild(css);
+        }
+        css.textContent = "html[data-vp-zoom]>body{height:calc(100vh/var(--vp-zoom,1))!important;margin:0!important;}";
       };
       apply();
       window.addEventListener("DOMContentLoaded", apply);

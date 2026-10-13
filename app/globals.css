@@ -8,6 +8,16 @@ body {
   background-color: #10204d; /* gray-950 */
 }
 
+/* Alturas en cadena para las pantallas completas (h-full): html y body con
+   altura definida para que height:100% de los editores resuelva. Las páginas
+   usan h-full en vez de h-screen porque el zoom automático (VisionPantalla-
+   zooms.js) no rehace las alturas en 100vh; con esta cadena el editor llena
+   toda la pantalla también con zoom activo. */
+html,
+body {
+  height: 100%;
+}
+
 /* Fuente Electrolize para todos los editores */
 @font-face {
   font-family: 'Electrolize';

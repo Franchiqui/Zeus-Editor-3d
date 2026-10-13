@@ -438,7 +438,7 @@ export default function CreateTexturesPage() {
   };
 
   return (
-    <main className="min-h-screen bg-slate-950 text-slate-100 pb-24">
+    <main className="min-h-full bg-slate-950 text-slate-100 pb-24">
       {/* Header */}
       <header className="sticky top-0 z-30 bg-slate-950/80 backdrop-blur-md border-b border-slate-800">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
