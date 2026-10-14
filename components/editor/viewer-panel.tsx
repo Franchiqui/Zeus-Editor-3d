@@ -2,11 +2,12 @@
 
 import { useState, useRef, useEffect, type FC } from 'react';
 import { createPortal } from 'react-dom';
-import Viewer3D, { type ObjectTransform, type GizmoMode, type ExtrusionCtrlSubSel, type VistaModo } from '@/components/viewer-3d';
+import Viewer3D, { type ObjectTransform, type GizmoMode, type ExtrusionCtrlSubSel, type VistaModo, type FaceSelectionTarget } from '@/components/viewer-3d';
 import type { TextureMaterialParams } from '@/lib/geometry';
 import type { EfectoObjeto } from '@/lib/efectos-objeto';
 import type { SplineEdicion, V3 } from '@/lib/spline-3d';
 import type { CapturaExtrusionMeta } from '@/lib/extrusion-spline';
+import type { TrazadoCorte } from '@/lib/corte-malla';
 import type { Mesh } from '@/lib/geometry';
 import { PanelButtons } from '@/components/editor/Editor3D';
 import { useI18n } from '@/lib/i18n';
@@ -61,7 +62,7 @@ interface ViewerPanelProps {
     onSelectionModeChange?: (active: boolean) => void;
     faceSelectMode?: boolean;
     faceSelectionTool?: 'rectangle' | 'circle' | 'line' | 'poligono' | 'directo';
-    faceSelectionTarget?: 'cara' | 'vertice' | 'segmento';
+    faceSelectionTarget?: FaceSelectionTarget;
     /** Modo ANILLOS de caras (botón junto a Mover/Extrudir). */
     anillosCaras?: boolean;
     /** Deformador directo en VISTA PREVIA (lavado gris + contorno cage). */
@@ -95,6 +96,14 @@ interface ViewerPanelProps {
         está activo. */
     splineContornos?: V3[][] | null;
     faceSelectVisibleOnly?: boolean;
+    /** CORTE RÁPIDO: zona → corta directo (sin selección de caras). */
+    corteRapido?: boolean;
+    /** Entrega los triángulos (malla vista) dentro de la zona al editor. */
+    onCorteRapido?: (triIds: number[]) => void;
+    /** CORTE POR TRAZADO (botón «Corte»): dibujar la polilínea discontinua. */
+    modoCorte?: boolean;
+    /** Entrega el trazado cerrado (cámara + rayos + px + matriz) al editor. */
+    onCorteZona?: (trazado: TrazadoCorte) => void;
     wireframeOffSignal?: number;
     /** Modo de visualización GLOBAL de las ventanas 3D (compartido por las cuatro). */
     vistaModo?: VistaModo;
@@ -117,7 +126,7 @@ interface ViewerPanelProps {
     onEdgeSelectionChange?: (edgeIds: string[]) => void;
     onFaceSelectionModeChange?: (active: boolean) => void;
     onFaceSelectionToolChange?: (tool: 'rectangle' | 'circle' | 'line' | 'poligono') => void;
-    onFaceSelectionTargetChange?: (target: 'cara' | 'vertice' | 'segmento') => void;
+    onFaceSelectionTargetChange?: (target: FaceSelectionTarget) => void;
     /** Registra la función de mover la selección del visor (campos numéricos). */
     onRegisterSelectionMove?: (fn: (dx: number, dy: number, dz: number) => void) => void;
     onMultiObjectTransform?: (transforms: { id: string; transform: ObjectTransform }[]) => void;
@@ -279,6 +288,10 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
     splinePreviewVisible,
     splineContornos,
     faceSelectVisibleOnly,
+    corteRapido,
+    onCorteRapido,
+    modoCorte,
+    onCorteZona,
     wireframeOffSignal,
     vistaModo,
     onVistaModoChange,
@@ -612,6 +625,10 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
            splinePreviewVisible={splinePreviewVisible}
            splineContornos={splineContornos}
            faceSelectVisibleOnly={faceSelectVisibleOnly}
+           corteRapido={corteRapido}
+           onCorteRapido={onCorteRapido}
+           modoCorte={modoCorte}
+           onCorteZona={onCorteZona}
            wireframeOffSignal={wireframeOffSignal}
            vistaModo={vistaModo}
            selectedFaceIds={selectedFaceIds}

@@ -441,6 +441,23 @@ var ejeDe = (params, id, porDefecto) => {
   const v = params[id];
   return v === "x" || v === "y" || v === "z" ? v : porDefecto;
 };
+var guiaDe = (mesh, params, eje) => {
+  const g = num(params, "guia", 0);
+  if (g <= 0) return null;
+  const c = caja(mesh, eje);
+  return c.min + g / 100 * (c.max - c.min);
+};
+var paramGuia = {
+  tipo: "slider",
+  id: "guia",
+  etiqueta: "Gu\xEDa",
+  min: 0,
+  max: 100,
+  paso: 1,
+  valor: 0,
+  unidad: "%",
+  descripcion: "D\xF3nde empieza/centra la deformaci\xF3n a lo largo del eje: 0 = donde empezaba de siempre (la base de la caja), 50 = el centro, 100 = el otro extremo. Tambi\xE9n se arrastra la gu\xEDa naranja en la ventana 3D."
+};
 var doblar = {
   id: "doblar",
   nombre: "Doblar (Bend)",
@@ -474,7 +491,8 @@ var doblar = {
       etiqueta: "Eje de curvatura",
       opciones: EJES,
       valor: "y"
-    }
+    },
+    paramGuia
   ],
   aplicar(mesh, params) {
     const anguloDeg = num(params, "angulo", 45);
@@ -487,20 +505,23 @@ var doblar = {
     const [e1] = ejesTransversales(eje);
     const extent = cajaEje.max - cajaEje.min;
     const diametroPct = num(params, "diametro", 0);
+    const ancla = guiaDe(mesh, params, eje) ?? cajaEje.min;
     const RManual = diametroPct > 0 ? diametroPct / 200 * extent : 0;
     const R = Math.max(RManual, extent / theta);
     const k = R * theta / extent;
     if (!Number.isFinite(R) || R < 1e-9) return mesh;
     const centroTransversal = caja(mesh, e1).centro;
     const vertices = mesh.vertices.map((v) => {
-      const s = (leerEje(v, eje) - cajaEje.min) * k;
+      const s = (leerEje(v, eje) - ancla) * k;
       const d = leerEje(v, e1) - centroTransversal;
-      const phi = s / R;
       const radial = R - d;
+      const phi = Math.max(0, s / R);
       const d2 = R - radial * Math.cos(phi);
       const h2 = radial * Math.sin(phi);
-      let nuevo = conEje(v, eje, cajaEje.min + h2);
-      nuevo = conEje(nuevo, e1, centroTransversal + d2);
+      const porDebajo = s <= 0;
+      const d2Salida = porDebajo ? d : d2;
+      let nuevo = conEje(v, eje, porDebajo ? ancla + s : ancla + h2);
+      nuevo = conEje(nuevo, e1, centroTransversal + d2Salida);
       return nuevo;
     });
     return { ...mesh, vertices };
@@ -528,7 +549,8 @@ var torcionar = {
       etiqueta: "Eje de giro",
       opciones: EJES,
       valor: "y"
-    }
+    },
+    paramGuia
   ],
   aplicar(mesh, params) {
     const anguloDeg = num(params, "angulo", 90);
@@ -541,8 +563,9 @@ var torcionar = {
     const [e1, e2] = ejesTransversales(eje);
     const c1 = caja(mesh, e1).centro;
     const c2 = caja(mesh, e2).centro;
+    const ancla = guiaDe(mesh, params, eje) ?? cajaEje.min;
     const vertices = mesh.vertices.map((v) => {
-      const t = (leerEje(v, eje) - cajaEje.min) / (cajaEje.max - cajaEje.min);
+      const t = (leerEje(v, eje) - ancla) / (cajaEje.max - cajaEje.min);
       const phi = theta * t;
       const cos = Math.cos(phi);
       const sin = Math.sin(phi);
@@ -587,7 +610,8 @@ var afilar = {
       etiqueta: "Eje de afilado",
       opciones: EJES,
       valor: "y"
-    }
+    },
+    paramGuia
   ],
   aplicar(mesh, params) {
     const fInicio = num(params, "escalaInicio", 100) / 100;
@@ -598,9 +622,10 @@ var afilar = {
     const [e1, e2] = ejesTransversales(eje);
     const c1 = caja(mesh, e1).centro;
     const c2 = caja(mesh, e2).centro;
+    const ancla = guiaDe(mesh, params, eje) ?? cajaEje.min;
     const vertices = mesh.vertices.map((v) => {
-      const t = (leerEje(v, eje) - cajaEje.min) / (cajaEje.max - cajaEje.min);
-      const f = fInicio + (fFin - fInicio) * t;
+      const t = (leerEje(v, eje) - ancla) / (cajaEje.max - cajaEje.min);
+      const f = t <= 0 ? fInicio : fInicio + (fFin - fInicio) * Math.min(t, 1);
       let nuevo = conEje(v, e1, c1 + (leerEje(v, e1) - c1) * f);
       nuevo = conEje(nuevo, e2, c2 + (leerEje(v, e2) - c2) * f);
       return nuevo;
@@ -723,6 +748,12 @@ function caja2(mesh, e) {
 function pluginAplicar(id, mesh, params) {
   const p = DEFORMADORES.find((d) => d.id === id);
   return p ? p.aplicar(mesh, params) : mesh;
+}
+function guiaDe2(mesh, params, eje) {
+  const g = num2(params, "guia", 0);
+  if (g <= 0) return null;
+  const c = caja2(mesh, eje);
+  return c.min + g / 100 * (c.max - c.min);
 }
 function bisel(mesh, params) {
   const radioPct = num2(params, "radio", 10);
@@ -1598,8 +1629,9 @@ function sesgar(mesh, params) {
   const cajaT = caja2(mesh, e1);
   const total = desplazamiento * cajaT.extension;
   if (!Number.isFinite(total)) return mesh;
+  const ancla = guiaDe2(mesh, params, eje) ?? cajaEje.min;
   const vertices = mesh.vertices.map((v) => {
-    const t = (leerEje2(v, eje) - cajaEje.min) / (cajaEje.max - cajaEje.min);
+    const t = (leerEje2(v, eje) - ancla) / (cajaEje.max - cajaEje.min);
     return conEje2(v, e1, leerEje2(v, e1) + total * t);
   });
   return { ...mesh, vertices };
@@ -1619,8 +1651,12 @@ function derretir(mesh, params) {
     caja2(mesh, e1).extension,
     caja2(mesh, e2).extension
   ) * ensanche;
+  const ancla = guiaDe2(mesh, params, eje) ?? cajaEje.min;
   const vertices = mesh.vertices.map((v) => {
-    const t = (leerEje2(v, eje) - cajaEje.min) / (cajaEje.max - cajaEje.min);
+    const t = Math.max(
+      0,
+      (leerEje2(v, eje) - ancla) / (cajaEje.max - cajaEje.min)
+    );
     const d1 = leerEje2(v, e1) - c1;
     const d2 = leerEje2(v, e2) - c2;
     let nuevo = conEje2(v, eje, leerEje2(v, eje) - caidaAbs * t * t);
@@ -2025,6 +2061,17 @@ var biselPlanoParams = [
     descripcion: "Sube (positivo) o hunde (negativo) el borde EXTERIOR del marco, % de la diagonal de la caja. Las caras vecinas se inclinan con \xE9l (marco \xABextruido\xBB)."
   }
 ];
+var paramGuia2 = {
+  tipo: "slider",
+  id: "guia",
+  etiqueta: "Gu\xEDa",
+  min: 0,
+  max: 100,
+  paso: 1,
+  valor: 0,
+  unidad: "%",
+  descripcion: "D\xF3nde empieza/centra la deformaci\xF3n a lo largo del eje: 0 = donde empezaba de siempre (la base de la caja), 50 = el centro, 100 = el otro extremo. Tambi\xE9n se arrastra la gu\xEDa naranja en la ventana 3D."
+};
 var DEFORMADORES_DIRECTOS = [
   {
     id: "doblar",
@@ -2102,7 +2149,8 @@ var DEFORMADORES_DIRECTOS = [
         etiqueta: "Eje de sesgado",
         opciones: EJES2,
         valor: "y"
-      }
+      },
+      paramGuia2
     ],
     aplicar: (mesh, params) => sesgar(mesh, params)
   },
@@ -2166,7 +2214,8 @@ var DEFORMADORES_DIRECTOS = [
         etiqueta: "Eje vertical",
         opciones: EJES2,
         valor: "y"
-      }
+      },
+      paramGuia2
     ],
     aplicar: (mesh, params) => derretir(mesh, params)
   },

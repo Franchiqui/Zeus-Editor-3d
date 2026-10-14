@@ -1,7 +1,7 @@
 /* Zoom automático por pantalla — generado por Visión Pantalla */
 (function () {
   "use strict";
-  var ZOOMS = {"4097x2160":0.7,"1821x960":0.7};
+  var ZOOMS = {"4097x2160":0.5131581182307065,"1821x960":0.5131581182307065};
   try {
     /* Dentro de un marco (iframe) el zoom lo pone quien incrusta la web
        (el visualizador de Visión Pantalla ya aplica el suyo): aquí sería
@@ -44,10 +44,11 @@
         st.zoom = String(z);
         st.setProperty("--vp-zoom", String(z));
         document.documentElement.setAttribute("data-vp-zoom", String(z));
-        /* El zoom CSS rehace anchos en % pero NO las alturas en 100vh: sin
-           esto la web se queda encogida en una franja y no llena la pantalla.
-           Con body alto exacto (viewport/z) y margen 0, las apps que encadenan
-           alturas en % llenan todo, como el zoom nativo del navegador (Ctrl -). */
+        /* El zoom CSS rehace anchos en % pero NO las alturas en 100vh:
+           sin esto la web se queda encogida en una franja y no llena la
+           pantalla. Con body alto exacto (viewport/z) y margen 0, las
+           apps que encadenan alturas en % llenan todo, como el zoom
+           nativo del navegador (Ctrl -). */
         var css = document.getElementById("vp-zoom-style");
         if (!css) {
           css = document.createElement("style");

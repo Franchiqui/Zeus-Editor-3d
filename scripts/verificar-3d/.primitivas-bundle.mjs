@@ -228,6 +228,25 @@ function transportadores(tangentes) {
   }
   return normales;
 }
+function frenet(tangentes) {
+  const total = tangentes.length;
+  const normales = [];
+  let prev = primeraNormal(tangentes[0]);
+  for (let i = 0; i < total; i++) {
+    const t = tangentes[i];
+    const t0 = tangentes[i === 0 ? 0 : i - 1];
+    const t1 = tangentes[i === total - 1 ? total - 1 : i + 1];
+    const curv = vsub(t1, t0);
+    if (vfinito(curv) && Math.hypot(curv.x, curv.y, curv.z) > 1e-9) {
+      const cu = vnorm(vmul(curv, -1));
+      const proj = vsub(cu, vmul(t, vdot(cu, t)));
+      if (Math.hypot(proj.x, proj.y, proj.z) > 1e-9) prev = vnorm(proj);
+    }
+    prev = vnorm(vsub(prev, vmul(t, vdot(prev, t))));
+    normales.push(prev);
+  }
+  return normales;
+}
 var UNIT = 2;
 var LIMITE_VERTICES = 2e5;
 function buildSpline3DMesh(nodes, options = {}) {
@@ -262,8 +281,11 @@ function buildSpline3DMesh(nodes, options = {}) {
     const d = vsub(next, prev);
     return Math.hypot(d.x, d.y, d.z) < 1e-9 ? { x: 1, y: 0, z: 0 } : vnorm(d);
   });
-  const normales = transportadores(tangentes);
+  const normales = options.orientacion === "radial" ? frenet(tangentes) : transportadores(tangentes);
   const tilts = util.map((n) => (n.tilt ?? 0) * Math.PI / 180);
+  const escalas = util.map(
+    (n) => n.escala && n.escala > 0 ? Math.max(0.01, Math.min(8, n.escala)) : esc
+  );
   const vertices = [];
   const anillas = [];
   for (let i = 0; i < total; i++) {
@@ -280,6 +302,9 @@ function buildSpline3DMesh(nodes, options = {}) {
       prof.push({ x: a.x + (b.x - a.x) * m.t, y: a.y + (b.y - a.y) * m.t });
     }
     const c = centroid(prof);
+    const escA = escalas[m.seg];
+    const escB = escalas[(m.seg + 1) % util.length];
+    const esc2 = escA + (escB - escA) * m.t;
     const t1 = tangentes[i];
     const n1 = normales[i];
     const b1 = vcross(n1, t1);
@@ -287,8 +312,8 @@ function buildSpline3DMesh(nodes, options = {}) {
     const sin = Math.sin(tilt);
     const ids = [];
     for (let k = 0; k < ringCount; k++) {
-      const lx = (prof[k].x - c.x) * UNIT * esc;
-      const ly = (prof[k].y - c.y) * UNIT * esc;
+      const lx = (prof[k].x - c.x) * UNIT * esc2;
+      const ly = (prof[k].y - c.y) * UNIT * esc2;
       const a = lx * cos - ly * sin;
       const b = lx * sin + ly * cos;
       const p = vadd(m.pos, vadd(vmul(n1, a), vmul(b1, b)));

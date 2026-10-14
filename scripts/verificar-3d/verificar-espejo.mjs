@@ -8,7 +8,8 @@
 //     --platform=node --outfile=scripts/verificar-3d/.espejo-bundle.mjs
 //   node scripts/verificar-3d/verificar-espejo.mjs
 
-import { espejarMesh } from './.espejo-bundle.mjs';
+import { espejarMesh, espejarObjetoMundo } from './.espejo-bundle.mjs';
+import * as THREE from 'three';
 
 let fallos = 0;
 const fallo = (msg) => { console.log(`  ✗ ${msg}`); fallos++; };
@@ -153,6 +154,158 @@ console.log('═══ UVs espejadas (con repetición) ═══');
   if (espejarMesh({ vertices: base.vertices, faces: base.faces }, 'x').uvs !== undefined)
     fallo('sin uvs: se inventó un mapeo');
   else ok('sin uvs: la malla espejada tampoco lleva uvs');
+}
+
+console.log('═══ Espejo EN MUNDO (crear objeto nuevo) ═══');
+{
+  // El BUG del usuario: cubo inclinado 45° — el espejo LOCAL daba la MISMA
+  // figura (parecía copia). El espejo en MUNDO debe reflejar la inclinación.
+  const ang = Math.PI / 4;
+  const transform = {
+    px: 3, py: 1, pz: -2,
+    rx: 0, ry: 0, rz: ang,
+    sx: 1, sy: 1, sz: 1,
+  };
+  const T = new THREE.Matrix4().compose(
+    new THREE.Vector3(3, 1, -2),
+    new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, ang)),
+    new THREE.Vector3(1, 1, 1)
+  );
+  const mundoDe = (m) =>
+    m.vertices.map(
+      (v) => new THREE.Vector3(v.x, v.y, v.z).applyMatrix4(T)
+    );
+
+  const base = { vertices: ESQ.map((v) => ({ ...v })), faces: CUBO[0].faces };
+  const mundo0 = mundoDe(base);
+
+  // La inclinación de partida: un vértice del cubo girado.
+  const mLocal = espejarMesh(base, 'x');
+  // Comparar como FIGURA (nube ordenada), no por índice: el volteo local
+  // permuta los vértices y el cubo simétrico vuelve a caer sobre sí mismo.
+  const nube = (ws) =>
+    ws.map((w) => [w.x, w.y, w.z])
+      .sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
+  const nubeA = nube(mundoDe(mLocal));
+  const nubeB = nube(mundo0);
+  const mismaFigura = nubeA.every(
+    (w, i) => Math.abs(w[0] - nubeB[i][0]) < 1e-9 && Math.abs(w[1] - nubeB[i][1]) < 1e-9
+  );
+  if (mismaFigura)
+    ok('contraste: el espejo LOCAL del cubo inclinado da la MISMA figura (el bug)');
+  else fallo('contraste: el cubo inclinado sí cambia con espejo local (contraste invalido)');
+
+  const res = espejarObjetoMundo(base, transform, 'x');
+  // El gemelo: transform con pivote en el centro de su caja y SIN giro.
+  if (res.transform.rx !== 0 || res.transform.ry !== 0 || res.transform.rz !== 0)
+    fallo(`gemelo con giro (${res.transform.rz}) — debía quedar horneado`);
+  else ok('gemelo con rotación a CERO (inclinación horneada en la malla)');
+  const esperadoPivote = new THREE.Vector3(
+    Math.min(...mundo0.map((w) => w.x)) + Math.max(...mundo0.map((w) => w.x)),
+    Math.min(...mundo0.map((w) => w.y)) + Math.max(...mundo0.map((w) => w.y)),
+    Math.min(...mundo0.map((w) => w.z)) + Math.max(...mundo0.map((w) => w.z))
+  ).multiplyScalar(0.5);
+  if (
+    !cerca(res.transform.px, esperadoPivote.x, 1e-9) ||
+    !cerca(res.transform.py, esperadoPivote.y, 1e-9) ||
+    !cerca(res.transform.pz, esperadoPivote.z, 1e-9)
+  )
+    fallo('gemelo con pivote ≠ centro de la caja mundial');
+  else ok(`gemelo con pivote en el centro de la caja (${esperadoPivote.toArray().map((n) => n.toFixed(2)).join(', ')})`);
+
+  // INDEPENDIENTE: el gemelo en mundo debe ser el REFLEJO del original
+  // respecto al plano x = centro (composición de matrices, otro camino).
+  const Tm = new THREE.Matrix4().compose(
+    new THREE.Vector3(res.transform.px, res.transform.py, res.transform.pz),
+    new THREE.Quaternion(),
+    new THREE.Vector3(res.transform.sx, res.transform.sy, res.transform.sz)
+  );
+  // M_x(c): x' = 2c - x  ==  Trans(c)·Diag(-1,1,1)·Trans(-c)
+  const Mx_c = new THREE.Matrix4()
+    .makeTranslation(esperadoPivote.x, esperadoPivote.y, esperadoPivote.z)
+    .multiply(new THREE.Matrix4().makeScale(-1, 1, 1))
+    .multiply(
+      new THREE.Matrix4().makeTranslation(
+        -esperadoPivote.x, -esperadoPivote.y, -esperadoPivote.z
+      )
+    );
+  const esperado = mundo0.map((w) => w.clone().applyMatrix4(Mx_c));
+  const twinMundo = res.mesh.vertices.map(
+    (v) =>
+      new THREE.Vector3(
+        v.x * res.transform.sx,
+        v.y * res.transform.sy,
+        v.z * res.transform.sz
+      )
+        .applyQuaternion(
+          new THREE.Quaternion().setFromEuler(
+            new THREE.Euler(res.transform.rx, res.transform.ry, res.transform.rz)
+          )
+        )
+        .add(
+          new THREE.Vector3(
+            res.transform.px, res.transform.py, res.transform.pz
+          )
+        )
+  );
+  const peor = Math.max(
+    ...esperado.map((w, i) => w.distanceTo(twinMundo[i] ?? new THREE.Vector3()))
+  );
+  if (peor > 1e-9) fallo(`gemelo en mundo ≠ reflejo del original (peor err ${peor.toExponential(2)})`);
+  else ok('gemelo en mundo = REFLEJO EXACTO del original (eje de la vista, con inclinación)');
+  if (twinMundo.every((w, i) => w.distanceTo(mundo0[i]) < 1e-9))
+    fallo('el gemelo en mundo es IGUAL al original — no refeja nada');
+  else ok('el gemelo en mundo es DISTINTO del original (deja de parecer copia)');
+
+  if (!manifoldCerrada(res.mesh)) fallo('mundo: manifold rota tras el espejo');
+  else ok('mundo: manifold cerrada intacta');
+  if (volumen(res.mesh) <= 0) fallo('mundo: volumen negativo (winding sin compensar)');
+  else ok('mundo: volumen saliente (caras recorridas al revés)');
+
+  // Sin giro: el espejo en mundo COINCIDE con el local (regresión).
+  const recto = espejarObjetoMundo(base, { sx: 1, sy: 1, sz: 1 }, 'x');
+  const conLocal = espejarMesh(base, 'x');
+  const igualLocal = recto.mesh.vertices.every(
+    (v, i) =>
+      Math.abs(v.x - conLocal.vertices[i].x) < 1e-9 &&
+      Math.abs(v.y - conLocal.vertices[i].y) < 1e-9 &&
+      Math.abs(v.z - conLocal.vertices[i].z) < 1e-9
+  );
+  if (!igualLocal) fallo('objeto sin girar: el espejo en mundo ≠ espejo local');
+  else ok('objeto sin girar: espejo en mundo ≡ espejo local (sin cambio de conducta)');
+
+  // Escala por eje + giro: la regla T·R·S también debe reflejar exacto.
+  const esc = { ...transform, sx: 2, sy: 0.5 };
+  const TE = new THREE.Matrix4().compose(
+    new THREE.Vector3(3, 1, -2),
+    new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, ang)),
+    new THREE.Vector3(2, 0.5, 1)
+  );
+  const mundoEsc = base.vertices.map(
+    (v) => new THREE.Vector3(v.x, v.y, v.z).applyMatrix4(TE)
+  );
+  const cxEsc = (Math.min(...mundoEsc.map((w) => w.x)) + Math.max(...mundoEsc.map((w) => w.x))) / 2;
+  const resEsc = espejarObjetoMundo(base, esc, 'x');
+  const twinEsc = resEsc.mesh.vertices.map(
+    (v) =>
+      new THREE.Vector3(
+        v.x * resEsc.transform.sx,
+        v.y * resEsc.transform.sy,
+        v.z * resEsc.transform.sz
+      ).applyQuaternion(
+        new THREE.Quaternion().setFromEuler(
+          new THREE.Euler(resEsc.transform.rx, resEsc.transform.ry, resEsc.transform.rz)
+        )
+      ).add(
+        new THREE.Vector3(resEsc.transform.px, resEsc.transform.py, resEsc.transform.pz)
+      )
+  );
+  const peorEsc = Math.max(...mundoEsc.map((w, i) =>
+    Math.abs(2 * cxEsc - w.x - twinEsc[i].x) +
+    Math.abs(w.y - twinEsc[i].y) + Math.abs(w.z - twinEsc[i].z)
+  ));
+  if (peorEsc > 1e-9) fallo(`escala+giro: reflejo mal (peor err ${peorEsc.toExponential(2)})`);
+  else ok('escala por eje + giro: reflejo exacto también');
 }
 
 console.log('═══ Degenerados ═══');

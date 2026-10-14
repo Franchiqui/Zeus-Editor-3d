@@ -110,6 +110,7 @@ import type {
 import { obtenerPlugin, type PluginParams } from '@/lib/plugins';
 import { muestrearSpline, type SplineEdicion, type SplineNode3D, type V3 } from '@/lib/spline-3d';
 import type { CapturaExtrusionMeta } from '@/lib/extrusion-spline';
+import type { TrazadoCorte } from '@/lib/corte-malla';
 import { useI18n } from '@/lib/i18n';
 import { smoothVoxelMesh } from '@/lib/mesh-smooth';
 import { Slider } from '@/components/ui/slider';
@@ -319,6 +320,11 @@ export function resolveSpotTarget(
   };
 }
 
+/** Objetivo de la sub-selección: cara/vértice/segmento por botón, o
+ *  «todo» JUNTO — el botón Seleccionar del editor dibuja una zona
+ *  (rectángulo o polígono) y coge los tres tipos a la vez. */
+export type FaceSelectionTarget = 'cara' | 'vertice' | 'segmento' | 'todo';
+
 /** Resultado de la extrusión con Ctrl (flecha de mover, bola de escala o
  *  cubo central — ver `onCtrlExtrudirSubSel`): la malla ya con la copia +
  *  paredes casi en el sitio de la selección y los mapas para que el
@@ -330,12 +336,10 @@ export type ExtrusionCtrlSubSel = {
   vmap: Map<number, number>;
   /** Índices de las caras-copia (la nueva selección, como en Blender). */
   carasNuevas: number[];
-  /** Normal suavizada unitaria (LOCAL) por VÉRTICE DUPLICADO, de la región
-   *  extraída. Con ella el arrastre de mover con Ctrl es INFLADO (estilo
-   *  Blender «Extrude along Normals»): cada vértice sale por la suya con la
-   *  misma profundidad, así en superficie curvada todas las caras salen
-   *  IGUAL. Ausente (o sin la entrada de un vértice) → arrastre clásico de
-   *  una sola dirección. */
+  /** Dirección (LOCAL) de la copia en el arrastre de mover con Ctrl: UNA
+   *  media de la región — las paredes salen PARALELAS (recto), sin abanico
+   *  (2026-10-14). Todos los VÉRTICES DUPLICADOS reciben el MISMO vector.
+   *  Ausente (o sin la entrada de un vértice) → arrastre clásico del eje. */
   normalesPorVert?: Map<number, Vertex3D>;
 };
 
@@ -415,8 +419,10 @@ interface Viewer3DProps {
      * (clics sucesivos) o DIRECTO — el clic elige el elemento bajo el
      * cursor, sin marco (los botones Polígono/Aristas/Puntos la fijan). */
     faceSelectionTool?: 'rectangle' | 'circle' | 'line' | 'poligono' | 'directo';
-    /** Qué se selecciona: caras, vértices o segmentos (aristas) */
-    faceSelectionTarget?: 'cara' | 'vertice' | 'segmento';
+    /** Qué se selecciona: caras, vértices o segmentos (aristas) — o «todo»
+     *  JUNTO: la zona de la herramienta (rectángulo/polígono) coge los tres
+     *  tipos a la vez (lo activa el botón Seleccionar del editor). */
+    faceSelectionTarget?: FaceSelectionTarget;
     /** Modo ANILLOS de caras: en el objetivo caras, el hover/clic agrupa el
      *  anillo completo de caras que pasa por el borde apuntado (los botones
      *  junto a Mover/Extrudir lo conmutan). */
@@ -466,6 +472,21 @@ interface Viewer3DProps {
     splineContornos?: V3[][] | null;
     /** Solo capturar lo visible (caras frontales, no lo que está detrás) */
     faceSelectVisibleOnly?: boolean;
+    /** CORTE RÁPIDO (objetivos «todo»): al soltar la zona, en vez de
+     *  seleccionar nada el visor hace UN barrido sobre los triángulos y
+     *  emite los índices que caen dentro — el editor los corta directo
+     *  (borrarCarasRegion). Los pasos pesados de selección (agrupados,
+     *  overlays) NO se tocan: era lo que tardaba horas en mallas enormes. */
+    corteRapido?: boolean;
+    /** Entrega los índices de triángulos (malla VISTA) dentro de la zona. */
+    onCorteRapido?: (triIds: number[]) => void;
+    /** CORTE POR TRAZADO (botón «Corte»): el usuario dibuja una polilínea
+     *  discontinua (clic = punto, Intro cierra, clic derecho cancela). Al
+     *  cerrar el trazado el visor entrega cámara + rayos (en espacio LOCAL
+     *  de la malla) + puntos en px + la matriz local→px: el editor llama a
+     *  cortarMallaPorTrazado. Trazado abierto (< 3 puntos) = solo corte. */
+    modoCorte?: boolean;
+    onCorteZona?: (trazado: TrazadoCorte) => void;
     /** Al incrementarse, apaga la vista de alambre (fin del ciclo de textura por caras) */
     wireframeOffSignal?: number;
     /** Modo de visualización compartido por TODAS las ventanas 3D (el panel lo manda igual a las cuatro). */
@@ -487,7 +508,7 @@ interface Viewer3DProps {
     /** Notifica al padre del cambio en la herramienta de selección */
     onFaceSelectionToolChange?: (tool: 'rectangle' | 'circle' | 'line' | 'poligono') => void;
     /** Notifica al padre del cambio en el objetivo de selección */
-    onFaceSelectionTargetChange?: (target: 'cara' | 'vertice' | 'segmento') => void;
+    onFaceSelectionTargetChange?: (target: FaceSelectionTarget) => void;
   onVerticesChange?: (vertices: Vertex3D[]) => void;
   /**
    * Ctrl mientras se arrastra una asa de la sub-selección (flechas de
@@ -1761,10 +1782,9 @@ type SelectionGizmoDrag = {
   vertOriginales: Vertex3D[];
   vertIdx: number[];
   centroLocal: THREE.Vector3;
-  /** Inflado (mover desde la extrusión con Ctrl): normal LOCAL unitaria
-   *  por índice de la malla arrastrada. Presente → cada vértice se mueve
-   *  por la suya × la profundidad del gesto (todas las caras salen igual);
-   *  un índice sin entrada cae al delta clásico del eje. */
+  /** Extrusión RECTA (mover desde la extrusión con Ctrl): dirección LOCAL
+   *  unitaria ÚNICA para TODOS los índices de la copia (paredes paralelas,
+   *  sin abanico); un índice sin entrada cae al delta clásico del eje. */
   normalesPorVert?: Map<number, Vertex3D>;
   latestVerts?: Vertex3D[];
   lastEmit?: number;
@@ -1775,13 +1795,17 @@ type SelectionGizmoDrag = {
  * caras; vértices → tal cual; segmentos → extremos de las aristas. */
 function collectSelectionVerts(
   m: Mesh,
-  target: 'cara' | 'vertice' | 'segmento',
+  target: FaceSelectionTarget,
   faceIds: number[],
   vertexIds: number[],
   edgeIds: string[]
 ): { vertIdx: number[]; centroLocal: THREE.Vector3 } {
+  // «todo» (zona del botón Seleccionar) se comporta como caras aquí:
+  // el grupo de vértices de la zona es el de TODAS las caras cogidas.
+  const objetivo: 'cara' | 'vertice' | 'segmento' =
+    target === 'todo' ? 'cara' : target;
   const set = new Set<number>();
-  if (target === 'cara') {
+  if (objetivo === 'cara') {
     for (const f of faceIds) {
       const face = m.faces[f];
       if (face) {
@@ -1822,13 +1846,17 @@ function collectSelectionVerts(
  *  objeto (el usuario lo vio con polígonos y con aristas). */
 function normalSubSeleccion(
   m: Mesh,
-  target: 'cara' | 'vertice' | 'segmento',
+  target: FaceSelectionTarget,
   faceIds: number[],
   vertexIds: number[],
   edgeIds: string[]
 ): THREE.Vector3 | null {
+  // «todo»: el gizmo no se usa en ese modo, pero la normal saldría de las
+  // caras de la zona — mismo camino que el objetivo caras.
+  const objetivo: 'cara' | 'vertice' | 'segmento' =
+    target === 'todo' ? 'cara' : target;
   const caras = new Set<number>();
-  if (target === 'cara') {
+  if (objetivo === 'cara') {
     for (const f of faceIds) caras.add(f);
   } else if (target === 'vertice') {
     // Caras que tocan CUALQUIERA de los vértices seleccionados.
@@ -2728,13 +2756,16 @@ function computeFaceNormal(mesh: Mesh, faceIdx: number): THREE.Vector3 | null {
 }
 
 // Cuaternio que «acoda» el gizmo con las caras seleccionadas: el eje Z
-// pintado sigue la NORMAL de la selección (en mundo, con el giro del
-// objeto) y X/Y quedan dentro del plano (X = la X del mundo proyectada al
-// plano; si cae casi sobre la normal, la Y del mundo y luego la Z).
+// pintado sigue la NORMAL MEDIA de la selección (en mundo, con el giro del
+// objeto) y X/Y quedan dentro del plano (X = la ARISTA DE FRONTERA más
+// larga de la selección llevada a mundo y proyectada al plano — así el
+// gizmo sale A ESCUADRA con el dibujo, p. ej. con el lado de un corte;
+// sin frontera o degenerada: la X del mundo, luego la Y y la Z).
 // `ladoVisto` (+1/−1): lado (respecto a la normal) desde el que miraba el
 // usuario al seleccionar — algunas mallas (p. ej. Cubo.zeus) guardan
 // caras con la normal hacia DENTRO; el gizmo sale siempre por el lado
-// VISIBLE. null si las caras no cuadran (normales repartidas).
+// VISIBLE. null si las caras no cuadran (normales contrarias reales —
+// bandas curvas de más de 120°).
 function quatAcodadoACaras(
   mesh: Mesh,
   faces: number[],
@@ -2748,18 +2779,61 @@ function quatAcodadoACaras(
   for (const f of faces) {
     const nf = computeFaceNormal(mesh, f);
     if (!nf) continue;
+    // Coherencia INSENSIBLE AL SENTIDO: el corte por trazado conserva el
+    // orden cíclico pero no garantiza el sentido — piezas hermanas pueden
+    // quedar enrolladas hacia dentro y hacia fuera; comparar el MÓDULO
+    // (y voltear las contrarias para que la media se sume, no cancele).
+    // Bandas curvadas reales (más de 120° entre sí) siguen descartadas.
+    const mediaHastaAhora = normal.lengthSq() > 1e-12
+      ? normal.clone().normalize()
+      : null;
+    if (mediaHastaAhora && nf.dot(mediaHastaAhora) < 0) nf.negate();
     normal.add(nf);
-    // Coherencia: que cada cara del grupo apunte en la misma dirección
-    // (>60° de desvío = bandas curvas, sin alineación).
-    if (nf.dot(primera) < 0.5) return null;
   }
   if (normal.lengthSq() < 1e-12) return null;
   const z = normal.normalize().transformDirection(worldMatrix);
   if (ladoVisto < 0) z.negate();
-  let ref = new THREE.Vector3(1, 0, 0);
-  if (Math.abs(ref.dot(z)) > 0.9) ref.set(0, 1, 0);
-  if (Math.abs(ref.dot(z)) > 0.9) ref.set(0, 0, 1);
-  const x = ref.clone().sub(z.clone().multiplyScalar(ref.dot(z))).normalize();
+  // X «a escuadra»: la arista que pertenece a UNA sola cara del grupo
+  // (frontera) con mayor longitud en local. Para el interior de un corte
+  // es un LADO del lazo dibujado; el gizmo queda alineado con el dibujo.
+  const conteoAristas = new Map<string, number>();
+  const parArista = new Map<string, { a: number; b: number }>();
+  for (const fi of faces) {
+    const anillo = mesh.faces[fi];
+    if (!anillo) continue;
+    for (let i = 0; i < anillo.length; i++) {
+      const a = anillo[i];
+      const b = anillo[(i + 1) % anillo.length];
+      const clave = `${Math.min(a, b)}-${Math.max(a, b)}`;
+      conteoAristas.set(clave, (conteoAristas.get(clave) ?? 0) + 1);
+      if (!parArista.has(clave)) parArista.set(clave, { a, b });
+    }
+  }
+  let mejor: { a: number; b: number; largo: number } | null = null;
+  for (const [clave, n] of conteoAristas) {
+    if (n !== 1) continue; // interior: dos caras del grupo la comparten
+    const par = parArista.get(clave)!;
+    const pa = mesh.vertices[par.a];
+    const pb = mesh.vertices[par.b];
+    if (!pa || !pb) continue;
+    const largo = Math.hypot(pb.x - pa.x, pb.y - pa.y, pb.z - pa.z);
+    if (!mejor || largo > mejor.largo) mejor = { ...par, largo };
+  }
+  let x: THREE.Vector3 | null = null;
+  if (mejor) {
+    const pa = mesh.vertices[mejor.a];
+    const pb = mesh.vertices[mejor.b];
+    const dirM = new THREE.Vector3(pb.x - pa.x, pb.y - pa.y, pb.z - pa.z)
+      .transformDirection(worldMatrix);
+    dirM.addScaledVector(z, -dirM.dot(z)); // dentro del plano del gizmo
+    if (dirM.lengthSq() > 1e-12) x = dirM.normalize();
+  }
+  if (!x) {
+    let ref = new THREE.Vector3(1, 0, 0);
+    if (Math.abs(ref.dot(z)) > 0.9) ref.set(0, 1, 0);
+    if (Math.abs(ref.dot(z)) > 0.9) ref.set(0, 0, 1);
+    x = ref.clone().sub(z.clone().multiplyScalar(ref.dot(z))).normalize();
+  }
   const y = new THREE.Vector3().crossVectors(z, x);
   return new THREE.Quaternion().setFromRotationMatrix(
     new THREE.Matrix4().makeBasis(x, y, z)
@@ -2843,73 +2917,115 @@ function carasElementoCara(
   return getFaceGroup(mesh, faceIdx);
 }
 
+/** Las mallas del visor son INMUTABLES (toda edición crea otro objeto:
+ *  los objetos van por referencia) — cachés por IDENTIDAD vía WeakMap.
+ *  Antes cada getVertexGroup/getEdgeGroup/deriveMeshEdges re-escaneaba
+ *  TODA la malla, y llamados por cada elemento de una selección grande
+ *  (zona del botón Seleccionar sobre un OBJ importado: cientos de miles
+ *  de vértices duplicados) tardaban HORAS. */
+const CACHE_GRUPOS_VERT = new WeakMap<Mesh, Map<string, number[]>>();
+const CACHE_ARISTAS = new WeakMap<Mesh, Array<{ a: number; b: number; key: string }>>();
+const CACHE_GRUPOS_ARISTAS = new WeakMap<Mesh, Map<string, string[]>>();
+
+const clavePosicionDe = (m: Mesh, i: number): string => {
+  const v = m.vertices[i];
+  return v
+    ? `${Math.round(v.x * 1e5)}|${Math.round(v.y * 1e5)}|${Math.round(v.z * 1e5)}`
+    : `?${i}`;
+};
+
+/** Vértices COINCIDENTES agrupados por clave de posición: UNA pasada
+ *  O(V) por malla; getVertexGroup pasa a consulta O(1). */
+function gruposDeVertices(m: Mesh): Map<string, number[]> {
+  let grupos = CACHE_GRUPOS_VERT.get(m);
+  if (!grupos) {
+    grupos = new Map();
+    for (let i = 0; i < m.vertices.length; i++) {
+      const v = m.vertices[i];
+      if (!v) continue;
+      const clave = `${Math.round(v.x * 1e5)}|${Math.round(v.y * 1e5)}|${Math.round(v.z * 1e5)}`;
+      const grupo = grupos.get(clave);
+      if (grupo) grupo.push(i);
+      else grupos.set(clave, [i]);
+    }
+    CACHE_GRUPOS_VERT.set(m, grupos);
+  }
+  return grupos;
+}
+
 export function getVertexGroup(mesh: Mesh, startVertexIdx: number): number[] {
-  const group: number[] = [];
   const startV = mesh.vertices[startVertexIdx];
   if (!startV) return [startVertexIdx];
-  for (let i = 0; i < mesh.vertices.length; i++) {
-    const v = mesh.vertices[i];
-    if (v && Math.abs(v.x - startV.x) < 1e-5 && Math.abs(v.y - startV.y) < 1e-5 && Math.abs(v.z - startV.z) < 1e-5) {
-      group.push(i);
-    }
-  }
-  return group;
+  const clave = clavePosicionDe(mesh, startVertexIdx);
+  return gruposDeVertices(mesh).get(clave) ?? [startVertexIdx];
 }
 
 export function getEdgeGroup(mesh: Mesh, startEdgeKey: string): string[] {
-  const edges = deriveMeshEdges(mesh);
-  const edgeMap = new Map<string, { a: number; b: number; key: string }>();
-  const adj = new Map<number, string[]>();
+  let grupos = CACHE_GRUPOS_ARISTAS.get(mesh);
+  if (!grupos) {
+    grupos = new Map();
+    const edges = deriveMeshEdges(mesh);
+    const edgeMap = new Map<string, { a: number; b: number; key: string }>();
+    const adj = new Map<number, string[]>();
+    for (const e of edges) {
+      edgeMap.set(e.key, e);
+      if (!adj.has(e.a)) adj.set(e.a, []);
+      adj.get(e.a)!.push(e.key);
+      if (!adj.has(e.b)) adj.set(e.b, []);
+      adj.get(e.b)!.push(e.key);
+    }
 
-  for (const e of edges) {
-    edgeMap.set(e.key, e);
-    if (!adj.has(e.a)) adj.set(e.a, []);
-    adj.get(e.a)!.push(e.key);
-    if (!adj.has(e.b)) adj.set(e.b, []);
-    adj.get(e.b)!.push(e.key);
-  }
+    const getDir = (e: { a: number; b: number }) => {
+      const p1 = mesh.vertices[e.a];
+      const p2 = mesh.vertices[e.b];
+      if (!p1 || !p2) return new THREE.Vector3();
+      return new THREE.Vector3(p2.x - p1.x, p2.y - p1.y, p2.z - p1.z).normalize();
+    };
 
-  const startEdge = edgeMap.get(startEdgeKey);
-  if (!startEdge) return [startEdgeKey];
-
-  const group = new Set<string>();
-  group.add(startEdgeKey);
-
-  const getDir = (e: { a: number; b: number }) => {
-    const p1 = mesh.vertices[e.a];
-    const p2 = mesh.vertices[e.b];
-    if (!p1 || !p2) return new THREE.Vector3();
-    return new THREE.Vector3(p2.x - p1.x, p2.y - p1.y, p2.z - p1.z).normalize();
-  };
-
-  const startDir = getDir(startEdge);
-  if (startDir.lengthSq() < 0.1) return [startEdgeKey];
-
-  const queue = [startEdgeKey];
-  while (queue.length > 0) {
-    const key = queue.shift()!;
-    const e = edgeMap.get(key);
-    if (!e) continue;
-
-    for (const vIdx of [e.a, e.b]) {
-      for (const nKey of adj.get(vIdx) || []) {
-        if (!group.has(nKey)) {
-          const nEdge = edgeMap.get(nKey)!;
-          const nDir = getDir(nEdge);
-          if (Math.abs(startDir.dot(nDir)) > 0.99) {
-            group.add(nKey);
-            queue.push(nKey);
+    // Las líneas de coplanares son una PARTICIÓN: cada arista pertenece a
+    // UN solo recorrido recto — un BFS por arista no visitada lo calcula
+    // UNA vez y todas las de su grupo quedan apuntando al mismo array
+    // (antes: BFS completo por CADA consulta, O(E²) en el finalize).
+    const visitadas = new Set<string>();
+    for (const e of edges) {
+      if (visitadas.has(e.key)) continue;
+      const startDir = getDir(e);
+      const grupo = new Set<string>([e.key]);
+      if (startDir.lengthSq() >= 0.1) {
+        const queue = [e.key];
+        visitadas.add(e.key);
+        while (queue.length > 0) {
+          const key = queue.shift()!;
+          const edge = edgeMap.get(key);
+          if (!edge) continue;
+          for (const vIdx of [edge.a, edge.b]) {
+            for (const nKey of adj.get(vIdx) || []) {
+              if (!grupo.has(nKey)) {
+                const nEdge = edgeMap.get(nKey)!;
+                if (Math.abs(startDir.dot(getDir(nEdge))) > 0.99) {
+                  grupo.add(nKey);
+                  visitadas.add(nKey);
+                  queue.push(nKey);
+                }
+              }
+            }
           }
         }
+      } else {
+        visitadas.add(e.key);
       }
+      const arr = Array.from(grupo);
+      for (const k of arr) grupos.set(k, arr);
     }
+    CACHE_GRUPOS_ARISTAS.set(mesh, grupos);
   }
-
-  return Array.from(group);
+  return grupos.get(startEdgeKey) ?? [startEdgeKey];
 }
 
 /** Aristas lógicas de la malla, excluyendo interiores entre caras coplanares */
 export function deriveMeshEdges(mesh: Mesh): Array<{ a: number; b: number; key: string }> {
+  const cache = CACHE_ARISTAS.get(mesh);
+  if (cache) return cache;
   const edgeToFaces = new Map<string, { a: number; b: number; faces: number[] }>();
   for (let i = 0; i < mesh.faces.length; i++) {
     const face = mesh.faces[i];
@@ -2946,6 +3062,7 @@ export function deriveMeshEdges(mesh: Mesh): Array<{ a: number; b: number; key: 
       }
     }
   }
+  CACHE_ARISTAS.set(mesh, logicalEdges);
   return logicalEdges;
 }
 
@@ -2966,9 +3083,6 @@ function distanceToSegment(
 /** Umbral en píxeles para la herramienta Línea (y para agarrar la selección). */
 const FACE_LINE_TOLERANCE = 12;
 
-/** Píxeles alrededor del primer vértice para CERRAR el polígono con clic. */
-const POLIGONO_CIERRE_PX = 10;
-
 /**
  * Elemento sub-seleccionable bajo el cursor: cara (raycast contra la
  * superficie + centroide más próximo), vértice (a <16 px) o arista (a
@@ -2982,7 +3096,7 @@ function pickSubElemento(
   clientX: number,
   clientY: number,
   canvasRect: DOMRect,
-  target: 'cara' | 'vertice' | 'segmento',
+  target: FaceSelectionTarget,
   visibleOnly: boolean,
   modoAnillos = false
 ): {
@@ -2991,6 +3105,10 @@ function pickSubElemento(
   anillos?: number[];
   anillosAristas?: string[];
 } | null {
+  // «todo» no llega al pick (no hay hover de elemento suelto sin marco),
+  // pero ninguna guarda debe romperse: se comporta como caras.
+  const objetivo: 'cara' | 'vertice' | 'segmento' =
+    target === 'todo' ? 'cara' : target;
   const raycasterPick = new THREE.Raycaster();
   const ndc = new THREE.Vector2(
     ((clientX - canvasRect.left) / canvasRect.width) * 2 - 1,
@@ -3024,7 +3142,7 @@ function pickSubElemento(
     }
   }
 
-  if (target === 'cara') {
+  if (objetivo === 'cara') {
     // Cara: raycast + cara más próxima al punto golpeado por su CENTROIDE
     // — el hover ilumina SIEMPRE la cara completa que elegiría el clic
     // (nunca un triángulo suelto del abanico).
@@ -3083,7 +3201,7 @@ function pickSubElemento(
     return { t: 'cara', id: mejor };
   }
 
-  if (target === 'vertice') {
+  if (objetivo === 'vertice') {
     // Vértice: el cursor debe estar SOBRE la superficie (raycast con hit)
     // y la esquina elegida es la más cercana al punto golpeado en 3D,
     // dentro de una tolerancia relativa al tamaño de la malla. Así solo
@@ -3232,6 +3350,11 @@ function buildVertexSelectionOverlay(
   opts?: { hover?: boolean }
 ): THREE.Group | null {
   if (vertexIds.size === 0) return null;
+  // TOPE con selecciones GIGANTES (objeto de OBJ importado): una esfera
+  // THREE por vértice llega a cientos de miles de objetos — minutos por
+  // rebuild. La selección sigue funcionando (contador, Borrar/Copiar…),
+  // solo salen sin las bolitas.
+  if (vertexIds.size > 30000) return null;
   // Radio en función del tamaño de la malla: 1/4 del tamaño anterior
   // (el usuario lo pidió: las esferas amarillas de vértice seleccionado
   // se ven muy grandes).
@@ -3292,6 +3415,8 @@ function buildEdgeSelectionOverlay(
   color?: number
 ): THREE.LineSegments | null {
   if (edgeKeys.size === 0) return null;
+  // TOPE con selecciones GIGANTES: una caja THREE por arista — minutos.
+  if (edgeKeys.size > 60000) return null;
   const edges = deriveMeshEdges(mesh);
   let maxDim = 1;
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
@@ -3554,6 +3679,10 @@ function buildAxisLabelSprite(text: string, color: number): THREE.Sprite {
 export default function Viewer3D({
    mesh,
    objects,
+   corteRapido,
+   onCorteRapido,
+   modoCorte,
+   onCorteZona,
    selectedObjectId,
    configObjectId,
    configMesh,
@@ -3855,6 +3984,25 @@ export default function Viewer3D({
     faceSelectionToolRef.current = faceSelectionTool ?? 'rectangle';
     const faceSelectionTargetRef = useRef(faceSelectionTarget ?? 'cara');
     faceSelectionTargetRef.current = faceSelectionTarget ?? 'cara';
+    // CORTE RÁPIDO: props para el finalize directo del objetivo «todo».
+    const corteRapidoRef = useRef(corteRapido ?? false);
+    corteRapidoRef.current = corteRapido ?? false;
+    const onCorteRapidoRef = useRef(onCorteRapido);
+    onCorteRapidoRef.current = onCorteRapido;
+    const modoCorteRef = useRef(modoCorte ?? false);
+    modoCorteRef.current = modoCorte ?? false;
+    const onCorteZonaRef = useRef(onCorteZona);
+    onCorteZonaRef.current = onCorteZona;
+    // CORTE: al apagarse el modo, el trazo en curso desaparece.
+    useEffect(() => {
+      if (modoCorte) return;
+      cortePuntosRef.current.length = 0;
+      if (cortePolyRef.current?.parentElement) {
+        cortePolyRef.current.parentElement.style.display = 'none';
+      }
+      if (cortePolyRef.current) cortePolyRef.current.style.display = 'none';
+      if (corteLineRef.current) corteLineRef.current.style.display = 'none';
+    }, [modoCorte]);
     // Modo ANILLOS de caras (botón junto a Mover/Extrudir).
     const faceAnillosRef = useRef(anillosCaras ?? false);
     faceAnillosRef.current = anillosCaras ?? false;
@@ -3907,6 +4055,26 @@ export default function Viewer3D({
     const onFaceSelectionTargetChangeRef = useRef(onFaceSelectionTargetChange);
     onFaceSelectionTargetChangeRef.current = onFaceSelectionTargetChange;
     const faceSelectionOverlayRef = useRef<THREE.Group | null>(null);
+    // FIRMAS de los overlays de selección: los tres arrays de selección son
+    // React state (identidad estable entre renders) — los overlays SOLO se
+    // reconstruyen cuando cambia una de esas identidades o la malla. Antes
+    // se limpiaban y reconstruían CADA FRAME (una esfera por vértice
+    // seleccionado… en selecciones grandes, minutos por frame).
+    const overlaysFirmaRef = useRef<{
+      m: Mesh | null;
+      target: FaceSelectionTarget;
+      f: number[] | undefined;
+      v: number[] | undefined;
+      e: string[] | undefined;
+    }>({ m: null, target: 'cara', f: undefined, v: undefined, e: undefined });
+    // El selKey (join de los tres arrays) se cachea igual: la cadena es de
+    // MBs con selecciones grandes y se reconstruía en cada frame.
+    const selKeyJoinRef = useRef<{
+      f: number[] | undefined;
+      v: number[] | undefined;
+      e: string[] | undefined;
+      s: string;
+    }>({ f: undefined, v: undefined, e: undefined, s: '' });
     const faceSelectionStartRef = useRef<{ x: number; y: number; rect: DOMRect } | null>(null);
     const faceSelectionPointsRef = useRef<Array<{ x: number; y: number }>>([]);
     // Polígono cerrado esperando a que el pointerup aplique la selección:
@@ -3916,6 +4084,11 @@ export default function Viewer3D({
     const faceSelectionRectDivRef = useRef<HTMLDivElement | null>(null);
     const faceSelectionCircleDivRef = useRef<HTMLDivElement | null>(null);
     const faceSelectionLineRef = useRef<SVGLineElement | null>(null);
+    // CORTE POR TRAZADO: puntos del trazo en px del canvas + SU SVG propio
+    // (polígono/línea discontinua NARANJA, distinto del de la zona verde).
+    const cortePuntosRef = useRef<Array<{ x: number; y: number }>>([]);
+    const cortePolyRef = useRef<SVGPolygonElement | null>(null);
+    const corteLineRef = useRef<SVGLineElement | null>(null);
     // Arrastre de MOVER la selección (vértices/segmentos/caras): el plano
     // de arrastre (mundo), el punto inicial en mundo y en espacio local de
     // la malla, los vértices originales y los índices afectados; en cada
@@ -4273,7 +4446,9 @@ export default function Viewer3D({
     const meshObj = findMainMesh(meshGroupRef.current);
     if (!m || !meshObj || !faceSelectModeRef.current) return;
     const vertIdxSet = new Set<number>();
-    const target = faceSelectionTargetRef.current;
+    const target = faceSelectionTargetRef.current === 'todo'
+      ? 'cara'
+      : faceSelectionTargetRef.current;
     if (target === 'cara') {
       for (const f of selectedFaceIdsRef.current) {
         const face = m.faces[f];
@@ -6900,40 +7075,74 @@ export default function Viewer3D({
           // Update 3D overlay of selected faces/vertices/edges
           const group = faceSelectionOverlayRef.current;
           if (group) {
-            // Remove old overlay meshes (los grupos anidan esferas: recorrer)
-            while (group.children.length) {
-              const child = group.children[0];
-              group.remove(child);
-              child.traverse?.((o) => {
-                if (o instanceof THREE.Mesh || o instanceof THREE.LineSegments) {
-                  o.geometry?.dispose?.();
-                  (o.material as THREE.Material)?.dispose?.();
+            // Reconstruir SOLO al cambiar la identidad de la malla, del
+            // target o de uno de los tres arrays de selección (los arrays
+            // son React state: identidad estable mientras no se editen).
+            const fAhora = selectedFaceIdsRef.current;
+            const vAhora = selectedVertexIdsRef.current;
+            const eAhora = selectedEdgeIdsRef.current;
+            const firmaAntes = overlaysFirmaRef.current;
+            const overlaysAlDia =
+              firmaAntes.m === m &&
+              firmaAntes.target === target &&
+              firmaAntes.f === fAhora &&
+              firmaAntes.v === vAhora &&
+              firmaAntes.e === eAhora;
+            if (!overlaysAlDia) {
+              overlaysFirmaRef.current = { m, target, f: fAhora, v: vAhora, e: eAhora };
+              // Remove old overlay meshes (los grupos anidan esferas: recorrer)
+              while (group.children.length) {
+                const child = group.children[0];
+                group.remove(child);
+                child.traverse?.((o) => {
+                  if (o instanceof THREE.Mesh || o instanceof THREE.LineSegments) {
+                    o.geometry?.dispose?.();
+                    (o.material as THREE.Material)?.dispose?.();
+                  }
+                });
+              }
+              if (target === 'todo') {
+                // Zona del botón Seleccionar: se pintan los TRES resaltes
+                // (caras + vértices + aristas) de la selección combinada.
+                const overlayF = buildFaceSelectionOverlay(
+                  m,
+                  new Set(selectedFaceIdsRef.current)
+                );
+                const overlayV = buildVertexSelectionOverlay(
+                  m,
+                  new Set(selectedVertexIdsRef.current)
+                );
+                const overlayE = buildEdgeSelectionOverlay(
+                  m,
+                  new Set(selectedEdgeIdsRef.current)
+                );
+                for (const ov of [overlayF, overlayV, overlayE]) {
+                  if (ov) group.add(ov);
                 }
-              });
-            }
-            if (target === 'cara') {
-              const overlay = buildFaceSelectionOverlay(
-                m,
-                new Set(selectedFaceIdsRef.current)
-              );
-              if (overlay) {
-                group.add(overlay);
-              }
-            } else if (target === 'vertice') {
-              const overlay = buildVertexSelectionOverlay(
-                m,
-                new Set(selectedVertexIdsRef.current)
-              );
-              if (overlay) {
-                group.add(overlay);
-              }
-            } else {
-              const overlay = buildEdgeSelectionOverlay(
-                m,
-                new Set(selectedEdgeIdsRef.current)
-              );
-              if (overlay) {
-                group.add(overlay);
+              } else if (target === 'cara') {
+                const overlay = buildFaceSelectionOverlay(
+                  m,
+                  new Set(selectedFaceIdsRef.current)
+                );
+                if (overlay) {
+                  group.add(overlay);
+                }
+              } else if (target === 'vertice') {
+                const overlay = buildVertexSelectionOverlay(
+                  m,
+                  new Set(selectedVertexIdsRef.current)
+                );
+                if (overlay) {
+                  group.add(overlay);
+                }
+              } else {
+                const overlay = buildEdgeSelectionOverlay(
+                  m,
+                  new Set(selectedEdgeIdsRef.current)
+                );
+                if (overlay) {
+                  group.add(overlay);
+                }
               }
             }
           }
@@ -7033,7 +7242,23 @@ export default function Viewer3D({
           // re-deduce al cambiar la selección o mientras un arrastre mueve
           // los vértices; el tamaño solo al cambiar (estable durante los
           // arrastres, como el gizmo de objetos).
-          const selKey = `${target}|${selectedFaceIdsRef.current.join(',')}|${selectedVertexIdsRef.current.join(',')}|${selectedEdgeIdsRef.current.join(',')}`;
+          // selKey CACHED por identidad de los tres arrays: el join(',') de
+          // una selección grande es una cadena de MBs y se construía en
+          // CADA frame (selecciones de coche: minutos solo en strings).
+          const joinAntes = selKeyJoinRef.current;
+          if (
+            joinAntes.f !== selectedFaceIdsRef.current ||
+            joinAntes.v !== selectedVertexIdsRef.current ||
+            joinAntes.e !== selectedEdgeIdsRef.current
+          ) {
+            selKeyJoinRef.current = {
+              f: selectedFaceIdsRef.current,
+              v: selectedVertexIdsRef.current,
+              e: selectedEdgeIdsRef.current,
+              s: `${selectedFaceIdsRef.current.join(',')}|${selectedVertexIdsRef.current.join(',')}|${selectedEdgeIdsRef.current.join(',')}`,
+            };
+          }
+          const selKey = `${target}|${selKeyJoinRef.current.s}`;
           if (selectionKeyRef.current !== selKey || selectionGizmoDragRef.current) {
             const cambioSel = selectionKeyRef.current !== selKey;
             selectionKeyRef.current = selKey;
@@ -7066,9 +7291,10 @@ export default function Viewer3D({
               // Al tomar caras (o cambiar de cara) el gizmo se acoda con la
               // selección: Z = normal de las caras (del lado visto); si el
               // grupo de caras no cuadra (normales repartidas), ejes de
-              // mundo.
+              // mundo. El objetivo 'todo' (corte cerrado, zona de
+              // Seleccionar) TAMBIÉN acoda: sus caras son la selección.
               selGizmoBaseQuatRef.current =
-                target === 'cara'
+                target === 'cara' || target === 'todo'
                   ? quatAcodadoACaras(m, selectedFaceIdsRef.current, worldMatrix, selGizmoLadoSignoRef.current)
                   : null;
               // Tamaño a la medida: radio de la selección (distancia máx.
@@ -7771,6 +7997,33 @@ export default function Viewer3D({
         return;
       }
 
+      // CORTE POR TRAZADO: previsualización — polígono + goma viva
+      // NARANJA (los SVG siguen al cursor entre clic y clic).
+      if (modoCorteRef.current && cortePuntosRef.current.length > 0) {
+        const canvasRectM = renderer.domElement.getBoundingClientRect();
+        const pts = cortePuntosRef.current;
+        const poly = cortePolyRef.current;
+        const lineEl = corteLineRef.current;
+        if (poly && poly.parentElement && lineEl) {
+          poly.parentElement.style.display = 'block';
+          poly.style.display = 'block';
+          poly.setAttribute(
+            'points',
+            pts
+              .map((p) => `${p.x - canvasRectM.left},${p.y - canvasRectM.top}`)
+              .join(' ') +
+              ` ${e.clientX - canvasRectM.left},${e.clientY - canvasRectM.top}`
+          );
+          const ultimo = pts[pts.length - 1];
+          lineEl.style.display = 'block';
+          lineEl.setAttribute('x1', String(ultimo.x - canvasRectM.left));
+          lineEl.setAttribute('y1', String(ultimo.y - canvasRectM.top));
+          lineEl.setAttribute('x2', String(e.clientX - canvasRectM.left));
+          lineEl.setAttribute('y2', String(e.clientY - canvasRectM.top));
+        }
+        return;
+      }
+
       // Modo grabación: marcar el arrastre como movimiento real (umbral
       // de 4 px) para no capturar un mero clic sin arrastre.
       if (
@@ -7921,9 +8174,9 @@ export default function Viewer3D({
                 const centroMundoAct = meshObjSelAct
                   ? centroLocal.clone().applyMatrix4(meshObjSelAct.matrixWorld)
                   : centroLocal.clone();
-                // Solo la FLECHA de MOVER infla la copia (normales
-                // suavizadas — todas las caras salen lo mismo); las bolas
-                // de escala siguen escalando la copia.
+                // Solo la FLECHA de MOVER lleva la DIRECCIÓN RECTA (una
+                // media para todo el parche — paredes paralelas); las
+                // bolas de escala siguen escalando la copia.
                 const normalesInfladoAct =
                   pendienteCtrl.udSel.mode === 'move'
                     ? resCtrl.normalesPorVert
@@ -7977,13 +8230,12 @@ export default function Viewer3D({
                 const dx = p1.x - p0.x;
                 const dy = p1.y - p0.y;
                 const dz = p1.z - p0.z;
-                // Inflado (extrusión con Ctrl, la pidió el usuario 2026-10-11
-                // tras ver en la cápsula que «unas caras salen más afuera
-                // que otras»): cada vértice avanza por SU normal suavizada
-                // con la MISMA profundidad (Blender «Extrude along
-                // Normals»). El signo sigue al gesto del ratón sobre la
-                // línea del eje; la magnitud es la del delta clásico en
-                // local (misma escala del objeto).
+                // Extrusión RECTA (2026-10-14, tras cortar se abría en
+                // abanico): TODOS los vértices llevan la MISMA dirección
+                // (media de la región venida del editor) con la misma
+                // profundidad — paredes paralelas. El signo sigue al gesto
+                // del ratón sobre la línea del eje; la magnitud es la del
+                // delta clásico en local (misma escala del objeto).
                 let sLocal = 0;
                 if (selDrag.normalesPorVert) {
                   const signo = Math.sign(tc - selDrag.startT);
@@ -9113,6 +9365,85 @@ export default function Viewer3D({
         if (hit && e.button !== 0) return; // botón derecho sobre asa: pan
       }
 
+      // CORTE POR TRAZADO: el dibujo ES el gesto — clic añade punto sobre
+      // SU SVG naranja; clic derecho cancela; el cierre es el INTRO (o un
+      // clic más: el trazado abierto también vale). La rama precede al
+      // gate de grabación para no armar el arrastre de cámara.
+      if (modoCorteRef.current) {
+        if (e.button === 2) {
+          if (cortePuntosRef.current.length > 0) {
+            cortePuntosRef.current.length = 0;
+            if (cortePolyRef.current?.parentElement) {
+              cortePolyRef.current.parentElement.style.display = 'none';
+            }
+            if (cortePolyRef.current) cortePolyRef.current.style.display = 'none';
+            if (corteLineRef.current) corteLineRef.current.style.display = 'none';
+          }
+          return;
+        }
+        if (e.button !== 0) return;
+        cortePuntosRef.current.push({ x: e.clientX, y: e.clientY });
+        const svgNS = 'http://www.w3.org/2000/svg';
+        const mountElC = mountRef.current;
+        const rectCorte = renderer.domElement.getBoundingClientRect();
+        if (mountElC && !cortePolyRef.current) {
+          const svg = document.createElementNS(svgNS, 'svg');
+          svg.style.position = 'absolute';
+          svg.style.top = '0';
+          svg.style.left = '0';
+          svg.style.width = '100%';
+          svg.style.height = '100%';
+          svg.style.pointerEvents = 'none';
+          svg.style.zIndex = '10';
+          const poly = document.createElementNS(svgNS, 'polygon');
+          poly.setAttribute('fill', 'rgba(255, 138, 26, 0.10)');
+          poly.setAttribute('stroke', '#ff8a1a');
+          poly.setAttribute('stroke-width', '1');
+          poly.setAttribute('stroke-dasharray', '5 4');
+          svg.appendChild(poly);
+          mountElC.appendChild(svg);
+          cortePolyRef.current = poly;
+        }
+        if (mountElC && !corteLineRef.current) {
+          const svg = document.createElementNS(svgNS, 'svg');
+          svg.style.position = 'absolute';
+          svg.style.top = '0';
+          svg.style.left = '0';
+          svg.style.width = '100%';
+          svg.style.height = '100%';
+          svg.style.pointerEvents = 'none';
+          svg.style.zIndex = '10';
+          const line = document.createElementNS(svgNS, 'line');
+          line.setAttribute('stroke', '#ff8a1a');
+          line.setAttribute('stroke-width', '1.5');
+          line.setAttribute('stroke-dasharray', '5 4');
+          svg.appendChild(line);
+          mountElC.appendChild(svg);
+          corteLineRef.current = line;
+        }
+        // Dibuja ya la forma para que el punto nuevo se vea con su tramo
+        // hacia el cursor (sin esperar al move).
+        const poly = cortePolyRef.current;
+        const lineEl = corteLineRef.current;
+        if (poly && poly.parentElement && lineEl) {
+          poly.parentElement.style.display = 'block';
+          poly.style.display = 'block';
+          poly.setAttribute(
+            'points',
+            cortePuntosRef.current
+              .map((p) => `${p.x - rectCorte.left},${p.y - rectCorte.top}`)
+              .join(' ')
+          );
+          const ultimo = cortePuntosRef.current[cortePuntosRef.current.length - 1];
+          lineEl.style.display = 'block';
+          lineEl.setAttribute('x1', String(ultimo.x - rectCorte.left));
+          lineEl.setAttribute('y1', String(ultimo.y - rectCorte.top));
+          lineEl.setAttribute('x2', String(e.clientX - rectCorte.left));
+          lineEl.setAttribute('y2', String(e.clientY - rectCorte.top));
+        }
+        return;
+      }
+
       // Modo grabación: armar el posible arrastre de cámara AL PRINCIPIO.
       // Los drags de gizmo, asas, textura, caras o vértices quedan excluidos
       // por sus refs en el pointermove (no marcan «moved») y los modos de
@@ -9391,19 +9722,9 @@ export default function Viewer3D({
               }
               return;
             }
-            // Cierre: clic dentro del radio del PRIMER vértice con ≥3 lados.
-            if (polig.length >= 3 && Math.hypot(e.clientX - polig[0].x, e.clientY - polig[0].y) <= POLIGONO_CIERRE_PX) {
-              poligonoCerradaRef.current = polig.slice();
-              polig.length = 0;
-              // El pointerup es quien aplica la selección (y devuelve aquí
-              // sin filtrar al resto de la lógica de clics).
-              faceSelectionStartRef.current = { x: e.clientX, y: e.clientY, rect };
-              controls.enabled = false;
-              renderer.domElement.style.cursor = 'crosshair';
-              if (faceSelectionPolyDivRef.current) faceSelectionPolyDivRef.current.style.display = 'none';
-              if (faceSelectionLineRef.current) faceSelectionLineRef.current.style.display = 'none';
-              return;
-            }
+            // Cierre SOLO con Intro (petición del usuario: cerrarlo con el
+            // ratón era demasiado sensible): un clic aquí añade un punto
+            // más, como cualquier otro.
             // Punto nuevo: aseguramos el SVG del polígono y crece la forma.
             polig.push({ x: e.clientX, y: e.clientY });
             poligonoCerradaRef.current = null;
@@ -9422,6 +9743,7 @@ export default function Viewer3D({
               poly.setAttribute('fill', 'rgba(6, 183, 163, 0.15)');
               poly.setAttribute('stroke', '#06b7a3');
               poly.setAttribute('stroke-width', '1');
+              poly.setAttribute('stroke-dasharray', '4 3');
               svg.appendChild(poly);
               mountElP.appendChild(svg);
               faceSelectionPolyDivRef.current = poly;
@@ -9490,7 +9812,9 @@ export default function Viewer3D({
 
             // Puntos de anclaje por objetivo: centroides de caras,
             // posiciones de vértices o puntos medios de segmentos.
-            const targetMove = faceSelectionTargetRef.current;
+            const targetMove = faceSelectionTargetRef.current === 'todo'
+              ? 'cara'
+              : faceSelectionTargetRef.current;
             const anchors: Array<{ world: THREE.Vector3; idx: number }> = [];
             const vertIdxSet = new Set<number>();
             if (targetMove === 'cara') {
@@ -9599,7 +9923,9 @@ export default function Viewer3D({
                   faceAnillosRef.current // herramienta 'directo': anillos activables
                 )
               : null;
-            const targetDir = faceSelectionTargetRef.current;
+            const targetDir = faceSelectionTargetRef.current === 'todo'
+              ? 'cara'
+              : faceSelectionTargetRef.current;
             const toggle = !!e.shiftKey || !!e.ctrlKey || !!e.metaKey;
             if (elegido) {
               if (targetDir === 'cara') {
@@ -9718,6 +10044,7 @@ export default function Viewer3D({
               poly.setAttribute('fill', 'rgba(6, 183, 163, 0.15)');
               poly.setAttribute('stroke', '#06b7a3');
               poly.setAttribute('stroke-width', '1');
+              poly.setAttribute('stroke-dasharray', '4 3');
               svg.appendChild(poly);
               mountEl.appendChild(svg);
               faceSelectionPolyDivRef.current = poly;
@@ -10511,6 +10838,14 @@ export default function Viewer3D({
           // un rectángulo atraviesa el objeto y captura lo que está detrás.
           const soloVisible = faceSelectVisibleOnlyRef.current;
           const camPos = camera.getWorldPosition(new THREE.Vector3());
+          // Vectores de rasca: sin ellos eran ~5 objetos THREE por cara
+          // (2M de asignaciones en un coche de 400k triángulos).
+          const _wa = new THREE.Vector3();
+          const _wb = new THREE.Vector3();
+          const _wc = new THREE.Vector3();
+          const _nf = new THREE.Vector3();
+          const _tmp = new THREE.Vector3();
+          const _camVista = new THREE.Vector3();
           let frenteCaras: Uint8Array | null = null;
           if (soloVisible) {
             frenteCaras = new Uint8Array(m.faces.length);
@@ -10521,16 +10856,175 @@ export default function Viewer3D({
               const b = m.vertices[face[1]];
               const c = m.vertices[face[2]];
               if (!a || !b || !c) continue;
-              const wa = new THREE.Vector3(a.x, a.y, a.z).applyMatrix4(worldMatrix);
-              const wb = new THREE.Vector3(b.x, b.y, b.z).applyMatrix4(worldMatrix);
-              const wc = new THREE.Vector3(c.x, c.y, c.z).applyMatrix4(worldMatrix);
-              const n = new THREE.Vector3()
-                .subVectors(wb, wa)
-                .cross(new THREE.Vector3().subVectors(wc, wa));
-              if (n.dot(new THREE.Vector3().subVectors(camPos, wa)) > 0) {
+              const wa = _wa.set(a.x, a.y, a.z).applyMatrix4(worldMatrix);
+              const wb = _wb.set(b.x, b.y, b.z).applyMatrix4(worldMatrix);
+              const wc = _wc.set(c.x, c.y, c.z).applyMatrix4(worldMatrix);
+              const n = _nf.subVectors(wb, wa).cross(_tmp.subVectors(wc, wa));
+              if (n.dot(_camVista.subVectors(camPos, wa)) > 0) {
                 frenteCaras[i] = 1;
               }
             }
+          }
+
+          if (target === 'todo') {
+            // ZONA COMPLETA (botón Seleccionar del editor): rectángulo o
+            // polígono sobre la ventana activa que coge CARAS + VÉRTICES +
+            // ARISTAS A LA VEZ — todo lo que cae dentro EN PANTALLA del
+            // objeto (lo pidió el usuario). El clic casi sin arrastre NO
+            // limpia nada: el usuario está empezando la forma.
+            if (clicSimple) return;
+
+            // Proyecciones de vértice cacheadas: vértices, aristas y caras
+            // comparten la misma pasada al mundo→pantalla.
+            const enPantallaV = new Map<number, { x: number; y: number } | null>();
+            const proyectaVertice = (vi: number) => {
+              let pt = enPantallaV.get(vi);
+              if (pt === undefined) {
+                const v = m.vertices[vi];
+                pt = v
+                  ? projectToScreen(
+                      new THREE.Vector3(v.x, v.y, v.z).applyMatrix4(worldMatrix),
+                      camera,
+                      rect
+                    )
+                  : null;
+                enPantallaV.set(vi, pt);
+              }
+              return pt ?? null;
+            };
+
+            // CORTE RÁPIDO (mallas enormes): sin selección, sin agrupados y
+            // sin overlays — UN barrido por triángulos (cualquier esquina
+            // dentro de la zona) y la emisión DIRECTA al editor, que corta
+            // con borrarCarasRegion (una pasada O(N)). Es lo que desbloquea
+            // los OBJ importados: lo que tardaba horas ahora son segundos.
+            if (corteRapidoRef.current) {
+              const ids: number[] = [];
+              for (let i = 0; i < m.faces.length; i++) {
+                if (frenteCaras && !frenteCaras[i]) continue;
+                const face = m.faces[i];
+                if (!face || face.length < 3) continue;
+                for (const vi of face) {
+                  const pt = proyectaVertice(vi);
+                  if (pt && insideShape(pt)) {
+                    ids.push(i);
+                    break;
+                  }
+                }
+              }
+              onCorteRapidoRef.current?.(ids);
+              return;
+            }
+
+            // Visibilidad heredada de las caras frontales (frenteCaras):
+            // un vértice/segmento es visible si pertenece a alguna de ellas.
+            let verticeVisible: Uint8Array | null = null;
+            let edgeVisible: Set<string> | null = null;
+            if (frenteCaras) {
+              verticeVisible = new Uint8Array(m.vertices.length);
+              edgeVisible = new Set<string>();
+              for (let i = 0; i < m.faces.length; i++) {
+                if (!frenteCaras[i]) continue;
+                const faceFrontal = m.faces[i];
+                for (const vi of faceFrontal) {
+                  if (vi < verticeVisible.length) verticeVisible[vi] = 1;
+                }
+                for (let j = 0; j < faceFrontal.length; j++) {
+                  const va = faceFrontal[j];
+                  const vb = faceFrontal[(j + 1) % faceFrontal.length];
+                  if (va !== vb) {
+                    edgeVisible.add(`${Math.min(va, vb)}-${Math.max(va, vb)}`);
+                  }
+                }
+              }
+            }
+
+            // Vértices: su punto proyectado cae dentro (con su grupo).
+            const vertsZonaSet = new Set<number>();
+            for (let i = 0; i < m.vertices.length; i++) {
+              if (verticeVisible && !verticeVisible[i]) continue;
+              const pt = proyectaVertice(i);
+              if (pt && insideShape(pt)) vertsZonaSet.add(i);
+            }
+            for (const v of [...vertsZonaSet]) {
+              getVertexGroup(m, v).forEach((gv) => vertsZonaSet.add(gv));
+            }
+
+            // Aristas: AMBOS extremos dentro de la figura (nada cogido
+            // «por la mitad») + expansión a la línea de coplanares.
+            const edgesZonaSet = new Set<string>();
+            for (const edge of deriveMeshEdges(m)) {
+              if (edgeVisible && !edgeVisible.has(edge.key)) continue;
+              const pA = proyectaVertice(edge.a);
+              const pB = proyectaVertice(edge.b);
+              if (pA && pB && insideShape(pA) && insideShape(pB)) {
+                edgesZonaSet.add(edge.key);
+              }
+            }
+            for (const k of [...edgesZonaSet]) {
+              getEdgeGroup(m, k).forEach((ge) => edgesZonaSet.add(ge));
+            }
+
+            // Caras: TODAS sus esquinas dentro + expansión a la cara
+            // LÓGICA completa (celda pareada o casquete del abanico).
+            const carasZona: number[] = [];
+            for (let i = 0; i < m.faces.length; i++) {
+              if (frenteCaras && !frenteCaras[i]) continue;
+              const face = m.faces[i];
+              if (!face || face.length < 3) continue;
+              let completa = true;
+              for (const vi of face) {
+                const pt = proyectaVertice(vi);
+                if (!pt || !insideShape(pt)) { completa = false; break; }
+              }
+              if (completa) carasZona.push(i);
+            }
+            const datosZona = construirAnillos(m);
+            const carasZonaSet = new Set<number>();
+            for (const f of carasZona) {
+              if (datosZona) {
+                caraLogicaDe(m, datosZona, f).forEach((gf) => carasZonaSet.add(gf));
+              } else {
+                carasZonaSet.add(f);
+              }
+            }
+
+            // Teclas acumuladoras EN BLOQUE sobre los tres arrays: sin
+            // teclas reemplaza, Ctrl AÑADE, Mayús QUITA (las mismas reglas
+            // de los objetivos sueltos, aplicadas a la selección combinada).
+            function combina<T>(prev: T[], zona: T[]): T[] {
+              if (zona.length === 0 && !modificada) return [];
+              if (esMayus) {
+                if (!zona.length) return prev;
+                // Set: antes un includes() POR elemento previo era O(P×Z)
+                // (200k × 200k = muerte en mallas grandes).
+                const quita = new Set(zona);
+                return prev.filter((p) => !quita.has(p));
+              }
+              if (esCtrl) {
+                return zona.length ? [...new Set([...prev, ...zona])] : prev;
+              }
+              return zona;
+            }
+            const novasF = combina(
+              selectedFaceIdsRef.current ?? [],
+              Array.from(carasZonaSet)
+            );
+            const novasV = combina(
+              selectedVertexIdsRef.current ?? [],
+              Array.from(vertsZonaSet)
+            );
+            const novasE = combina(
+              selectedEdgeIdsRef.current ?? [],
+              Array.from(edgesZonaSet)
+            );
+            onFaceSelectionChangeRef.current?.(novasF);
+            selectedFaceIdsRef.current = novasF;
+            onVertexSelectionChangeRef.current?.(novasV);
+            selectedVertexIdsRef.current = novasV;
+            onEdgeSelectionChangeRef.current?.(novasE);
+            selectedEdgeIdsRef.current = novasE;
+            return;
           }
 
           if (target === 'vertice') {
@@ -10587,9 +11081,10 @@ export default function Viewer3D({
               // Clic o área en el vacío sin teclas: deselecciona todo.
               newIds = [];
             } else if (esMayus) {
-              // Mayús+clic o Mayús+área: QUITA los vértices del área.
+              // Mayús+clic o Mayús+área: QUITA los vértices del área (Set:
+              // el includes() era O(P×Z) en selecciones grandes).
               newIds = expandedArray.length
-                ? prev.filter((f) => !expandedArray.includes(f))
+                ? prev.filter((f) => !expandedSelected.has(f))
                 : prev;
             } else if (esCtrl) {
               // Ctrl+clic o Ctrl+área: AÑADE los vértices del área.
@@ -11271,9 +11766,163 @@ export default function Viewer3D({
     };
     renderer.domElement.addEventListener('dblclick', onDobleClicSpline);
 
+    // POLÍGONO DE LA ZONA (botón Seleccionar): el cierre SOLO con INTRO
+    // (petición del usuario: el doble clic era demasiado sensible — el
+    // segundo clic de un clic normal lo cerraba sin querer). El clic
+    // derecho sigue CANCELANDO la forma en curso. Cierra desde el teclado
+    // y dispara un pointerup SINTÉTICO: el finalize del pointerup existe
+    // ya y no sabe quién lo llama.
+    const cierraPoligonoZona = (clientX: number, clientY: number) => {
+      const polig = faceSelectionPointsRef.current;
+      // Un doble clic empuja DOS puntos (un pointerdown por clic del
+      // par): el duplicado casi-idéntico se retira antes de validar.
+      if (
+        polig.length >= 2 &&
+        Math.hypot(
+          polig[polig.length - 1].x - polig[polig.length - 2].x,
+          polig[polig.length - 1].y - polig[polig.length - 2].y
+        ) <= 1
+      ) {
+        polig.length = polig.length - 1;
+      }
+      if (polig.length < 3) return false;
+      poligonoCerradaRef.current = polig.slice();
+      polig.length = 0;
+      faceSelectionStartRef.current = {
+        x: clientX,
+        y: clientY,
+        rect: renderer.domElement.getBoundingClientRect(),
+      };
+      controls.enabled = false;
+      renderer.domElement.style.cursor = 'crosshair';
+      if (faceSelectionPolyDivRef.current) {
+        if (faceSelectionPolyDivRef.current.parentElement) {
+          faceSelectionPolyDivRef.current.parentElement.style.display = 'none';
+        }
+        faceSelectionPolyDivRef.current.style.display = 'none';
+      }
+      if (faceSelectionLineRef.current) faceSelectionLineRef.current.style.display = 'none';
+      renderer.domElement.dispatchEvent(
+        new PointerEvent('pointerup', {
+          clientX,
+          clientY,
+          button: 0,
+          bubbles: true,
+        })
+      );
+      return true;
+    };
+    // CORTE POR TRAZADO: cierra con INTRO — SIN pointerup sintético ni
+    // jugueteo de OrbitControls: el cierre vive todo aquí. Trazado abierto
+    // (2 puntos) vale: corta la línea sin seleccionar interior.
+    const cierraCorteZona = () => {
+      const puntos = cortePuntosRef.current;
+      // Doble clic: retira el duplicado casi-idéntico (como en la zona).
+      if (
+        puntos.length >= 2 &&
+        Math.hypot(
+          puntos[puntos.length - 1].x - puntos[puntos.length - 2].x,
+          puntos[puntos.length - 1].y - puntos[puntos.length - 2].y
+        ) <= 1
+      ) {
+        puntos.length -= 1;
+      }
+      if (puntos.length < 2) return false;
+      const rect = renderer.domElement.getBoundingClientRect();
+      const meshObj = findMainMesh(meshGroupRef.current);
+      if (!meshObj) return false;
+      meshObj.updateWorldMatrix(true, false);
+      const worldMatrix = meshObj.matrixWorld;
+      const invMatrix = new THREE.Matrix4().copy(worldMatrix).invert();
+      const cerrado = puntos.length >= 3;
+      const pantalla = puntos.map((p) => ({
+        x: p.x - rect.left,
+        y: p.y - rect.top,
+      }));
+      const W = rect.width;
+      const H = rect.height;
+      // Rayo por punto (en MUNDO → LOCAL): perspectiva comparte la cámara;
+      // en orto cada rayo lleva su origen (los rayos van paralelos).
+      const rayos = pantalla.map((p) => {
+        const ndc = new THREE.Vector2(
+          (p.x / W) * 2 - 1,
+          -((p.y / H) * 2 - 1)
+        );
+        raycasterRef.current.setFromCamera(ndc, camera);
+        const o = raycasterRef.current.ray.origin
+          .clone()
+          .applyMatrix4(invMatrix);
+        const d = raycasterRef.current.ray.direction
+          .clone()
+          .transformDirection(invMatrix);
+        return {
+          o: [o.x, o.y, o.z] as [number, number, number],
+          d: [d.x, d.y, d.z] as [number, number, number],
+        };
+      });
+      // Matriz local → px del canvas (la misma composición con la que el
+      // algoritmo proyecta: perspectiva Y ortográfica, ambas).
+      camera.updateMatrixWorld();
+      camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+      const matriz = new THREE.Matrix4()
+        .makeTranslation(W / 2, H / 2, 0)
+        .multiply(new THREE.Matrix4().makeScale(W / 2, -H / 2, 1))
+        .multiply(camera.projectionMatrix)
+        .multiply(camera.matrixWorldInverse)
+        .multiply(worldMatrix)
+        .elements.slice();
+      const camara = new THREE.Vector3()
+        .copy(camera.position)
+        .applyMatrix4(invMatrix);
+      // Limpia el dibujo y entrega el trazado (el modo queda activo: en
+      // serie; solo se sale re-pulsando el botón u otro modo).
+      cortePuntosRef.current = [];
+      if (cortePolyRef.current?.parentElement) {
+        cortePolyRef.current.parentElement.style.display = 'none';
+      }
+      if (cortePolyRef.current) cortePolyRef.current.style.display = 'none';
+      if (corteLineRef.current) corteLineRef.current.style.display = 'none';
+      onCorteZonaRef.current?.({
+        camara: [camara.x, camara.y, camara.z],
+        rayos,
+        pantalla,
+        matriz,
+        cerrado,
+      });
+      return true;
+    };
+    // Enter: cierra la forma en curso (si no se está en un campo).
+    const onEnterZona = (e: KeyboardEvent) => {
+      if (e.key !== 'Enter') return;
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+      // El corte precede a la zona: Intro cierra SU trazo (≥2 puntos).
+      if (modoCorteRef.current) {
+        if (cortePuntosRef.current.length >= 2 && cierraCorteZona()) {
+          e.preventDefault();
+        }
+        return;
+      }
+      if (faceSelectionToolRef.current !== 'poligono') return;
+      if (faceSelectionPointsRef.current.length === 0) return;
+      if (cierraPoligonoZona(0, 0)) e.preventDefault();
+    };
+    window.addEventListener('keydown', onEnterZona);
+
     return () => {
       cancelAnimationFrame(animId);
     // Clean up face selection HTML overlays
+    if (cortePolyRef.current) {
+      const parent = cortePolyRef.current.ownerSVGElement;
+      if (parent) parent.remove();
+    }
+    if (corteLineRef.current) {
+      const parent = corteLineRef.current.ownerSVGElement;
+      if (parent) parent.remove();
+    }
+    cortePolyRef.current = null;
+    corteLineRef.current = null;
+    cortePuntosRef.current = [];
     if (faceSelectionRectDivRef.current) faceSelectionRectDivRef.current.remove();
     if (faceSelectionCircleDivRef.current) faceSelectionCircleDivRef.current.remove();
     if (faceSelectionPolyDivRef.current) {
@@ -11292,6 +11941,7 @@ export default function Viewer3D({
       window.removeEventListener('pointerup', onPointerUp);
       renderer.domElement.removeEventListener('pointerleave', onPointerLeaveCanvas);
       renderer.domElement.removeEventListener('dblclick', onDobleClicSpline);
+      window.removeEventListener('keydown', onEnterZona);
       renderer.domElement.removeEventListener('wheel', onRuedaGrabacion);
       renderer.domElement.removeEventListener('wheel', handleWheelPlano);
       if (recZoomTimerRef.current) clearTimeout(recZoomTimerRef.current);

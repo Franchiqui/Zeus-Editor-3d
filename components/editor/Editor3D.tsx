@@ -1,7 +1,7 @@
-'use client';
+﻿'use client';
 
 import { Fragment, useState, useMemo, useCallback, useEffect, useRef } from 'react';
-import type { ComponentType, Key } from 'react';
+import type { ComponentType, Key, SetStateAction } from 'react';
 import * as THREE from 'three';
 import DrawingCanvas from '@/components/drawing-canvas';
 import EditorCanvas from '@/components/editor-canvas';
@@ -163,10 +163,16 @@ import {
 import {
   regionSegunObjetivo,
   extrudeRegionMesh,
-  normalesSuavizadasDeRegion,
   aristasDeMalla,
   type ObjetivoSeleccion,
 } from '@/lib/extrusion-seleccion';
+import {
+  borrarCarasRegion,
+  submallaDeRegion,
+  hornearEnMundo,
+} from '@/lib/seleccion-operaciones';
+import { cortarMallaPorTrazado, type TrazadoCorte } from '@/lib/corte-malla';
+import type { FaceSelectionTarget } from '@/components/viewer-3d';
 import { resolveLatheProfile, resampleLatheProfile, LATHE_PRESET_NAMES } from '@/lib/lathe-profiles';
 import { buildViewsMesh, buildExtrudeMesh, buildExtrudeMeshes, polylineToPolygon } from '@/lib/views-mesh';
 import { mapeaColocacionExtrusion, type CapturaExtrusionMeta } from '@/lib/extrusion-spline';
@@ -3933,7 +3939,24 @@ export default function Home({
   // malla, el objeto seleccionado y el dueño de la configuración. Se
   // declaran aquí arriba porque el historial de deshacer/rehacer los
   // fotografía en cada paso.
-  const [sceneObjects, setSceneObjects] = useState<SceneObject[]>([]);
+  const [sceneObjects, setSceneObjectsState] = useState<SceneObject[]>([]);
+  // TAZA TEMPORAL (2026-10-14, bug «rugosa»): envoltorio que apunta en la
+  // consola a quiénes escriben la escena y con qué texturas por cara cada
+  // uno acaba. Quitar junto con el resto de TRAZA.
+  const setSceneObjects = useCallback((v: SetStateAction<SceneObject[]>) => {
+    const pila = new Error().stack?.split('\n').slice(2, 5).join(' ~ ');
+    setSceneObjectsState((cur) => {
+      const res = typeof v === 'function' ? (v as (c: SceneObject[]) => SceneObject[])(cur) : v;
+      try {
+        const resumen = (arr: SceneObject[]) =>
+          arr.map((o) => `${(o.id as string).slice(4, 12)}:${o.mesh?.faceTextures ? o.mesh.faceTextures.filter(Boolean).length : '-'}`).join('|');
+        const antes = cur.length ? resumen(cur) : '(vacio)';
+        const despues = (res as SceneObject[]).length ? resumen(res as SceneObject[]) : '(vacio)';
+        console.log(antes !== despues ? 'TRACESCENE>>>' : 'TRACESCENE>>>', antes === despues ? '(igual)' : `ANTES:${antes} DESPUES:${despues} POR:${pila}`);
+      } catch { /* traza best-effort */ }
+      return res;
+    });
+  }, []);
   const aiBridge = useAIEditorBridgeOptional();
   // Cuadradito de textura que salta la primera aplicación tras un
   // cambio de pestaña, de selección o de restauración del panel (lo
@@ -3958,8 +3981,29 @@ export default function Home({
   const [renameDraft, setRenameDraft] = useState('');
    const [selectionMode, setSelectionMode] = useState(false);
    const [faceSelectMode, setFaceSelectMode] = useState(false);
+   // Menú del botón Seleccionar CONTROLADO: con menú libre Radix alterna
+   // abrir/cerrar en cada pointerdown Y el click alterna el modo — quedan
+   // desfasados (menú cerrado con modo activo) y no hay forma de elegir
+   // herramienta a mitad de modo. Controlado: cada pulsación alterna el
+   // modo y deja el menú ABIERTO; Escape/clic fuera solo cierran el menú.
+   const [menuSelAbierto, setMenuSelAbierto] = useState(false);
+   // CORTE RÁPIDO del desplegable de Seleccionar: el visor corta directo
+   // por triángulos (sin selección ni overlays) — para mallas enormes de
+   // OBJ importado en las que el camino de selección tarda horas.
+   const [corteRapido, setCorteRapido] = useState(false);
+   // CORTE POR TRAZADO (botón «Corte»): el usuario dibuja la polilínea
+   // discontinua sobre el objeto; al cerrar con Intro la malla se CORTA
+   // por el trazado y el interior queda seleccionado al instante.
+   const [modoCorte, setModoCorte] = useState(false);
    const [faceSelectionTool, setFaceSelectionTool] = useState<'rectangle' | 'circle' | 'line' | 'poligono' | 'directo'>('rectangle');
-   const [faceSelectionTarget, setFaceSelectionTarget] = useState<'cara' | 'vertice' | 'segmento'>('cara');
+   const [faceSelectionTarget, setFaceSelectionTarget] = useState<FaceSelectionTarget>('cara');
+   // Portapapeles de la ZONA (botón Seleccionar): Copiar guarda la submalla
+   // horneada a mundo + los datos del objeto origen; Pegar crea un objeto
+   // desde él en la MISMA posición de la zona copiada.
+   const [seleccionClipboard, setSeleccionClipboard] = useState<{
+     mesh: Mesh;
+     meta: Partial<SceneObject>;
+   } | null>(null);
    // Solo capturar lo visible (caras de frente, no lo que está detrás).
    const [faceSelectVisibleOnly, setFaceSelectVisibleOnly] = useState(true);
    // Modo ANILLOS de caras/aristas: en caras, el hover/clic agrupa el
@@ -8631,7 +8675,8 @@ pluginTracks,
       }
       const dx = moveSelDelta.x, dy = moveSelDelta.y, dz = moveSelDelta.z;
       if (dx === 0 && dy === 0 && dz === 0) return;
-      const objetivo: ObjetivoSeleccion = faceSelectionTarget;
+      const objetivo: ObjetivoSeleccion =
+        faceSelectionTarget === 'todo' ? 'cara' : faceSelectionTarget;
       // Con la malla vista = malla del objeto los índices coinciden tal cual.
       const region = regionSegunObjetivo(
         object.mesh,
@@ -8692,7 +8737,7 @@ pluginTracks,
       // hay extrusión — el gesto cae al clásico (mover/escalar tal cual).
       const region = regionSegunObjetivo(
         mesh,
-        faceSelectionTarget,
+        faceSelectionTarget === 'todo' ? 'cara' : faceSelectionTarget,
         selectedFaceIds,
         selectedVertexIds,
         selectedEdgeIds,
@@ -8701,6 +8746,10 @@ pluginTracks,
       // Delta mínimo a lo largo de la normal media de la región: separa la
       // copia de la base para que no se solapen (z-fighting) si el usuario
       // suelta sin mover. 0.002 = lo justo en unidades de la escena.
+      // Cada normal se VOLTEA contra la media acumulada antes de sumar: el
+      // corte por trazado conserva el ORDEN cíclico pero no el sentido, y
+      // piezas con enrolado contrario se CANCELAN entre sí (media ~0 → el
+      // arrastre caía al clásico y estiraba los vecinos = «salía doblada»).
       let nx = 0, ny = 0, nz = 0, cuenta = 0;
       for (const idx of region) {
         const cara = mesh.faces[idx];
@@ -8716,7 +8765,13 @@ pluginTracks,
         const cz = ux * vy - uy * vx;
         const l = Math.hypot(cx, cy, cz);
         if (l < 1e-12) continue;
-        nx += cx / l; ny += cy / l; nz += cz / l; cuenta++;
+        let ux1 = cx / l, uy1 = cy / l, uz1 = cz / l;
+        // Volteo contra la media acumulada: enrolado contrario no cancela.
+        const parcial = Math.hypot(nx, ny, nz);
+        if (parcial > 1e-9 && ux1 * nx + uy1 * ny + uz1 * nz < 0) {
+          ux1 = -ux1; uy1 = -uy1; uz1 = -uz1;
+        }
+        nx += ux1; ny += uy1; nz += uz1; cuenta++;
       }
       let delta: Vertex3D;
       if (cuenta > 0 && Math.hypot(nx, ny, nz) > 1e-9) {
@@ -8727,26 +8782,31 @@ pluginTracks,
       }
       const res = extrudeRegionMesh(mesh, region, delta);
       if (!res || res.haciaDentro) return null;
-      // Inflado del arrastre (Ctrl+flecha de mover): normal suavizada por
-      // vértice de la región (coherencia de enrolado + hacia fuera + cúmulos
-      // por posición), pasada a índices DUPLICADOS. Así cada cara de la
-      // copia sale por la suya con la misma profundidad — en superficie
-      // curvada todas salen igual, como pidió el usuario.
+      // Extrusión RECTA del arrastre (Ctrl+asa de mover): UNA dirección
+      // para todo el parche — la MISMA media corregida que el delta — así
+      // las paredes salen paralelas y la copia NO se abre en abanico ni se
+      // estira si la media degenera (quejas tras cortar: 2026-10-14).
       const normalesPorVert = new Map<number, Vertex3D>();
-      for (const [orig, n] of normalesSuavizadasDeRegion(mesh, region)) {
-        const dup = res.vmap.get(orig);
-        if (dup !== undefined) normalesPorVert.set(dup, n);
+      if (cuenta > 0) {
+        const largoM = Math.hypot(nx, ny, nz);
+        const media: Vertex3D = { x: nx / largoM, y: ny / largoM, z: nz / largoM };
+        for (const [orig] of res.vmap) {
+          const dup = res.vmap.get(orig);
+          if (dup !== undefined) normalesPorVert.set(dup, media);
+        }
       }
       setSceneObjects((current) =>
         current.map((o) => (o.id === id ? { ...o, mesh: res.mesh } : o)),
       );
       // La selección sigue a la copia (los índices originales se quedan
       // con la base), como hace el botón Extrudir: según el objetivo.
-      if (faceSelectionTarget === 'cara') {
+      const objetivoCtrl: ObjetivoSeleccion =
+        faceSelectionTarget === 'todo' ? 'cara' : faceSelectionTarget;
+      if (objetivoCtrl === 'cara') {
         setSelectedFaceIds(res.carasNuevas);
         if (selectedVertexIds.length > 0) setSelectedVertexIds([]);
         if (selectedEdgeIds.length > 0) setSelectedEdgeIds([]);
-      } else if (faceSelectionTarget === 'vertice') {
+      } else if (objetivoCtrl === 'vertice') {
         setSelectedVertexIds(selectedVertexIds.map((v) => res.vmap.get(v) ?? v));
       } else {
         setSelectedEdgeIds(selectedEdgeIds.map((k) => res.mapaAristas.get(k) ?? k));
@@ -8762,6 +8822,305 @@ pluginTracks,
       selectedVertexIds,
       selectedEdgeIds,
     ]);
+
+    // ---- Zona del botón «Seleccionar»: Borrar/Copiar/Pegar/Crear ------
+    // Operan sobre la selección COMBINADA del objetivo «todo». La región
+    // de malla es la de las CARAS capturadas: en pantalla la zona coge
+    // caras + aristas + vértices de la MISMA parte del objeto.
+    const regionSelZona = useCallback((): {
+      id: string;
+      object: SceneObject;
+      mesh: Mesh;
+      region: number[];
+    } | null => {
+      const id = selectedObjectId ?? configObjectId;
+      if (!id) return null;
+      const object = sceneObjects.find((o) => o.id === id);
+      if (!object?.mesh || object.mesh.vertices.length === 0) return null;
+      const mesh = object.mesh;
+      if (mesh.faces.length !== (id === configObjectId ? triMesh : object.mesh).faces.length) {
+        return null; // Solo con la malla vista = malla del objeto (modo escena).
+      }
+      const region = regionSegunObjetivo(
+        mesh,
+        'cara',
+        selectedFaceIds,
+        selectedVertexIds,
+        selectedEdgeIds,
+      );
+      if (region.length === 0) return null;
+      return { id, object, mesh, region };
+    }, [
+      selectedObjectId,
+      configObjectId,
+      sceneObjects,
+      triMesh,
+      selectedFaceIds,
+      selectedVertexIds,
+      selectedEdgeIds,
+    ]);
+
+    const salirSelZona = useCallback(() => {
+      setSelectedFaceIds([]);
+      setSelectedVertexIds([]);
+      setSelectedEdgeIds([]);
+      setFaceSelectionTool((prevTool) =>
+        prevTool === 'poligono' ? 'poligono' : 'rectangle'
+      );
+      setFaceSelectMode(false);
+    }, []);
+
+    /**
+     * CORTE RÁPIDO (mallas enormes): el visor ya hizo todo el trabajo —
+     * emite los TRIÁNGULOS de la malla vista que cayeron dentro de la
+     * zona; aquí solo se remapean a caras lógicas (triangleToFaceMap:
+     * para los OBJ importados es identidad), se corta con
+     * borrarCarasRegion (una pasada O(N), sin overlays ni agrupados) y
+     * queda un ÚNICO setSceneObjects (historial por referencia, O(1)).
+     */
+    const aplicarCorteRapido = useCallback(
+      (triIds: number[]) => {
+        const id = selectedObjectId ?? configObjectId;
+        if (!id) return;
+        const object = sceneObjects.find((o) => o.id === id);
+        if (!object?.mesh || object.mesh.vertices.length === 0) return;
+        const vista = id === configObjectId ? triMesh : object.mesh;
+        let region = triIds;
+        if (vista.faces.length !== object.mesh.faces.length) {
+          const map = triangleToFaceMap(object.mesh);
+          region = [
+            ...new Set(
+              triIds
+                .map((tx) => map[tx])
+                .filter((f) => f !== undefined)
+            ),
+          ];
+        }
+        if (region.length === 0) {
+          toast.error(t('editor3D.selZonaNadaSeleccionado'));
+          return;
+        }
+        const hueco = borrarCarasRegion(object.mesh, region);
+        if (!hueco) {
+          toast.error(t('editor3D.selZonaNadaSeleccionado'));
+          return;
+        }
+        setSceneObjects((current) =>
+          current.map((o) =>
+            o.id === id
+              ? {
+                  ...o,
+                  mesh: hueco,
+                  primitiveParams: undefined,
+                  spline: undefined,
+                  pluginEdit: undefined,
+                }
+              : o
+          )
+        );
+        // El corte deja la malla nueva: las selecciones (si las hubiera de
+        // otros objetivos) quedan huérfanas — fuera.
+        setSelectedFaceIds([]);
+        setSelectedVertexIds([]);
+        setSelectedEdgeIds([]);
+        setViewRefreshTick((v) => v + 1);
+        toast.success(
+          t('editor3D.selZonaCortadaRapida').replace('{n}', String(region.length))
+        );
+      },
+      [
+        selectedObjectId,
+        configObjectId,
+        sceneObjects,
+        triMesh,
+        triangleToFaceMap,
+        t,
+      ]
+    );
+
+    // CORTE POR TRAZADO: el visor entrega el trazado (cámara + rayos en
+    // local + pantalla en px + matriz); cortarMallaPorTrazado parte las
+    // caras por los planos del trazo y, si se cerró, marca el interior.
+    const aplicarCorteZona = useCallback(
+      (trazado: TrazadoCorte) => {
+        const id = selectedObjectId ?? configObjectId;
+        if (!id) return;
+        const object = sceneObjects.find((o) => o.id === id);
+        if (!object?.mesh || object.mesh.vertices.length === 0) return;
+        const resultado = cortarMallaPorTrazado(object.mesh, trazado);
+        if ('error' in resultado) {
+          toast.error(t('editor3D.corteZonaNada'));
+          return;
+        }
+        setSceneObjects((current) =>
+          current.map((o) =>
+            o.id === id
+              ? {
+                  ...o,
+                  mesh: resultado.mesh,
+                  primitiveParams: undefined,
+                  spline: undefined,
+                  pluginEdit: undefined,
+                }
+              : o
+          )
+        );
+        // La malla cambió: selecciones previas (con índices antiguos)
+        // quedan huérfanas — fuera antes de marcar el interior.
+        setSelectedFaceIds([]);
+        setSelectedVertexIds([]);
+        setSelectedEdgeIds([]);
+        if (trazado.cerrado && resultado.carasInterior.length > 0) {
+          // Interior del lazo seleccionado AL INSTANTE (semántica «todo»:
+          // caras + sus aristas + sus vértices; Escape las limpia).
+          setSelectedFaceIds(resultado.carasInterior);
+          setSelectedEdgeIds(resultado.aristasInterior);
+          setSelectedVertexIds(resultado.verticesCorte);
+          setFaceSelectionTarget('todo');
+          setFaceSelectMode(true);
+        }
+        setViewRefreshTick((v) => v + 1);
+        toast.success(
+          t('editor3D.corteZonaOK').replace(
+            '{n}',
+            String(resultado.mesh.faces.length - object.mesh.faces.length)
+          )
+        );
+      },
+      [selectedObjectId, configObjectId, sceneObjects, t]
+    );
+
+    const aplicarBorrarSeleccion = useCallback(() => {
+      const base = regionSelZona();
+      if (!base) {
+        toast.error(t('editor3D.selZonaNadaSeleccionado'));
+        return;
+      }
+      const hueco = borrarCarasRegion(base.mesh, base.region);
+      if (!hueco) {
+        toast.error(t('editor3D.selZonaNadaSeleccionado'));
+        return;
+      }
+      setSceneObjects((current) =>
+        current.map((o) =>
+          o.id === base.id
+            ? {
+                ...o,
+                mesh: hueco,
+                primitiveParams: undefined,
+                spline: undefined,
+                pluginEdit: undefined,
+              }
+            : o
+        )
+      );
+      salirSelZona();
+      setViewRefreshTick((v) => v + 1);
+      toast.success(t('editor3D.selZonaBorrada'));
+    }, [regionSelZona, salirSelZona, t]);
+
+    const aplicarCopiarSeleccion = useCallback(() => {
+      const base = regionSelZona();
+      if (!base) {
+        toast.error(t('editor3D.selZonaNadaSeleccionado'));
+        return;
+      }
+      const sub = submallaDeRegion(base.mesh, base.region);
+      if (!sub) {
+        toast.error(t('editor3D.selZonaNadaSeleccionado'));
+        return;
+      }
+      // La submalla se HORNEA A MUNDO ya al Copiar: Pegar cae en la MISMA
+      // posición de la zona copiada (no persigue al objeto origen).
+      const { mesh: horneada } = hornearEnMundo(sub.mesh, base.object.transform);
+      const { id: _id, mesh: _mesh, transform: _transform, ...meta } =
+        structuredClone(base.object);
+      setSeleccionClipboard({
+        meta: {
+          ...meta,
+          primitiveParams: undefined,
+          spline: undefined,
+          pluginEdit: undefined,
+        },
+        mesh: horneada,
+      });
+      toast.success(t('editor3D.selZonaCopiada'));
+    }, [regionSelZona, t]);
+
+    const aplicarPegarSeleccion = useCallback(() => {
+      if (!seleccionClipboard) {
+        toast.error(t('editor3D.selZonaSinPortapapeles'));
+        return;
+      }
+      // Re-pivotar al centro de SU caja (idempotente): el objeto nace con
+      // transform limpio (pivote/rot 0/esc 1) en el sitio horneado.
+      const recolocada = hornearEnMundo(seleccionClipboard.mesh);
+      const nuevoId = `object-${Date.now()}`;
+      const nuevo: SceneObject = {
+        ...seleccionClipboard.meta,
+        id: nuevoId,
+        name: `${seleccionClipboard.meta.name ?? 'Zona'} ${t('editor3D.selPegadaSufijo')}`,
+        mesh: recolocada.mesh,
+        transform: recolocada.transform as SceneObject['transform'],
+      };
+      setSceneObjects((current) => [...current, nuevo]);
+      setSelectedObjectId(nuevoId);
+      setSelectedObjectIds([nuevoId]);
+      salirSelZona();
+      setViewRefreshTick((v) => v + 1);
+      toast.success(t('editor3D.selZonaPegada'));
+    }, [seleccionClipboard, salirSelZona, t]);
+
+    const aplicarCrearNuevoObjeto = useCallback(() => {
+      const base = regionSelZona();
+      if (!base) {
+        toast.error(t('editor3D.selZonaNadaSeleccionado'));
+        return;
+      }
+      const hueco = borrarCarasRegion(base.mesh, base.region);
+      const sub = submallaDeRegion(base.mesh, base.region);
+      if (!hueco || !sub) {
+        toast.error(t('editor3D.selZonaNadaSeleccionado'));
+        return;
+      }
+      const horneada = hornearEnMundo(sub.mesh, base.object.transform);
+      const { id: _oid, mesh: _omesh, transform: _otransform, ...meta } = base.object;
+      const nuevoId = `object-${Date.now()}-corte`;
+      // UN solo update: el ORIGINAL pierde la zona (hueco abierto) y entra
+      // el objeto nuevo con la misma pieza horneada a mundo.
+      setSceneObjects((current) => {
+        const resultado: SceneObject[] = [];
+        for (const o of current) {
+          if (o.id === base.id) {
+            resultado.push({
+              ...o,
+              mesh: hueco,
+              primitiveParams: undefined,
+              spline: undefined,
+              pluginEdit: undefined,
+            });
+          }
+        }
+        resultado.push({
+          ...meta,
+          copiasCalculadas: undefined,
+          copiasSetId: undefined,
+          primitiveParams: undefined,
+          spline: undefined,
+          pluginEdit: undefined,
+          id: nuevoId,
+          name: `${base.object.name} ${t('editor3D.selCortadaSufijo')}`,
+          mesh: horneada.mesh,
+          transform: horneada.transform as SceneObject['transform'],
+        });
+        return resultado;
+      });
+      setSelectedObjectId(nuevoId);
+      setSelectedObjectIds([nuevoId]);
+      salirSelZona();
+      setViewRefreshTick((v) => v + 1);
+      toast.success(t('editor3D.selZonaNuevoObjeto'));
+    }, [regionSelZona, salirSelZona, t]);
 
     // ---- Resalte por textura automática -------------------------------
     // El usuario lo pidió así: las caras seleccionadas se pintan con una
@@ -8839,7 +9198,10 @@ pluginTracks,
     // salir del modo (o cambiar de objetivo) se limpian los colores
     // automáticos que quedaran puestos.
     useEffect(() => {
-      if (faceSelectMode && faceSelectionTarget === 'cara') {
+      if (
+        faceSelectMode &&
+        (faceSelectionTarget === 'cara' || faceSelectionTarget === 'todo')
+      ) {
         pintarSeleccionAuto(selectedFaceIds);
       } else if (autoPintadasRef.current.size > 0) {
         pintarSeleccionAuto([]);
@@ -8868,6 +9230,7 @@ pluginTracks,
     // pulsarse → se sale del modo y se limpia la selección (los overlays
     // del visor se retiran al apagarse el modo).
     const toggleSubSelectTarget = useCallback((tg: 'cara' | 'vertice' | 'segmento') => {
+      setModoCorte(false);
       // Exclusividad de modos, SALVO Bisel plano: su captura de caras ES
       // la sub-selección (conviwiendo), así que los otros deformadores se
       // apagan al entrar pero éste sobrevive (comparten lavado gris; los
@@ -8900,6 +9263,46 @@ pluginTracks,
     }, [faceSelectionTarget, deformadorId]);
 
     /**
+     * Botón SELECCIONAR (desplegable junto al Espejo): selección por ZONA
+     * — rectángulo/polígono sobre la ventana activa que coge caras +
+     * aristas + vértices JUNTOS (objetivo «todo»). Re-pulsar el botón
+     * (con el modo ya activo) sale y limpia.
+     */
+    const toggleSeleccionZona = useCallback(() => {
+      setModoCorte(false);
+      if (deformadorId) {
+        setDeformParams({});
+        setDeformadorId(null);
+      }
+      setModoSpline(false);
+      setSelGizmoConfigMode(false);
+      resetSelGizmo();
+      if (faceSelectMode && faceSelectionTarget === 'todo') {
+        // Salir: limpiar las tres selecciones y la herramienta clásica.
+        setSelectedFaceIds([]);
+        setSelectedVertexIds([]);
+        setSelectedEdgeIds([]);
+        setFaceSelectionTool('rectangle');
+        setFaceSelectMode(false);
+        setCorteRapido(false);
+        return;
+      }
+      setSelectedFaceIds([]);
+      setSelectedVertexIds([]);
+      setSelectedEdgeIds([]);
+      setFaceSelectionTarget('todo');
+      // El corte rápido no persiste: cada entrada del modo empieza en el
+      // camino de selección normal (el corte silencioso sería una sorpresa).
+      setCorteRapido(false);
+      // La herramienta se conserva si el usuario ya eligió en el
+      // desplegable (polígono); si no, rectángulo arrastrable.
+      setFaceSelectionTool((prevTool) =>
+        prevTool === 'poligono' ? 'poligono' : 'rectangle'
+      );
+      setFaceSelectMode(true);
+    }, [deformadorId, faceSelectMode, faceSelectionTarget, resetSelGizmo]);
+
+    /**
      * ENTRA/SUBE en un deformador directo. Si el mismo está activo, lo
      * apaga (re-pulsar = salir). Al entrar fija sus params por defecto.
      */
@@ -8917,6 +9320,7 @@ pluginTracks,
           setDeformadorId(null);
           return;
         }
+        setModoCorte(false);
         setModoSpline(false);
         setSelGizmoConfigMode(false);
         resetSelGizmo();
@@ -8938,6 +9342,7 @@ pluginTracks,
       }
       // Los demás deformadores SÍ se excluyen mutuamente con la
       // sub-selección (y el spline).
+      setModoCorte(false);
       setFaceSelectMode(false);
       setSelectedFaceIds([]);
       setSelectedVertexIds([]);
@@ -8997,8 +9402,30 @@ pluginTracks,
      * spline lo carga clonado (reeditarlo); si no, arranca un trazado
      * nuevo. Re-pulsar = salir (Cancelar: el Aplicar crea el objeto).
      */
+    // --- Modo CORTE (botón «Corte») ---
+    /** Re-pulsar el mismo = salir (el corte no toca la escena por sí solo). */
+    const toggleModoCorte = useCallback(() => {
+      if (modoCorte) {
+        setModoCorte(false);
+        return;
+      }
+      // Exclusividad: apaga spline, deformador, sub-selección y corte rápido.
+      setFaceSelectMode(false);
+      setSelectedFaceIds([]);
+      setSelectedVertexIds([]);
+      setSelectedEdgeIds([]);
+      salirModoSpline();
+      setSelGizmoConfigMode(false);
+      resetSelGizmo();
+      setDeformadorId(null);
+      setDeformParams({});
+      setCorteRapido(false);
+      setModoCorte(true);
+    }, [modoCorte, resetSelGizmo, salirModoSpline]);
+
     const toggleModoSpline = useCallback(() => {
       // Exclusividad: el spline apaga la sub-selección y el deformador.
+      setModoCorte(false);
       setFaceSelectMode(false);
       setSelectedFaceIds([]);
       setSelectedVertexIds([]);
@@ -13618,6 +14045,10 @@ pluginTracks,
       splineContornos={splineContornos}
       onCtrlExtrudirSubSel={handleCtrlExtrudirSubSel}
       faceSelectVisibleOnly={faceSelectVisibleOnly}
+      corteRapido={corteRapido}
+      onCorteRapido={aplicarCorteRapido}
+      modoCorte={modoCorte}
+      onCorteZona={aplicarCorteZona}
       wireframeOffSignal={wireframeOffSignal}
       vistaModo={vistaModos[viewName] ?? 'textura'}
       onVistaModoChange={(m) => setVistaModos((prev) => ({ ...prev, [viewName]: m }))}
@@ -13879,6 +14310,43 @@ pluginTracks,
               </button>
             );
           })}
+          {/* CORTE: traza una polilínea discontinua NARANJA sobre el objeto
+              (clic = punto, clic derecho cancela, Intro cierra). Al cerrar,
+              la malla se CORTA por el trazado y el interior queda
+              seleccionado al instante (semántica «todo»). Trazado abierto
+              (2 clics + Intro): corta la línea sin seleccionar. El corte
+              NO es un deformador ni un desplegable: onClick simple. */}
+          <button
+            title={modoCorte ? t('editor3D.corteBtnOffTitle') : t('editor3D.corteBtnTitle')}
+            data-testid="boton-corte"
+            data-activo={modoCorte ? '1' : '0'}
+            disabled={viewerMesh.vertices.length === 0}
+            onClick={toggleModoCorte}
+            className={`relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border disabled:opacity-40 disabled:cursor-not-allowed ${
+              modoCorte
+                ? 'bg-gray-700 border-cyan-300 ring-2 ring-cyan-300 shadow-[0_0_5px_1px_rgba(34,211,238,0.9),0_0_16px_6px_rgba(34,211,238,0.4)] hover:bg-gray-600'
+                : 'bg-gray-700 hover:bg-gray-600 border-gray-500'
+            }`}
+          >
+            <span
+              data-letra
+              className="hidden text-[10px] font-bold text-gray-300 select-none"
+            >
+              C
+            </span>
+            <img
+              src="/icons/Cortar.png"
+              alt=""
+              draggable={false}
+              onError={(e) => {
+                // Sin icono en /icons/Cortar.png: asoma la letra C.
+                const letra = e.currentTarget.parentElement?.querySelector('[data-letra]');
+                if (letra) letra.classList.remove('hidden');
+                e.currentTarget.style.display = 'none';
+              }}
+              className="h-full w-full object-contain"
+            />
+          </button>
           {/* SPLINE 3D: traza el camino con vértices en las ventanas planas
               (clic = vértice, plantilla por vértice) y al aplicar genera la
               malla como barrido 3D. SPLINE ROSCA: entra en el MISMO modo
@@ -14015,6 +14483,160 @@ pluginTracks,
                 data-testid="espejo-z"
               >
                 {t('editor3D.espejoEjeZ')}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          {/* SELECCIONAR: botón de ZONA (rectángulo o polígono discontinuo
+              en la ventana activa) que coge caras + aristas + vértices
+              JUNTOS del objeto activo, con desplegable de acciones sobre
+              la selección: Borrar / Copiar / Pegar / Crear nuevo objeto
+              (corta la zona del original y crea otro con ella). */}
+          {/* modal={false}: el menú modal pone el body pointer-events:none
+              en cuanto se abre — el click del trigger se pierde y el modo
+              nunca alterna (hallado en e2e). Sin modal, el click llega. */}
+          <DropdownMenu modal={false} open={menuSelAbierto} onOpenChange={setMenuSelAbierto}>
+            <DropdownMenuTrigger asChild>
+              <button
+                title={t('editor3D.seleccionarBtnTitle')}
+                data-testid="boton-seleccionar"
+                data-activo={
+                  faceSelectMode && faceSelectionTarget === 'todo' ? '1' : '0'
+                }
+                disabled={viewerMesh.vertices.length === 0}
+                /* El modo alterna en POINTERDOWN y preventDefault() detiene el
+                   onOpenToggle interno de Radix (menú controlado): sin esto,
+                   Radix alterna el menú en pointerdown y el click alterna el
+                   modo — quedan desfasados y no se puede elegir herramienta
+                   con el modo ya activo. Semántica: con modo apagado la
+                   pulsación ENTRA y abre el menú; con modo activo y menú
+                   cerrado SOLO reabre el menú (la zona dibujada se conserva
+                   para Borrar/Copiar/Pegar/Crear); con el menú abierto
+                   re-pulsar SALE del modo y cierra. */
+                onPointerDown={(e) => {
+                  e.preventDefault();
+                  if (menuSelAbierto) {
+                    toggleSeleccionZona();
+                    setMenuSelAbierto(false);
+                    return;
+                  }
+                  if (!faceSelectMode || faceSelectionTarget !== 'todo') {
+                    toggleSeleccionZona();
+                  }
+                  setMenuSelAbierto(true);
+                }}
+                className={`relative flex h-8 w-8 items-center justify-center rounded-md p-0.5 transition-all border ${
+                  faceSelectMode && faceSelectionTarget === 'todo'
+                    ? 'bg-gray-700 border-cyan-300 ring-2 ring-cyan-300 shadow-[0_0_5px_1px_rgba(34,211,238,0.9),0_0_16px_6px_rgba(34,211,238,0.4)] hover:bg-gray-600'
+                    : 'bg-gray-700 hover:bg-gray-600 border-gray-500'
+                } disabled:opacity-40 disabled:cursor-not-allowed`}
+              >
+                <span
+                  data-letra
+                  className="hidden text-[10px] font-bold text-gray-300 select-none"
+                >
+                  Z
+                </span>
+                <img
+                  src="/icons/Seleccionar.png"
+                  alt=""
+                  draggable={false}
+                  onError={(e) => {
+                    const letra = e.currentTarget.parentElement?.querySelector('[data-letra]');
+                    if (letra) letra.classList.remove('hidden');
+                    e.currentTarget.style.display = 'none';
+                  }}
+                  className="h-full w-full object-contain"
+                />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="start"
+              className="bg-gray-900 border-gray-800 text-white min-w-[230px]"
+              /* El pointerdown del trigger (re-pulsar: alternar modo y
+                 reabrir) llegará al menú como «fuera del contenido» DESPUÉS
+                 del handler del botón (Radix escucha el pointerdown en la
+                 fase burbuja del document) y cerraría el menú recién abierto.
+                 preventDefault() cuando el origen es el propio trigger: el
+                 menú se queda; clics fuera o Escape siguen cerrándolo. */
+              onPointerDownOutside={(e) => {
+                const origen = e.detail.originalEvent.target;
+                if (
+                  origen instanceof Element &&
+                  origen.closest('[data-testid="boton-seleccionar"]')
+                ) {
+                  e.preventDefault();
+                }
+              }}
+            >
+              <DropdownMenuRadioGroup
+                value={faceSelectionTool === 'poligono' ? 'poligono' : 'rectangle'}
+                onValueChange={(v) => setFaceSelectionTool(v === 'poligono' ? 'poligono' : 'rectangle')}
+              >
+                <DropdownMenuRadioItem
+                  value="rectangle"
+                  data-testid="seleccionar-tool-rectangulo"
+                  onSelect={(e) => e.preventDefault()}
+                >
+                  {t('editor3D.seleccionarToolRectangulo')}
+                </DropdownMenuRadioItem>
+                <DropdownMenuRadioItem
+                  value="poligono"
+                  data-testid="seleccionar-tool-poligono"
+                  onSelect={(e) => e.preventDefault()}
+                >
+                  {t('editor3D.seleccionarToolPoligono')}
+                </DropdownMenuRadioItem>
+              </DropdownMenuRadioGroup>
+              <DropdownMenuSeparator />
+              {/* CORTE RÁPIDO: checkbox del desplegable. onSelect con
+                  preventDefault: abrir/cerrar el menú no reconstruye su DOM
+                  (la zona dibujada se conserva); el modo sigue activo y
+                  cada zona nueva CORTA en vez de seleccionar. */}
+              <DropdownMenuCheckboxItem
+                checked={corteRapido}
+                onCheckedChange={(v) => setCorteRapido(v === true)}
+                onSelect={(e) => e.preventDefault()}
+                data-testid="seleccionar-accion-rapido"
+              >
+                <span className="flex flex-col items-start">
+                  <span className="font-bold">
+                    {t('editor3D.selAccionRapida')}
+                  </span>
+                  <span className="text-[11px] text-gray-400">
+                    {t('editor3D.selAccionRapidaDesc')}
+                  </span>
+                </span>
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={() => {
+                  if (!faceSelectMode || faceSelectionTarget !== 'todo') {
+                    toggleSeleccionZona();
+                  }
+                  aplicarBorrarSeleccion();
+                }}
+                data-testid="seleccionar-accion-borrar"
+              >
+                {t('editor3D.selAccionBorrar')}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={aplicarCopiarSeleccion}
+                data-testid="seleccionar-accion-copiar"
+              >
+                {t('editor3D.selAccionCopiar')}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={aplicarPegarSeleccion}
+                data-testid="seleccionar-accion-pegar"
+                disabled={!seleccionClipboard}
+              >
+                {t('editor3D.selAccionPegar')}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={aplicarCrearNuevoObjeto}
+                data-testid="seleccionar-accion-crear"
+              >
+                {t('editor3D.selAccionCrear')}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -18732,7 +19354,13 @@ pluginTracks,
               className="absolute bottom-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 bg-gray-900/90 rounded-lg border border-cyan-500/30 px-3 py-2 shadow-lg max-w-[calc(100%-4rem)] flex-wrap"
             >
               <span className="text-xs text-cyan-300 shrink-0">
-                {faceSelectionTarget === 'cara'
+                {faceSelectionTarget === 'todo'
+                  ? t('editor3D.faceSelTodo', {
+                      nf: selectedFaceIds.length,
+                      nv: selectedVertexIds.length,
+                      ne: selectedEdgeIds.length,
+                    })
+                  : faceSelectionTarget === 'cara'
                   ? t('editor3D.faceSelFaces', { n: selectedFaceIds.length })
                   : faceSelectionTarget === 'vertice'
                     ? t('editor3D.faceSelVertices', { n: selectedVertexIds.length })
@@ -18763,8 +19391,11 @@ pluginTracks,
                   {t('editor3D.ringsSel')}
                 </button>
               )}
-              {/* Campos numéricos: desplazar la selección por eje */}
-              {(faceSelectionTarget === 'cara'
+              {/* Campos numéricos: desplazar la selección por eje — SOLO en
+                  los objetivos sueltos (el gizmo/mover asumen un objetivo
+                  único; la zona «todo» opera desde su desplegable). */}
+              {faceSelectionTarget !== 'todo' &&
+                (faceSelectionTarget === 'cara'
                 ? selectedFaceIds.length
                 : faceSelectionTarget === 'vertice'
                   ? selectedVertexIds.length
@@ -18818,6 +19449,45 @@ pluginTracks,
                   {/* Configuración del gizmo de la sub-selección (como la
                       del gizmo de objetos): gris + sus asas lo mueven a él
                       y sus aros lo GIRAN (la selección no se toca). */}
+                  <button
+                    data-testid="sel-gizmo-config-btn"
+                    onClick={() => {
+                      if (selGizmoConfigMode) {
+                        setSelGizmoConfigMode(false);
+                      } else {
+                        setSelGizmoConfigMode(true);
+                      }
+                    }}
+                    className={`px-2 py-1 rounded-md text-xs font-medium transition-colors shrink-0 ${
+                      selGizmoConfigMode
+                        ? 'bg-green-500/20 text-green-200 border border-green-500/40'
+                        : 'bg-black/40 text-muted-foreground hover:text-foreground border border-white/10'
+                    }`}
+                    title={selGizmoConfigMode
+                      ? t('editor3D.gizmoApply')
+                      : t('editor3D.gizmoConfigureSel')}
+                  >
+                    {selGizmoConfigMode ? <Check className="w-3.5 h-3.5" /> : '⚙'}
+                  </button>
+                  {selGizmoConfigMode && (
+                    <button
+                      data-testid="sel-gizmo-center-btn"
+                      onClick={resetSelGizmo}
+                      className="px-2 py-1 rounded-md text-xs font-medium bg-black/40 text-muted-foreground hover:text-foreground border border-white/10 transition-colors shrink-0"
+                      title={t('editor3D.gizmoCenterOnSel')}
+                    >
+                      <Target className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              )}
+              {/* Botón de configuración del gizmo TAMBIÉN con el objetivo
+                  'todo' (corte cerrado, zona de Seleccionar): el usuario
+                  lo pedía — sin él no se podían girar los aros. Los
+                  campos numéricos/extrudir siguen solo en objetivos
+                  sueltos. */}
+              {faceSelectionTarget === 'todo' && selectedFaceIds.length > 0 && (
+                <div className="flex items-center gap-1 shrink-0">
                   <button
                     data-testid="sel-gizmo-config-btn"
                     onClick={() => {

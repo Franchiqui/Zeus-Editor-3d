@@ -249,12 +249,11 @@ function frenet(tangentes) {
 }
 var UNIT = 2;
 var LIMITE_VERTICES = 2e5;
-function buildSpline3DMesh(nodes, options = {}) {
-  const empty = { vertices: [], faces: [] };
+function prepararSpline(nodes, options) {
   const util = nodes.filter(
     (n) => vfinito(n.p) && (n.esquina || (n.polygon ?? []).length >= 3)
   );
-  if (util.length < 2) return empty;
+  if (util.length < 2) return null;
   const closed = !!options.closed;
   const esc = options.escala && options.escala > 0 ? options.escala : 0.5;
   const DEF = options.plantillaPorDefecto ?? [];
@@ -264,12 +263,12 @@ function buildSpline3DMesh(nodes, options = {}) {
   });
   let densa = 0;
   for (const f of flats) densa = Math.max(densa, f.length);
-  if (flats.some((f) => f.length < 3)) return empty;
+  if (flats.some((f) => f.length < 3)) return null;
   const ringCount = Math.max(16, Math.min(96, densa));
   const rings = flats.map((f) => resampleClosed(f, ringCount));
   const subdivisions = Math.max(1, Math.min(64, Math.round(options.subdivisions ?? 5)));
   const muestras = muestrearSpline(util, closed, subdivisions);
-  if (muestras.length < 2) return empty;
+  if (muestras.length < 2) return null;
   let steps = subdivisions;
   const maxSteps = Math.max(1, Math.floor(LIMITE_VERTICES / (util.length * ringCount)));
   if (steps > maxSteps) steps = maxSteps;
@@ -286,42 +285,119 @@ function buildSpline3DMesh(nodes, options = {}) {
   const escalas = util.map(
     (n) => n.escala && n.escala > 0 ? Math.max(0.01, Math.min(8, n.escala)) : esc
   );
+  const rolls = tilts.slice();
+  const facX = util.map(() => 1);
+  const facY = util.map(() => 1);
+  if (util.some((n) => n.baseMundo)) {
+    const proyecta = (v, t) => {
+      const p = vsub(v, vmul(t, vdot(v, t)));
+      return { d: vnorm(p), largo: Math.hypot(p.x, p.y, p.z) };
+    };
+    for (let j = 0; j < util.length; j++) {
+      const base = util[j].baseMundo;
+      if (!base) continue;
+      if (!vfinito(base.right) || !vfinito(base.up) || Math.hypot(base.right.x, base.right.y, base.right.z) < 1e-9 || Math.hypot(base.up.x, base.up.y, base.up.z) < 1e-9)
+        continue;
+      facX[j] = Math.max(0.01, Math.min(32, base.rx > 0 ? base.rx : 1));
+      facY[j] = Math.max(0.01, Math.min(32, base.ry > 0 ? base.ry : 1));
+      const idx = !closed && j === util.length - 1 ? total - 1 : j * steps;
+      const t = tangentes[idx];
+      const n1 = normales[idx];
+      const b1 = vcross(n1, t);
+      const dR = proyecta(base.right, t);
+      const dU = proyecta(base.up, t);
+      let d = null;
+      let ejeY = false;
+      if (dR.largo >= 0.05) {
+        d = dR.d;
+      } else if (dU.largo >= 0.05) {
+        d = dU.d;
+        ejeY = true;
+      }
+      if (!d) continue;
+      rolls[j] = tilts[j] + (ejeY ? Math.atan2(-vdot(d, n1), vdot(d, b1)) : Math.atan2(vdot(d, b1), vdot(n1, d)));
+    }
+  }
+  return {
+    util,
+    closed,
+    rings,
+    ringCount,
+    muestras: muestrasFinal,
+    tangentes,
+    normales,
+    rolls,
+    escalas,
+    facX,
+    facY,
+    steps
+  };
+}
+function anilloDeMuestra(prep, i) {
+  const m = prep.muestras[i];
+  const j = m.seg;
+  const j2 = (j + 1) % prep.util.length;
+  const ringA = prep.rings[j];
+  const ringB = prep.rings[j2];
+  const prof = [];
+  for (let k = 0; k < prep.ringCount; k++) {
+    const a = ringA[k];
+    const b = ringB[k];
+    prof.push({ x: a.x + (b.x - a.x) * m.t, y: a.y + (b.y - a.y) * m.t });
+  }
+  const c = centroid(prof);
+  const esc = prep.escalas[j] + (prep.escalas[j2] - prep.escalas[j]) * m.t;
+  const fX = prep.facX[j] + (prep.facX[j2] - prep.facX[j]) * m.t;
+  const fY = prep.facY[j] + (prep.facY[j2] - prep.facY[j]) * m.t;
+  const t1 = prep.tangentes[i];
+  const n1 = prep.normales[i];
+  const b1 = vcross(n1, t1);
+  const roll = prep.rolls[j] + (prep.rolls[j2] - prep.rolls[j]) * m.t;
+  const cos = Math.cos(roll);
+  const sin = Math.sin(roll);
+  const ux = UNIT * esc * fX;
+  const uy = UNIT * esc * fY;
+  const anillo = [];
+  for (let k = 0; k < prep.ringCount; k++) {
+    const lx = (prof[k].x - c.x) * ux;
+    const ly = (prof[k].y - c.y) * uy;
+    const a2 = lx * cos - ly * sin;
+    const b2 = lx * sin + ly * cos;
+    anillo.push(vadd(m.pos, vadd(vmul(n1, a2), vmul(b1, b2))));
+  }
+  return anillo;
+}
+function contornosDeVertices(nodes, options = {}) {
+  const prep = prepararSpline(nodes, options);
+  if (!prep) return [];
+  const ultima = prep.util.length - 1;
+  const salida = [];
+  for (let j = 0; j <= ultima; j++) {
+    const idx = !prep.closed && j === ultima ? prep.muestras.length - 1 : j * prep.steps;
+    salida.push(anilloDeMuestra(prep, idx));
+  }
+  return salida;
+}
+function buildSpline3DMesh(nodes, options = {}) {
+  const empty = { vertices: [], faces: [] };
+  const prep = prepararSpline(nodes, options);
+  if (!prep) return empty;
+  const total = prep.muestras.length;
   const vertices = [];
   const anillas = [];
   for (let i = 0; i < total; i++) {
-    const m = muestrasFinal[i];
-    const ringA = rings[m.seg];
-    const ringB = rings[(m.seg + 1) % util.length];
-    const tiltA = tilts[m.seg];
-    const tiltB = tilts[(m.seg + 1) % util.length];
-    const tilt = tiltA + (tiltB - tiltA) * m.t;
-    const prof = [];
-    for (let k = 0; k < ringCount; k++) {
-      const a = ringA[k];
-      const b = ringB[k];
-      prof.push({ x: a.x + (b.x - a.x) * m.t, y: a.y + (b.y - a.y) * m.t });
-    }
-    const c = centroid(prof);
-    const escA = escalas[m.seg];
-    const escB = escalas[(m.seg + 1) % util.length];
-    const esc2 = escA + (escB - escA) * m.t;
-    const t1 = tangentes[i];
-    const n1 = normales[i];
-    const b1 = vcross(n1, t1);
-    const cos = Math.cos(tilt);
-    const sin = Math.sin(tilt);
     const ids = [];
-    for (let k = 0; k < ringCount; k++) {
-      const lx = (prof[k].x - c.x) * UNIT * esc2;
-      const ly = (prof[k].y - c.y) * UNIT * esc2;
-      const a = lx * cos - ly * sin;
-      const b = lx * sin + ly * cos;
-      const p = vadd(m.pos, vadd(vmul(n1, a), vmul(b1, b)));
+    for (const p of anilloDeMuestra(prep, i)) {
       vertices.push({ x: p.x, y: p.y, z: p.z });
       ids.push(vertices.length - 1);
     }
     anillas.push(ids);
   }
+  const ringCount = prep.ringCount;
+  const closed = prep.closed;
+  const muestrasFinal = prep.muestras;
+  const tangentes = prep.tangentes;
+  const normales = prep.normales;
   const faces = [];
   const stitch = (aIds, bIds, eje) => {
     for (let k = 0; k < ringCount; k++) {
@@ -461,6 +537,32 @@ function validarSplineDatos(raw) {
       }
       if (poly.length >= 3) node.polygon = poly;
     }
+    if (o.baseMundo && typeof o.baseMundo === "object") {
+      const b = o.baseMundo;
+      const v3 = (v) => {
+        if (!v || typeof v !== "object") return null;
+        const w = v;
+        const vx = puntoNum(w.x);
+        const vy = puntoNum(w.y);
+        const vz = puntoNum(w.z);
+        if (vx === null || vy === null || vz === null) return null;
+        const p = { x: vx, y: vy, z: vz };
+        if (Math.hypot(p.x, p.y, p.z) < 1e-9) return null;
+        return vnorm(p);
+      };
+      const right = v3(b.right);
+      const up = v3(b.up);
+      const rxN = puntoNum(b.rx);
+      const ryN = puntoNum(b.ry);
+      if (right && up && rxN !== null && ryN !== null && rxN > 0 && ryN > 0) {
+        node.baseMundo = {
+          right,
+          up,
+          rx: Math.max(0.01, Math.min(32, rxN)),
+          ry: Math.max(0.01, Math.min(32, ryN))
+        };
+      }
+    }
     nodes.push(node);
   }
   if (nodes.length < 2) return void 0;
@@ -501,6 +603,7 @@ export {
   buildRoscaMesh,
   buildSpline3DMesh,
   construirMuestraHelix,
+  contornosDeVertices,
   muestrearSpline,
   validarSplineDatos
 };
