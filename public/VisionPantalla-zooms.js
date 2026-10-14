@@ -1,7 +1,7 @@
 /* Zoom automático por pantalla — generado por Visión Pantalla */
 (function () {
   "use strict";
-  var ZOOMS = {"4097x2160":0.5131581182307065,"1821x960":0.5131581182307065};
+  var ZOOMS = {"4097x2160":0.7,"1821x960":0.7};
   try {
     /* Dentro de un marco (iframe) el zoom lo pone quien incrusta la web
        (el visualizador de Visión Pantalla ya aplica el suyo): aquí sería
