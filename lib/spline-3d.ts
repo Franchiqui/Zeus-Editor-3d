@@ -31,11 +31,14 @@ export type SplineNode3D = {
   esquina?: boolean;
   /** Inclinación de la plantilla en grados alrededor del eje del trazado. */
   tilt?: number;
-  /** Inclinación en grados alrededor del EJE-X de la plantilla (su ancho):
-      la parte alta «se acuesta» — acorta el ALTO del anillo (corte oblicuo). */
+  /** Giro REAL del plano de la plantilla en grados alrededor de SU EJE-X
+      (su ancho): la parte alta sale del plano y se inclina hacia el
+      vértice vecino a lo largo del trazado (positivo = hacia el siguiente,
+      negativo = hacia el anterior) — la barra inclinada / ||| del camino */
   tiltX?: number;
-  /** Inclinación en grados alrededor del EJE-Y de la plantilla (su alto):
-      acorta el ANCHO del anillo (corte oblicuo). */
+  /** Giro REAL del plano de la plantilla en grados alrededor de SU EJE-Y
+      (su alto): los lados derecho/izquierdo se inclinan hacia el vértice
+      vecino (positivo = hacia el siguiente). */
   tiltY?: number;
   /**
    * Escala PROPIA de la plantilla (unidades del mundo). Si falta, se usa
@@ -54,6 +57,15 @@ export type SplineNode3D = {
    * Falta = comportamiento de siempre (marco RMF).
    */
   baseMundo?: { right: V3; up: V3; rx: number; ry: number };
+  /**
+   * EXCENTRICIDAD de la anilla: desplazamiento libre (mundo) del CENTRO
+   * de la plantilla respecto a la posición del vértice en el trazado. Al
+   * calcá sobre una ventana (⤢), la plantilla se sobrepone donde se
+   * dibujó — a veces fuera de la propia trayectoria — SIN mover el
+   * vértice: el camino sigue exactamente donde el usuario lo trazó. Falta
+   * = anilla centrada en el vértice (plantillas a mano en el lienzo).
+   */
+  excentricidad?: V3;
 };
 
 export type SplineDatos = {
@@ -71,7 +83,105 @@ export type SplineDatos = {
       parámetros del muelle: el panel los enseña y editarlos rehace la
       hélice conservando las plantillas editadas. */
   rosca?: RoscaParams;
+  /** Giro del trazado COMPLETO en el mundo (grados, compuesto X→Y→Z):
+      rotación rígida de todo — vértices, marcos de plantilla, vista
+      previa y malla — alrededor del centroide del trazado. Falta o ceros
+      = sin giro. Los nodos viajan SIN girar: el giro se aplica al pintar
+      y al hornear la malla, así los sliders del panel siguen siendo
+      absolutos. */
+  rotacion?: GiroSpline;
 };
+
+/** Giro del spline completo (grados): X, Y y Z (compuesto X→Y→Z). */
+export type GiroSpline = { x: number; y: number; z: number };
+export const GIRO_SPLINE_NULO: GiroSpline = { x: 0, y: 0, z: 0 };
+
+/** ¿El giro está a cero en los tres ejes (identidad, sin recomputar)? */
+export function giroSplineActivo(g: GiroSpline | undefined): boolean {
+  return !!g && (g.x !== 0 || g.y !== 0 || g.z !== 0);
+}
+
+const GRAD = Math.PI / 180;
+
+const rotaXm = (v: V3, a: number): V3 => ({
+  x: v.x,
+  y: v.y * Math.cos(a) - v.z * Math.sin(a),
+  z: v.y * Math.sin(a) + v.z * Math.cos(a),
+});
+const rotaYm = (v: V3, a: number): V3 => ({
+  x: v.x * Math.cos(a) + v.z * Math.sin(a),
+  y: v.y,
+  z: -v.x * Math.sin(a) + v.z * Math.cos(a),
+});
+const rotaZm = (v: V3, a: number): V3 => ({
+  x: v.x * Math.cos(a) - v.y * Math.sin(a),
+  y: v.x * Math.sin(a) + v.y * Math.cos(a),
+  z: v.z,
+});
+
+/** Giro directo (grados) de una dirección: primero X, luego Y, luego Z. */
+export function rotaPuntoGiro(v: V3, giro: GiroSpline): V3 {
+  if (!giroSplineActivo(giro)) return v;
+  return rotaZm(rotaYm(rotaXm(v, giro.x * GRAD), giro.y * GRAD), giro.z * GRAD);
+}
+
+/** Giro INVERSO (deshace `rotaPuntoGiro`): primero Z⁻¹, luego Y⁻¹, X⁻¹. */
+export function desrotaPuntoGiro(v: V3, giro: GiroSpline): V3 {
+  if (!giroSplineActivo(giro)) return v;
+  return rotaXm(
+    rotaYm(rotaZm(v, -giro.z * GRAD), -giro.y * GRAD),
+    -giro.x * GRAD
+  );
+}
+
+/** Centroide de las posiciones del trazado (pivote del giro). Sin nodos
+ *  útiles cae al origen — rotar desde ahí sigue siendo un giro válido. */
+export function pivoteSplineGiro(nodes: SplineNode3D[]): V3 {
+  let n = 0;
+  const c: V3 = { x: 0, y: 0, z: 0 };
+  for (const nd of nodes) {
+    if (!vfinito(nd.p)) continue;
+    c.x += nd.p.x;
+    c.y += nd.p.y;
+    c.z += nd.p.z;
+    n++;
+  }
+  if (n === 0) return c;
+  return { x: c.x / n, y: c.y / n, z: c.z / n };
+}
+
+/** Nodos con el giro APLICADO (posiciones + ejes right/up de baseMundo):
+ *  la lista que ven el visor, los contornos y la malla horneada. Con giro
+ *  nulo devuelve la MISMA lista (identidad, sin copiar). */
+export function aplicaGiroSplineNodos(
+  nodes: SplineNode3D[],
+  giro: GiroSpline | undefined,
+  pivote?: V3
+): SplineNode3D[] {
+  if (!giroSplineActivo(giro)) return nodes;
+  const g = giro as GiroSpline;
+  const c = pivote ?? pivoteSplineGiro(nodes);
+  return nodes.map((n) => {
+    // Rotación rígida alrededor del pivote: p' = c + R·(p − c).
+    const rel = vsub(n.p, c);
+    const pG = vadd(rotaPuntoGiro(rel, g), c);
+    return {
+      ...n,
+      p: {
+        x: pG.x,
+        y: pG.y,
+        z: pG.z,
+      },
+      baseMundo: n.baseMundo
+        ? {
+            ...n.baseMundo,
+            right: rotaPuntoGiro(n.baseMundo.right, g),
+            up: rotaPuntoGiro(n.baseMundo.up, g),
+          }
+        : undefined,
+    };
+  });
+}
 
 /** Parámetros del muelle (botón "Spline Rosca"): hélice con tubo redondo. */
 export type RoscaParams = {
@@ -381,11 +491,16 @@ type Preparo = {
   /** Giro TOTAL de cada vértice alrededor del trazado (radianes): el tilt
       manual + el φ automático de baseMundo (ver prepararSpline). */
   rolls: number[];
-  /** Inclinación de cada vértice alrededor del eje-x / eje-y de SU
-      plantilla (radianes): acortan alto/ancho del anillo (corte oblicuo). */
+  /** Giro REAL del plano de cada anilla alrededor del eje-x / eje-y de SU
+      plantilla (radianes): la anilla sale del plano ⟂ al trazado y se
+      inclina hacia el vértice vecino (la barra / |||). */
   inclX: number[];
   inclY: number[];
   escalas: number[];
+  /** Excentricidad de cada vértice: desvío del CENTRO de su anilla
+      respecto a la posición del trazado (plantilla calcada a un lado del
+      camino). Interpolada linealmente entre vértices. */
+  excentricidad: V3[];
   /** Factores anisótropos del lienzo→mundo (baseMundo.rx/ry; 1 = cuadrado). */
   facX: number[];
   facY: number[];
@@ -449,14 +564,22 @@ function prepararSpline(
       : transportadores(tangentes);
 
   const tilts = util.map((n) => ((n.tilt ?? 0) * Math.PI) / 180);
-  // Inclinación del CORTE alrededor de los ejes de la propia plantilla: el
-  // eje-x «acuesta» el alto (canvas-y · cos) y el eje-y acorta el ancho.
+  // GIRO REAL alrededor de los ejes de la propia plantilla (antes: «corte
+  // oblicuo» fingido — solo ·cos, la anilla se acortaba sin salir del
+  // plano). Ahora la anilla se inclina de verdad hacia el vértice vecino.
   const inclX = util.map((n) => ((n.tiltX ?? 0) * Math.PI) / 180);
   const inclY = util.map((n) => ((n.tiltY ?? 0) * Math.PI) / 180);
   // Escala de plantilla por vértice (0.01..8): la del nodo si la trae,
   // si no la de los datos (compatibilidad con .zeus anteriores).
   const escalas = util.map(
     (n) => (n.escala && n.escala > 0 ? Math.max(0.01, Math.min(8, n.escala)) : esc)
+  );
+  // Excentricidad por vértice (desvío del centro de la anilla respecto al
+  // camino): 0 salvo en las plantillas calcadas fuera de la trayectoria.
+  const excentricidad = util.map((n) =>
+    n.excentricidad && vfinito(n.excentricidad)
+      ? n.excentricidad
+      : { x: 0, y: 0, z: 0 }
   );
 
   // ALINEACIÓN A LA VENTANA DE LA CAPTURA (baseMundo). Giro TOTAL de cada
@@ -531,6 +654,7 @@ function prepararSpline(
     inclX,
     inclY,
     escalas,
+    excentricidad,
     facX,
     facY,
     steps,
@@ -562,24 +686,44 @@ function anilloDeMuestra(prep: Preparo, i: number): V3[] {
   const n1 = prep.normales[i];
   const b1 = vcross(n1, t1);
   const roll = prep.rolls[j] + (prep.rolls[j2] - prep.rolls[j]) * m.t;
-  // Inclinación del corte interpolada A→B: el giro alrededor del eje-y
-  // acorta el ANCHO (lx·cos) y el del eje-x acorta el ALTO (ly·cos) — el
-  // anillo sale elíptico como un corte oblicuo del barrido.
+  // GIRO REAL del plano de la anilla, interpolado A→B: inclY gira alrededor
+  // del EJE-Y de la plantilla (su alto) — el ANCHO (N) se inclina hacia la
+  // tangente; inclX gira alrededor de SU EJE-X (su ancho) — lo ALTO (B) se
+  // inclina hacia la tangente. Positivo = hacia el vértice SIGUIENTE,
+  // negativo = hacia el anterior. La anilla sigue plana pero YA NO a
+  // escuadra: la esquina sale del plano y busca la plantilla vecina
+  // (la barra inclinada / |||). Antes (hasta 15/10) era un corte oblicuo
+  // fingido con ·cos que solo acortaba la anilla dentro del plano.
   const inclXi = prep.inclX[j] + (prep.inclX[j2] - prep.inclX[j]) * m.t;
   const inclYi = prep.inclY[j] + (prep.inclY[j2] - prep.inclY[j]) * m.t;
   const cosX = Math.cos(inclXi);
+  const sinX = Math.sin(inclXi);
   const cosY = Math.cos(inclYi);
+  const sinY = Math.sin(inclYi);
+  // Ejes de la anilla SALIENDO del plano (N, B) hacia la tangente t1:
+  const ejeU: V3 = vadd(vmul(n1, cosY), vmul(t1, sinY));
+  const ejeV: V3 = vadd(vmul(b1, cosX), vmul(t1, sinX));
   const cos = Math.cos(roll);
   const sin = Math.sin(roll);
-  const ux = UNIT * esc * fX * cosY;
-  const uy = UNIT * esc * fY * cosX;
+  // Sin los ·cos de antes: el tamaño ya no se recorta, el plano entero es
+  // el que se inclina.
+  const ux = UNIT * esc * fX;
+  const uy = UNIT * esc * fY;
   const anillo: V3[] = [];
+  // Excentricidad interpolada A→B: las plantillas calcadas fuera del
+  // camino deslizan su desvío suavemente entre vértices; en el cruce del
+  // vértice (t=0) es EXACTAMENTE el suyo. Sin excentricidad (0) el anillo
+  // queda centrado en el trazado, como siempre.
+  const eX = prep.excentricidad[j].x + (prep.excentricidad[j2].x - prep.excentricidad[j].x) * m.t;
+  const eY = prep.excentricidad[j].y + (prep.excentricidad[j2].y - prep.excentricidad[j].y) * m.t;
+  const eZ = prep.excentricidad[j].z + (prep.excentricidad[j2].z - prep.excentricidad[j].z) * m.t;
+  const centro = vadd(m.pos, { x: eX, y: eY, z: eZ });
   for (let k = 0; k < prep.ringCount; k++) {
     const lx = (prof[k].x - c.x) * ux;
     const ly = (prof[k].y - c.y) * uy;
     const a2 = lx * cos - ly * sin;
     const b2 = lx * sin + ly * cos;
-    anillo.push(vadd(m.pos, vadd(vmul(n1, a2), vmul(b1, b2))));
+    anillo.push(vadd(centro, vadd(vmul(ejeU, a2), vmul(ejeV, b2))));
   }
   return anillo;
 }
@@ -854,6 +998,17 @@ export function validarSplineDatos(raw: unknown): SplineDatos | undefined {
         };
       }
     }
+    // Excentricidad de la anilla (plantilla calcada fuera del trazado):
+    // sólo entran números finitos; basura = sin desvío (anilla centrada).
+    if (o.excentricidad && typeof o.excentricidad === 'object') {
+      const e = o.excentricidad as Record<string, unknown>;
+      const ex = puntoNum(e.x);
+      const ey = puntoNum(e.y);
+      const ez = puntoNum(e.z);
+      if (ex !== null && ey !== null && ez !== null) {
+        node.excentricidad = { x: ex, y: ey, z: ez };
+      }
+    }
     nodes.push(node);
   }
   if (nodes.length < 2) return undefined;
@@ -871,6 +1026,19 @@ export function validarSplineDatos(raw: unknown): SplineDatos | undefined {
     escala: escalaN !== null ? Math.max(0.01, Math.min(8, escalaN)) : 0.5,
     orientacion: r.orientacion === 'radial' ? 'radial' : undefined,
   };
+  // Giro completo del trazado (X→Y→Z en grados): clamps de los mismos
+  // ±360 de los tilts; si falta o está podrido, sin giro.
+  if (r.rotacion && typeof r.rotacion === 'object') {
+    const g = r.rotacion as Record<string, unknown>;
+    const gx = puntoNum(g.x);
+    const gy = puntoNum(g.y);
+    const gz = puntoNum(g.z);
+    const c = (v: number): number => Math.max(-360, Math.min(360, v));
+    datos.rotacion =
+      gx !== null || gy !== null || gz !== null
+        ? { x: c(gx ?? 0), y: c(gy ?? 0), z: c(gz ?? 0) }
+        : undefined;
+  }
   // Parámetros del muelle precargado (si los trae): clamps iguales a los
   // de la primitiva — sin ellos el panel del muelle no reaparece al
   // reeditar y el trazado pierde su origen.

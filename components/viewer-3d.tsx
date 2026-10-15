@@ -467,6 +467,19 @@ interface Viewer3DProps {
      *  (desactivable en el panel del spline; la línea cian y los vértices
      *  siguen siempre). */
     splinePreviewVisible?: boolean;
+    /** Vista previa del spline CON ASPECTO DE OBJETO APLICADO (gris sólido
+     *  con sombreado, como tras «Aplicar») en vez del velo azul translúcido;
+     *  el trazado y las plantillas siguen dibujados encima en sus colores. */
+    splinePreviewObjeto?: boolean;
+    /** VISTA PREVIA del ESPEJO (hover sobre un eje del desplegable): la
+     *  malla espejada como FANTASMA translúcido — `gemelo` false: en el
+     *  sitio del objeto (modo transformar); true: en su posición de MUNDO
+     *  (el gemelo «al lado» que crearía Aplicar). */
+    espejoPreview?: {
+      mesh: Mesh;
+      transform: ObjectTransform;
+      gemelo: boolean;
+    } | null;
     /** Contornos (en mundo) de la plantilla de cada vértice del spline —
         se dibujan en naranja SOLO mientras el balón azul está visible. */
     splineContornos?: V3[][] | null;
@@ -1203,6 +1216,46 @@ function disposeMaterial(material: THREE.Material | THREE.Material[]): void {
 const texturaBaseDe = new Map<string, THREE.Texture>();
 const texturaClonDe = new Map<string, THREE.Texture>();
 
+/** ¿La textura de la URL usa TRANSPARENCIA (algún píxel con alfa < 250)?
+ *  Escaneo UNA vez por URL (muestreo 64×64 sobre la imagen del cache
+ *  compartido) y se cachea. null = imagen aún sin llegar o escaneo con
+ *  CORS imposible: el caller decide el retro (de serie, comporte del
+ *  objeto). Sirve para lo pedido por el usuario 15/10: una textura
+ *  asignada a CARAS y opaca debe pintarse la cara OPACA aunque el objeto
+ *  sea de cristal (su opacidad global < 1) — solo una textura con alfa
+ *  propio conserva el vidrio. */
+const texturaConAlfaDe = new Map<string, boolean>();
+
+function imagenTieneAlfa(img: HTMLImageElement | null | undefined): boolean | null {
+  if (!img || !img.naturalWidth) return null;
+  try {
+    const tmp = document.createElement('canvas');
+    tmp.width = Math.max(1, Math.min(64, img.naturalWidth));
+    tmp.height = Math.max(1, Math.min(64, img.naturalHeight));
+    const ctx = tmp.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
+    ctx.drawImage(img, 0, 0, tmp.width, tmp.height);
+    const datos = ctx.getImageData(0, 0, tmp.width, tmp.height).data;
+    for (let i = 3; i < datos.length; i += 4) {
+      if (datos[i] < 250) return true;
+    }
+    return false;
+  } catch {
+    return null; // canvas manchado (CORS): la imagen vive sin leerse
+  }
+}
+
+function texturaTieneAlfa(url: string): boolean | null {
+  const ya = texturaConAlfaDe.get(url);
+  if (ya !== undefined) return ya;
+  const base = texturaBaseDe.get(url);
+  const img = (base?.image ?? null) as HTMLImageElement | null;
+  if (!img || !img.naturalWidth) return null;
+  const resultado = imagenTieneAlfa(img);
+  if (resultado !== null) texturaConAlfaDe.set(url, resultado);
+  return resultado;
+}
+
 function texturaImagenCompartida(
   url: string,
   repeatX: number,
@@ -1496,11 +1549,16 @@ export function buildSnapshotObjectVisual(
       // replantear el material con map null).
       for (const entry of faceEntries) {
         if (!entry.tex || texMatIndex.has(entry.tex)) continue;
+        // Textura de cara OPACA (sin alfa propio): la cara sale OPACA a
+        // pesar del cristal del objeto (petición 15/10). Solo una textura
+        // con alfa propio — o imagen aún sin leer — conserva la opacidad
+        // global del objeto (vidrio).
+        const alfaPropia = texturaTieneAlfa(entry.tex);
         const faceMat = new THREE.MeshPhysicalMaterial({
           color: 0xcccccc,
           side: THREE.DoubleSide,
-          transparent: true,
-          opacity: finalOpacity,
+          transparent: alfaPropia !== false,
+          opacity: alfaPropia === false ? 1 : finalOpacity,
           map: null,
           metalness: material.metalness,
           roughness: material.roughness,
@@ -3709,6 +3767,8 @@ export default function Viewer3D({
     splineEdicion = null,
     splinePreview = null,
     splinePreviewVisible = true,
+    splinePreviewObjeto = false,
+    espejoPreview = null,
     splineContornos = null,
     faceSelectVisibleOnly,
     wireframeOffSignal,
@@ -4023,7 +4083,13 @@ export default function Viewer3D({
       line: THREE.Line;
       markers: THREE.Group;
       contornos: THREE.LineSegments;
+      /** Materiales de la malla de vista previa: velo azul translúcido y
+          objeto gris sólido (aspecto de «Aplicar», elegible en el panel). */
+      previewVelo: THREE.MeshBasicMaterial;
+      previewObjeto: THREE.MeshStandardMaterial;
     } | null>(null);
+    // ESPEJO (vista previa en el desplegable): el espejado como fantasma.
+    const espejoPreviewRef = useRef<THREE.Group | null>(null);
     // Arrastre activo de un marcador del trazado: plano orto de la ventana
     // (fijo en el eje que la vista no ve) + vértice arrastrado.
     const splineDragRef = useRef<{
@@ -4818,19 +4884,17 @@ export default function Viewer3D({
     }
     full(vertexHelpersRef.current, true);
      full(gizmoGroupRef.current, false);
-     // Ventanas 2D: el gizmo NO hereda la rotación del objeto. Cuando
-     // un objeto ya está girado, el aro de la cámara se pintaba
-     // inclinado y el arrastre rotaba sobre ese eje inclinado (la
-     // figura tumbeaba en 3D y se perdía el dibujo técnico). Con el
-     // gizmo alineado a los ejes del mundo, el override de arrastre
-     // (que sale del cuaternión del gizmo) apunta SIEMPRE a un eje del
-     // mundo: la rotación en 2D es de pantalla y mover/escalar sigue
-     // ejes del mundo. El offset (modo configuración) se aplica después
-     // sobre esta pose.
-     if (flat2DRef.current) {
-       const gizFlat = gizmoGroupRef.current;
-       if (gizFlat) gizFlat.rotation.set(0, 0, 0);
-     }
+     // GIZMO A ESCUADRA (pedido del usuario 15/10): el manipulador NO
+     // hereda la rotación del objeto — sus asas X/Y/Z miran SIEMPRE a los
+     // ejes del MUNDO, también en la ventana 3D. Antes solo las ventanas
+     // 2D lo enderezaban (el aro de la cámara tumbeado...): con un objeto
+     // ya girado, el gizmo salía tumbeado CON él y moverlo/rotarlo era
+     // mover/rotar "en diagonal" (el reporte: «que estén CORRECTAMENTE a
+     // escuadra respecto al mundo»). El override de arrastre (que sale
+     // del cuaternión del gizmo) apunta SIEMPRE a un eje del mundo; el
+     // offset (modo configuración) se aplica después sobre esta pose.
+     const gizBase = gizmoGroupRef.current;
+     if (gizBase) gizBase.rotation.set(0, 0, 0);
      // Si hay un offset del gizmo, aplicarlo SOBRE la pose del objeto:
      // el gizmo se desplaza/gira respecto al centro del objeto sin
      // tocar la figura (modo configuración).
@@ -5610,6 +5674,20 @@ export default function Viewer3D({
       splinePreviewMesh.renderOrder = 990;
       splinePreviewMesh.raycast = () => {};
       splineOverlayGroup.add(splinePreviewMesh);
+      // Material «como aplicar» (pedido del usuario 15/10): gris sólido con
+      // el mismo sombreado que el lavado de los objetos (0xdedede, la misma
+      // receta del grupo de la malla) — la vista previa se ve como el objeto
+      // que saldría del botón Aplicar, y el trazado cian + contornos naranja
+      // siguen dibujados encima (depthTest false, renderOrder superior).
+      const splinePreviewObjetoMat = new THREE.MeshStandardMaterial({
+        color: 0xdedede,
+        metalness: 0.3,
+        roughness: 0.45,
+        flatShading: true,
+        side: THREE.DoubleSide,
+        envMapIntensity: 0,
+      });
+      splinePreviewObjetoMat.depthTest = true;
       // Contornos NARANJAS de la plantilla de cada vértice (cuando la
       // vista previa está activa): un LineSegments con los pares de cada
       // anillo — distinto del azul del balón y del cian del camino.
@@ -5631,7 +5709,18 @@ export default function Viewer3D({
         line: splineLine,
         markers: splineMarkers,
         contornos: splineContornosLine,
+        previewVelo: splinePreviewMesh
+          .material as THREE.MeshBasicMaterial,
+        previewObjeto: splinePreviewObjetoMat,
       };
+
+      // ESPEJO — grupo del FANTASMA de la vista previa (hover en el
+      // desplegable del Espejo). Lo llena el effect de espejoPreview.
+      const espejoPreviewGroup = new THREE.Group();
+      espejoPreviewGroup.name = 'espejoPreview';
+      espejoPreviewGroup.visible = false;
+      scene.add(espejoPreviewGroup);
+      espejoPreviewRef.current = espejoPreviewGroup;
 
       const meshGroup = new THREE.Group();
     meshGroup.receiveShadow = true;
@@ -6619,6 +6708,26 @@ export default function Viewer3D({
     const animate = () => {
       animId = requestAnimationFrame(animate);
       controls.update();
+      // SPLINE 3D: los marcadores del trazado miden lo MISMO en pantalla
+      // siempre (radio fijo en píxeles, como los vértices de los lienzos
+      // 2D): su escala en mundo sigue a la cámara — distancia al foco en
+      // perspectiva, altura del frustum en orto — y así el zoom no los
+      // agranda. El activo va algo más grande, como en 2D.
+      const overlaySpline = splineOverlayRef.current;
+      if (overlaySpline && overlaySpline.group.visible) {
+        const altoPx = renderer.domElement.clientHeight;
+        if (altoPx > 0) {
+          const distFoco = camera.position.distanceTo(controls.target);
+          const mundoPorPx =
+            camera instanceof THREE.OrthographicCamera
+              ? (2 * camera.top) / altoPx
+              : (2 * Math.tan((camera.fov * Math.PI) / 360) * distFoco) / altoPx;
+          for (const m of overlaySpline.markers.children) {
+            const activo = m.userData.splineActivo === true;
+            m.scale.setScalar((mundoPorPx * (activo ? 7 : 4.5)) / 0.045);
+          }
+        }
+      }
       const dt = Math.min(clock.getDelta(), 0.05);
 
       const exportState = exportStateRef.current;
@@ -12043,12 +12152,15 @@ export default function Viewer3D({
       transparent: true,
       opacity: 1,
     });
+    // Escala 1 aquí: el tamaño en pantalla lo fija el bucle de animación
+    // (marcadores de tamaño constante COMO LOS LIENZOS 2D, el zoom no los
+    // agranda); qué marcador está activo viaja en userData.
     for (const n of ed.nodes) {
       const activo = n.id === ed.activoId;
       const s = new THREE.Mesh(geo, activo ? matActivo : mat);
       s.position.set(n.p.x, n.p.y, n.p.z);
-      if (activo) s.scale.setScalar(1.6);
       s.userData.splineNodeId = n.id;
+      s.userData.splineActivo = activo;
       s.renderOrder = 996;
       markers.add(s);
     }
@@ -12060,6 +12172,16 @@ export default function Viewer3D({
       | undefined;
     if (pm) {
       pm.visible = splinePreviewVisible;
+      // Modo de la vista previa: velo azul translúcido (de siempre) o objeto
+      // gris sólido «como aplicar» (el trazado y las plantillas siguen en
+      // sus colores encima, pedido del usuario 15/10). En modo objeto la
+      // malla necesita normales para el sombreado de MeshStandardMaterial.
+      const mats = splineOverlayRef.current;
+      if (mats) {
+        pm.material = splinePreviewObjeto
+          ? mats.previewObjeto
+          : mats.previewVelo;
+      }
       const salida = new THREE.BufferGeometry();
       const pos = new Float32Array(prev.vertices.length * 3);
       for (let i = 0; i < prev.vertices.length; i++) {
@@ -12075,6 +12197,7 @@ export default function Viewer3D({
         for (let i = 1; i + 1 < f.length; i++) idx.push(f[0], f[i], f[i + 1]);
       }
       salida.setIndex(idx);
+      if (splinePreviewObjeto) salida.computeVertexNormals();
       pm.geometry.dispose();
       pm.geometry = salida;
     }
@@ -12104,7 +12227,64 @@ export default function Viewer3D({
     group.visible = true;
     // Vuelta al manejo de cámara si un arrastre quedó a mitad (remontaje).
     // El visor no necesita nada más aquí: el gate de puntero es el que arma.
-  }, [splineEdicion, splinePreview, splinePreviewVisible, splineContornos]);
+  }, [splineEdicion, splinePreview, splinePreviewVisible, splinePreviewObjeto, splineContornos]);
+
+  // VISTA PREVIA del ESPEJO (hover en el desplegable): la malla espejada
+  // como fantasma translúcido — `gemelo`=false: superpuesta en el sitio del
+  // objeto (con SU transform: así se ve la forma que tomaría al aplicar);
+  // `gemelo`=true: en el transform DESTINO del gemelo (aparecería AL LADO,
+  // reflejado en mundo). Sin raycast e intocable para la escena.
+  useEffect(() => {
+    const grupo = espejoPreviewRef.current;
+    if (!grupo) return;
+    for (const child of [...grupo.children]) {
+      grupo.remove(child);
+      if (child instanceof THREE.Mesh) child.geometry?.dispose();
+    }
+    const prev = espejoPreview;
+    if (!prev || prev.mesh.vertices.length === 0 || prev.mesh.faces.length === 0) {
+      grupo.visible = false;
+      return;
+    }
+    const { mesh, transform, gemelo } = prev;
+    const positions = new Float32Array(mesh.vertices.length * 3);
+    for (let i = 0; i < mesh.vertices.length; i++) {
+      const v = mesh.vertices[i];
+      positions[i * 3] = v.x;
+      positions[i * 3 + 1] = v.y;
+      positions[i * 3 + 2] = v.z;
+    }
+    const idx: number[] = [];
+    for (const f of mesh.faces) {
+      if (f.length < 3) continue;
+      for (let i = 1; i + 1 < f.length; i++) idx.push(f[0], f[i], f[i + 1]);
+    }
+    const geometria = new THREE.BufferGeometry();
+    geometria.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometria.setIndex(idx);
+    geometria.computeVertexNormals();
+    // Cian cuando el objeto CAMBIARÍA (transformar) y verde cuando nacería
+    // OTRO objeto (gemelo): los dos colores de la herramienta de siempre.
+    const material = new THREE.MeshStandardMaterial({
+      color: gemelo ? 0x34d399 : 0x22d3ee,
+      metalness: 0.1,
+      roughness: 0.5,
+      flatShading: true,
+      transparent: true,
+      opacity: 0.45,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      envMapIntensity: 0,
+    });
+    const pieza = new THREE.Mesh(geometria, material);
+    pieza.raycast = () => {};
+    pieza.renderOrder = 985;
+    grupo.add(pieza);
+    grupo.position.set(transform.px, transform.py, transform.pz);
+    grupo.rotation.set(transform.rx, transform.ry, transform.rz);
+    grupo.scale.set(transform.sx, transform.sy, transform.sz);
+    grupo.visible = true;
+  }, [espejoPreview]);
 
   useEffect(() => {
     if (latheAxisRef.current) latheAxisRef.current.visible = showLatheAxis;
@@ -12431,6 +12611,14 @@ export default function Viewer3D({
               texture.wrapT = THREE.RepeatWrapping;
               mat.map = texture;
               mat.color.set(0xffffff);
+              // La imagen YA está: si es opaca, la cara pierde el vidrio
+              // también en la carga tardía (reporte 15/10).
+              const alfaLlegada = imagenTieneAlfa((texture.image ?? null) as HTMLImageElement | null);
+              if (alfaLlegada === false) {
+                texturaConAlfaDe.set(url, false);
+                mat.transparent = false;
+                mat.opacity = 1;
+              }
               mat.needsUpdate = true;
             },
             undefined,
@@ -12439,11 +12627,14 @@ export default function Viewer3D({
         };
         for (const entry of faceEntries) {
           if (!entry.tex || texMatIndex.has(entry.tex)) continue;
+          // Igual que el camino de instantáneas: textura de cara SIN alfa
+          // propio → cara OPACA aunque el objeto lleve cristal/opacity < 1.
+          const alfaPropia = texturaTieneAlfa(entry.tex);
           const faceMat = new THREE.MeshPhysicalMaterial({
             color: 0xcccccc,
             side: THREE.DoubleSide,
-            transparent: true,
-            opacity,
+            transparent: alfaPropia !== false,
+            opacity: alfaPropia === false ? 1 : opacity,
             map: null,
             metalness: material.metalness,
             roughness: material.roughness,

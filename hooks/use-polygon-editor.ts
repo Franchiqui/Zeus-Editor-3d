@@ -681,12 +681,24 @@ export function usePolygonEditor({
       if (!gd) return;
       const grabbedStart = gd.positions.find((s) => sameRef(s.ref, gd.grabbed));
       if (!grabbedStart) return;
-      const target = clampPoint(
-        snapPoint({
-          x: grabbedStart.x + (raw.x - gd.origin.x),
-          y: grabbedStart.y + (raw.y - gd.origin.y),
-        })
-      );
+      // Imán sobre el DESPLAZAMIENTO, no sobre la posición absoluta: el
+      // grupo avanza a pasos EXACTOS de celda siguiendo al ratón. Imantar
+      // la posición absoluta del vértice agarrado con su zona de atracción
+      // (35 % de celda) congelaba el arrastre — el grupo se quedaba pegado
+      // a cada cruce de la cuadrícula: «se movía un tris y se frenaba» — y
+      // el congelamiento crecía al alejarse el punto de los cruces.
+      const delta = { x: raw.x - gd.origin.x, y: raw.y - gd.origin.y };
+      let deltaX = delta.x;
+      let deltaY = delta.y;
+      if (snap) {
+        const cell = 1 / resolution;
+        deltaX = Math.round(deltaX / cell) * cell;
+        deltaY = Math.round(deltaY / cell) * cell;
+      }
+      const target = clampPoint({
+        x: grabbedStart.x + deltaX,
+        y: grabbedStart.y + deltaY,
+      });
       const dx = target.x - grabbedStart.x;
       const dy = target.y - grabbedStart.y;
       if (dx === 0 && dy === 0) return;
@@ -729,7 +741,7 @@ export function usePolygonEditor({
         );
       }
     },
-    [clampPoint, snapPoint, polygon, onChange, onPolylinesChange, polylinesOrDefault]
+    [clampPoint, snap, resolution, polygon, onChange, onPolylinesChange, polylinesOrDefault]
   );
 
   /** Arrastra un único vértice de polilínea a la posición del ratón */

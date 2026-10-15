@@ -58,6 +58,72 @@ function resampleClosed(poly, n) {
 }
 
 // lib/spline-3d.ts
+var GIRO_SPLINE_NULO = { x: 0, y: 0, z: 0 };
+function giroSplineActivo(g) {
+  return !!g && (g.x !== 0 || g.y !== 0 || g.z !== 0);
+}
+var GRAD = Math.PI / 180;
+var rotaXm = (v, a) => ({
+  x: v.x,
+  y: v.y * Math.cos(a) - v.z * Math.sin(a),
+  z: v.y * Math.sin(a) + v.z * Math.cos(a)
+});
+var rotaYm = (v, a) => ({
+  x: v.x * Math.cos(a) + v.z * Math.sin(a),
+  y: v.y,
+  z: -v.x * Math.sin(a) + v.z * Math.cos(a)
+});
+var rotaZm = (v, a) => ({
+  x: v.x * Math.cos(a) - v.y * Math.sin(a),
+  y: v.x * Math.sin(a) + v.y * Math.cos(a),
+  z: v.z
+});
+function rotaPuntoGiro(v, giro) {
+  if (!giroSplineActivo(giro)) return v;
+  return rotaZm(rotaYm(rotaXm(v, giro.x * GRAD), giro.y * GRAD), giro.z * GRAD);
+}
+function desrotaPuntoGiro(v, giro) {
+  if (!giroSplineActivo(giro)) return v;
+  return rotaXm(
+    rotaYm(rotaZm(v, -giro.z * GRAD), -giro.y * GRAD),
+    -giro.x * GRAD
+  );
+}
+function pivoteSplineGiro(nodes) {
+  let n = 0;
+  const c = { x: 0, y: 0, z: 0 };
+  for (const nd of nodes) {
+    if (!vfinito(nd.p)) continue;
+    c.x += nd.p.x;
+    c.y += nd.p.y;
+    c.z += nd.p.z;
+    n++;
+  }
+  if (n === 0) return c;
+  return { x: c.x / n, y: c.y / n, z: c.z / n };
+}
+function aplicaGiroSplineNodos(nodes, giro, pivote) {
+  if (!giroSplineActivo(giro)) return nodes;
+  const g = giro;
+  const c = pivote ?? pivoteSplineGiro(nodes);
+  return nodes.map((n) => {
+    const rel = vsub(n.p, c);
+    const pG = vadd(rotaPuntoGiro(rel, g), c);
+    return {
+      ...n,
+      p: {
+        x: pG.x,
+        y: pG.y,
+        z: pG.z
+      },
+      baseMundo: n.baseMundo ? {
+        ...n.baseMundo,
+        right: rotaPuntoGiro(n.baseMundo.right, g),
+        up: rotaPuntoGiro(n.baseMundo.up, g)
+      } : void 0
+    };
+  });
+}
 var vsub = (a, b) => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z });
 var vadd = (a, b) => ({ x: a.x + b.x, y: a.y + b.y, z: a.z + b.z });
 var vmul = (a, s) => ({ x: a.x * s, y: a.y * s, z: a.z * s });
@@ -282,8 +348,13 @@ function prepararSpline(nodes, options) {
   });
   const normales = options.orientacion === "radial" ? frenet(tangentes) : transportadores(tangentes);
   const tilts = util.map((n) => (n.tilt ?? 0) * Math.PI / 180);
+  const inclX = util.map((n) => (n.tiltX ?? 0) * Math.PI / 180);
+  const inclY = util.map((n) => (n.tiltY ?? 0) * Math.PI / 180);
   const escalas = util.map(
     (n) => n.escala && n.escala > 0 ? Math.max(0.01, Math.min(8, n.escala)) : esc
+  );
+  const excentricidad = util.map(
+    (n) => n.excentricidad && vfinito(n.excentricidad) ? n.excentricidad : { x: 0, y: 0, z: 0 }
   );
   const rolls = tilts.slice();
   const facX = util.map(() => 1);
@@ -327,7 +398,10 @@ function prepararSpline(nodes, options) {
     tangentes,
     normales,
     rolls,
+    inclX,
+    inclY,
     escalas,
+    excentricidad,
     facX,
     facY,
     steps
@@ -353,17 +427,29 @@ function anilloDeMuestra(prep, i) {
   const n1 = prep.normales[i];
   const b1 = vcross(n1, t1);
   const roll = prep.rolls[j] + (prep.rolls[j2] - prep.rolls[j]) * m.t;
+  const inclXi = prep.inclX[j] + (prep.inclX[j2] - prep.inclX[j]) * m.t;
+  const inclYi = prep.inclY[j] + (prep.inclY[j2] - prep.inclY[j]) * m.t;
+  const cosX = Math.cos(inclXi);
+  const sinX = Math.sin(inclXi);
+  const cosY = Math.cos(inclYi);
+  const sinY = Math.sin(inclYi);
+  const ejeU = vadd(vmul(n1, cosY), vmul(t1, sinY));
+  const ejeV = vadd(vmul(b1, cosX), vmul(t1, sinX));
   const cos = Math.cos(roll);
   const sin = Math.sin(roll);
   const ux = UNIT * esc * fX;
   const uy = UNIT * esc * fY;
   const anillo = [];
+  const eX = prep.excentricidad[j].x + (prep.excentricidad[j2].x - prep.excentricidad[j].x) * m.t;
+  const eY = prep.excentricidad[j].y + (prep.excentricidad[j2].y - prep.excentricidad[j].y) * m.t;
+  const eZ = prep.excentricidad[j].z + (prep.excentricidad[j2].z - prep.excentricidad[j].z) * m.t;
+  const centro = vadd(m.pos, { x: eX, y: eY, z: eZ });
   for (let k = 0; k < prep.ringCount; k++) {
     const lx = (prof[k].x - c.x) * ux;
     const ly = (prof[k].y - c.y) * uy;
     const a2 = lx * cos - ly * sin;
     const b2 = lx * sin + ly * cos;
-    anillo.push(vadd(m.pos, vadd(vmul(n1, a2), vmul(b1, b2))));
+    anillo.push(vadd(centro, vadd(vmul(ejeU, a2), vmul(ejeV, b2))));
   }
   return anillo;
 }
@@ -510,6 +596,10 @@ function validarSplineDatos(raw) {
     if (o.esquina === true) node.esquina = true;
     if (typeof o.tilt === "number" && Number.isFinite(o.tilt))
       node.tilt = Math.max(-360, Math.min(360, o.tilt));
+    if (typeof o.tiltX === "number" && Number.isFinite(o.tiltX))
+      node.tiltX = Math.max(-360, Math.min(360, o.tiltX));
+    if (typeof o.tiltY === "number" && Number.isFinite(o.tiltY))
+      node.tiltY = Math.max(-360, Math.min(360, o.tiltY));
     const escalaN2 = puntoNum(o.escala);
     if (escalaN2 !== null && escalaN2 > 0) node.escala = Math.max(0.01, Math.min(8, escalaN2));
     if (Array.isArray(o.polygon)) {
@@ -563,6 +653,15 @@ function validarSplineDatos(raw) {
         };
       }
     }
+    if (o.excentricidad && typeof o.excentricidad === "object") {
+      const e = o.excentricidad;
+      const ex = puntoNum(e.x);
+      const ey = puntoNum(e.y);
+      const ez = puntoNum(e.z);
+      if (ex !== null && ey !== null && ez !== null) {
+        node.excentricidad = { x: ex, y: ey, z: ez };
+      }
+    }
     nodes.push(node);
   }
   if (nodes.length < 2) return void 0;
@@ -577,6 +676,14 @@ function validarSplineDatos(raw) {
     escala: escalaN !== null ? Math.max(0.01, Math.min(8, escalaN)) : 0.5,
     orientacion: r.orientacion === "radial" ? "radial" : void 0
   };
+  if (r.rotacion && typeof r.rotacion === "object") {
+    const g = r.rotacion;
+    const gx = puntoNum(g.x);
+    const gy = puntoNum(g.y);
+    const gz = puntoNum(g.z);
+    const c = (v) => Math.max(-360, Math.min(360, v));
+    datos.rotacion = gx !== null || gy !== null || gz !== null ? { x: c(gx ?? 0), y: c(gy ?? 0), z: c(gz ?? 0) } : void 0;
+  }
   if (r.rosca && typeof r.rosca === "object") {
     const c = r.rosca;
     const vueltas = puntoNum(c.vueltas);
@@ -598,12 +705,18 @@ function validarSplineDatos(raw) {
   return datos;
 }
 export {
+  GIRO_SPLINE_NULO,
   PLANTILLA_SPLINE_DEFECTO,
   ROSCA_DEFECTO,
+  aplicaGiroSplineNodos,
   buildRoscaMesh,
   buildSpline3DMesh,
   construirMuestraHelix,
   contornosDeVertices,
+  desrotaPuntoGiro,
+  giroSplineActivo,
   muestrearSpline,
+  pivoteSplineGiro,
+  rotaPuntoGiro,
   validarSplineDatos
 };

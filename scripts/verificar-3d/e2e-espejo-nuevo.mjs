@@ -1,9 +1,11 @@
-// e2e-espejo-nuevo.mjs: el desplegable del Espejo ahora ofrece DOS modos —
+// e2e-espejo-nuevo.mjs: el desplegable del Espejo ofrece DOS modos —
 // TRANSFORMAR (original) y CREAR objeto nuevo gemelo espejado. En vivo:
 // 1) cubo por el puente, 2) espejo X en modo transformar (sin objeto nuevo),
-// 3) cambia a «Crear objeto nuevo», espejo Y → aparece «Cubo espejo» con la
-// MISMA transformación (el gemelo cae encima: espejo sobre la caja propia)
-// y queda seleccionado. El servidor dev ya corre en :3002 (NO se reinicia).
+// 3) cambia a «Crear objeto nuevo», espejo Y → aparece «Cubo espejo» AL
+// LADO del original (espejo apoyado en su cara: py ≈ +1 para un cubo
+// unitario a origin) y queda seleccionado. Reporte del usuario 15/10: el
+// gemelo ya NO cae encima — se coloca como el reflejo de un espejo.
+// El servidor dev ya corre en :3002 (NO se reinicia).
 import { sembrarAuth } from './comun.mjs';
 import { chromium } from 'playwright';
 
@@ -98,7 +100,15 @@ const gemelo = objs2.find((o) => o.name !== 'Cubo');
 revisar(objs2.length === objs0.length + 1, `modo nuevo CREÓ su objeto (${objs2.length} = ${objs0.length + 1})`);
 revisar(!!gemelo, `gemelo en la escena${gemelo ? ` → «${gemelo.name}»` : ''}`);
 revisar(!!gemelo && /espejo|mirror/i.test(gemelo.name), `gemelo con sufijo de espejo («${gemelo?.name}»)`);
-revisar(!!gemelo && tIgual(gemelo.transform, cubo.transform), `gemelo con la MISMA transformación ${gemelo ? redT(gemelo.transform) : ''} vs ${redT(cubo.transform)}`);
+// El gemelo sale AL LADO: espejo en la cara de la caja del eje pedido —
+// para el cubo unitario (±0.5) con espejo Y: py ≈ 1.0, px/pz intactos.
+const t = gemelo?.transform;
+const alLado = !!t
+  && Math.abs(t.py - 1) < 0.05
+  && Math.abs(t.px) < 1e-6
+  && Math.abs(t.pz) < 1e-6
+  && Math.abs(t.rx) < 1e-6 && Math.abs(t.ry) < 1e-6 && Math.abs(t.rz) < 1e-6;
+revisar(alLado, `gemelo AL LADO del original (espejo en su cara: ${gemelo ? redT(gemelo.transform) : ''})`);
 
 // 4. El gemelo quedó seleccionado (el estado de React pesca el hook string).
 const selDespues = await page.evaluate((ids) => {

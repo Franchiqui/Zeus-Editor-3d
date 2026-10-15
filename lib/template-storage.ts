@@ -4,7 +4,7 @@ import { join } from 'path';
 export interface SavedTemplate {
   id: string;
   name: string;
-  type: 'views' | 'lathe' | 'mesh';
+  type: 'views' | 'lathe' | 'mesh' | 'forma';
   data: Record<string, unknown>;
   createdAt: number;
 }

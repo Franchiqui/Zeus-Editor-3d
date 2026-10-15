@@ -91,6 +91,17 @@ interface ViewerPanelProps {
     /** Muestra/oculta SOLO la malla translúcida de vista previa del
         spline (la cian siempre queda: línea y vértices). */
     splinePreviewVisible?: boolean;
+    /** Vista previa del spline con ASPECTO DE OBJETO APLICADO (gris sólido)
+        en vez del velo azul; el trazado y las plantillas siguen visibles. */
+    splinePreviewObjeto?: boolean;
+    /** VISTA PREVIA del ESPEJO: eje bajo el ratón del desplegable — mesh
+        espejada + transform destino (modo transformar: sobre el objeto;
+        modo gemelo: al lado, reflejado en mundo). */
+    espejoPreview?: {
+      mesh: Mesh;
+      transform: ObjectTransform;
+      gemelo: boolean;
+    } | null;
     /** Contorno (en mundo) de la plantilla de CADA vértice del spline —
         se traza en naranja sobre la vista previa solo cuando el balón
         está activo. */
@@ -286,6 +297,8 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
     splineEdicion,
     splinePreview,
     splinePreviewVisible,
+    splinePreviewObjeto,
+    espejoPreview,
     splineContornos,
     faceSelectVisibleOnly,
     corteRapido,
@@ -623,6 +636,8 @@ export const ViewerPanel: FC<ViewerPanelProps> = ({  viewName,
            splineEdicion={splineEdicion}
            splinePreview={splinePreview}
            splinePreviewVisible={splinePreviewVisible}
+           splinePreviewObjeto={splinePreviewObjeto}
+           espejoPreview={espejoPreview}
            splineContornos={splineContornos}
            faceSelectVisibleOnly={faceSelectVisibleOnly}
            corteRapido={corteRapido}

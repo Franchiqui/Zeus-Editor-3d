@@ -159,3 +159,56 @@ export function mapeaColocacionExtrusion(
     sz: 1,
   };
 }
+
+/**
+ * Posición en MUNDO del CENTRO DE UN TRAZO calcao sobre la captura del
+ * spline (⤢ con destino spline): el punto medio del polígono (el mismo
+ * centro que usa el constructor de la malla para situar su anillo) llevado
+ * a la ventana capturada. La plantilla del calco se muestra SIEMPRE a
+ * escala 1 y offset 0 (el lienzo 0..1 ES el PNG cuadrado), así que el
+ * mapeo es el mismo aFrac/mundo de arriba sin plantilla propia.
+ *
+ * Sirve para sobreponer la malla del spline EXACTAMENTE donde y del tamaño
+ * con que se dibujó en la ventana de origen: el vértice se coloca en el
+ * punto de mundo del trazo y su anillo (centrado en el vértice) cae sobre
+ * el dibujo original.
+ *
+ * @param poly Trazo del usuario (unidades del lienzo 0..1).
+ * @returns null con trazos sin área (menos de 3 puntos).
+ */
+export function centroTrazoEnCaptura(
+  poly: Array<{ x: number; y: number }>,
+  meta: CapturaExtrusionMeta
+): Vec3L | null {
+  if (poly.length < 3 || meta.pxW <= 0 || meta.pxH <= 0) return null;
+  // Como el anillo del spline se centra en el CENTROIDE del polígono
+  // (media de sus puntos), aquí se mapea ESSE punto: así el anillo cae
+  // sobre el dibujo, no alrededor de él.
+  let cx = 0;
+  let cy = 0;
+  for (const q of poly) {
+    cx += q.x;
+    cy += q.y;
+  }
+  cx /= poly.length;
+  cy /= poly.length;
+  const px = meta.px;
+  const kX = meta.pxW / px;
+  const kY = meta.pxH / px;
+  const aFrac = (u: number, eje: 'x' | 'y'): number =>
+    eje === 'x' ? u * kX + (1 - kX) / 2 : u * kY + (1 - kY) / 2;
+  return {
+    x:
+      meta.centro.x +
+      (aFrac(cx, 'x') - 0.5) * meta.spanX * meta.right.x +
+      (0.5 - aFrac(cy, 'y')) * meta.spanY * meta.up.x,
+    y:
+      meta.centro.y +
+      (aFrac(cx, 'x') - 0.5) * meta.spanX * meta.right.y +
+      (0.5 - aFrac(cy, 'y')) * meta.spanY * meta.up.y,
+    z:
+      meta.centro.z +
+      (aFrac(cx, 'x') - 0.5) * meta.spanX * meta.right.z +
+      (0.5 - aFrac(cy, 'y')) * meta.spanY * meta.up.z,
+  };
+}

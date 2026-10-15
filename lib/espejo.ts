@@ -59,11 +59,18 @@ export function espejarMesh(mesh: Mesh, eje: EjeEspejo): Mesh {
  *
  * Receta: sube cada vértice a mundo con la transformada del objeto
  * (misma regla que el visor: T·R·S, euler XYZ en radianes), refleja el
- * componente del eje respecto al CENTRO de la caja MUNDIAL (la pieza no
- * salta de sitio) y hornea el resultado con un transform NUEVO: pivote en
- * ese centro y rotación a cero — la inclinación original queda HORNEADA
- * dentro de la malla reflejada, y el gemelo se mueve/gira/escala desde
- * su propio centro (pivote limpio, rotación a 0).
+ * componente del eje y hornea el resultado con un transform NUEVO:
+ * pivote en el centro de la caja del gemelo y rotación a cero — la
+ * inclinación original queda HORNEADA dentro de la malla reflejada, y
+ * el gemelo se mueve/gira/escala desde su propio centro (pivote limpio,
+ * rotación a 0).
+ *
+ * El PLANO DE ESPEJO es la CARA de la caja del objeto hacia el lado del
+ * eje elegido (max del eje en mundo), NO el centro de su caja (pedido del
+ * usuario 15/10): antes el reflejo caía ENCIMA del original (espejo en su
+ * propio centro, superpuesto — había que arrastrar el gemelo a mano);
+ * ahora el gemelo sale AL LADO, pegado a esa cara, como un espejo
+ * apoyado contra la pieza: el original y su reflejo, separados.
  *
  * Las caras se recorren al revés (la reflexión invierte el winding) y
  * las UV se dejan CLAVADAS a sus vértices: con un eje de reflexión que
@@ -119,11 +126,16 @@ export function espejarObjetoMundo(
   const centro = new THREE.Vector3(
     (minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2
   );
-  // 3) Reflejo en mundo (eje de la vista) y pivote en el centro.
+  // 3) Reflejo en mundo con el ESPEJO apoyado en la CARA de la caja (max
+  // del eje, lado positive del eje pedido): el gemelo sale al OTRO lado de
+  // esa cara, pegado al original pero FUERA de él — el reflejo de verdad.
+  const plano = eje === 'x' ? maxX : eje === 'y' ? maxY : maxZ;
+  const pivote = centro.clone();
+  pivote[eje] = 2 * plano - pivote[eje];
   const vertices: Vertex3D[] = mundo.map((w) => {
     const m = w.clone();
-    m[eje] = 2 * centro[eje] - m[eje];
-    m.sub(centro);
+    m[eje] = 2 * plano - m[eje];
+    m.sub(pivote);
     return { x: m.x, y: m.y, z: m.z };
   });
   const faces: number[][] = mesh.faces.map((f) =>
@@ -132,7 +144,7 @@ export function espejarObjetoMundo(
   return {
     mesh: { ...mesh, vertices, faces },
     transform: {
-      px: centro.x, py: centro.y, pz: centro.z,
+      px: pivote.x, py: pivote.y, pz: pivote.z,
       rx: 0, ry: 0, rz: 0,
       sx: 1, sy: 1, sz: 1,
     },

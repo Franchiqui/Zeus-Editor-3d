@@ -101,8 +101,14 @@ import {
   construirMuestraHelix,
   contornosDeVertices,
   validarSplineDatos,
+  aplicaGiroSplineNodos,
+  desrotaPuntoGiro,
+  giroSplineActivo,
+  pivoteSplineGiro,
+  GIRO_SPLINE_NULO,
   ROSCA_DEFECTO,
   PLANTILLA_SPLINE_DEFECTO,
+  type GiroSpline,
   type SplineNode3D,
   type SplineDatos,
   type RoscaParams,
@@ -175,7 +181,11 @@ import { cortarMallaPorTrazado, type TrazadoCorte } from '@/lib/corte-malla';
 import type { FaceSelectionTarget } from '@/components/viewer-3d';
 import { resolveLatheProfile, resampleLatheProfile, LATHE_PRESET_NAMES } from '@/lib/lathe-profiles';
 import { buildViewsMesh, buildExtrudeMesh, buildExtrudeMeshes, polylineToPolygon } from '@/lib/views-mesh';
-import { mapeaColocacionExtrusion, type CapturaExtrusionMeta } from '@/lib/extrusion-spline';
+import {
+  mapeaColocacionExtrusion,
+  centroTrazoEnCaptura,
+  type CapturaExtrusionMeta,
+} from '@/lib/extrusion-spline';
 import { sanitizePolylinesByCanvas, newPolylineId } from '@/lib/polylines';
 import type { PolylinesByCanvas, Polyline, CanvasTool } from '@/lib/polylines';
 import { listTemplates, saveTemplate, deleteTemplate, type SavedTemplate } from '@/lib/template-storage';
@@ -783,6 +793,15 @@ type SceneObject = {
     * y sustituyen con este marcador.
     */
    copiasSetId?: string;
+   /**
+    * Configuración de las asas del gizmo PROPIA de este objeto (offset/
+    * giro/escala aplicados con «Configurar asas del gizmo» y guardados
+    * con su ⚙ Aplicar). Persistencia por objeto (pedido del usuario
+    * 15/10): al seleccionar el objeto vuelve a su configuración en vez
+    * del offset global del último objeto trabajado. Ausente = gizmo al
+    * centro. Viaja con el objeto en los .zeus.
+    */
+   gizmoAsas?: ObjectTransform;
  };
 
 /**
@@ -949,6 +968,8 @@ type HistoryState = {
     splineActivoId: number | null;
     /** Spline 3D: objeto cuya spline se reedita (null = trazado nuevo). */
     splineEditandoId: string | null;
+    /** Spline 3D: giro completo del trazado (X/Y/Z en grados). */
+    splineGiro: GiroSpline;
   };
 
 // Comparación de dos fotos del editor (para saber si un cambio es real o
@@ -1022,7 +1043,10 @@ const isSameHistoryState = (a: HistoryState, b: HistoryState): boolean =>
   (a.splineRadial ?? false) === (b.splineRadial ?? false) &&
   sameHistoryValue(a.splineRosca ?? null, b.splineRosca ?? null) &&
   (a.splineActivoId ?? null) === (b.splineActivoId ?? null) &&
-  (a.splineEditandoId ?? null) === (b.splineEditandoId ?? null);
+  (a.splineEditandoId ?? null) === (b.splineEditandoId ?? null) &&
+  (a.splineGiro?.x ?? 0) === (b.splineGiro?.x ?? 0) &&
+  (a.splineGiro?.y ?? 0) === (b.splineGiro?.y ?? 0) &&
+  (a.splineGiro?.z ?? 0) === (b.splineGiro?.z ?? 0);
 
 // Plantillas por defecto: vacías. Los lienzos 2D arrancan en blanco
 // — el usuario dibuja desde cero o inserta una forma de un clic. El
@@ -1985,6 +2009,10 @@ export default function Home({
       por defecto a pedido del usuario (13/10): dibujar con el balón
       es opt-in, de serie se ve solo la línea. */
   const [splinePrevVista, setSplinePrevVista] = useState(false);
+  /** Spline: la vista previa se ve CON aspecto de objeto aplicado (gris
+      sólido) en vez de velo azul — se sigue editando el trazado encima;
+      pide el usuario (15/10) ver el objeto «como si diera Aplicar». */
+  const [splinePrevObjeto, setSplinePrevObjeto] = useState(false);
   const [splineSubdivisions, setSplineSubdivisions] = useState(5);
   const [splineEscala, setSplineEscala] = useState(0.5);
   /** Spline: la plantilla gira con el enrollado (marco radial, tornillo). */
@@ -1993,6 +2021,13 @@ export default function Home({
   const [splineRosca, setSplineRosca] = useState<RoscaParams | null>(null);
   // Objeto cuya spline se reedita (null = trazado nuevo).
   const [splineEditandoId, setSplineEditandoId] = useState<string | null>(null);
+  // Giro del trazado COMPLETO (grados X/Y/Z): gira TODO — vértices, marcos
+  // de plantilla y vista previa (el velo azul) — como cuerpo rígido
+  // alrededor del centroide. Los nodos NO giran en los datos (el giro
+  // viaja aparte con ellos, tanto en el historial como en el objeto).
+  const [splineGiro, setSplineGiro] = useState<GiroSpline>({
+    ...GIRO_SPLINE_NULO,
+  });
   const splineIdRef = useRef(1);
   // Escala uniforme de la figura 2D en Extruir (slider del toolbar).
   const [resizeScale, setResizeScale] = useState(1);
@@ -3932,7 +3967,7 @@ export default function Home({
   const [templateMsg, setTemplateMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [templateAction, setTemplateAction] = useState<'save' | 'load'>('save');
   const [templateName, setTemplateName] = useState('');
-  const [templateType, setTemplateType] = useState<'views' | 'lathe' | 'mesh'>('views');
+  const [templateType, setTemplateType] = useState<'views' | 'lathe' | 'mesh' | 'forma'>('views');
   const [selectedTemplateIds, setSelectedTemplateIds] = useState<string[]>([]);
 
   // La escena: objetos con sus transformaciones e instantáneas de
@@ -3949,7 +3984,10 @@ export default function Home({
       const res = typeof v === 'function' ? (v as (c: SceneObject[]) => SceneObject[])(cur) : v;
       try {
         const resumen = (arr: SceneObject[]) =>
-          arr.map((o) => `${(o.id as string).slice(4, 12)}:${o.mesh?.faceTextures ? o.mesh.faceTextures.filter(Boolean).length : '-'}`).join('|');
+          arr.map((o) => {
+            const ft = o.mesh?.faceTextures;
+            return `${(o.id as string).slice(4, 12)}:${ft === undefined ? 'X' : ft.filter(Boolean).length}g${o.mesh?.faceTextureGroups === undefined ? 'X' : o.mesh.faceTextureGroups.filter(Boolean).length}`;
+          }).join('|');
         const antes = cur.length ? resumen(cur) : '(vacio)';
         const despues = (res as SceneObject[]).length ? resumen(res as SceneObject[]) : '(vacio)';
         console.log(antes !== despues ? 'TRACESCENE>>>' : 'TRACESCENE>>>', antes === despues ? '(igual)' : `ANTES:${antes} DESPUES:${despues} POR:${pila}`);
@@ -3970,6 +4008,10 @@ export default function Home({
   // Modo del Espejo: false = transformar el objeto seleccionado (original),
   // true = crear un objeto nuevo gemelo con la malla espejada.
   const [espejoCrearNuevo, setEspejoCrearNuevo] = useState(false);
+  // ESPEJO: eje BAJO EL RATÓN del desplegable (hover) — mientras pasa por
+  // X/Y/Z se ve el espejado en el visor ANTES de aplicar (pedido del
+  // usuario 15/10): superpuesto al objeto (transformar) o al lado (gemelo).
+  const [espejoHoverEje, setEspejoHoverEje] = useState<'x' | 'y' | 'z' | null>(null);
   // Espejo del estado de escena para lecturas fuera de los updaters
   // (el timer del debounce de «Copias calculadas» lee el estado fresco
   // sin encadenar setState dentro de setState).
@@ -5868,6 +5910,7 @@ export default function Home({
       splineRosca,
       splineActivoId,
       splineEditandoId,
+      splineGiro: { ...splineGiro },
       textMode,
       useFontColor,
       baseColor,
@@ -5959,6 +6002,7 @@ viewsOpacity,
       splineRosca,
       splineActivoId,
       splineEditandoId,
+      splineGiro,
       textMode,
     useFontColor,
     baseColor,
@@ -6083,6 +6127,7 @@ pluginTracks,
     setSweepActiveId(state.sweepActiveId ?? null);
     // Spline 3D: fotos antiguas sin borrador -> vacío (fuera del modo).
     setSplineNodes(state.splineNodes ?? []);
+    setSplineGiro(state.splineGiro ?? { ...GIRO_SPLINE_NULO });
     setSplineClosed(state.splineClosed ?? false);
     setSplineSubdivisions(state.splineSubdivisions ?? 5);
     setSplineEscala(state.splineEscala ?? 0.5);
@@ -7648,21 +7693,71 @@ pluginTracks,
     setSplineActivoId((cur) => (cur === id ? null : cur));
   }, []);
 
+  /** Ancla de una plantilla dibujada A MANO: el lienzo de la plantilla del
+      vértice es la vista FRONTAL — la x del dibujo → mundo X y la y del
+      dibujo (hacia abajo) → mundo −Y. Sin este ancla la plantilla la
+      orientaba el MARCO TRANSPORTADO del trazado: su ángulo dependía de la
+      curvatura y de todos los vértices a la vez — lo dibujado en el lienzo
+      no coincidía con lo que salía en el 3D y, al mover/arreglar un
+      vértice, se giraban los demás ya arreglados. Con el ancla, cada
+      anilla depende SOLO de su vértice: misma forma, tamaño (escala) y
+      ángulo que el dibujo. El trazado SIEMPRE atraviesa la plantilla ⟂ a
+      su cara plana (la parte plana la fija la dirección del segmento);
+      este ancla fija solo la rotación EN el plano de la anilla. La captura
+      (⤢) ancla a SU ventana vía setSplineNodeBaseMundo. */
+  const anclaSplineBaseMundo = useCallback(
+    () => ({
+      right: { x: 1, y: 0, z: 0 },
+      up: { x: 0, y: 1, z: 0 },
+      rx: 1,
+      ry: 1,
+    }),
+    []
+  );
+
   const updateSplineNodePolygon = useCallback(
     (id: number, polygon: Polygon) => {
       setSplineNodes((prev) =>
         prev.map((n) => {
           if (n.id !== id) return n;
-          // Sin captura activa, el dibujo ya NO corresponde a la ventana
-          // de la última captura: pierde su anclaje mundial (baseMundo)
-          // y vuelve al marco del trazado. Con el calco abierto se
-          // conserva (se sigue dibujando EN la imagen de esa ventana).
-          const baseMundo = capturaSpline ? n.baseMundo : undefined;
-          return { ...n, polygon, baseMundo };
+          // Con el calco (⤢) visible — lienzo MAXIMIZADO con captura —, el
+          // dibujo va EN la ventana capturada: manda su anclaje. En el
+          // mini-lienzo del panel (aunque la captura siga viva en memoria,
+          // ahí NO se ve su imagen) y en el maximizado sin captura el
+          // dibujo es frontal: ancla SUS ejes (ver anclaSplineBaseMundo).
+          // Ya no se devuelve el anillo al marco transportado: eso era lo
+          // que descasaba el trazado al arreglar las plantillas.
+          const baseMundo = capturaSpline && editingSplineCanvas
+            ? n.baseMundo
+            : anclaSplineBaseMundo();
+          // SOBREPOSICIÓN EXACTA de la captura (⤢) SIN mover la
+          // trayectoria: el centro del trazo calcao en la ventana se lleva
+          // a mundo y viaja como EXCENTRICIDAD de la anilla (desvío del
+          // centro de la plantilla respecto al vértice en el trazado). Así
+          // el camino queda EXACTAMENTE donde el usuario lo trazó (reporte
+          // 15/10: capturar aplanaba los vértices al plano de la ventana y
+          // «el spline ya no estaba donde lo dibujó») y la plantilla se
+          // sobrepone donde se dibujó — tamaño y rumbo ya los fija
+          // baseMundo. En el lienzo a mano (sin calco) la anilla vuelve a
+          // centrarse en el vértice: excentricidad 0.
+          let excentricidad = n.excentricidad;
+          if (capturaSpline && editingSplineCanvas && polygon.length >= 3) {
+            const centro = centroTrazoEnCaptura(polygon, capturaSpline);
+            if (centro) {
+              excentricidad = {
+                x: centro.x - n.p.x,
+                y: centro.y - n.p.y,
+                z: centro.z - n.p.z,
+              };
+            }
+          } else if (!(capturaSpline && editingSplineCanvas)) {
+            excentricidad = undefined;
+          }
+          return { ...n, polygon, baseMundo, excentricidad, p: n.p };
         })
       );
     },
-    [capturaSpline]
+    [capturaSpline, editingSplineCanvas, anclaSplineBaseMundo]
   );
 
   const toggleSplineEsquina = useCallback((id: number) => {
@@ -7679,9 +7774,10 @@ pluginTracks,
     );
   }, []);
 
-  // Inclinación del CORTE de la plantilla alrededor de SU eje-x (acuesta el
-  // alto) o SU eje-y (acorta el ancho) — «los 3 ejes»: tilt = giro en el
-  // propio plano del trazado, tiltX/tiltY = inclinación del corte. Grados.
+  // GIRO REAL de la plantilla alrededor de SU eje-x (la parte alta se
+  // inclina hacia el vértice vecino, barra / |||) o de SU eje-y (se
+  // inclinan los lados) — «los 3 ejes»: tilt = giro en el propio plano del
+  // trazado, tiltX/tiltY = giro real del plano hacia el vecino. Grados.
   const setSplineNodeInclinacion = useCallback(
     (id: number, eje: 'tiltX' | 'tiltY', grados: number) => {
       const v = Math.max(-360, Math.min(360, grados));
@@ -7795,6 +7891,40 @@ pluginTracks,
     setSplineRosca(params);
   }, []);
 
+  // GIRO COMPLETO del trazado: pivote (centroide de los nodos SIN girar) y
+  // nodos con el giro aplicado — la lista que ven la vista previa (velo
+  // azul), los contornos naranjas, los marcadores del visor y la malla
+  // horneada. Los datos guardan los nodos SIN girar: el giro viaja aparte.
+  const splinePivoteGiro = useMemo(
+    () => pivoteSplineGiro(splineNodes),
+    [splineNodes]
+  );
+  const splineNodesGirados = useMemo(
+    () => aplicaGiroSplineNodos(splineNodes, splineGiro, splinePivoteGiro),
+    [splineNodes, splineGiro, splinePivoteGiro]
+  );
+  /** De un punto del espacio GIRADO (lo que toca el usuario en el visor)
+      a su posición verdadera en los datos (inverso del giro, mismo pivote). */
+  const desrotaPuntoSpline = useCallback(
+    (q: { x: number; y: number; z: number }) => {
+      if (!giroSplineActivo(splineGiro)) return q;
+      const d = desrotaPuntoGiro(
+        {
+          x: q.x - splinePivoteGiro.x,
+          y: q.y - splinePivoteGiro.y,
+          z: q.z - splinePivoteGiro.z,
+        },
+        splineGiro
+      );
+      return {
+        x: splinePivoteGiro.x + d.x,
+        y: splinePivoteGiro.y + d.y,
+        z: splinePivoteGiro.z + d.z,
+      };
+    },
+    [splineGiro, splinePivoteGiro]
+  );
+
   // Vista previa EN VIVO del trazado spline (botón Spline): la malla del
   // barrido con el borrador actual, solo mientras el modo está activo y
   // hay al menos 2 vértices con plantilla.
@@ -7803,7 +7933,7 @@ pluginTracks,
     if (splineNodes.filter((n) => (n.polygon ?? []).length >= 3).length < 2)
       return null;
     try {
-      return buildSpline3DMesh(splineNodes, {
+      return buildSpline3DMesh(splineNodesGirados, {
         closed: splineClosed,
         subdivisions: splineSubdivisions,
         escala: splineEscala,
@@ -7812,7 +7942,7 @@ pluginTracks,
     } catch {
       return null;
     }
-  }, [modoSpline, splineNodes, splineClosed, splineSubdivisions, splineEscala, splineRadial]);
+  }, [modoSpline, splineNodesGirados, splineNodes, splineClosed, splineSubdivisions, splineEscala, splineRadial]);
 
   // Contorno de la plantilla de CADA vértice (el dibujo que ahí va). Mismo
   // mapeo que la malla y misma condición: con el balón azul activo, el
@@ -7823,7 +7953,7 @@ pluginTracks,
     if (splineNodes.filter((n) => (n.polygon ?? []).length >= 3).length < 2)
       return null;
     try {
-      return contornosDeVertices(splineNodes, {
+      return contornosDeVertices(splineNodesGirados, {
         closed: splineClosed,
         subdivisions: splineSubdivisions,
         escala: splineEscala,
@@ -7832,22 +7962,31 @@ pluginTracks,
     } catch {
       return null;
     }
-  }, [modoSpline, splineNodes, splineClosed, splineSubdivisions, splineEscala, splineRadial]);
+  }, [modoSpline, splineNodesGirados, splineNodes, splineClosed, splineSubdivisions, splineEscala, splineRadial]);
 
   // Overlay de edición del trazado para el visor (línea + marcadores de
-  // vértice), siguiendo el patrón de deformadorActivo.
+  // vértice), siguiendo el patrón de deformadorActivo. Con giro, los
+  // marcadores van en el espacio GIRADO y cada punto que llega del arrastre
+  // se des-gira antes de guardar: mover un marcador sigue siendo intuitivo.
   const splineEdicion = useMemo(() => {
     if (!modoSpline) return null;
+    const giroActivo = giroSplineActivo(splineGiro);
     return {
-      nodes: splineNodes,
+      nodes: splineNodesGirados,
       closed: splineClosed,
       activoId: splineActivoId,
-      onAdd: addSplineNode,
-      onMove: moveSplineNode,
+      onAdd: giroActivo
+        ? (p: { x: number; y: number; z: number }) =>
+            addSplineNode(desrotaPuntoSpline(p))
+        : addSplineNode,
+      onMove: giroActivo
+        ? (id: number, p: { x: number; y: number; z: number }) =>
+            moveSplineNode(id, desrotaPuntoSpline(p))
+        : moveSplineNode,
       onSelect: setSplineActivoId,
       onRemove: removeSplineNode,
     };
-  }, [modoSpline, splineNodes, splineClosed, splineActivoId, addSplineNode, moveSplineNode, removeSplineNode]);
+  }, [modoSpline, splineNodesGirados, splineClosed, splineActivoId, addSplineNode, moveSplineNode, removeSplineNode, splineGiro, desrotaPuntoSpline]);
 
   const activeSweepNode =
     mode === 'extrude'
@@ -7948,6 +8087,22 @@ pluginTracks,
         },
       };
     }
+    // SPLINE (pestaña Escena): la plantilla del vértice activo ES otro
+    // lienzo del grupo — el maximizado (editingSplineCanvas) o el mini del
+    // panel (modoSpline). Sin este caso Copiar/Pegar trabajaban con la
+    // configuración del objeto y Pegar no volcaba nada en el vértice.
+    if (mode === 'scene' && (editingSplineCanvas || modoSpline)) {
+      const nodoSpline = splineNodes.find((n) => n.id === splineActivoId);
+      if (nodoSpline) {
+        const idxS = splineNodes.indexOf(nodoSpline) + 1;
+        return {
+          name: `${t('editor3D.splineTemplateLabel')}${idxS ? ` #${idxS}` : ''}`,
+          polygon: nodoSpline.polygon ?? [],
+          apply: (poly: Polygon) =>
+            updateSplineNodePolygon(nodoSpline.id, structuredClone(poly)),
+        };
+      }
+    }
     return null;
   }, [
     mode,
@@ -7965,6 +8120,12 @@ pluginTracks,
     sweepNodeNumber,
     updateSweepNodePolygon,
     updateView,
+    editingSplineCanvas,
+    modoSpline,
+    splineNodes,
+    splineActivoId,
+    updateSplineNodePolygon,
+    t,
   ]);
 
   const openSaveModal = useCallback(() => {
@@ -9392,6 +9553,7 @@ pluginTracks,
       setSplineEditandoId(null);
       setSplineRadial(false);
       setSplineRosca(null);
+      setSplineGiro({ ...GIRO_SPLINE_NULO });
       setCapturaSpline(null);
       // Si el lienzo de plantilla estaba maximizado, devuelve la rejilla.
       setEditingSplineCanvas(false);
@@ -9451,6 +9613,7 @@ pluginTracks,
         setSplineEscala(clon.escala);
         setSplineRadial(clon.orientacion === 'radial');
         setSplineRosca(clon.rosca ?? null);
+        setSplineGiro(clon.rotacion ?? { ...GIRO_SPLINE_NULO });
         setSplineActivoId(clon.nodes[clon.nodes.length - 1]?.id ?? null);
         setSplineEditandoId(objeto.id);
         const maxId = clon.nodes.reduce((m, n) => Math.max(m, n.id), 0);
@@ -9460,6 +9623,7 @@ pluginTracks,
         setSplineClosed(false);
         setSplineRadial(false);
         setSplineRosca(null);
+        setSplineGiro({ ...GIRO_SPLINE_NULO });
         setSplineActivoId(null);
         setSplineEditandoId(null);
       }
@@ -11036,6 +11200,52 @@ pluginTracks,
      []
      );
 
+    // --- Persistencia por OBJETO de las asas del gizmo -------------------
+    // El offset/escala/rotación de las asas («Configurar asas del gizmo»)
+    // era UNO global: tocar el gizmo de B pisa el de A y al volver a A
+    // se había perdido (reporte del usuario 15/10). Ahora cada objeto
+    // guarda el suyo (SceneObject.gizmoAsas): el saliente apunta sus
+    // ajustes y el entrante carga el suyo (o el centro si nunca tuvo).
+    const gizmoOffsetRef = useRef(gizmoOffset);
+    gizmoOffsetRef.current = gizmoOffset;
+
+    const guardarGizmoAsas = useCallback(
+      (id: string | null, off: ObjectTransform | null) => {
+        if (!id) return;
+        setSceneObjects((cur) =>
+          cur.map((o) =>
+            o.id === id
+              ? off
+                ? { ...o, gizmoAsas: { ...off } }
+                : o
+              : o
+          )
+        );
+      },
+      []
+    );
+
+    /** Cambio de dueño del gizmo: el objeto SALIENTE retiene su
+        configuración actual y el ENTRANTE carga la suya guardada
+        (fallback: gizmo centrado). */
+    const migrarGizmoAsas = useCallback(
+      (saliente: string | null, entrante: string | null) => {
+        if (saliente) guardarGizmoAsas(saliente, gizmoOffsetRef.current);
+        const destino = entrante
+          ? sceneObjectsRef.current.find((o) => o.id === entrante)
+          : undefined;
+        setGizmoOffset(
+          destino?.gizmoAsas
+            ? {
+                ...structuredClone(IDENTITY_TRANSFORM),
+                ...structuredClone(destino.gizmoAsas),
+              }
+            : structuredClone(IDENTITY_TRANSFORM)
+        );
+      },
+      [guardarGizmoAsas]
+    );
+
     const handleObjectSelect = useCallback(
     (id: string | null) => {
       // Clic sobre el objeto que ya estaba seleccionado: no cambia
@@ -11043,6 +11253,11 @@ pluginTracks,
       // que hay en pantalla ahora, que puede traer la textura de una
       // copia ajustada hace un momento.)
       if (id === selectedObjectId) return;
+
+      // Persistencia del gizmo: el saliente apunta SU configuración y el
+      // entrante carga la suya (antes de cualquier rama temprana, para
+      // que también la apliquen las cámaras).
+      migrarGizmoAsas(selectedObjectId, id);
 
       // Cámara-objeto: solo selección. Nunca congela al dueño (no tiene
       // figura ni configuración de panel), nunca adopta plantillas y no
@@ -11112,6 +11327,7 @@ pluginTracks,
       sceneObjects,
       mode,
       selectedObjectIds,
+      migrarGizmoAsas,
     ]
      );
 
@@ -11861,6 +12077,12 @@ pluginTracks,
           )
         );
         setCapturaSpline(meta);
+        // El calco se muestra SIEMPRE a escala 1, sin offset (y opaco):
+        // el mapeo de tamaño/posición (aFrac/centroTrazoEnCaptura) supone
+        // que el lienzo 0..1 ES el PNG cuadrado completo.
+        setTemplateScale(1);
+        setTemplateOffset({ x: 0, y: 0 });
+        setTemplateOpacity(1);
         setSolicitudCapturaVista(null);
         if (destinoId !== null) {
           setSplineActivoId(destinoId);
@@ -12042,6 +12264,10 @@ pluginTracks,
    */
   const handleSplineAplicar = useCallback(() => {
     if (!modoSpline) return;
+    // El giro viaja APARTE en los datos (rotación): la malla se hornea
+    // desde los nodos GIRADOS mientras los datos guardan los nodos tal
+    // cual — reeditarlos restaura el giro y el trazado sigue editable en
+    // sus coordenadas originales.
     const datos: SplineDatos = {
       nodes: splineNodes,
       closed: splineClosed,
@@ -12049,8 +12275,9 @@ pluginTracks,
       escala: splineEscala,
       orientacion: splineRadial ? 'radial' : undefined,
       rosca: splineRosca ? { ...splineRosca } : undefined,
+      rotacion: giroSplineActivo(splineGiro) ? { ...splineGiro } : undefined,
     };
-    const malla = buildSpline3DMesh(datos.nodes, datos);
+    const malla = buildSpline3DMesh(splineNodesGirados, datos);
     if (malla.vertices.length === 0) return; // nada construido aún
     const editando = splineEditandoId;
     // Selección de la Escena (patrón de handleObjectSelect): el dueño
@@ -12091,10 +12318,12 @@ pluginTracks,
   }, [
     modoSpline,
     splineNodes,
+    splineNodesGirados,
     splineClosed,
     splineSubdivisions,
     splineEscala,
     splineRadial,
+    splineGiro,
     splineEditandoId,
     configObjectId,
     freezeObjectSnapshot,
@@ -12117,7 +12346,10 @@ pluginTracks,
    * malla espejada EN MUNDO (espejarObjetoMundo): un objeto inclinado
    * sale reflejado de verdad — inclinación invertida, no la misma — con
    * transform NUEVO (pivote en el centro de su caja, rotación a cero:
-   * la inclinación original viaja horneada dentro de la malla reflejada).
+   * la inclinación original viaja horneada dentro de la malla reflejada)
+   * y colocado AL LADO del original, pegado a la cara de su caja hacia el
+   * eje pedido (espejo apoyado en la pieza — pedido del usuario 15/10:
+   * antes caía encima, superpuesto).
    * Sin parametrización (primitiveParams/spline/pluginEdit se retiran,
    * mismo horneado) y `espejoSufijo` se añade al nombre.
    */
@@ -12193,6 +12425,41 @@ pluginTracks,
     [selectedObjectId, sceneObjects, setSceneObjects, t]
   );
 
+  // VISTA PREVIA del Espejo (hover sobre un eje del desplegable): el mesh
+  // espejado + el transform con el que lo pondría el visor. Modo
+  // transformar: la misma malla espejada EN SU SITIO (transform del
+  // objeto); modo nuevo: el GEMELO en mundo (mesh horneada + transform
+  // destino de espejarObjetoMundo — aparece AL LADO, reflejado de verdad).
+  // Sin hover o sin objeto: null (el visor no pinta nada).
+  const espejoHoverPreview = useMemo(() => {
+    if (!espejoHoverEje) return null;
+    const obj = sceneObjects.find((o) => o.id === selectedObjectId);
+    if (!obj?.mesh || obj.mesh.vertices.length < 3) return null;
+    if (espejoCrearNuevo) {
+      const { mesh, transform } = espejarObjetoMundo(obj.mesh, obj.transform, espejoHoverEje);
+      // El transform del gemelo trae los campos OPCIONALES (TransformEspejo):
+      // normalizar al ObjectTransform completo del visor (identidad donde
+      // falte — espejarObjetoMundo siempre da los 9, pero sanear por si acaso).
+      const completo: ObjectTransform = {
+        px: transform.px ?? 0,
+        py: transform.py ?? 0,
+        pz: transform.pz ?? 0,
+        rx: transform.rx ?? 0,
+        ry: transform.ry ?? 0,
+        rz: transform.rz ?? 0,
+        sx: transform.sx ?? 1,
+        sy: transform.sy ?? 1,
+        sz: transform.sz ?? 1,
+      };
+      return { mesh, transform: completo, gemelo: true };
+    }
+    return {
+      mesh: espejarMesh(obj.mesh, espejoHoverEje),
+      transform: obj.transform,
+      gemelo: false,
+    };
+  }, [espejoHoverEje, espejoCrearNuevo, selectedObjectId, sceneObjects]);
+
   /**
    * Cambia la spline de un objeto desde la pestaña Escena (reediéndola con
    * el botón aplicado): regenera la malla en vivo con los datos nuevos.
@@ -12205,7 +12472,12 @@ pluginTracks,
             ? {
                 ...o,
                 spline: datos,
-                mesh: buildSpline3DMesh(datos.nodes, datos),
+                // El giro completo (datos.rotacion) se aplica a los nodos
+                // antes de hornear: malla = trazado girado, datos intactos.
+                mesh: buildSpline3DMesh(
+                  aplicaGiroSplineNodos(datos.nodes, datos.rotacion),
+                  datos
+                ),
                 smooth: true,
               }
             : o
@@ -13833,8 +14105,20 @@ pluginTracks,
       sy: 1,
       sz: 1,
     });
+    // Persistencia por objeto: el centrado también queda en su ficha.
+    guardarGizmoAsas(selectedObjectId, {
+      px: cx,
+      py: cy,
+      pz: cz,
+      rx: 0,
+      ry: 0,
+      rz: 0,
+      sx: 1,
+      sy: 1,
+      sz: 1,
+    });
     toast.success(t('editor3D.gizmoCentered'));
-  }, [selectedObjectId, sceneObjects, t]);
+  }, [selectedObjectId, sceneObjects, t, guardarGizmoAsas]);
 
   // Template save/load handlers
   const openTemplateModal = useCallback(async (action: 'save' | 'load') => {
@@ -13843,7 +14127,17 @@ pluginTracks,
     setTemplateName('');
     setSelectedTemplateIds([]);
     if (action === 'save') {
-      setTemplateType(mode === 'lathe' ? 'lathe' : mode === 'mesh' ? 'mesh' : 'views');
+      // En el SPLINE (pestaña Escena) la plantilla a guardar es la FORMA
+      // del lienzo abierto (el vértice activo), no un conjunto de vistas.
+      setTemplateType(
+        mode === 'lathe'
+          ? 'lathe'
+          : mode === 'mesh'
+            ? 'mesh'
+            : mode === 'scene' && (modoSpline || editingSplineCanvas)
+              ? 'forma'
+              : 'views'
+      );
     }
     setTemplateLoading(true);
     try {
@@ -13855,7 +14149,7 @@ pluginTracks,
       setTemplateLoading(false);
     }
     setTemplateModalOpen(true);
-  }, [mode, t]);
+  }, [mode, t, modoSpline, editingSplineCanvas]);
 
   const handleSaveTemplate = useCallback(async () => {
     if (!templateName.trim()) {
@@ -13864,7 +14158,25 @@ pluginTracks,
     }
     try {
       let data: Record<string, unknown> = {};
-      if (templateType === 'views') {
+      if (templateType === 'forma') {
+        // Forma suelta del lienzo ABIERTO: vale para el vértice del spline,
+        // para cualquier plantilla de cualquier otra pestaña y, sin lienzo
+        // abierto, es la figura principal de la pestaña actual.
+        const poly =
+          fullScreenCanvas?.polygon ??
+          (modoSpline || editingSplineCanvas
+            ? (splineNodes.find((n) => n.id === splineActivoId)?.polygon ?? [])
+            : mode === 'lathe'
+              ? latheProfile
+              : mode === 'mesh'
+                ? (editingMeshProfile === 'side' ? meshSideView : meshSilhouette)
+                : views.front);
+        if (poly.length < 3) {
+          setTemplateMsg({ ok: false, text: t('editor3D.templateFormaVacia') });
+          return;
+        }
+        data = { polygon: structuredClone(poly) };
+      } else if (templateType === 'views') {
         data = { views: { front: structuredClone(views.front), side: structuredClone(views.side), top: structuredClone(views.top) } };
       } else if (templateType === 'lathe') {
         data = { latheProfile: structuredClone(latheProfile) };
@@ -13878,12 +14190,27 @@ pluginTracks,
     } catch (e) {
       setTemplateMsg({ ok: false, text: t('editor3D.templateSaveError') });
     }
-  }, [templateName, templateType, views, latheProfile, meshSilhouette, meshSections, t]);
+  }, [templateName, templateType, views, latheProfile, meshSilhouette, meshSections, meshSideView, editingMeshProfile, fullScreenCanvas, modoSpline, editingSplineCanvas, splineNodes, splineActivoId, mode, t]);
 
   const handleApplyTemplate = useCallback(async (tpl: SavedTemplate) => {
     try {
       const data = tpl.data;
-      if (tpl.type === 'views' && data.views) {
+      if (tpl.type === 'forma' && Array.isArray(data.polygon)) {
+        // Forma suelta: entra en el lienzo que esté abierto (cualquiera:
+        // vista, silueta, sección, perfil del torno, recorrido o el vértice
+        // del spline). Sin lienzo abierto, cae en el vértice activo del
+        // spline si el modo está activo, y si no en el Frente.
+        const poly = structuredClone(data.polygon as Point2D[]);
+        if (fullScreenCanvas) {
+          fullScreenCanvas.apply(poly);
+        } else if (modoSpline || editingSplineCanvas) {
+          const nodoSpline = splineNodes.find((n) => n.id === splineActivoId);
+          if (nodoSpline) updateSplineNodePolygon(nodoSpline.id, poly);
+        } else {
+          setViews((prev) => ({ ...prev, front: poly }));
+        }
+        setEditedVertices(null);
+      } else if (tpl.type === 'views' && data.views) {
         const v = data.views as { front: unknown; side: unknown; top: unknown };
         if (v.front) setViews((prev) => ({ ...prev, front: structuredClone(v.front as Point2D[]) }));
         if (v.side) setViews((prev) => ({ ...prev, side: structuredClone(v.side as Point2D[]) }));
@@ -13898,7 +14225,7 @@ pluginTracks,
     } catch (e) {
       setTemplateMsg({ ok: false, text: t('editor3D.templateApplyError') });
     }
-  }, [t]);
+  }, [t, fullScreenCanvas, modoSpline, editingSplineCanvas, splineNodes, splineActivoId, updateSplineNodePolygon]);
 
   const handleDeleteTemplate = useCallback(async (id: string) => {
     try {
@@ -14042,6 +14369,8 @@ pluginTracks,
       splineEdicion={splineEdicion}
       splinePreview={splineVistaPrevia}
       splinePreviewVisible={splinePrevVista}
+      splinePreviewObjeto={splinePrevObjeto}
+      espejoPreview={espejoHoverPreview}
       splineContornos={splineContornos}
       onCtrlExtrudirSubSel={handleCtrlExtrudirSubSel}
       faceSelectVisibleOnly={faceSelectVisibleOnly}
@@ -14416,7 +14745,13 @@ pluginTracks,
               aplica según ese modo respecto al centro de la caja del objeto
               (la malla queda horneada — lib/espejo.ts). Sin selección: aviso.
               Icono /icons/Espejo.png (igual que los deformadores). */}
-          <DropdownMenu>
+          <DropdownMenu
+            /* Al cerrar el desplegable (click fuera/Esc/selección) la vista
+               previa de hover muere: sin ella el fantasma quedaba pegado. */
+            onOpenChange={(abierto) => {
+              if (!abierto) setEspejoHoverEje(null);
+            }}
+          >
             <DropdownMenuTrigger asChild>
               <button
                 title={t('editor3D.espejoBtnTitle')}
@@ -14445,6 +14780,8 @@ pluginTracks,
             <DropdownMenuContent
               align="start"
               className="bg-gray-900 border-gray-800 text-white min-w-[230px]"
+              onMouseLeave={() => setEspejoHoverEje(null)}
+              onPointerLeave={() => setEspejoHoverEje(null)}
             >
               <DropdownMenuRadioGroup
                 value={espejoCrearNuevo ? 'nuevo' : 'transformar'}
@@ -14469,18 +14806,21 @@ pluginTracks,
               <DropdownMenuItem
                 onClick={() => aplicarEspejo('x', espejoCrearNuevo)}
                 data-testid="espejo-x"
+                onMouseEnter={() => setEspejoHoverEje('x')}
               >
                 {t('editor3D.espejoEjeX')}
               </DropdownMenuItem>
               <DropdownMenuItem
                 onClick={() => aplicarEspejo('y', espejoCrearNuevo)}
                 data-testid="espejo-y"
+                onMouseEnter={() => setEspejoHoverEje('y')}
               >
                 {t('editor3D.espejoEjeY')}
               </DropdownMenuItem>
               <DropdownMenuItem
                 onClick={() => aplicarEspejo('z', espejoCrearNuevo)}
                 data-testid="espejo-z"
+                onMouseEnter={() => setEspejoHoverEje('z')}
               >
                 {t('editor3D.espejoEjeZ')}
               </DropdownMenuItem>
@@ -16881,6 +17221,11 @@ pluginTracks,
                           setGizmoModes(gizmoModesDraft);
                           setGizmoConfigMode(false);
                           setShowGizmo(prevGizmoVisibleRef.current);
+                          // «Aplicar» también GUARDA la configuración en la
+                          // ficha del objeto activo (persistencia por
+                          // objeto, pedido 15/10): aunque nunca cambies de
+                          // objeto, la configuración queda suya.
+                          guardarGizmoAsas(selectedObjectId, gizmoOffset);
                         } else {
                           if (!selectedObjectId) return;
                           // Entrar en modo configuración: guardar si el gizmo
@@ -17931,6 +18276,22 @@ pluginTracks,
                       />
                       {t('editor3D.splinePrevToggle')}
                     </label>
+                    {/* Modo de la vista previa (pedido del usuario 15/10):
+                        con la vista previa activa, ver el objeto COMO
+                        quedaría tras Aplicar (gris sólido con sombreado)
+                        en vez del velo azul — el trazado y las plantillas
+                        siguen en sus colores encima, se sigue editando. */}
+                    <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground cursor-pointer">
+                      <input
+                        type="checkbox"
+                        data-testid="spline-preview-objeto"
+                        checked={splinePrevObjeto}
+                        disabled={!splinePrevVista}
+                        onChange={(e) => setSplinePrevObjeto(e.target.checked)}
+                        className="w-3 h-3 accent-gray-400 disabled:opacity-40"
+                      />
+                      {t('editor3D.splinePrevObjeto')}
+                    </label>
                     <label className="flex items-center gap-2 cursor-pointer select-none">
                       <input
                         type="checkbox"
@@ -18041,6 +18402,69 @@ pluginTracks,
                             testId="spline-tilt"
                             suffix="°"
                           />
+                        </div>
+                        {/* GIRO DEL SPLINE COMPLETO: junto a los tilts de la
+                            plantilla (pedido del usuario 15/10). Gira TODO -
+                            vértices, plantillas y vista previa (el velo azul)
+                            - como cuerpo rígido alrededor del centroide del
+                            trazado. Los nodos no cambian de sitio en los
+                            datos: el giro viaja aparte y se hornea al Aplicar. */}
+                        <div className="pt-1.5 mt-1.5 border-t border-white/5">
+                          <div className="flex items-center justify-between">
+                            <label className="text-[10px] text-muted-foreground/80 font-medium cursor-default">
+                              {t('editor3D.splineGiroCompleto')}
+                            </label>
+                            <button
+                              type="button"
+                              data-testid="spline-giro-reset"
+                              onClick={() => setSplineGiro({ ...GIRO_SPLINE_NULO })}
+                              disabled={!giroSplineActivo(splineGiro)}
+                              className="px-1.5 py-0.5 rounded bg-black/40 border border-white/10 text-[9px] text-muted-foreground hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                            >
+                              {t('editor3D.splineGiroReset')}
+                            </button>
+                          </div>
+                          <div className="grid grid-cols-2 gap-1.5 mt-0.5">
+                            <label className="text-[10px] text-muted-foreground/80">X</label>
+                            <NumberInput
+                              value={Math.round(splineGiro.x)}
+                              step={5}
+                              onCommit={(n) =>
+                                setSplineGiro((g) => ({
+                                  ...g,
+                                  x: Math.max(-360, Math.min(360, n)),
+                                }))
+                              }
+                              testId="spline-giro-x"
+                              suffix="°"
+                            />
+                            <label className="text-[10px] text-muted-foreground/80">Y</label>
+                            <NumberInput
+                              value={Math.round(splineGiro.y)}
+                              step={5}
+                              onCommit={(n) =>
+                                setSplineGiro((g) => ({
+                                  ...g,
+                                  y: Math.max(-360, Math.min(360, n)),
+                                }))
+                              }
+                              testId="spline-giro-y"
+                              suffix="°"
+                            />
+                            <label className="text-[10px] text-muted-foreground/80">Z</label>
+                            <NumberInput
+                              value={Math.round(splineGiro.z)}
+                              step={5}
+                              onCommit={(n) =>
+                                setSplineGiro((g) => ({
+                                  ...g,
+                                  z: Math.max(-360, Math.min(360, n)),
+                                }))
+                              }
+                              testId="spline-giro-z"
+                              suffix="°"
+                            />
+                          </div>
                         </div>
                       </div>
                     )}
@@ -19532,7 +19956,12 @@ pluginTracks,
               <button
                 data-testid="face-texture-assign"
                 disabled={
-                  faceSelectionTarget !== 'cara' ||
+                  /* 'todo' cuenta como 'cara' (la zona Seleccionar nace en
+                      'todo' y puebla selectedFaceIds igual): con el objetivo
+                      por defecto los botones no se activaban NUNCA aunque
+                      hubiera caras seleccionadas (reporte del usuario
+                      15/10). Vertices/aristas solos: sí deshabilitado. */
+                  !(faceSelectionTarget === 'cara' || faceSelectionTarget === 'todo') ||
                   selectedFaceIds.length === 0 ||
                   !faceTextureTargetId
                 }
@@ -19545,7 +19974,7 @@ pluginTracks,
               <button
                 data-testid="face-texture-gallery"
                 disabled={
-                  faceSelectionTarget !== 'cara' ||
+                  !(faceSelectionTarget === 'cara' || faceSelectionTarget === 'todo') ||
                   selectedFaceIds.length === 0 ||
                   !faceTextureTargetId
                 }
@@ -19562,7 +19991,7 @@ pluginTracks,
               <button
                 data-testid="face-texture-clear"
                 disabled={
-                  faceSelectionTarget !== 'cara' ||
+                  !(faceSelectionTarget === 'cara' || faceSelectionTarget === 'todo') ||
                   selectedFaceIds.length === 0 ||
                   !faceTextureTargetId
                 }
@@ -19593,52 +20022,59 @@ pluginTracks,
             </div>
           )}
 
-          {/* Herramientas de la columna derecha: importar PNG y plantilla */}
+          {/* Herramientas de la columna derecha: importar PNG y plantilla.
+              También se ve en el SPLINE (pestaña Escena): ahí no hay
+              importe PNG, pero sí Guardar/Cargar plantilla del vértice. */}
           {(mode === 'views' ||
             mode === 'mesh' ||
             mode === 'lathe' ||
-            mode === 'extrude') && (
+            mode === 'extrude' ||
+            (mode === 'scene' && (modoSpline || editingSplineCanvas))) && (
             <div className="shrink-0 flex items-center gap-3 px-4 py-2 border-t border-white/5 bg-[hsl(224_50%_6%)]">
-              <input
-                ref={pngImportInputRef}
-                type="file"
-                accept="image/png,image/*"
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) handlePngImport(file);
-                  e.target.value = '';
-                }}
-                className="hidden"
-              />
-              <button
-                onClick={() => pngImportInputRef.current?.click()}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-green-500/15 hover:bg-green-500/25 text-green-200 border border-green-500/30 transition-colors"
-                title={t('editor3D.importPngTitle')}
-              >
-                <ImageIcon className="w-3.5 h-3.5" />
-                {t('editor3D.importPng')}
-              </button>
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-muted-foreground">{t('editor3D.detailLabel')}</span>
-                <Slider
-                  min={0}
-                  max={100}
-                  step={1}
-                  value={[importDetailLevel]}
-                  onValueChange={([v]) => setImportDetailLevel(v)}
-                  className="w-28"
-                />
-                <span className="font-mono text-xs text-green-400 w-8">
-                  {importDetailLevel}%
-                </span>
-              </div>
-              <span className="text-xs text-muted-foreground/60">
-                {importDetailLevel < 30
-                  ? t('editor3D.fewVertices')
-                  : importDetailLevel > 80
-                    ? t('editor3D.manyVertices')
-                    : t('editor3D.mediumQuality')}
-              </span>
+              {mode !== 'scene' && (
+                <>
+                  <input
+                    ref={pngImportInputRef}
+                    type="file"
+                    accept="image/png,image/*"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) handlePngImport(file);
+                      e.target.value = '';
+                    }}
+                    className="hidden"
+                  />
+                  <button
+                    onClick={() => pngImportInputRef.current?.click()}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-green-500/15 hover:bg-green-500/25 text-green-200 border border-green-500/30 transition-colors"
+                    title={t('editor3D.importPngTitle')}
+                  >
+                    <ImageIcon className="w-3.5 h-3.5" />
+                    {t('editor3D.importPng')}
+                  </button>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground">{t('editor3D.detailLabel')}</span>
+                    <Slider
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={[importDetailLevel]}
+                      onValueChange={([v]) => setImportDetailLevel(v)}
+                      className="w-28"
+                    />
+                    <span className="font-mono text-xs text-green-400 w-8">
+                      {importDetailLevel}%
+                    </span>
+                  </div>
+                  <span className="text-xs text-muted-foreground/60">
+                    {importDetailLevel < 30
+                      ? t('editor3D.fewVertices')
+                      : importDetailLevel > 80
+                        ? t('editor3D.manyVertices')
+                        : t('editor3D.mediumQuality')}
+                  </span>
+                </>
+              )}
 
               {/* Plantilla de referencia */}
               <div className="w-px h-5 bg-white/10"></div>
@@ -20039,11 +20475,18 @@ pluginTracks,
               <div className="max-h-72 overflow-y-auto pr-1 modal-scrollbar space-y-3">
                 {/* Offset actual del gizmo con botón de reset. */}
                 <div className="flex items-center gap-1 mt-1">
-                  <span className="text-[9px] text-muted-foreground/60 font-mono">
+                  <span
+                    data-testid="gizmo-offset-info"
+                    className="text-[9px] text-muted-foreground/60 font-mono"
+                  >
                     {t('editor3D.gizmoOffset')} {Math.round(gizmoOffset.px * 10) / 10}, {Math.round(gizmoOffset.py * 10) / 10}, {Math.round(gizmoOffset.pz * 10) / 10}
                   </span>
                   <button
-                    onClick={() => setGizmoOffset(structuredClone(IDENTITY_TRANSFORM))}
+                    onClick={() => {
+                      setGizmoOffset(structuredClone(IDENTITY_TRANSFORM));
+                      // El restablecido también queda en la ficha del objeto.
+                      guardarGizmoAsas(selectedObjectId, structuredClone(IDENTITY_TRANSFORM));
+                    }}
                     data-testid="gizmo-reset-offset"
                     title={t('editor3D.gizmoResetOffset')}
                     className="ml-auto px-1.5 py-0.5 rounded text-[10px] text-muted-foreground/60 hover:text-foreground hover:bg-white/5 border border-white/10 transition-colors"
@@ -20189,6 +20632,18 @@ pluginTracks,
                   >
                     {t('editor3D.templateTypeMesh')}
                   </button>
+                  {/* Formas sueltas: UN lienzo (el abierto ahora). Son las
+                      que se pueden aplicar a CUALQUIER lienzo 2D después. */}
+                  <button
+                    onClick={() => setTemplateType('forma')}
+                    className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                      templateType === 'forma'
+                        ? 'bg-purple-600 text-white'
+                        : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                    }`}
+                  >
+                    {t('editor3D.templateTypeForma')}
+                  </button>
                 </div>
               </div>
 
@@ -20237,7 +20692,9 @@ pluginTracks,
                             ? t('editor3D.templateTypeViews')
                             : tpl.type === 'lathe'
                               ? t('editor3D.templateTypeLathe')
-                              : t('editor3D.templateTypeMesh')}
+                              : tpl.type === 'forma'
+                                ? t('editor3D.templateTypeForma')
+                                : t('editor3D.templateTypeMesh')}
                         </div>
                       </div>
                       <div className="flex items-center gap-1 opacity-60 group-hover:opacity-100 transition-opacity">
