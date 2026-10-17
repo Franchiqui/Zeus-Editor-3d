@@ -217,7 +217,12 @@ export async function readProject(projectPath: string): Promise<any | null> {
 export async function saveProject(projectPath: string, data: any): Promise<boolean> {
   if (isElectron()) {
     const res = await window.electronAPI!.fsSaveProject(projectPath, data);
-    return res.success;
+    // Propagar el error real del proceso principal: el mensaje genérico
+    // ('No se pudo escribir el archivo') oculta la causa (disco lleno,
+    // serialización circular, permisos...). Los editores ya lo capturan
+    // con try/catch y muestran e.message.
+    if (!res.success) throw new Error(res.error || 'No se pudo guardar el archivo (sin detalles del proceso principal)');
+    return true;
   }
   return false;
 }

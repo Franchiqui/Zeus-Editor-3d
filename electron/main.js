@@ -499,11 +499,158 @@ ipcMain.handle('fs:readProject', async (_, projectPath) => {
   }
 });
 
-ipcMain.handle('fs:saveProject', async (_, projectPath, data) => {
+// Serializador JSON incremental: produce EXACTAMENTE el mismo formato que
+// JSON.stringify(valor, null, 2) pero cediendo el resultado en trozos
+// pequeños. Los proyectos 3D con texturas base64 superan el límite de
+// longitud de string de V8 (~512M de caracteres), que hace que
+// JSON.stringify lance "Invalid string length"; en streaming no existe
+// tal límite porque nunca se construye el string completo.
+const JSON_INDENT = '  ';
+const JSON_ARRAY_BATCH = 1000; // por rendimiento solo en arrays de primitivos
+
+// Claves/elementos que JSON.stringify omite en objetos o convierte a null
+// en arrays: undefined, funciones y símbolos.
+function isOmittableJson(v) {
+  return v === undefined || typeof v === 'function' || typeof v === 'symbol';
+}
+
+function* jsonChunksRec(value, level, visited) {
+  const indent = JSON_INDENT.repeat(level);
+  const inner = JSON_INDENT.repeat(level + 1);
+
+  // null, primitivos y valores que JSON.stringify serializa como 'null'
+  if (value === null) { yield 'null'; return; }
+  switch (typeof value) {
+    case 'undefined': yield 'null'; return; // solo alcanza como elemento de array
+    case 'string': yield JSON.stringify(value); return;
+    case 'number': yield JSON.stringify(value); return; // NaN/Infinity → 'null'
+    case 'boolean': yield JSON.stringify(value); return;
+    case 'bigint':
+      throw new Error('Do not know how to serialize a BigInt');
+    case 'function':
+    case 'symbol': yield 'null'; return; // solo alcanza como elemento de array
+  }
+  if (typeof value.toJSON === 'function') {
+    yield* jsonChunksRec(value.toJSON(), level, visited);
+    return;
+  }
+  if (visited.has(value)) {
+    throw new Error('Converting circular structure to JSON');
+  }
+
+  if (Array.isArray(value)) {
+    visited.add(value);
+    try {
+      const n = value.length;
+      if (n === 0) { yield '[]'; return; }
+      // Optimización para arrays de primitivos (mallas, UVs...): lotes de
+      // líneas preformateadas en vez de un yield por elemento.
+      let allPrim = true;
+      for (let i = 0; i < n; i++) {
+        const item = value[i];
+        if (item !== null && typeof item === 'object') { allPrim = false; break; }
+      }
+      if (allPrim) {
+        yield '[';
+        for (let i = 0; i < n; i += JSON_ARRAY_BATCH) {
+          // Primer lote: salto inicial tras '['; los siguientes continúan
+          // tras la ',\n' del último elemento del lote anterior.
+          let piece = i === 0 ? '\n' : '';
+          const end = Math.min(n, i + JSON_ARRAY_BATCH);
+          for (let j = i; j < end; j++) {
+            let item = value[j];
+            if (isOmittableJson(item)) item = null;
+            piece += inner + JSON.stringify(item) + (j + 1 < n ? ',\n' : '');
+          }
+          yield piece;
+        }
+        yield '\n' + indent + ']';
+        return;
+      }
+      let first = true;
+      yield '[';
+      for (let i = 0; i < n; i++) {
+        yield (first ? '' : ',') + '\n' + inner;
+        yield* jsonChunksRec(value[i], level + 1, visited);
+        first = false;
+      }
+      yield '\n' + indent + ']';
+      return;
+    } finally {
+      visited.delete(value);
+    }
+  }
+
+  // Objeto: claves enumerables propias, omite undefined/function/symbol
+  // (igual que JSON.stringify) y salta referencias circulares con error.
+  const entries = [];
+  for (const key of Object.keys(value)) {
+    const item = value[key];
+    if (isOmittableJson(item)) continue;
+    entries.push([key, item]);
+  }
+  if (entries.length === 0) { yield '{}'; return; }
+  visited.add(value);
   try {
-    fs.writeFileSync(projectPath, JSON.stringify(data, null, 2), 'utf-8');
-    return { success: true };
+    let first = true;
+    yield '{';
+    for (const [key, item] of entries) {
+      yield (first ? '' : ',') + '\n' + inner + JSON.stringify(key) + ': ';
+      yield* jsonChunksRec(item, level + 1, visited);
+      first = false;
+    }
+    yield '\n' + indent + '}';
+  } finally {
+    visited.delete(value);
+  }
+}
+
+// Escribir un valor JSON a un archivo en streaming, con contrapresión.
+function writeJsonStream(value, outPath) {
+  return new Promise((resolve, reject) => {
+    const stream = fs.createWriteStream(outPath, { encoding: 'utf-8' });
+    stream.on('finish', () => resolve());
+    stream.on('error', (err) => reject(err));
+    const visited = new WeakSet();
+    const pushNext = () => {
+      try {
+        const { done, value: chunk } = iterator.next();
+        if (done) { stream.end(); return; }
+        if (stream.write(chunk)) pushNext();
+        else stream.once('drain', pushNext);
+      } catch (err) {
+        try { stream.destroy(); } catch {}
+        reject(err);
+      }
+    };
+    const iterator = jsonChunksRec(value, 0, visited);
+    pushNext();
+  });
+}
+
+ipcMain.handle('fs:saveProject', async (_, projectPath, data) => {
+  // Escritura atómica: temp + rename. Si el disco o la serialización fallan
+  // a mitad, se pierde el .tmp, nunca el proyecto real (writeFileSync
+  // truncaría el destino y lo dejaría corrupto).
+  const tmpPath = `${projectPath}.tmp-${Date.now()}`;
+  try {
+    if (fs.existsSync(projectPath)) {
+      // Verificar ANTES de escribir que podemos escribir.
+      fs.accessSync(projectPath, fs.constants.W_OK);
+    }
+    await writeJsonStream(data, tmpPath);
+    try {
+      fs.renameSync(tmpPath, projectPath);
+      return { success: true };
+    } catch (renameErr) {
+      // Fallback: si el rename falla (p.ej. el destino abierto por otro
+      // programa), escribir directo sobre el destino truncándolo.
+      await writeJsonStream(data, projectPath);
+      try { fs.unlinkSync(tmpPath); } catch {}
+      return { success: true };
+    }
   } catch (e) {
+    try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch {}
     return { success: false, error: e.message };
   }
 });

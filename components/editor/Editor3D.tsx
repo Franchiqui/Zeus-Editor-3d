@@ -310,6 +310,7 @@ import {
    Eraser,
    Upload,
    Target,
+   Move,
  } from 'lucide-react';
 import { useAIEditorBridgeOptional } from '@/components/AIEditorBridgeContext';
 import { applyZeiaPlansToScene, type ZeiaSceneObject } from '@/lib/zeia-scene';
@@ -8445,6 +8446,9 @@ pluginTracks,
        panelViews,
        windowLayout,
        showGrid,
+       // Paso del movimiento con flechas: viaja con el proyecto (los
+       // proyectos viejos no lo traen y usan su valor por defecto)
+       pasoPulsacion: pasoPulsacionNum,
         fxConfig,
         groundTexture,
         groundTextureFinish,
@@ -10184,6 +10188,14 @@ pluginTracks,
           if (data.panelViews && typeof data.panelViews === 'object') {
             setPanelViews((prev) => ({ ...prev, ...data.panelViews }));
           }
+          // Paso del movimiento con flechas: los proyectos que lo guardan
+          // lo restauran (los viejos siguen con su valor por defecto)
+          if (
+            typeof data.pasoPulsacion === 'number' &&
+            data.pasoPulsacion > 0
+          ) {
+            setPasoPulsacion(String(data.pasoPulsacion));
+          }
           if (typeof data.windowLayout === 'string') {
             setWindowLayout(data.windowLayout as WindowLayout);
           }
@@ -11466,6 +11478,232 @@ pluginTracks,
     },
     []
   );
+
+  // Mover la selección con las flechas del teclado siguiendo la VENTANA
+  // ACTIVA: cada flecha mueve la figura en la dirección que apuntan las
+  // flechas de vista de esa ventana (la misma base de pantalla que pan3D
+  // y la alineación usan para mover la vista). ←/→ van por el eje que más
+  // pinta de horizontal en esa ventana y ↑/↓ por el más vertical; con
+  // Espacio o Ctrl mantenidos se mueve IGUAL (▲ sube, ▼ baja).
+  // Cada pulsación —también las que repite tener la tecla apretada— avanza
+  // el paso configurado en el menú «Acciones» (fino ×5 con Shift); pasa por
+  // setSceneObjects: el historial y el visor reaccionan como en un arrastre.
+  const [pasoPulsacion, setPasoPulsacion] = useState('0.25');
+  // Paso efectivo: la caja puede quedar vacía o con un número inválido
+  // mientras se escribe — en ese momento se usa el paso por defecto.
+  const pasoPulsacionNum = (() => {
+    const v = Number(pasoPulsacion);
+    return Number.isFinite(v) && v > 0 ? v : 0.25;
+  })();
+  // Carga única del paso guardado. El GUARDADO no va en un efecto de
+  // estado: al montar (StrictMode de dev remonta doble) corría el guardar
+  // con el 0.25 por defecto ANTES de que el valor cargado llegase, y
+  // machacaba el guardado — de ahí que tras reiniciar volviera el valor
+  // inicial. Se guarda directo en el onChange del campo.
+  useEffect(() => {
+    try {
+      const guardado = window.localStorage.getItem('zeus-editor3d-paso-pulsacion');
+      if (guardado && Number(guardado) > 0) setPasoPulsacion(guardado);
+    } catch {
+      // localStorage puede fallar (modo privado, datos bloqueados): el
+      // paso por defecto (0.25) sigue siendo válido.
+    }
+  }, []);
+  /** Guarda el paso solo si el valor tecleado es válido (>0). */
+  const guardarPaso = useCallback((texto: string) => {
+    const v = Number(texto);
+    if (Number.isFinite(v) && v > 0) {
+      try {
+        window.localStorage.setItem('zeus-editor3d-paso-pulsacion', String(v));
+      } catch {
+        // Sin persistencia: el paso vive solo en esta sesión y en el proyecto.
+      }
+    }
+  }, []);
+  // Pasos rápidos junto al campo: los FIJOS siempre están y a ellos se
+  // suman los que el usuario añade (la «+» guarda el valor tecleado).
+  // Solo los añadidos se quitan; los añadidos persisten en localStorage.
+  const [pasosRapidosCustom, setPasosRapidosCustom] = useState<string[]>([]);
+  const pasoPulsacionRef = useRef('0.25');
+  pasoPulsacionRef.current = pasoPulsacion;
+  useEffect(() => {
+    try {
+      const crudos = window.localStorage.getItem('zeus-editor3d-pasos-custom');
+      if (!crudos) return;
+      const lista = JSON.parse(crudos);
+      if (Array.isArray(lista)) {
+        const validos = lista.filter(
+          (x): x is string => typeof x === 'string' && Number(x) > 0
+        );
+        setPasosRapidosCustom(validos);
+      }
+    } catch {
+      // Lista inválida o storage fallando: quedan los fijos.
+    }
+  }, []);
+  /** Añade el valor tecleado como paso rápido (normalizado, sin duplicar). */
+  const agregarPasoRapido = useCallback(() => {
+    setPasosRapidosCustom((prev) => {
+      const texto = pasoPulsacionRef.current;
+      const v = Number(texto);
+      if (!Number.isFinite(v) || v <= 0) return prev;
+      const normal = String(v);
+      const FIJOS = ['0.05', '0.1', '0.25', '0.5', '1'];
+      if (prev.includes(normal) || FIJOS.includes(normal)) return prev;
+      const next = [...prev, normal].slice(-6);
+      try {
+        window.localStorage.setItem('zeus-editor3d-pasos-custom', JSON.stringify(next));
+      } catch {
+        // Sin persistencia: quedan en esta sesión.
+      }
+      return next;
+    });
+  }, []);
+  /** Quita un paso rápido añadido por el usuario. */
+  const quitarPasoRapido = useCallback((valor: string) => {
+    setPasosRapidosCustom((prev) => {
+      const next = prev.filter((x) => x !== valor);
+      try {
+        window.localStorage.setItem('zeus-editor3d-pasos-custom', JSON.stringify(next));
+      } catch {
+        // Sin persistencia: quedan en esta sesión.
+      }
+      return next;
+    });
+  }, []);
+  /** Selecciona un paso rápido: vale como si se hubiera tecleado. */
+  const elegirPasoRapido = useCallback(
+    (valor: string) => {
+      setPasoPulsacion(valor);
+      guardarPaso(valor);
+    },
+    [guardarPaso]
+  );
+
+  // Espacio MANTENIDO: no hay forma de saberlo desde el keydown de una
+  // flecha (su e.code es el de la flecha, nunca 'Space'), así que se
+  // sigue el estado de la tecla por aparte y se olvida si la ventana
+  // pierde el foco (una tecla soltada «fuera» puede quedar pegada).
+  const espacioPulsadoRef = useRef(false);
+  useEffect(() => {
+    const bajar = (e: KeyboardEvent) => {
+      espacioPulsadoRef.current = e.code === 'Space';
+    };
+    const soltar = () => {
+      espacioPulsadoRef.current = false;
+    };
+    window.addEventListener('keydown', bajar);
+    window.addEventListener('keyup', soltar);
+    window.addEventListener('blur', soltar);
+    return () => {
+      window.removeEventListener('keydown', bajar);
+      window.removeEventListener('keyup', soltar);
+      window.removeEventListener('blur', soltar);
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (
+        e.key !== 'ArrowLeft' &&
+        e.key !== 'ArrowRight' &&
+        e.key !== 'ArrowUp' &&
+        e.key !== 'ArrowDown'
+      )
+        return;
+      if (document.querySelector('[role="dialog"]')) return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) return;
+      const ids =
+        selectedObjectIds.length > 0
+          ? selectedObjectIds
+          : selectedObjectId
+            ? [selectedObjectId]
+            : [];
+      if (ids.length === 0) return;
+      e.preventDefault();
+      // Base de pantalla de la ventana activa (fórmula compartida con
+      // pan3D y la alineación): n apunta del objetivo hacia la cámara,
+      // v es el ARRIBA de pantalla y h la DERECHA. En vistas cenitales
+      // la vertical degenera: arriba = −Z (superior) y +Z (inferior).
+      // Con Espacio o Ctrl: ▲/▼ = ALTURA del mundo (▲ +Y, ▼ −Y), sin
+      // depender de la ventana — así arriba siempre es arriba aunque la
+      // ventana activa mire desde arriba (v2 lo puso en la profundidad
+      // de la ventana y quedó invertido; v3 lo igualó a las flechas
+      // solas y en ventanas cenitales la altura quedaba inaccesible).
+      const cam = panelCameras[activeView];
+      const rotX = cam?.rotationX ?? 0;
+      const rotY = cam?.rotationY ?? 0;
+      const n = new THREE.Vector3(
+        Math.cos(rotX) * Math.sin(rotY),
+        Math.sin(rotX),
+        Math.cos(rotX) * Math.cos(rotY)
+      ).normalize();
+      const v = new THREE.Vector3(0, 1, 0).sub(n.clone().multiplyScalar(n.y));
+      if (v.lengthSq() < 1e-8) v.set(0, 0, rotX >= 0 ? -1 : 1);
+      v.normalize();
+      const h = v.clone().cross(n).normalize();
+      // El eje DEL MUNDO que más pinta en la dirección de pantalla pedida,
+      // con su signo: así cada flecha empuja hacia donde apunta la flecha
+      // del gizmo de ejes de la ventana (los empates van en orden de
+      // prioridad; un vector casi nulo no mueve).
+      const ejeFlecha = (
+        vec: THREE.Vector3,
+        prioridad: ('x' | 'y' | 'z')[]
+      ): { eje: 'x' | 'y' | 'z'; signo: number } => {
+        const comps: Record<'x' | 'y' | 'z', number> = {
+          x: vec.x,
+          y: vec.y,
+          z: vec.z,
+        };
+        let mejor: 'x' | 'y' | 'z' | null = null;
+        for (const ej of prioridad) {
+          if (mejor === null || Math.abs(comps[ej]) > Math.abs(comps[mejor])) {
+            mejor = ej;
+          }
+        }
+        const eje = mejor ?? 'y';
+        if (Math.abs(comps[eje]) < 1e-6) return { eje, signo: 0 };
+        return { eje, signo: comps[eje] > 0 ? 1 : -1 };
+      };
+      const pasoReal = e.shiftKey ? pasoPulsacionNum / 5 : pasoPulsacionNum;
+      const d = { x: 0, y: 0, z: 0 };
+      if ((espacioPulsadoRef.current || e.ctrlKey) && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+        // Con Espacio o Ctrl: ▲ sube (+Y), ▼ baja (−Y) — altura del mundo.
+        d.y = e.key === 'ArrowUp' ? 1 : -1;
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        const { eje, signo } = ejeFlecha(h, ['x', 'z']);
+        if (signo !== 0) {
+          d[eje] = e.key === 'ArrowRight' ? signo : -signo;
+        }
+      } else {
+        const { eje, signo } = ejeFlecha(v, ['y', 'z', 'x']);
+        if (signo !== 0) {
+          d[eje] = e.key === 'ArrowUp' ? signo : -signo;
+        }
+      }
+      if (d.x === 0 && d.y === 0 && d.z === 0) return;
+      setSceneObjects((prev) => {
+        const idSet = new Set(ids);
+        return prev.map((obj) => {
+          if (!idSet.has(obj.id)) return obj;
+          const t = obj.transform ?? IDENTITY_TRANSFORM;
+          return {
+            ...obj,
+            transform: {
+              ...t,
+              px: t.px + d.x * pasoReal,
+              py: t.py + d.y * pasoReal,
+              pz: t.pz + d.z * pasoReal,
+            },
+          };
+        });
+      });
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [selectedObjectIds, selectedObjectId, panelCameras, activeView, pasoPulsacion, setSceneObjects]);
 
   /**
    * Efectos por objeto cambiados desde el visor (aplicar/retirar en
@@ -14997,6 +15235,107 @@ pluginTracks,
               align="start"
               className="bg-gray-900 border-gray-800 text-white min-w-[200px]"
             >
+              {/* PASO POR PULSACIÓN del movimiento con flechas. El campo
+                  vive dentro del menú; parar el keydown/pointerdown: así
+                  Radix (Escape/Enter/typeahead) no reacciona al teclear y
+                  el editor no procesa estas teclas como mover el objeto. */}
+              <div
+                className="px-3 pt-2.5 pb-3 border-b border-gray-800"
+                data-testid="paso-pulsacion-field"
+                onKeyDown={(e) => e.stopPropagation()}
+                onPointerDown={(e) => e.stopPropagation()}
+              >
+                <div className="text-sm font-bold flex items-center gap-1.5">
+                  <Move className="w-3.5 h-3.5 text-cyan-400" />
+                  {t('editor3D.flechasPaso')}
+                </div>
+                <div className="mt-1 mb-1.5 text-[10px] leading-snug text-gray-400">
+                  {t('editor3D.flechasPasoDesc')}
+                </div>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={0.05}
+                    step={0.05}
+                    value={pasoPulsacion}
+                    onChange={(e) => {
+                      setPasoPulsacion(e.target.value);
+                      guardarPaso(e.target.value);
+                    }}
+                    title={t('editor3D.flechasPasoDesc')}
+                    data-testid="paso-pulsacion-input"
+                    className="w-24 px-2 py-1 rounded bg-gray-800 border border-gray-600 text-white text-xs outline-none focus:border-cyan-400"
+                  />
+                  <span className="text-[10px] text-gray-400">un.</span>
+                </label>
+                {/* Pasos rápidos: un clic y el paso se cambia. Fijos +
+                    los que el usuario añadió con la «+» (con una × para
+                    quitarlos). El activo se resalta. */}
+                <div className="mt-1.5 flex flex-wrap items-center gap-1">
+                  {['0.05', '0.1', '0.25', '0.5', '1'].map((v) => {
+                    const activo = Number(pasoPulsacion) === Number(v);
+                    return (
+                      <button
+                        key={v}
+                        type="button"
+                        onClick={() => elegirPasoRapido(v)}
+                        title={t('editor3D.flechasRapidoElegir')}
+                        data-testid={`paso-rapido-${v}`}
+                        className={`px-1.5 py-0.5 rounded text-[10px] border transition-colors ${
+                          activo
+                            ? 'bg-cyan-500/20 border-cyan-400 text-cyan-200'
+                            : 'bg-gray-800 border-gray-600 text-gray-300 hover:bg-gray-700'
+                        }`}
+                      >
+                        {v}
+                      </button>
+                    );
+                  })}
+                  {pasosRapidosCustom.map((v) => {
+                    const activo = Number(pasoPulsacion) === Number(v);
+                    return (
+                      <span
+                        key={`custom-${v}`}
+                        className={`relative inline-flex items-center rounded text-[10px] border ${
+                          activo
+                            ? 'bg-cyan-500/20 border-cyan-400'
+                            : 'bg-gray-800 border-gray-600'
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => elegirPasoRapido(v)}
+                          title={t('editor3D.flechasRapidoElegir')}
+                          data-testid={`paso-rapido-custom-${v}`}
+                          className={`px-1.5 py-0.5 rounded ${
+                            activo ? 'text-cyan-200' : 'text-gray-300'
+                          } hover:bg-gray-700`}
+                        >
+                          {v}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => quitarPasoRapido(v)}
+                          title={t('editor3D.flechasRapidoQuitar')}
+                          data-testid={`paso-rapido-quitar-${v}`}
+                          className="px-1 py-0.5 mr-0.5 rounded text-gray-500 hover:text-red-400 hover:bg-gray-700"
+                        >
+                          ×
+                        </button>
+                      </span>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    onClick={agregarPasoRapido}
+                    title={t('editor3D.flechasRapidoGuardar')}
+                    data-testid="paso-rapido-agregar"
+                    className="px-1.5 py-0.5 rounded text-[10px] border border-dashed border-gray-600 text-gray-400 hover:text-cyan-300 hover:border-cyan-400"
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
               <DropdownMenuItem
                 onSelect={(e) => {
                   e.preventDefault();
